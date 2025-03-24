@@ -1,16 +1,52 @@
 ﻿using Socketizer;
+using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 
-int messages = 0;
-using var set = new ManagedSocketSet(ReadSocket);
-var ep = new IPEndPoint(IPAddress.Loopback, 6379);
 const int SOCKETS = 20;
+var ep = new IPEndPoint(IPAddress.Loopback, 6380);
+var timeout = TimeSpan.FromSeconds(10);
+Socket[] socks = new Socket[SOCKETS];
+Task[] tasks = new Task[SOCKETS];
+int messages = 0;
+
+for (int i = 0; i < SOCKETS; i++)
+{
+    Socket socket = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+    socks[i] = socket;
+    socket.Connect(ep);
+    tasks[i] = Task.Run(async () =>
+    {
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(64);
+        try
+        {
+            while (true)
+            {
+                socket.Send(Ping());
+                int bytes = await socket.ReceiveAsync(buffer);
+                Interlocked.Increment(ref messages);
+            }
+        }
+        catch { }
+    });
+}
+await Task.Delay(timeout);
+foreach (var sock in socks)
+{
+    sock.Dispose();
+}
+await Task.WhenAll(tasks);
+Console.WriteLine($"async read: {Volatile.Read(ref messages)} messages received in {timeout.TotalSeconds}s using {SOCKETS} connections, no pipelining");
+
+using var set = new SemiManagedSocketSet(ReadSocket); // 2573906
+//using var set = new ManagedSocketSet(ReadSocket); // 2382757
+//using var set = new WindowsUnmanagedSocketSet(ReadSocket); // 404192
+messages = 0;
 for (int i = 0; i < SOCKETS; i++)
 {
     set.Open(ep, $"connection {i}").Write(Ping());
 }
-var timeout = TimeSpan.FromSeconds(10); 
+
 Thread.Sleep(timeout);
 Console.WriteLine($"{set.GetType().Name}: {Volatile.Read(ref messages)} messages received in {timeout.TotalSeconds}s using {SOCKETS} connections, no pipelining");
 

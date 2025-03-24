@@ -21,7 +21,7 @@ sealed class ManagedSocketSet : SocketSet
 
         if (disposing)
         {
-            Socket[] arr = children.Keys.ToArray();
+            Socket[] arr = [.. children.Keys];
             children.Clear();
             foreach (Socket child in arr)
             {
@@ -66,21 +66,23 @@ sealed class ManagedSocketSet : SocketSet
     protected override void Write(SocketBase socket, ReadOnlySpan<byte> value)
     {
         ThrowIfDisposed();
-        do
+        while (true)
         {
             var sent = ((ManagedSocket)socket).Socket.Send(value);
+            if (sent == value.Length) break;
             value = value.Slice(sent);
         }
-        while (!value.IsEmpty);
     }
 
     private readonly List<Socket> _pendingRead = [];
 
     public ManagedSocketSet(ReadCallback onRead) : base(onRead)
     {
-        var thread = new Thread(DedicatedLoop);
-        thread.Priority = ThreadPriority.AboveNormal;
-        thread.Name = "SocketPoll";
+        var thread = new Thread(DedicatedLoop)
+        {
+            Priority = ThreadPriority.AboveNormal,
+            Name = "ManagedSocketPoll"
+        };
         thread.Start();
     }
 
