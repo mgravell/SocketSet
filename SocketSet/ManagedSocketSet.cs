@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -12,7 +13,7 @@ sealed class ManagedSocketSet : SocketSet
         internal readonly Socket Socket = socket;
     }
 
-    private readonly List<ManagedSocket> children = [];
+    private readonly ConcurrentDictionary<Socket, ManagedSocket> children = [];
 
     protected override void Dispose(bool disposing)
     {
@@ -20,15 +21,11 @@ sealed class ManagedSocketSet : SocketSet
 
         if (disposing)
         {
-            ManagedSocket[] arr;
-            lock (children)
+            Socket[] arr = children.Keys.ToArray();
+            children.Clear();
+            foreach (Socket child in arr)
             {
-                arr = children.ToArray();
-                children.Clear();
-            }
-            foreach (ManagedSocket child in arr)
-            {
-                try { child.Socket.Dispose(); }
+                try { child.Dispose(); }
                 catch { }
             }
         }
@@ -41,10 +38,7 @@ sealed class ManagedSocketSet : SocketSet
         Socket socket = new(endpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         socket.Connect(endpoint);
         var child = new ManagedSocket(this, socket, userToken);
-        lock (children)
-        {
-            children.Add(child);
-        }
+        children.TryAdd(socket, child);
         if (read)
         {
             Read(child);
@@ -55,9 +49,17 @@ sealed class ManagedSocketSet : SocketSet
     protected override void Read(SocketBase socket)
     {
         ThrowIfDisposed();
+        var s = ((ManagedSocket)socket).Socket;
         lock (_pendingRead)
         {
-            _pendingRead.Add((ManagedSocket)socket);
+            if (!_pendingRead.Contains(s))
+            {
+                _pendingRead.Add(s);
+                if (_pendingRead.Count == 1)
+                {
+                    Monitor.Pulse(_pendingRead);
+                }
+            }
         }
     }
 
@@ -72,7 +74,7 @@ sealed class ManagedSocketSet : SocketSet
         while (!value.IsEmpty);
     }
 
-    private readonly List<ManagedSocket> _pendingRead = [], _pendingWrite = [];
+    private readonly List<Socket> _pendingRead = [];
 
     public ManagedSocketSet(ReadCallback onRead) : base(onRead)
     {
@@ -85,68 +87,55 @@ sealed class ManagedSocketSet : SocketSet
     private void DedicatedLoop()
     {
         List<Socket> read = [];
-        var timeout = TimeSpan.FromMilliseconds(50);
+        var pulseTimeoutMilliseconds = 1000;
+        var selectTimeoutMicroseconds = 50 * 1000;
         byte[] readBuffer = ArrayPool<byte>.Shared.Rent(8 * 1024);
-        Dictionary<Socket, ManagedSocket> lookup = new();
+
         while (!IsDisposed)
         {
-            bool any = false;
-            read.Clear();
-            lookup.Clear();
             lock (_pendingRead)
             {
-                var src = CollectionsMarshal.AsSpan(_pendingRead);
-                if (src.Length != 0)
+                if (_pendingRead.Count == 0)
                 {
-                    read.EnsureCapacity(src.Length);
-                    foreach (var socket in src)
-                    {
-                        read.Add(socket.Socket);
-                        lookup[socket.Socket] = socket;
-                    }
-                    any = true;
+                    Monitor.Wait(_pendingRead, pulseTimeoutMilliseconds);
+                    continue;
                 }
+                CollectionsMarshal.SetCount(read, _pendingRead.Count);
+                CollectionsMarshal.AsSpan(_pendingRead).CopyTo(CollectionsMarshal.AsSpan(read));
             }
 
-            if (!any)
-            {
-                Thread.Sleep(timeout);
-                continue;
-            }
-
-            Socket.Select(read, null, null, timeout);
+            Socket.Select(read, null, null, microSeconds: selectTimeoutMicroseconds);
             if (read.Count != 0)
             {
                 foreach (var socket in CollectionsMarshal.AsSpan(read))
                 {
-                    var child = lookup[socket];
-                    int bytes;
-                    SocketError error;
-                    bool readAgain;
-                    try
+                    bool readAgain = false;
+                    if (children.TryGetValue(socket, out var child))
                     {
-                        bytes = child.Socket.Receive(readBuffer, SocketFlags.None);
-                        error = SocketError.Success;
-                    }
-                    catch (Exception e)
-                    {
-                        bytes = 0;
-                        error = AsSocketError(e);
-                    }
-                    try
-                    {
-                        readAgain = OnRead(child, error, bytes > 0 ? readBuffer.AsSpan(0, bytes) : default)
-                            & error == SocketError.Success;
-                    }
-                    catch
-                    {
-                        readAgain = false;
+                        int bytes;
+                        SocketError error;
+                        try
+                        {
+                            bytes = child.Socket.Receive(readBuffer, SocketFlags.None);
+                            error = SocketError.Success;
+                        }
+                        catch (Exception e)
+                        {
+                            bytes = 0;
+                            error = AsSocketError(e);
+                        }
+                        try
+                        {
+                            readAgain = OnRead(child, error, bytes > 0 ? readBuffer.AsSpan(0, bytes) : default)
+                                & error == SocketError.Success;
+                        }
+                        catch { }
                     }
                     if (!readAgain)
                     {
                         lock (_pendingRead)
                         {
-                            _pendingRead.Remove(child);
+                            _pendingRead.Remove(socket);
                         }
                     }
                 }

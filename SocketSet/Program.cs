@@ -17,7 +17,7 @@ Console.WriteLine($"{set.GetType().Name}: {Volatile.Read(ref messages)} messages
 bool ReadSocket(SocketSet.SocketBase socket, SocketError error, ReadOnlySpan<byte> bytes)
 {
     Interlocked.Increment(ref messages);
-    // Console.WriteLine($"received {bytes.Length} bytes from {(string)socket.UserToken!}");
+    //Console.WriteLine($"received {bytes.Length} bytes from {(string)socket.UserToken!}");
     ThreadPool.QueueUserWorkItem(static s =>
     {
         s.Write(Ping());
