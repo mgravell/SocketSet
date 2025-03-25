@@ -171,7 +171,7 @@ internal partial class WindowsUnmanagedSocketSet : SocketSet
             fixed (byte* ptr = value)
             {
                 WSABuffer writeBuffer = new WSABuffer(value.Length, new(ptr));
-                err = WSASend(socketHandle, &writeBuffer, 1, out bytesTransferred, SocketFlags.None, null, IntPtr.Zero);
+                err = WSASend(socketHandle, &writeBuffer, 1, out bytesTransferred, SocketFlags.None, null, null);
             }
             if (err != SocketError.Success) ThrowSocketError(err);
             if (bytesTransferred == value.Length) break;

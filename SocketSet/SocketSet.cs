@@ -16,7 +16,7 @@ abstract class SocketSet(SocketSet.ReadCallback onRead) : IDisposable
         public void Write(ReadOnlySpan<byte> value) => Owner.Write(this, value);
     }
 
-    protected readonly ReadCallback OnRead = onRead;
+    public readonly ReadCallback OnRead = onRead;
 
     public abstract SocketBase Open(EndPoint endpoint, object? userToken = null, bool read = true);
 

@@ -1,15 +1,16 @@
 ﻿using Socketizer;
-using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 
-const int SOCKETS = 20;
+const int SOCKETS = 100;
 var ep = new IPEndPoint(IPAddress.Loopback, 6380);
 var timeout = TimeSpan.FromSeconds(10);
+int messages;
+
+/*
 Socket[] socks = new Socket[SOCKETS];
 Task[] tasks = new Task[SOCKETS];
-int messages = 0;
-
+messages = 0;
 for (int i = 0; i < SOCKETS; i++)
 {
     Socket socket = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
@@ -37,14 +38,21 @@ foreach (var sock in socks)
 }
 await Task.WhenAll(tasks);
 Console.WriteLine($"async read: {Volatile.Read(ref messages)} messages received in {timeout.TotalSeconds}s using {SOCKETS} connections, no pipelining");
+*/
 
-using var set = new SemiManagedSocketSet(ReadSocket); // 2573906
-//using var set = new ManagedSocketSet(ReadSocket); // 2382757
-//using var set = new WindowsUnmanagedSocketSet(ReadSocket); // 404192
 messages = 0;
+// allow 10s using 100 connections, no pipelining
+using var set = new SemiManagedSocketSet(ReadSocket, overlapped: true); // 3463540
+//using var set = new SemiManagedSocketSet(ReadSocket, overlapped: false); // 2850682
+//using var set = new ManagedSocketSet(ReadSocket); // 2559801
+//using var set = new WindowsUnmanagedSocketSet(ReadSocket); // 404192 <== unexpectedly low, probably missing a socket flag
 for (int i = 0; i < SOCKETS; i++)
 {
-    set.Open(ep, $"connection {i}").Write(Ping());
+    var socket = set.Open(ep, $"connection {i}", read: false);
+    socket.Read();
+    //socket.ReceiveOverlapped();
+    socket.Write(Ping());
+    
 }
 
 Thread.Sleep(timeout);
@@ -53,7 +61,7 @@ Console.WriteLine($"{set.GetType().Name}: {Volatile.Read(ref messages)} messages
 bool ReadSocket(SocketSet.SocketBase socket, SocketError error, ReadOnlySpan<byte> bytes)
 {
     Interlocked.Increment(ref messages);
-    //Console.WriteLine($"received {bytes.Length} bytes from {(string)socket.UserToken!}");
+    // Console.WriteLine($"received {bytes.Length} bytes from {(string)socket.UserToken!}");
     ThreadPool.QueueUserWorkItem(static s =>
     {
         s.Write(Ping());

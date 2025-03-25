@@ -11,7 +11,7 @@ internal static partial class Winsock
 
     const string WS2_32 = "ws2_32.dll";
 
-    [LibraryImport(WS2_32, SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
+    [LibraryImport(WS2_32, StringMarshalling = StringMarshalling.Utf16)]
     internal static partial IntPtr WSASocketW(
            AddressFamily addressFamily,
            SocketType socketType,
@@ -20,7 +20,7 @@ internal static partial class Winsock
            int group,
            int flags);
 
-    [LibraryImport(WS2_32, SetLastError = true)]
+    [LibraryImport(WS2_32)]
     internal static unsafe partial SocketError WSAConnect(
         IntPtr socketHandle,
         byte* socketAddress,
@@ -31,7 +31,7 @@ internal static partial class Winsock
         IntPtr gQOS);
 
 
-    [LibraryImport(WS2_32, SetLastError = true)]
+    [LibraryImport(WS2_32)]
     internal static partial SocketError ioctlsocket(
             IntPtr socketHandle,
             int cmd,
@@ -47,7 +47,7 @@ internal static partial class Winsock
     }
 
 
-    [LibraryImport(WS2_32, SetLastError = true)]
+    [LibraryImport(WS2_32)]
     internal static unsafe partial SocketError WSARecv(
         IntPtr socketHandle,
         WSABuffer* buffer,
@@ -55,7 +55,7 @@ internal static partial class Winsock
         out int bytesTransferred,
         ref SocketFlags socketFlags,
         NativeOverlapped* overlapped,
-        IntPtr completionRoutine);
+        delegate* unmanaged[Stdcall]<SocketError, int, NativeOverlapped*, SocketFlags, void> completionRoutine);
 
     [StructLayout(LayoutKind.Sequential)]
     internal readonly struct WSABuffer(int length, IntPtr pointer)
@@ -64,7 +64,7 @@ internal static partial class Winsock
         public readonly IntPtr Pointer = pointer; // Pointer to Buffer
     }
 
-    [LibraryImport(WS2_32, SetLastError = true)]
+    [LibraryImport(WS2_32)]
     internal static unsafe partial int select(
         int nfds,
         IntPtr* readfds,
@@ -79,7 +79,7 @@ internal static partial class Winsock
         public readonly int Microseconds = microseconds;
     }
 
-    [LibraryImport(WS2_32, SetLastError = true)]
+    [LibraryImport(WS2_32)]
     internal static unsafe partial SocketError WSASend(
        IntPtr socketHandle,
        WSABuffer* buffers,
@@ -87,14 +87,28 @@ internal static partial class Winsock
        out int bytesTransferred,
        SocketFlags socketFlags,
        NativeOverlapped* overlapped,
-       IntPtr completionRoutine);
+       delegate* unmanaged[Stdcall]<SocketError, int, NativeOverlapped*, SocketFlags, void> completionRoutine);
+
+    [LibraryImport(WS2_32)]
+    internal static partial IntPtr WSACreateEvent();
+
+    [LibraryImport(WS2_32)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool WSACloseEvent(IntPtr eventHandle);
+
+    [LibraryImport(WS2_32)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool WSAResetEvent(IntPtr eventHandle);
 
     internal static SocketError GetLastSocketError()
     {
-        int win32Error = Marshal.GetLastPInvokeError();
+        int win32Error = WSAGetLastError(); // Marshal.GetLastPInvokeError();
         Debug.Assert(win32Error != 0, "Expected non-0 error");
         return (SocketError)win32Error;
     }
+
+    [LibraryImport(WS2_32)]
+    internal static partial int WSAGetLastError();
 
     [MethodImpl(MethodImplOptions.NoInlining), DoesNotReturn]
     internal static void ThrowLastSocketError()
@@ -114,7 +128,7 @@ internal static partial class Winsock
     internal static unsafe SocketError Read(IntPtr socketHandle, WSABuffer* readBuffer, out int bytes)
     {
         SocketFlags flags = SocketFlags.None;
-        var error = WSARecv(socketHandle, readBuffer, 1, out bytes, ref flags, null, IntPtr.Zero);
+        var error = WSARecv(socketHandle, readBuffer, 1, out bytes, ref flags, null, null);
         switch (error)
         {
             case SocketError.Success:
@@ -127,4 +141,14 @@ internal static partial class Winsock
                 return error;
         }
     }
+
+    /*
+    public unsafe static readonly delegate* unmanaged[Stdcall]<int, int, NativeOverlapped*, SocketFlags, void> OnRead = &ReadCallback;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
+    private static unsafe void ReadCallback(int status, int bytesTransferred, NativeOverlapped* overlapped, SocketFlags flags)
+    {
+        throw new NotImplementedException();
+    }
+    */
 }

@@ -1,5 +1,4 @@
-﻿using System.Buffers;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
@@ -10,9 +9,108 @@ namespace Socketizer;
 
 sealed class SemiManagedSocketSet : SocketSet
 {
-    public sealed class SemiManagedSocket(SemiManagedSocketSet owner, Socket socket, object? userToken) : SocketBase(owner, userToken)
+    public sealed class SemiManagedSocket : SocketBase
     {
-        internal readonly Socket Socket = socket;
+        private readonly SemiManagedSocketPinned pinned;
+        public unsafe SemiManagedSocket(SemiManagedSocketSet owner, Socket socket, object? userToken, IntPtr readEvent) : base(owner, userToken)
+        {
+            Socket = socket;
+            readBuffer = GC.AllocateArray<byte>(1024, pinned: true);
+            var arr = GC.AllocateArray<byte>(1024, pinned: true);
+            fixed (byte* ptr = arr) // OK to escape: buffer is pinned
+            {
+                pinned = new(
+                    new WSABuffer(arr.Length, new(ptr)),
+                    new NativeOverlapped { EventHandle = readEvent });
+            }
+            socketsByOverlappedHandle.TryAdd(readEvent, this);
+        }
+
+        private ReadOnlySpan<byte> GetReadBuffer(int bytes) => bytes >= 0 ? readBuffer.AsSpan(0, bytes) : default;
+
+        static readonly ConcurrentDictionary<IntPtr, SemiManagedSocket> socketsByOverlappedHandle = [];
+
+        // we need to pin ourselves so we have somewhere for the chunks that we're handing to winsock
+        // (we could potentially also self-alloc a read buffer at the same time, if we want)
+        private sealed class SemiManagedSocketPinned
+        {
+            private GCHandle pin;
+            public WSABuffer WsaBuffer;
+            public NativeOverlapped Overlapped;
+
+            public SemiManagedSocketPinned(WSABuffer buffer, NativeOverlapped overlapped)
+            {
+                pin = GCHandle.Alloc(this, GCHandleType.Pinned);
+                this.WsaBuffer = buffer;
+                this.Overlapped = overlapped;
+            }
+
+            public unsafe WSABuffer* WSABufferPtr => (WSABuffer*)Unsafe.AsPointer(ref WsaBuffer);
+            public unsafe NativeOverlapped* OverlappedPtr => (NativeOverlapped*)Unsafe.AsPointer(ref Overlapped);
+
+            ~SemiManagedSocketPinned()
+            {
+                var tmp = pin;
+                pin = default;
+                if (tmp.IsAllocated)
+                {
+                    tmp.Free();
+                }
+            }
+        }
+
+        private readonly byte[] readBuffer;
+        internal readonly Socket Socket;
+
+        internal unsafe void ReceiveOverlapped()
+        {
+            bool repeat;
+            do
+            {
+                repeat = false;
+                SocketFlags flags = SocketFlags.None;
+                var status = WSARecv(Socket.Handle, pinned.WSABufferPtr, 1, out int bytes, ref flags, pinned.OverlappedPtr, &ReadCallbackUnmanaged);
+                switch (status)
+                {
+                    case SocketError.Success:
+                        // single-call sync
+                        repeat = Owner.OnRead(this, status, GetReadBuffer(bytes)) & status == SocketError.Success;
+                        break;
+                    case SocketError.IOPending:
+                        // single-call async
+                        break;
+                    case SocketError.SocketError:
+                        status = GetLastSocketError();
+                        if (status == SocketError.IOPending)
+                        {
+                            // callback deferred
+                            break;
+                        }
+                        else
+                        {
+                            ThrowSocketError(status);
+                        }
+                        break;
+                    default:
+                        ThrowSocketError(status);
+                        break;
+                }
+            } while (repeat);
+        }
+
+        [UnmanagedCallersOnly(CallConvs = [typeof(CallConvStdcall)])]
+        private static unsafe void ReadCallbackUnmanaged(SocketError status, int bytesTransferred, NativeOverlapped* overlapped, SocketFlags flags)
+        {
+            // we should be on an IOCP thread here; danger, will!
+            if (socketsByOverlappedHandle.TryGetValue(overlapped->EventHandle, out var socket))
+            {
+                if (socket.Owner.OnRead(socket, status, socket.GetReadBuffer(bytesTransferred))
+                    & status == SocketError.Success)
+                {
+                    socket.ReceiveOverlapped();
+                }
+            }
+        }
     }
 
     private readonly ConcurrentDictionary<IntPtr, SemiManagedSocket> children = [];
@@ -39,8 +137,11 @@ sealed class SemiManagedSocketSet : SocketSet
         ThrowIfDisposed();
         Socket socket = new(endpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         socket.Connect(endpoint);
-        var child = new SemiManagedSocket(this, socket, userToken);
+        var readEvent = WSACreateEvent();
+        if (readEvent == ~0) ThrowLastSocketError();
+        var child = new SemiManagedSocket(this, socket, userToken, readEvent);
         children.TryAdd(socket.Handle, child);
+
         if (read)
         {
             Read(child);
@@ -51,15 +152,23 @@ sealed class SemiManagedSocketSet : SocketSet
     protected override void Read(SocketBase socket)
     {
         ThrowIfDisposed();
-        var s = ((SemiManagedSocket)socket).Socket.Handle;
-        lock (_pendingRead)
+        var s = ((SemiManagedSocket)socket);
+        if (overlapped)
         {
-            if (!_pendingRead.Contains(s))
+            s.ReceiveOverlapped();
+        }
+        else
+        {
+            var handle = s.Socket.Handle;
+            lock (_pendingRead)
             {
-                _pendingRead.Add(s);
-                if (_pendingRead.Count == 1)
+                if (!_pendingRead.Contains(handle))
                 {
-                    Monitor.Pulse(_pendingRead);
+                    _pendingRead.Add(handle);
+                    if (_pendingRead.Count == 1)
+                    {
+                        Monitor.Pulse(_pendingRead);
+                    }
                 }
             }
         }
@@ -72,15 +181,19 @@ sealed class SemiManagedSocketSet : SocketSet
     }
 
     private readonly List<IntPtr> _pendingRead = [];
-
-    public SemiManagedSocketSet(ReadCallback onRead) : base(onRead)
+    private readonly bool overlapped;
+    public SemiManagedSocketSet(ReadCallback onRead, bool overlapped = false) : base(onRead)
     {
-        var thread = new Thread(DedicatedLoop)
+        this.overlapped = overlapped;
+        if (!overlapped)
         {
-            Priority = ThreadPriority.AboveNormal,
-            Name = "SemiManagedSocketPoll"
-        };
-        thread.Start();
+            var thread = new Thread(DedicatedLoop)
+            {
+                Priority = ThreadPriority.AboveNormal,
+                Name = "SemiManagedSocketPoll"
+            };
+            thread.Start();
+        }
     }
 
     private unsafe void DedicatedLoop()
