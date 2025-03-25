@@ -50,9 +50,7 @@ for (int i = 0; i < SOCKETS; i++)
 {
     var socket = set.Open(ep, $"connection {i}", read: false);
     socket.Read();
-    //socket.ReceiveOverlapped();
     socket.Write(Ping());
-    
 }
 
 Thread.Sleep(timeout);
