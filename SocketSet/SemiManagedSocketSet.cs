@@ -9,6 +9,7 @@ namespace Socketizer;
 
 sealed class SemiManagedSocketSet : SocketSet
 {
+    public static readonly bool IsWindows = OperatingSystem.IsWindows();
     public sealed class SemiManagedSocket : SocketBase
     {
         private readonly SemiManagedSocketPinned pinned;
@@ -137,7 +138,9 @@ sealed class SemiManagedSocketSet : SocketSet
         ThrowIfDisposed();
         Socket socket = new(endpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
         socket.Connect(endpoint);
-        var readEvent = WSACreateEvent();
+
+
+        var readEvent = IsWindows ? WSACreateEvent() : 0;
         if (readEvent == ~0) ThrowLastSocketError();
         var child = new SemiManagedSocket(this, socket, userToken, readEvent);
         children.TryAdd(socket.Handle, child);
@@ -177,7 +180,14 @@ sealed class SemiManagedSocketSet : SocketSet
     protected override void Write(SocketBase socket, ReadOnlySpan<byte> value)
     {
         ThrowIfDisposed();
-        WindowsUnmanagedSocketSet.Write(((SemiManagedSocket)socket).Socket.Handle, value);
+        if (IsWindows)
+        {
+            WindowsUnmanagedSocketSet.Write(((SemiManagedSocket)socket).Socket.Handle, value);
+        }
+        else
+        {
+            ((SemiManagedSocket)socket).Socket.Send(value);
+        }
     }
 
     private readonly List<IntPtr> _pendingRead = [];
@@ -236,13 +246,25 @@ sealed class SemiManagedSocketSet : SocketSet
                 bool readAgain = false;
                 if (children.TryGetValue(socket, out var child))
                 {
-                    SocketError error = Winsock.Read(socket, &readBuffer, out int bytes);
-                    try
+                    if (IsWindows)
                     {
-                        readAgain = OnRead(child, error, bytes > 0 ? pinnedBuffer.AsSpan(0, bytes) : default)
-                            & error == SocketError.Success;
+                        SocketError error = Winsock.Read(socket, &readBuffer, out int bytes);
+                        try
+                        {
+                            readAgain = OnRead(child, error, bytes > 0 ? pinnedBuffer.AsSpan(0, bytes) : default)
+                                & error == SocketError.Success;
+                        }
+                        catch { }
                     }
-                    catch { }
+                    else
+                    {
+                        try
+                        {
+                            int bytes = ((SemiManagedSocket)child).Socket.Receive(pinnedBuffer);
+                            readAgain = OnRead(child, SocketError.Success, bytes > 0 ? pinnedBuffer.AsSpan(0, bytes) : default);
+                        } catch{}
+                        
+                    }
                 }
                 if (!readAgain)
                 {
