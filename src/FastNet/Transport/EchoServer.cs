@@ -29,6 +29,7 @@ internal sealed unsafe class EchoServer : IDisposable
     private const uint RingEntries = 4096;
 
     private readonly int _port;
+    private readonly int _shardId;
     private readonly BufferPool _pool;
     private readonly Connection[] _conns;
 
@@ -36,9 +37,10 @@ internal sealed unsafe class EchoServer : IDisposable
     private int _listenFd = -1;
     private volatile bool _running;
 
-    public EchoServer(int port, int maxConnections, int bufferSize)
+    public EchoServer(int port, int maxConnections, int bufferSize, int shardId = 0)
     {
         _port = port;
+        _shardId = shardId;
         _pool = new BufferPool(maxConnections, bufferSize);
         _conns = new Connection[maxConnections];
     }
@@ -61,7 +63,7 @@ internal sealed unsafe class EchoServer : IDisposable
         int rc = io_uring_queue_init(RingEntries, _ring, 0);
         if (rc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-rc}");
 
-        Console.WriteLine($"[io_uring] ring up ({RingEntries} entries), listening on :{_port}, " +
+        Console.WriteLine($"[io_uring #{_shardId}] ring up ({RingEntries} entries), listening on :{_port}, " +
                           $"{_pool.SlotCount} slots x {_pool.SlotSize}B");
     }
 
