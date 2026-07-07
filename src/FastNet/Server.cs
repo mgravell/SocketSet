@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using FastNet.Fallback;
 using FastNet.Transport;
+using FastNet.WinRio;
 
 namespace FastNet;
 
@@ -67,8 +68,10 @@ internal static class Program
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            throw new PlatformNotSupportedException(
-                "RIO backend not implemented yet — see WinRio.RioEngine. io_uring is the reference transport.");
+            var server = new RioEngine(port: port, workerThreadCount: shards);
+            Console.WriteLine($"[Boot] RIO echo server — {shards} shard(s) — Ctrl+C to stop.");
+            Console.ReadLine();
+            Console.WriteLine("[Boot] stopped.");
         }
         else
         {
