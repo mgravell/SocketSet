@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/bench/">
+    <Project Path="bench/Bench.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/FastNet/FastNet.csproj" />
+  </Folder>
+</Solution>
