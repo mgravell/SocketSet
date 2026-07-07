@@ -13,6 +13,7 @@ internal static class Program
         // Socket baseline even on Linux; "-shards N" sets the io_uring shard
         // count (default = core count); "-pin" pins each shard to a core.
         bool forceSocket = false;
+        bool ring = false;
         bool pin = false;
         int port = 8080;
         int shards = Environment.ProcessorCount;
@@ -21,6 +22,7 @@ internal static class Program
         {
             var a = args[i];
             if (a == "-socket") forceSocket = true;
+            else if (a == "-ring") ring = true;
             else if (a == "-pin") pin = true;
             else if (a == "-shards" && i + 1 < args.Length && int.TryParse(args[i + 1], out var n)) { shards = Math.Max(1, n); i++; }
             else if (!portSet && int.TryParse(a, out var p)) { port = p; portSet = true; }
@@ -32,6 +34,17 @@ internal static class Program
         if (forceSocket)
         {
             RunSocket(port, bufferSize);
+        }
+        else if (ring && RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            // SKETCH backend: multishot recv + provided buffer ring (single shard).
+            using var server = new RingEchoServer(port, maxConnections, bufferSize);
+            server.Initialize();
+
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; server.Stop(); };
+            Console.WriteLine("[Boot] io_uring ring-buffer echo server (sketch) — Ctrl+C to stop.");
+            server.Run();
+            Console.WriteLine("[Boot] stopped.");
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {

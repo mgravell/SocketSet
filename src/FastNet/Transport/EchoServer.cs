@@ -215,7 +215,7 @@ internal sealed unsafe class EchoServer : IDisposable
 
     // --- listener setup ----------------------------------------------------
 
-    private static int CreateListener(int port)
+    internal static int CreateListener(int port)
     {
         int fd = LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");

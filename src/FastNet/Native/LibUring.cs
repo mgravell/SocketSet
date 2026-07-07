@@ -28,6 +28,17 @@ internal static unsafe class LibUring
     // more completions. If clear on a multishot op, we must re-arm.
     internal const uint IORING_CQE_F_MORE = 1u << 1;
 
+    // cqe->flags bit: the completion carries a provided-buffer id (in the high
+    // bits, see IORING_CQE_BUFFER_SHIFT). Set on every provided-buffer recv.
+    internal const uint IORING_CQE_F_BUFFER = 1u << 0;
+
+    // The selected buffer id lives in the top 16 bits of cqe->flags.
+    internal const int IORING_CQE_BUFFER_SHIFT = 16;
+
+    // sqe->flags bit: pick the buffer from the group set via sqe_set_buf_group
+    // rather than from an addr/len in the SQE. Required for provided-buffer recv.
+    internal const uint IOSQE_BUFFER_SELECT = 1u << 5;
+
     static LibUring()
     {
         NativeLibrary.SetDllImportResolver(typeof(LibUring).Assembly, Resolve);
@@ -62,6 +73,18 @@ internal static unsafe class LibUring
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_prep_recv(IoUringSqe* sqe, int sockfd, void* buf, nuint len, int flags);
 
+    // Multishot recv: stays armed and posts a CQE (each carrying a provided
+    // buffer) per arrival, until EOF/error/buffer exhaustion. buf/len are
+    // ignored — buffers come from the group named by sqe_set_buf_group.
+    [DllImport(Lib), SuppressGCTransition]
+    internal static extern void io_uring_prep_recv_multishot(IoUringSqe* sqe, int sockfd, void* buf, nuint len, int flags);
+
+    [DllImport(Lib), SuppressGCTransition]
+    internal static extern void io_uring_sqe_set_flags(IoUringSqe* sqe, uint flags);
+
+    [DllImport(Lib), SuppressGCTransition]
+    internal static extern void io_uring_sqe_set_buf_group(IoUringSqe* sqe, int bgid);
+
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_prep_send(IoUringSqe* sqe, int sockfd, void* buf, nuint len, int flags);
 
@@ -93,6 +116,26 @@ internal static unsafe class LibUring
 
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_cq_advance(void* ring, uint nr);
+
+    // --- provided buffer rings (multishot recv) ---------------------------
+    // A buf ring is a kernel-shared SPSC array of {addr,len,bid} the kernel
+    // draws from when a BUFFER_SELECT recv completes. setup/free mmap+register
+    // the ring; add/advance publish buffers back to the kernel for reuse.
+
+    [DllImport(Lib)]
+    internal static extern IoUringBufRing* io_uring_setup_buf_ring(void* ring, uint nentries, int bgid, uint flags, int* ret);
+
+    [DllImport(Lib)]
+    internal static extern int io_uring_free_buf_ring(void* ring, IoUringBufRing* br, uint nentries, int bgid);
+
+    // Stage one buffer into the ring at (tail + buf_offset). Touches only the
+    // shared ring memory, so the GC transition is pure overhead here.
+    [DllImport(Lib), SuppressGCTransition]
+    internal static extern void io_uring_buf_ring_add(IoUringBufRing* br, void* addr, uint len, ushort bid, int mask, int buf_offset);
+
+    // Publish `count` staged buffers by advancing the ring tail.
+    [DllImport(Lib), SuppressGCTransition]
+    internal static extern void io_uring_buf_ring_advance(IoUringBufRing* br, int count);
 }
 
 /// <summary>
@@ -115,6 +158,14 @@ internal struct IoUringCqe
 /// <summary>Opaque SQE handle — we only ever fill it via prep_* helpers.</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct IoUringSqe
+{
+    // Intentionally empty: liburing owns the layout; we pass the pointer back.
+}
+
+/// <summary>Opaque provided-buffer-ring handle — filled by io_uring_setup_buf_ring,
+/// only ever passed back to buf_ring_add/advance/free.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct IoUringBufRing
 {
     // Intentionally empty: liburing owns the layout; we pass the pointer back.
 }
