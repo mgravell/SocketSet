@@ -1,4 +1,3 @@
-using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using FastNet.Buffers;
@@ -29,6 +28,7 @@ internal sealed unsafe class EchoServer : IDisposable
     private const uint RingEntries = 4096;
 
     private readonly int _port;
+    private readonly string? _udsName; // abstract UDS name; null => TCP on _port
     private readonly int _shardId;
     private readonly BufferPool _pool;
     private readonly Connection[] _conns;
@@ -37,9 +37,10 @@ internal sealed unsafe class EchoServer : IDisposable
     private int _listenFd = -1;
     private volatile bool _running;
 
-    public EchoServer(int port, int maxConnections, int bufferSize, int shardId = 0)
+    public EchoServer(int port, int maxConnections, int bufferSize, int shardId = 0, string? udsName = null)
     {
         _port = port;
+        _udsName = udsName;
         _shardId = shardId;
         _pool = new BufferPool(maxConnections, bufferSize);
         _conns = new Connection[maxConnections];
@@ -55,7 +56,7 @@ internal sealed unsafe class EchoServer : IDisposable
 
     public void Initialize()
     {
-        _listenFd = CreateListener(_port);
+        _listenFd = CreateListener(_port, _udsName);
 
         _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
         NativeMemory.Clear(_ring, RingStructSize);
@@ -63,7 +64,8 @@ internal sealed unsafe class EchoServer : IDisposable
         int rc = io_uring_queue_init(RingEntries, _ring, 0);
         if (rc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-rc}");
 
-        Console.WriteLine($"[io_uring #{_shardId}] ring up ({RingEntries} entries), listening on :{_port}, " +
+        string where = _udsName != null ? $"abstract UDS @{_udsName}" : $":{_port}";
+        Console.WriteLine($"[io_uring #{_shardId}] ring up ({RingEntries} entries), listening on {where}, " +
                           $"{_pool.SlotCount} slots x {_pool.SlotSize}B");
     }
 
@@ -215,14 +217,28 @@ internal sealed unsafe class EchoServer : IDisposable
 
     // --- listener setup ----------------------------------------------------
 
-    internal static int CreateListener(int port)
+    /// <summary>
+    /// Create, bind and listen. When <paramref name="udsName"/> is non-null the
+    /// listener is an abstract-namespace AF_UNIX socket (loopback proxy front
+    /// end: no port churn, no TIME_WAIT, no socket file); otherwise it is a TCP
+    /// socket on <paramref name="port"/> with Nagle disabled. TCP_NODELAY is set
+    /// on the listener because Linux propagates it to accepted sockets, which
+    /// keeps it off the accept hot path; UDS has no Nagle so the option is N/A.
+    /// </summary>
+    internal static int CreateListener(int port, string? udsName = null)
     {
+        if (udsName != null) return CreateUnixListener(udsName);
+
         int fd = LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
 
         int one = 1;
         LibC.setsockopt(fd, LibC.SOL_SOCKET, LibC.SO_REUSEADDR, &one, sizeof(int));
         LibC.setsockopt(fd, LibC.SOL_SOCKET, LibC.SO_REUSEPORT, &one, sizeof(int));
+        // Disable Nagle so request/response echoes are not held for coalescing
+        // (Nagle + delayed-ACK is the classic ~40ms ping-pong stall). Inherited
+        // by every socket accept() returns from this listener.
+        LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
 
         var addr = new SockAddrIn
         {
@@ -232,6 +248,24 @@ internal sealed unsafe class EchoServer : IDisposable
         };
         if (LibC.bind(fd, &addr, 16) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "bind() failed");
+        if (LibC.listen(fd, 512) < 0)
+            throw new Win32Exception(Marshal.GetLastPInvokeError(), "listen() failed");
+
+        return fd;
+    }
+
+    private static int CreateUnixListener(string name)
+    {
+        int fd = LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0);
+        if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket(AF_UNIX) failed");
+
+        // No SO_REUSEPORT/REUSEADDR: an abstract address is freed as soon as the
+        // last holder closes, so there is nothing to reuse or clean up. No
+        // TCP_NODELAY either — AF_UNIX has no Nagle.
+        SockAddrUn addr;
+        uint len = SockAddrUn.InitAbstract(&addr, name);
+        if (LibC.bind(fd, &addr, len) < 0)
+            throw new Win32Exception(Marshal.GetLastPInvokeError(), "bind(AF_UNIX) failed");
         if (LibC.listen(fd, 512) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "listen() failed");
 

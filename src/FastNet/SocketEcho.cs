@@ -1,8 +1,5 @@
-using System;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace FastNet.Fallback;
 
@@ -15,28 +12,44 @@ namespace FastNet.Fallback;
 /// and <c>Transport.EchoServer</c> is exactly the transport cost we want to see.
 ///
 /// Socket options mirror the io_uring listener (SO_REUSEADDR, backlog 512, and
-/// notably <em>no</em> TCP_NODELAY) so the only variable is the I/O mechanism.
+/// TCP_NODELAY on TCP connections) so the only variable is the I/O mechanism.
+/// With a UDS name it binds an abstract-namespace Unix socket instead of TCP;
+/// UDS has no Nagle, so NoDelay is skipped there.
 /// </summary>
 internal sealed class SocketEchoServer : IDisposable
 {
     private readonly int _port;
     private readonly int _bufferSize;
+    private readonly string? _udsName; // abstract UDS name; null => TCP on _port
     private readonly Socket _listener;
     private readonly CancellationTokenSource _cts = new();
 
-    public SocketEchoServer(int port, int bufferSize)
+    public SocketEchoServer(int port, int bufferSize, string? udsName = null)
     {
         _port = port;
         _bufferSize = bufferSize;
-        _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        _udsName = udsName;
+        _listener = udsName != null
+            ? new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
+            : new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
     }
 
     public void Initialize()
     {
+        if (_udsName != null)
+        {
+            // A leading NUL in the path selects Linux's abstract namespace:
+            // no socket file to create or unlink, gone when the last ref closes.
+            _listener.Bind(new UnixDomainSocketEndPoint("\0" + _udsName));
+            _listener.Listen(512);
+            Console.WriteLine($"[socket] listening on abstract UDS @{_udsName}, {_bufferSize}B/conn");
+            return;
+        }
+
         _listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _listener.Bind(new IPEndPoint(IPAddress.Any, _port));
         _listener.Listen(512);
-        Console.WriteLine($"[socket] listening on :{_port}, {_bufferSize}B/conn");
+        Console.WriteLine($"[socket] listening on :{_port}, {_bufferSize}B/conn (TCP_NODELAY)");
     }
 
     public void Run()
@@ -54,6 +67,9 @@ internal sealed class SocketEchoServer : IDisposable
             try { conn = await _listener.AcceptAsync(ct); }
             catch (OperationCanceledException) { break; }
             catch (SocketException) { continue; } // transient accept error; keep listening
+
+            // Kill Nagle on TCP so echoes aren't held for coalescing; N/A on UDS.
+            if (_udsName == null) conn.NoDelay = true;
 
             _ = EchoAsync(conn, ct); // one task per connection; recv -> echo -> recv ...
         }

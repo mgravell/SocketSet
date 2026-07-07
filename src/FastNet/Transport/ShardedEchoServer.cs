@@ -1,5 +1,3 @@
-using System;
-using System.Threading;
 using FastNet.Native;
 
 namespace FastNet.Transport;
@@ -23,9 +21,20 @@ internal sealed class ShardedEchoServer : IDisposable
     private readonly Thread[] _threads;
     private readonly bool _pin;
 
-    public ShardedEchoServer(int port, int shards, int maxConnections, int bufferSize, bool pin)
+    public ShardedEchoServer(int port, int shards, int maxConnections, int bufferSize, bool pin, string? udsName = null)
     {
         if (shards < 1) shards = 1;
+
+        // SO_REUSEPORT sharding is an AF_INET(6) feature: a single abstract UDS
+        // name can only be bound once (a second bind gets EADDRINUSE), so the
+        // kernel can't fan connections across per-shard listeners. Collapse to a
+        // single shard for UDS. (Multi-shard UDS would need one distinct name
+        // per shard and a client that spreads across them — not worth it here.)
+        if (udsName != null && shards > 1)
+        {
+            Console.WriteLine("[shard] UDS listener does not support REUSEPORT sharding; using 1 shard.");
+            shards = 1;
+        }
         _pin = pin;
 
         // maxConnections is the total across the server; REUSEPORT only balances
@@ -35,7 +44,7 @@ internal sealed class ShardedEchoServer : IDisposable
         _shards = new EchoServer[shards];
         _threads = new Thread[shards];
         for (int i = 0; i < shards; i++)
-            _shards[i] = new EchoServer(port, perShard, bufferSize, shardId: i);
+            _shards[i] = new EchoServer(port, perShard, bufferSize, shardId: i, udsName: udsName);
     }
 
     public void Initialize()

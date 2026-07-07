@@ -16,20 +16,34 @@ using System.Net.Sockets;
 //            workload where a server that keeps recv continuously armed
 //            (multishot + buffer ring) should pull ahead of one-recv-at-a-time.
 //
-// usage: Bench <host> <port> <connections> <depth> <payload> <seconds> [-stream]
+// usage: Bench <host> <port> <connections> <depth> <payload> <seconds> [-stream] [-uds]
+//
+//  -uds : connect to the server's abstract Unix socket instead of TCP (matches
+//         the server's -uds mode). host/port are ignored. UDS has no Nagle, so
+//         NoDelay is not set there.
 
 bool stream = args.Contains("-stream");
+bool uds = args.Contains("-uds");
 var pos = args.Where(a => !a.StartsWith('-')).ToArray();
 
-string host = pos.Length > 0 ? pos[0] : "127.0.0.1";
-int port = pos.Length > 1 ? int.Parse(pos[1]) : 8080;
-int connections = pos.Length > 2 ? int.Parse(pos[2]) : 64;
-int depth = pos.Length > 3 ? int.Parse(pos[3]) : 16;
-int payload = pos.Length > 4 ? int.Parse(pos[4]) : 64;
-double seconds = pos.Length > 5 ? double.Parse(pos[5]) : 5.0;
+// Must match Program.AbstractName on the server side.
+const string abstractName = "fastnet-echo";
 
+// Tolerant parsing: unparseable/absent positionals fall back to defaults, so
+// -uds runs (where host/port are meaningless) can pass anything or nothing.
+int Int(int i, int def) => pos.Length > i && int.TryParse(pos[i], out var v) ? v : def;
+double Dbl(int i, double def) => pos.Length > i && double.TryParse(pos[i], out var v) ? v : def;
+
+string host = pos.Length > 0 ? pos[0] : "127.0.0.1";
+int port = Int(1, 8080);
+int connections = Int(2, 64);
+int depth = Int(3, 16);
+int payload = Int(4, 64);
+double seconds = Dbl(5, 5.0);
+
+string target = uds ? $"abstract UDS @{abstractName}" : $"{host}:{port}";
 Console.WriteLine($"mode={(stream ? "stream" : "ping-pong")} conns={connections} depth={depth} " +
-                  $"payload={payload}B duration={seconds}s -> {host}:{port}");
+                  $"payload={payload}B duration={seconds}s -> {target}");
 
 var deadline = Stopwatch.GetTimestamp() + (long)(seconds * Stopwatch.Frequency);
 long totalOps = 0;
@@ -37,6 +51,14 @@ var latencies = new List<double>[connections];
 
 async Task<Socket> Connect()
 {
+    if (uds)
+    {
+        // Leading NUL => Linux abstract namespace; no NoDelay (UDS has no Nagle).
+        var s = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        await s.ConnectAsync(new UnixDomainSocketEndPoint("\0" + abstractName));
+        return s;
+    }
+
     var sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
     await sock.ConnectAsync(IPAddress.Parse(host), port);
     return sock;

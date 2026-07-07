@@ -1,5 +1,3 @@
-using System;
-using System.ComponentModel;
 using System.Runtime.InteropServices;
 using FastNet.Buffers;
 using FastNet.Native;
@@ -40,6 +38,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
     private const int BufGroupId = 0;
 
     private readonly int _port;
+    private readonly string? _udsName; // abstract UDS name; null => TCP on _port
     private readonly int _shardId;
     private readonly BufferPool _pool;   // backing store for the ring buffers; bid == slot index
     private readonly int _bufMask;       // ring size - 1 (ring size is a power of two)
@@ -59,9 +58,10 @@ internal sealed unsafe class RingEchoServer : IDisposable
     private int _listenFd = -1;
     private volatile bool _running;
 
-    public RingEchoServer(int port, int maxConnections, int bufferSize, int shardId = 0)
+    public RingEchoServer(int port, int maxConnections, int bufferSize, int shardId = 0, string? udsName = null)
     {
         _port = port;
+        _udsName = udsName;
         _shardId = shardId;
 
         // Buffer-ring entry count must be a power of two. Size it to the max
@@ -84,7 +84,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
 
     public void Initialize()
     {
-        _listenFd = EchoServer.CreateListener(_port);
+        _listenFd = EchoServer.CreateListener(_port, _udsName);
 
         _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
         NativeMemory.Clear(_ring, RingStructSize);
@@ -100,7 +100,8 @@ internal sealed unsafe class RingEchoServer : IDisposable
             io_uring_buf_ring_add(_bufRing, _pool.PointerFor(bid), (uint)_pool.SlotSize, (ushort)bid, _bufMask, bid);
         io_uring_buf_ring_advance(_bufRing, _pool.SlotCount);
 
-        Console.WriteLine($"[io_uring-ring #{_shardId}] ring up ({RingEntries} entries), listening on :{_port}, " +
+        string where = _udsName != null ? $"abstract UDS @{_udsName}" : $":{_port}";
+        Console.WriteLine($"[io_uring-ring #{_shardId}] ring up ({RingEntries} entries), listening on {where}, " +
                           $"{_pool.SlotCount} provided buffers x {_pool.SlotSize}B");
     }
 

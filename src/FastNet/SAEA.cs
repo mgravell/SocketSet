@@ -1,5 +1,3 @@
-using System;
-
 namespace FastNet.Fallback;
 
 /// <summary>

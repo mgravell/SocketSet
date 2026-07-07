@@ -1,4 +1,4 @@
-using FastNet;        // OpType
+// OpType
 using FastNet.Native; // IoUringCqe
 
 namespace FastNet.Transport;
