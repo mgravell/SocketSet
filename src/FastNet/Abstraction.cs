@@ -18,4 +18,5 @@ public enum OpType
     Recv = 1,
     Send = 2,
     Close = 3,
+    Wake = 4,
 }

@@ -23,7 +23,7 @@ internal static class Program
         bool pin = false;
         bool uds = false;
         int port = 8080;
-        int shards = Environment.ProcessorCount;
+        int shards = 4;
         bool portSet = false;
         for (int i = 0; i < args.Length; i++)
         {
@@ -32,9 +32,11 @@ internal static class Program
             else if (a == "-ring") ring = true;
             else if (a == "-pin") pin = true;
             else if (a == "-uds") uds = true;
-            else if (a == "-shards" && i + 1 < args.Length && int.TryParse(args[i + 1], out var n)) { shards = Math.Max(1, n); i++; }
+            else if (a == "-shards" && i + 1 < args.Length && int.TryParse(args[i + 1], out var n)) { shards = n; i++; }
             else if (!portSet && int.TryParse(a, out var p)) { port = p; portSet = true; }
         }
+
+        if (shards <= 0) shards = Environment.ProcessorCount;
 
         string? udsName = uds ? AbstractName : null;
 

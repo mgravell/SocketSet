@@ -36,6 +36,12 @@ internal static unsafe class LibUring
     // sqe->flags bit: pick the buffer from the group set via sqe_set_buf_group
     // rather than from an addr/len in the SQE. Required for provided-buffer recv.
     internal const uint IOSQE_BUFFER_SELECT = 1u << 5;
+    
+    // Locks submissions strictly to the creating thread, removing internal kernel locks
+    public const uint IORING_SETUP_SINGLE_ISSUER = 1U << 12;
+
+    // Defers kernel task work execution to run lazily inside your thread context
+    public const uint IORING_SETUP_DEFER_TASKRUN = 1U << 13;
 
     static LibUring()
     {
@@ -95,17 +101,48 @@ internal static unsafe class LibUring
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_prep_close(IoUringSqe* sqe, int fd);
 
+    // Post a completion to another ring (IORING_MSG_RING / IORING_MSG_DATA). The
+    // target CQE lands on ring `fd` with res = `len` and user_data = `data`, and
+    // the wait on that ring is woken. We use it to hand an accepted socket fd
+    // (packed into `len`) from the single accept ring to a worker ring — the one
+    // cross-thread signal in the sharded-UDS design, and the only reason it is
+    // safe: each thread still only ever touches its own SQ. Touches only the
+    // caller's SQE, so the GC transition is pure overhead here.
+    [DllImport(Lib), SuppressGCTransition]
+    internal static extern void io_uring_prep_msg_ring(IoUringSqe* sqe, int fd, uint len, ulong data, uint flags);
+
+    [DllImport(Lib), SuppressGCTransition]
+    public static extern void io_uring_prep_poll_add(
+        IoUringSqe*  sqe,       // The raw pointer to the SQE slot acquired from your ring
+        int fd,           // Your 32-bit _eventFd integer
+        uint poll_mask    // The event mask to look for (use IoUringNative.POLLIN)
+    );
+
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_sqe_set_data64(IoUringSqe* sqe, ulong data);
 
     // io_uring_submit / submit_and_wait may enter the kernel (io_uring_enter)
     // and submit_and_wait blocks — so NO SuppressGCTransition here.
 
-    [DllImport(Lib)]
+    [DllImport(Lib), SuppressGCTransition]
     internal static extern int io_uring_submit(void* ring);
 
-    [DllImport(Lib)]
-    internal static extern int io_uring_submit_and_wait(void* ring, uint waitNr);
+    internal static int io_uring_submit_and_wait(void* ring, uint waitNr)
+    {
+        return waitNr is 0
+            ? io_uring_submit_and_wait_nonblocking(ring, waitNr)
+            : io_uring_submit_and_wait_blocking(ring, waitNr);
+
+        // don't use SuppressGCTransition if we're going to block/sleep in unmanaged code - it could
+        // prevent GC indefinitely
+        [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait))]
+        static extern int io_uring_submit_and_wait_blocking(void* ring, uint waitNr);
+
+        [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait)), SuppressGCTransition]
+        static extern int io_uring_submit_and_wait_nonblocking(void* ring, uint waitNr);
+    }
+    
+    
 
     // --- completion -------------------------------------------------------
 

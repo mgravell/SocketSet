@@ -43,6 +43,19 @@ internal static unsafe class LibC
     [DllImport(Lib, SetLastError = true)]
     internal static extern int sched_setaffinity(int pid, nuint cpusetsize, void* mask);
 
+    [DllImport(Lib, EntryPoint = "eventfd", SetLastError = true)]
+    public static extern int eventfd(uint initval, int flags);
+
+    [DllImport(Lib, EntryPoint = "write", SetLastError = true)]
+    public static extern unsafe nint write(int fd, void* buf, nuint count);
+    
+    [DllImport(Lib, EntryPoint = "read", SetLastError = true)]
+    public static extern unsafe nint read(int fd, void* buf, nuint count);
+
+    public const int EFD_NONBLOCK = 0x00000800;
+    public const uint POLLIN = 0x0001;
+    public const int EAGAIN = 11;
+
     /// <summary>Host-to-network byte order for a 16-bit port.</summary>
     internal static ushort Htons(ushort value)
         => BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness(value) : value;

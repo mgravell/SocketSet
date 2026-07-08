@@ -84,11 +84,11 @@ internal sealed unsafe class RingEchoServer : IDisposable
 
     public void Initialize()
     {
-        _listenFd = EchoServer.CreateListener(_port, _udsName);
+        _listenFd = EchoServer.CreateListener(_port, 0, _udsName);
 
         _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
         NativeMemory.Clear(_ring, RingStructSize);
-        int rc = io_uring_queue_init(RingEntries, _ring, 0);
+        int rc = io_uring_queue_init(RingEntries, _ring, IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
         if (rc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-rc}");
 
         // Register the provided-buffer ring and publish every buffer into it.
