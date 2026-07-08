@@ -130,8 +130,22 @@ async Task Stream(int id)
     var recvBuf = new byte[payload * depth];
     long recvd = 0;
     // Drain until the writer is done AND every sent byte has been echoed back.
-    while (Volatile.Read(ref writing) || recvd < Interlocked.Read(ref sent))
+    //
+    // Only ever block in ReceiveAsync when bytes are actually outstanding
+    // (sent > recvd) — those echoes are guaranteed to arrive. Gating the receive
+    // on `writing` alone is a check-then-block race: we could pass the test while
+    // fully caught up (recvd == sent, nothing in flight), commit to ReceiveAsync,
+    // and then the writer hits its deadline and stops without sending more — the
+    // receive would wait forever on an echo that will never come (empty buffers,
+    // idle connection). When caught up, exit if the writer is done, else yield.
+    while (true)
     {
+        if (recvd >= Interlocked.Read(ref sent))
+        {
+            if (!Volatile.Read(ref writing)) break; // done and fully drained
+            await Task.Yield();                     // caught up but writer still active
+            continue;
+        }
         int n = await sock.ReceiveAsync(recvBuf, SocketFlags.None);
         if (n <= 0) throw new IOException("server closed mid-stream");
         recvd += n;
