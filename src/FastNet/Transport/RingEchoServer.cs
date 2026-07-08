@@ -56,6 +56,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
     private void* _ring;
     private IoUringBufRing* _bufRing;
     private int _listenFd = -1;
+    private int _eventFd = -1;
     private volatile bool _running;
 
     public RingEchoServer(int port, int maxConnections, int bufferSize, int shardId = 0, string? udsName = null)
@@ -84,6 +85,13 @@ internal sealed unsafe class RingEchoServer : IDisposable
 
     public void Initialize()
     {
+        // Wake channel: an eventfd the loop keeps a poll armed on, so Stop() can
+        // unblock the drain thread parked in io_uring_submit_and_wait (which has
+        // no other reason to return once the load stops).
+        _eventFd = LibC.eventfd(0, LibC.EFD_NONBLOCK);
+        if (_eventFd < 0)
+            throw new InvalidOperationException($"eventfd failed: {Marshal.GetLastPInvokeError()}");
+
         _listenFd = EchoServer.CreateListener(_port, 0, _udsName);
 
         _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
@@ -109,6 +117,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
     {
         _running = true;
         PostAccept();
+        PostWake();
 
         while (_running)
         {
@@ -118,6 +127,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
                 if (-rc == 4 /* EINTR */) continue;
                 throw new InvalidOperationException($"io_uring_submit_and_wait failed: {-rc}");
             }
+            if (!_running) break; // Stop() woke us via the eventfd
             Drain();
         }
     }
@@ -141,6 +151,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
                 case OpType.Accept: OnAccept(res, flags); break;
                 case OpType.Recv: OnRecv(packed & 0xFFFF, res, flags); break;
                 case OpType.Send: OnSend(packed & 0xFFFF, packed >> 16, res); break;
+                case OpType.Wake: OnWake(); break;
             }
         }
     }
@@ -217,6 +228,26 @@ internal sealed unsafe class RingEchoServer : IDisposable
         io_uring_sqe_set_data64(sqe, Pack(OpType.Accept, 0));
     }
 
+    // Arm a one-shot poll on the eventfd. Not multishot: a single wake is all we
+    // need to break the submit_and_wait, and OnWake re-arms it.
+    private void PostWake()
+    {
+        var sqe = Sqe();
+        io_uring_prep_poll_add(sqe, _eventFd, LibC.POLLIN);
+        io_uring_sqe_set_data64(sqe, Pack(OpType.Wake, 0));
+    }
+
+    private void OnWake()
+    {
+        ulong signalValue;
+        if (LibC.read(_eventFd, &signalValue, sizeof(ulong)) < 0)
+        {
+            var err = Marshal.GetLastPInvokeError();
+            if (err != LibC.EAGAIN) throw new Exception($"eventfd read failed: {err}");
+        }
+        PostWake(); // re-arm; the _running re-check in Run() handles shutdown
+    }
+
     private void PostRecvMultishot(int conn)
     {
         var sqe = Sqe();
@@ -251,7 +282,20 @@ internal sealed unsafe class RingEchoServer : IDisposable
         _freeConn[_freeConnCount++] = conn;
     }
 
-    public void Stop() => _running = false;
+    public void Stop()
+    {
+        if (!_running) return;
+        _running = false;
+        Wake(); // unblock the drain thread parked in submit_and_wait
+    }
+
+    // Write to the eventfd so the armed poll completes and the loop wakes. Safe
+    // to call from another thread (e.g. the Ctrl+C handler): it only touches the
+    // eventfd, never the ring's SQ.
+    private void Wake(ulong signalValue = 1)
+    {
+        if (_eventFd >= 0) LibC.write(_eventFd, &signalValue, sizeof(ulong));
+    }
 
     public void Dispose()
     {
@@ -267,6 +311,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
             _ring = null;
         }
         if (_listenFd >= 0) { LibC.close(_listenFd); _listenFd = -1; }
+        if (_eventFd >= 0) { LibC.close(_eventFd); _eventFd = -1; }
         _pool.Dispose();
     }
 }

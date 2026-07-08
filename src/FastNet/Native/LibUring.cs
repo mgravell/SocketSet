@@ -148,6 +148,10 @@ internal static unsafe class LibUring
 
     [DllImport(Lib), SuppressGCTransition]
     internal static extern int io_uring_peek_cqe(void* ring, IoUringCqe** cqePtr);
+    
+    // Fetches up to 'count' CQE pointer addresses in a single memory read
+    [DllImport(Lib, EntryPoint = "io_uring_peek_batch_cqe", CallingConvention = CallingConvention.Cdecl)]
+    public static extern uint io_uring_peek_batch_cqe( void* ring, IoUringCqe** cqePtrs, uint count);
 
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_cq_advance(void* ring, uint nr);

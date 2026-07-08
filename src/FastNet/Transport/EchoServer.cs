@@ -1,10 +1,13 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using FastNet.Buffers;
 using FastNet.Native;
 using static FastNet.Native.LibUring;
 using static FastNet.Transport.IoUringCqeExtensions;
+
+[module: SkipLocalsInit]
 
 namespace FastNet.Transport;
 
@@ -110,8 +113,14 @@ internal sealed unsafe class EchoServer : IDisposable
             int rc = io_uring_submit_and_wait(_ring, 1);
             if (rc < 0)
             {
-                if (-rc == 4 /* EINTR */) continue;
-                throw new InvalidOperationException($"io_uring_submit_and_wait failed: {-rc}, shard {_shardId}");
+                switch (-rc)
+                {
+                    case LibC.EINTR: // SIGINT etc
+                    case LibC.EBUSY: // couldn't submit, but we can mitigate that by doing a drain
+                        break; // proceed to drain
+                    default:
+                        throw new InvalidOperationException($"io_uring_submit_and_wait failed: {-rc}, shard {_shardId}");
+                }
             }
 
             if (!_running) break;
@@ -121,29 +130,37 @@ internal sealed unsafe class EchoServer : IDisposable
 
     private void Drain()
     {
+        const int MaxBatch = 32;
+        IoUringCqe** cqePtrs = stackalloc IoUringCqe*[MaxBatch];
+        // we will want to snapshot the incoming, so that we can release the CQE *before*
+        // we start processing results, which may have side-effects that need SQEs -
+        // and if the SQE queue is full, the way to release it is to call submit, which will
+        // report EBUSY; make space *first*
+        IoUringCqe* snapshot = stackalloc IoUringCqe[MaxBatch];
         while (true)
         {
-            IoUringCqe* cqe;
-            if (io_uring_peek_cqe(_ring, &cqe) != 0 || cqe == null) break;
+            uint count = io_uring_peek_batch_cqe(_ring, cqePtrs, MaxBatch);
+            if (count == 0) break; // drained
 
-            // Snapshot the fields before advancing: cq_advance frees the slot
-            // back to the kernel, which may overwrite this CQE.
-            OpType op = cqe->Op;
-            int slot = cqe->Slot;
-            int res = cqe->res;
-            uint flags = cqe->flags;
-
-            // Consume this CQE before we post follow-up SQEs.
-            io_uring_cq_advance(_ring, 1);
-
-            switch (op)
+            for (uint i = 0; i < count; i++)
             {
-                case OpType.Accept: OnAccept(res, flags); break;
-                case OpType.Recv: OnRecv(slot, res); break;
-                case OpType.Send: OnSend(slot, res); break;
-                case OpType.Wake: OnWake(); break;
-                case OpType.Close: OnClose(slot); break;
+                snapshot[i] = *cqePtrs[i];
             }
+            io_uring_cq_advance(_ring, count);
+            for (uint i = 0; i < count; i++)
+            {
+                IoUringCqe* cqe = snapshot + i;
+                switch (cqe -> Op) // Op and Slot interpret -> userdata
+                {
+                    case OpType.Accept: OnAccept(cqe -> res, cqe -> flags); break;
+                    case OpType.Recv: OnRecv(cqe -> Slot, cqe -> res); break;
+                    case OpType.Send: OnSend(cqe -> Slot, cqe -> res); break;
+                    case OpType.Wake: OnWake(); break;
+                    case OpType.Close: OnClose(cqe -> Slot); break;
+                }
+            }
+
+            if (count < MaxBatch) break; // incomplete read; don't bother reading again
         }
     }
 
@@ -176,10 +193,11 @@ internal sealed unsafe class EchoServer : IDisposable
             var err = Marshal.GetLastPInvokeError();
             if (err != LibC.EAGAIN) throw new Exception($"Fatal error reading eventfd file descriptor. Linux errno: {err}");
         }
-        PostWake(); // re-arm: we don't multi-shot this to avoid floods, but do this *first*
 
         // since we're here, we can check the queue even if the wake was invalid
         ProcessInbound();
+
+        PostWake(); // re-arm: we don't multi-shot this to avoid floods
     }
 
     private void ProcessInbound()

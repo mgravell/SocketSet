@@ -54,7 +54,7 @@ internal static unsafe class LibC
 
     public const int EFD_NONBLOCK = 0x00000800;
     public const uint POLLIN = 0x0001;
-    public const int EAGAIN = 11;
+    public const int EAGAIN = 11, EINTR = 4, EBUSY = 16;
 
     /// <summary>Host-to-network byte order for a 16-bit port.</summary>
     internal static ushort Htons(ushort value)
