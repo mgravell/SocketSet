@@ -61,10 +61,10 @@ internal static unsafe class LibUring
 
     // --- ring lifecycle ---------------------------------------------------
 
-    [DllImport(Lib, SetLastError = false)]
+    [DllImport(Lib, SetLastError = false), SuppressGCTransition]
     internal static extern int io_uring_queue_init(uint entries, IoUringOpaque* ring, uint flags);
 
-    [DllImport(Lib, SetLastError = false)]
+    [DllImport(Lib, SetLastError = false), SuppressGCTransition]
     internal static extern void io_uring_queue_exit(IoUringOpaque* ring);
 
     // --- submission -------------------------------------------------------
@@ -127,22 +127,18 @@ internal static unsafe class LibUring
     [DllImport(Lib), SuppressGCTransition]
     internal static extern int io_uring_submit(IoUringOpaque* ring);
 
-    internal static int io_uring_submit_and_wait(IoUringOpaque* ring, uint waitNr)
-    {
-        return waitNr is 0
+    // if in doubt: this handles blocking/non-blocking gracefully
+    internal static int io_uring_submit_and_wait(IoUringOpaque* ring, uint waitNr) => waitNr is 0
             ? io_uring_submit_and_wait_nonblocking(ring, waitNr)
             : io_uring_submit_and_wait_blocking(ring, waitNr);
 
-        // don't use SuppressGCTransition if we're going to block/sleep in unmanaged code - it could
-        // prevent GC indefinitely
-        [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait))]
-        static extern int io_uring_submit_and_wait_blocking(IoUringOpaque* ring, uint waitNr);
+    // don't use SuppressGCTransition if we're going to block/sleep in unmanaged code - it could
+    // prevent GC indefinitely
+    [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait))]
+    internal static extern int io_uring_submit_and_wait_blocking(IoUringOpaque* ring, uint waitNr);
 
-        [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait)), SuppressGCTransition]
-        static extern int io_uring_submit_and_wait_nonblocking(IoUringOpaque* ring, uint waitNr);
-    }
-    
-    
+    [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait)), SuppressGCTransition]
+    internal static extern int io_uring_submit_and_wait_nonblocking(IoUringOpaque* ring, uint waitNr);
 
     // --- completion -------------------------------------------------------
 
@@ -150,7 +146,7 @@ internal static unsafe class LibUring
     internal static extern int io_uring_peek_cqe(IoUringOpaque* ring, IoUringCqe** cqePtr);
     
     // Fetches up to 'count' CQE pointer addresses in a single memory read
-    [DllImport(Lib, EntryPoint = "io_uring_peek_batch_cqe", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(Lib, EntryPoint = "io_uring_peek_batch_cqe"), SuppressGCTransition]
     public static extern uint io_uring_peek_batch_cqe( IoUringOpaque* ring, IoUringCqe** cqePtrs, uint count);
 
     [DllImport(Lib), SuppressGCTransition]
@@ -161,10 +157,10 @@ internal static unsafe class LibUring
     // draws from when a BUFFER_SELECT recv completes. setup/free mmap+register
     // the ring; add/advance publish buffers back to the kernel for reuse.
 
-    [DllImport(Lib)]
+    [DllImport(Lib), SuppressGCTransition]
     internal static extern IoUringBufRing* io_uring_setup_buf_ring(IoUringOpaque* ring, uint nentries, int bgid, uint flags, int* ret);
 
-    [DllImport(Lib)]
+    [DllImport(Lib), SuppressGCTransition]
     internal static extern int io_uring_free_buf_ring(IoUringOpaque* ring, IoUringBufRing* br, uint nentries, int bgid);
 
     // Stage one buffer into the ring at (tail + buf_offset). Touches only the

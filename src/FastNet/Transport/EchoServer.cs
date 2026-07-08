@@ -110,7 +110,7 @@ internal sealed unsafe class EchoServer : IDisposable
         while (_running)
         {
             // Block until at least one completion; flushes queued SQEs too.
-            int rc = io_uring_submit_and_wait(_ring, 1);
+            int rc = io_uring_submit_and_wait_blocking(_ring, 1);
             if (rc < 0)
             {
                 switch (-rc)

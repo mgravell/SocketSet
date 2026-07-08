@@ -121,7 +121,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
 
         while (_running)
         {
-            int rc = io_uring_submit_and_wait(_ring, 1);
+            int rc = io_uring_submit_and_wait_blocking(_ring, 1);
             if (rc < 0)
             {
                 if (-rc == 4 /* EINTR */) continue;
