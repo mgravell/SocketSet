@@ -36,6 +36,12 @@ internal static unsafe class LibUring
     // sqe->flags bit: pick the buffer from the group set via sqe_set_buf_group
     // rather than from an addr/len in the SQE. Required for provided-buffer recv.
     internal const uint IOSQE_BUFFER_SELECT = 1u << 5;
+    
+    // Locks submissions strictly to the creating thread, removing internal kernel locks
+    public const uint IORING_SETUP_SINGLE_ISSUER = 1U << 12;
+
+    // Defers kernel task work execution to run lazily inside your thread context
+    public const uint IORING_SETUP_DEFER_TASKRUN = 1U << 13;
 
     static LibUring()
     {
@@ -94,6 +100,13 @@ internal static unsafe class LibUring
 
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_prep_close(IoUringSqe* sqe, int fd);
+    
+    [DllImport(Lib), SuppressGCTransition]
+    public static extern void io_uring_prep_poll_add(
+        IoUringSqe*  sqe,       // The raw pointer to the SQE slot acquired from your ring
+        int fd,           // Your 32-bit _eventFd integer
+        uint poll_mask    // The event mask to look for (use IoUringNative.POLLIN)
+    );
 
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_sqe_set_data64(IoUringSqe* sqe, ulong data);

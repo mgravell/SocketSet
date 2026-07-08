@@ -54,14 +54,26 @@ internal sealed unsafe class EchoServer : IDisposable
         public int SendRemaining; // bytes still to send
     }
 
+    public unsafe void Wake(ulong signalValue = 1)
+    {
+        LibC.write(_eventFd, &signalValue, sizeof(ulong));
+    }
+
+    private int _eventFd;
+    
     public void Initialize()
     {
+        _eventFd = LibC.eventfd(0, LibC.EFD_NONBLOCK);
+        if (_eventFd < 0)
+        {
+            throw new Exception($"Failed to allocate kernel eventfd resource. System error code: {Marshal.GetLastWin32Error()}");
+        }
         _listenFd = CreateListener(_port, _udsName);
 
         _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
         NativeMemory.Clear(_ring, RingStructSize);
 
-        int rc = io_uring_queue_init(RingEntries, _ring, 0);
+        int rc = io_uring_queue_init(RingEntries, _ring, flags: IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
         if (rc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-rc}");
 
         string where = _udsName != null ? $"abstract UDS @{_udsName}" : $":{_port}";
@@ -73,6 +85,7 @@ internal sealed unsafe class EchoServer : IDisposable
     {
         _running = true;
         PostAccept();
+        PostWake();
 
         while (_running)
         {
@@ -109,11 +122,29 @@ internal sealed unsafe class EchoServer : IDisposable
                 case OpType.Accept: OnAccept(res, flags); break;
                 case OpType.Recv: OnRecv(slot, res); break;
                 case OpType.Send: OnSend(slot, res); break;
+                case OpType.Wake: OnWake(); break;
                 case OpType.Close: OnClose(slot); break;
             }
         }
     }
 
+    private void OnWake()
+    {
+        ulong signalValue;
+        bool invalid;
+        // ReSharper disable once AssignmentInConditionalExpression
+        if (invalid = (LibC.read(_eventFd, &signalValue, sizeof(ulong)) < 0))
+        {
+            var err = Marshal.GetLastPInvokeError();
+            if (err != LibC.EAGAIN) throw new Exception($"Fatal error reading eventfd file descriptor. Linux errno: {err}");
+        }
+        PostWake(); // re-arm: we don't multi-shot this to avoid floods, but do this *first*
+
+        if (!invalid)
+        {
+            // TODO: do something with the signal   
+        }
+    }
     private void OnAccept(int res, uint flags)
     {
         // Multishot accept yields one completion per new connection. If the
@@ -182,6 +213,12 @@ internal sealed unsafe class EchoServer : IDisposable
         return sqe;
     }
 
+    private void PostWake()
+    {
+        var sqe = Sqe();
+        io_uring_prep_poll_add(sqe, _eventFd, LibC.POLLIN);
+        io_uring_sqe_set_data64(sqe, Pack(OpType.Wake, 0));
+    }
     private void PostAccept()
     {
         var sqe = Sqe();
