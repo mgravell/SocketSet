@@ -66,7 +66,11 @@ internal sealed class SocketEchoServer : IDisposable
             Socket conn;
             try { conn = await _listener.AcceptAsync(ct); }
             catch (OperationCanceledException) { break; }
-            catch (SocketException) { continue; } // transient accept error; keep listening
+            catch (SocketException ex) // transient accept error; keep listening
+            {
+                Console.WriteLine($"[socket] AcceptAsync SocketException: {ex.SocketErrorCode} ({ex.NativeErrorCode}) {ex.Message}");
+                continue;
+            }
 
             // Kill Nagle on TCP so echoes aren't held for coalescing; N/A on UDS.
             if (_udsName == null) conn.NoDelay = true;
@@ -90,9 +94,16 @@ internal sealed class SocketEchoServer : IDisposable
                     sent += await conn.SendAsync(buf.AsMemory(sent, n - sent), SocketFlags.None, ct);
             }
         }
-        catch (SocketException) { }        // peer reset
-        catch (OperationCanceledException) { } // Stop()
+        catch (SocketException ex)             // peer reset (expected on client close)
+        {
+            Console.WriteLine($"[socket] EchoAsync SocketException: {ex.SocketErrorCode} ({ex.NativeErrorCode}) {ex.Message}");
+        }
+        catch (OperationCanceledException) { }  // Stop()
         catch (ObjectDisposedException) { }
+        catch (Exception ex)                    // anything unexpected — we want to see this
+        {
+            Console.WriteLine($"[socket] EchoAsync {ex.GetType().Name}: {ex.Message}");
+        }
         finally { conn.Dispose(); }
     }
 

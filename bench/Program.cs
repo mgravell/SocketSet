@@ -64,6 +64,17 @@ async Task<Socket> Connect()
     return sock;
 }
 
+// SendAsync on a stream socket may flush only part of the buffer under send-buffer
+// pressure (it returns the byte count). Loop until the whole payload is on the wire,
+// otherwise we'd credit bytes we never actually sent and the echo drain would wait
+// forever for the shortfall — an intermittent hang on TCP (UDS rarely partials).
+async Task SendAll(Socket s, byte[] buf)
+{
+    int off = 0;
+    while (off < buf.Length)
+        off += await s.SendAsync(buf.AsMemory(off), SocketFlags.None);
+}
+
 // --- ping-pong: write a batch, read it back, repeat -----------------------
 async Task PingPong(int id)
 {
@@ -79,7 +90,7 @@ async Task PingPong(int id)
     {
         long t0 = Stopwatch.GetTimestamp();
 
-        await sock.SendAsync(sendBuf, SocketFlags.None);
+        await SendAll(sock, sendBuf);
 
         int got = 0;
         while (got < recvBuf.Length)
@@ -110,7 +121,7 @@ async Task Stream(int id)
     {
         while (Stopwatch.GetTimestamp() < deadline)
         {
-            await sock.SendAsync(sendBuf, SocketFlags.None);
+            await SendAll(sock, sendBuf);
             Interlocked.Add(ref sent, sendBuf.Length);
         }
         Volatile.Write(ref writing, false);
