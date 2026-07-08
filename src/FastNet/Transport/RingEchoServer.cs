@@ -84,7 +84,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
 
     public void Initialize()
     {
-        _listenFd = EchoServer.CreateListener(_port, _udsName);
+        _listenFd = EchoServer.CreateListener(_port, 0, _udsName);
 
         _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
         NativeMemory.Clear(_ring, RingStructSize);

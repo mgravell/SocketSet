@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using FastNet.Buffers;
@@ -36,14 +37,17 @@ internal sealed unsafe class EchoServer : IDisposable
     private void* _ring;
     private int _listenFd = -1;
     private volatile bool _running;
+    private uint _nextPeer; 
+    private readonly EchoServer[]? _peers;
 
-    public EchoServer(int port, int maxConnections, int bufferSize, int shardId = 0, string? udsName = null)
+    public EchoServer(int port, int maxConnections, int bufferSize, int shardId = 0, string? udsName = null, EchoServer[]? peers = null)
     {
         _port = port;
         _udsName = udsName;
         _shardId = shardId;
         _pool = new BufferPool(maxConnections, bufferSize);
         _conns = new Connection[maxConnections];
+        _peers = peers; // can include self when present
     }
 
     private struct Connection
@@ -54,13 +58,15 @@ internal sealed unsafe class EchoServer : IDisposable
         public int SendRemaining; // bytes still to send
     }
 
-    public unsafe void Wake(ulong signalValue = 1)
+    public void Wake(ulong signalValue = 1)
     {
-        LibC.write(_eventFd, &signalValue, sizeof(ulong));
+        if (_eventFd >= 0)
+        {
+            LibC.write(_eventFd, &signalValue, sizeof(ulong));
+        }
     }
 
-    private int _eventFd;
-    
+    private int _eventFd = -1;
     public void Initialize()
     {
         _eventFd = LibC.eventfd(0, LibC.EFD_NONBLOCK);
@@ -68,23 +74,34 @@ internal sealed unsafe class EchoServer : IDisposable
         {
             throw new Exception($"Failed to allocate kernel eventfd resource. System error code: {Marshal.GetLastWin32Error()}");
         }
-        _listenFd = CreateListener(_port, _udsName);
 
-        _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
-        NativeMemory.Clear(_ring, RingStructSize);
-
-        int rc = io_uring_queue_init(RingEntries, _ring, flags: IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
-        if (rc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-rc}");
-
-        string where = _udsName != null ? $"abstract UDS @{_udsName}" : $":{_port}";
-        Console.WriteLine($"[io_uring #{_shardId}] ring up ({RingEntries} entries), listening on {where}, " +
-                          $"{_pool.SlotCount} slots x {_pool.SlotSize}B");
+        if (_peers is null | _shardId is 0)
+        {
+            _listenFd = CreateListener(_port, _shardId, _udsName);
+        }
     }
 
     public void Run()
     {
+        // The ring must be created on the same thread that submits to it:
+        // IORING_SETUP_SINGLE_ISSUER binds the ring to its creating task, so a
+        // submit from any other thread returns -EEXIST. Initialize() runs on the
+        // setup thread (shared by all shards), so allocate + queue_init here, on
+        // the shard's own loop thread. The eventfd and listener stay in
+        // Initialize(): shard 0 may Wake() a peer's eventfd before that peer's
+        // Run() has started, so the eventfd must already exist process-wide.
+        _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
+        NativeMemory.Clear(_ring, RingStructSize);
+
+        int initRc = io_uring_queue_init(RingEntries, _ring, flags: IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
+        if (initRc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-initRc}");
+
+        string where = _udsName != null ? $"abstract UDS @{_udsName}" : $":{_port}";
+        Console.WriteLine($"[io_uring #{_shardId}] ring up ({RingEntries} entries), listening on {where}, " +
+                          $"{_pool.SlotCount} slots x {_pool.SlotSize}B");
+
         _running = true;
-        PostAccept();
+        if (_listenFd >= 0) PostAccept();
         PostWake();
 
         while (_running)
@@ -94,8 +111,10 @@ internal sealed unsafe class EchoServer : IDisposable
             if (rc < 0)
             {
                 if (-rc == 4 /* EINTR */) continue;
-                throw new InvalidOperationException($"io_uring_submit_and_wait failed: {-rc}");
+                throw new InvalidOperationException($"io_uring_submit_and_wait failed: {-rc}, shard {_shardId}");
             }
+
+            if (!_running) break;
             Drain();
         }
     }
@@ -128,23 +147,58 @@ internal sealed unsafe class EchoServer : IDisposable
         }
     }
 
+    private void AddLocal(int fd)
+    {
+        if (!_running)
+        {
+            // we're shutting down
+            LibC.close(fd);
+            return;
+        }
+        int slot = _pool.Rent();
+        if (slot < 0)
+        {
+            // Out of slots — refuse the connection cleanly.
+            LibC.close(fd);
+            return;
+        }
+
+        _conns[slot] = new Connection { Fd = fd, Active = true };
+        PostRecv(slot);
+    }
+    
     private void OnWake()
     {
         ulong signalValue;
-        bool invalid;
         // ReSharper disable once AssignmentInConditionalExpression
-        if (invalid = (LibC.read(_eventFd, &signalValue, sizeof(ulong)) < 0))
+        if (LibC.read(_eventFd, &signalValue, sizeof(ulong)) < 0)
         {
             var err = Marshal.GetLastPInvokeError();
             if (err != LibC.EAGAIN) throw new Exception($"Fatal error reading eventfd file descriptor. Linux errno: {err}");
         }
         PostWake(); // re-arm: we don't multi-shot this to avoid floods, but do this *first*
 
-        if (!invalid)
+        // since we're here, we can check the queue even if the wake was invalid
+        ProcessInbound();
+    }
+
+    private void ProcessInbound()
+    {
+        while (_incoming.TryDequeue(out int fd))
         {
-            // TODO: do something with the signal   
+            AddLocal(fd);
         }
     }
+
+    
+    private void AddRemote(int fd)
+    {
+        _incoming.Enqueue(fd);
+        Wake();
+    }
+
+    private readonly ConcurrentQueue<int> _incoming = new();
+
     private void OnAccept(int res, uint flags)
     {
         // Multishot accept yields one completion per new connection. If the
@@ -153,17 +207,15 @@ internal sealed unsafe class EchoServer : IDisposable
 
         if (res < 0) return; // transient accept error; loop stays armed
 
-        int newFd = res;
-        int slot = _pool.Rent();
-        if (slot < 0)
+        EchoServer peer;
+        if (_peers is null || ReferenceEquals(this, peer = _peers[_nextPeer++ % _peers.Length]))
         {
-            // Out of slots — refuse the connection cleanly.
-            LibC.close(newFd);
-            return;
+            AddLocal(res);
         }
-
-        _conns[slot] = new Connection { Fd = newFd, Active = true };
-        PostRecv(slot);
+        else
+        {
+            peer.AddRemote(res);
+        }
     }
 
     private void OnRecv(int slot, int res)
@@ -262,9 +314,9 @@ internal sealed unsafe class EchoServer : IDisposable
     /// on the listener because Linux propagates it to accepted sockets, which
     /// keeps it off the accept hot path; UDS has no Nagle so the option is N/A.
     /// </summary>
-    internal static int CreateListener(int port, string? udsName = null)
+    internal static int CreateListener(int port, int shard, string? udsName = null)
     {
-        if (udsName != null) return CreateUnixListener(udsName);
+        if (udsName != null) return CreateUnixListener(shard, udsName);
 
         int fd = LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
@@ -291,10 +343,10 @@ internal sealed unsafe class EchoServer : IDisposable
         return fd;
     }
 
-    private static int CreateUnixListener(string name)
+    private static int CreateUnixListener(int shard, string name)
     {
         int fd = LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0);
-        if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket(AF_UNIX) failed");
+        if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), $"socket(AF_UNIX) failed for shard {shard}");
 
         // No SO_REUSEPORT/REUSEADDR: an abstract address is freed as soon as the
         // last holder closes, so there is nothing to reuse or clean up. No
@@ -302,14 +354,21 @@ internal sealed unsafe class EchoServer : IDisposable
         SockAddrUn addr;
         uint len = SockAddrUn.InitAbstract(&addr, name);
         if (LibC.bind(fd, &addr, len) < 0)
-            throw new Win32Exception(Marshal.GetLastPInvokeError(), "bind(AF_UNIX) failed");
+            throw new Win32Exception(Marshal.GetLastPInvokeError(), $"bind(AF_UNIX) failed for shard {shard}");
         if (LibC.listen(fd, 512) < 0)
-            throw new Win32Exception(Marshal.GetLastPInvokeError(), "listen() failed");
+            throw new Win32Exception(Marshal.GetLastPInvokeError(), $"listen() failed for shard {shard}");
 
         return fd;
     }
 
-    public void Stop() => _running = false;
+    public void Stop()
+    {
+        if (_running)
+        {
+            _running = false;
+            Wake();
+        }
+    }
 
     public void Dispose()
     {
