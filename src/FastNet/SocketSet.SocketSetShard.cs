@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 
 namespace FastNet;
@@ -38,11 +39,11 @@ public partial class SocketSet
             if (TrySetFlag(FLAG_STOPPED, true))
             {
                 // the actual stop is co-operative
-                OnWake();
+                Wake();
             }
         }
 
-        protected virtual void OnWake()
+        protected virtual void Wake()
         {
         }
 
@@ -57,6 +58,7 @@ public partial class SocketSet
                     Interlocked.CompareExchange(ref _flags, FLAG_COMPLETE | FLAG_STOPPED, old);
                     break;
             }
+
             OnDispose(true);
         }
 
@@ -112,6 +114,57 @@ public partial class SocketSet
 
         protected internal abstract void OnRun();
 
-        public virtual void Listen(EndPoint endpoint) => throw new NotSupportedException();
+        public void Listen(EndPoint endpoint) => AddPending(new(Operation.Listen, -1, endpoint));
+
+        private void AddPending(in PendingItem item)
+        {
+            // the actual runner needs to service everything
+            if (!IsStopped)
+            {
+                if (IsCurrent)
+                {
+                    switch (item.Operation)
+                    {
+                        case Operation.Listen when item.AcceptEndPoint is not null:
+                            OnListen(item.AcceptEndPoint);
+                            break;
+                        default:
+                            Throw(item.Operation);
+
+                            static void Throw(Operation operation) =>
+                                throw new NotSupportedException(operation.ToString());
+
+                            break;
+                    }
+                }
+                else
+                {
+                    _pending.Enqueue(item);
+                    Wake();
+                }
+            }
+        }
+
+        protected virtual void OnListen(EndPoint endPoint) => throw new NotSupportedException();
+
+        private readonly ConcurrentQueue<PendingItem> _pending = [];
+
+        private readonly struct PendingItem(Operation operation, int fd, EndPoint? acceptEndPoint)
+        {
+            public readonly Operation Operation = operation;
+            public readonly int Fd = fd;
+            public readonly EndPoint? AcceptEndPoint = acceptEndPoint;
+        }
+
+        protected enum Operation
+        {
+            None = 0,
+            Listen = 1,
+            Accept = 2,
+            Send = 3,
+            Receive = 4,
+            Wake = 5,
+            Close = 6,
+        }
     }
 }

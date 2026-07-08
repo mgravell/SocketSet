@@ -1,10 +1,9 @@
-﻿using System.ComponentModel;
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;using FastNet.IOUring;
 using FastNet.Native;
-
+using static FastNet.Native.LibUring;
 namespace FastNet.IOUring;
 
-internal sealed partial class IOUringSocketSet : SocketSet
+internal sealed unsafe partial class IOUringSocketSet : SocketSet
 {
     protected override SocketSetShard CreateShard() => new IOUringSocketSetShard();
 
@@ -20,34 +19,36 @@ internal sealed partial class IOUringSocketSet : SocketSet
             base.OnInit();
         }
         private int _eventFd = -1;
+        private IoUringOpaque* _ring;
+
         protected internal override void OnRun()
         {
-            _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
+            _ring = (IoUringOpaque*) NativeMemory.AlignedAlloc(RingStructSize, 64);
             NativeMemory.Clear(_ring, RingStructSize);
 
             int initRc = io_uring_queue_init(RingEntries, _ring, flags: IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
             if (initRc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-initRc}");
 
-            string where = _udsName != null ? $"abstract UDS @{_udsName}" : $":{_port}";
-            Console.WriteLine($"[io_uring #{_shardId}] ring up ({RingEntries} entries), listening on {where}, " +
-                              $"{_pool.SlotCount} slots x {_pool.SlotSize}B");
-
-            _running = true;
-            if (_listenFd >= 0) PostAccept();
+            ProcessInbound();
             PostWake();
 
-            while (_running)
+            while (true)
             {
                 // Block until at least one completion; flushes queued SQEs too.
-                int rc = io_uring_submit_and_wait(_ring, 1);
+                int rc = io_uring_submit_and_wait_blocking(_ring, 1);
                 if (rc < 0)
                 {
-                    if (-rc == 4 /* EINTR */) continue;
-                    throw new InvalidOperationException($"io_uring_submit_and_wait failed: {-rc}, shard {_shardId}");
+                    switch (-rc)
+                    {
+                        case LibC.EINTR: // SIGINT etc
+                        case LibC.EBUSY: // couldn't submit, but we can mitigate that by doing a drain
+                            break; // proceed to drain
+                        default:
+                            throw new InvalidOperationException($"io_uring_submit_and_wait failed: {-rc}, shard {Index}");
+                    }
                 }
 
-                if (!_running) break;
-                Drain();
+                if (IsStopped) break;
             }
         }
 

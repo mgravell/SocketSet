@@ -91,8 +91,9 @@ public abstract partial class SocketSet : IDisposable
     }
 
     protected virtual bool IsSingleListener => true;
-    public virtual void Listen(EndPoint endpoint)
+    public void Listen(EndPoint endpoint)
     {
+        ThrowIfDisposed();
         if (IsSingleListener) NextShard().Listen(endpoint);
         else
         {
@@ -101,6 +102,12 @@ public abstract partial class SocketSet : IDisposable
                 shard.Listen(endpoint);
             }
         }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_isDisposed) Throw(this);
+        static void Throw(object @this) => throw new ObjectDisposedException(@this.GetType().Name);
     }
 
     protected abstract SocketSetShard CreateShard();
