@@ -53,7 +53,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
     private readonly int[] _sendOffset;
     private readonly int[] _sendRemaining;
 
-    private void* _ring;
+    private IoUringOpaque* _ring;
     private IoUringBufRing* _bufRing;
     private int _listenFd = -1;
     private int _eventFd = -1;
@@ -94,7 +94,7 @@ internal sealed unsafe class RingEchoServer : IDisposable
 
         _listenFd = EchoServer.CreateListener(_port, 0, _udsName);
 
-        _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
+        _ring = (IoUringOpaque*) NativeMemory.AlignedAlloc(RingStructSize, 64);
         NativeMemory.Clear(_ring, RingStructSize);
         int rc = io_uring_queue_init(RingEntries, _ring, IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
         if (rc < 0) throw new InvalidOperationException($"io_uring_queue_init failed: {-rc}");

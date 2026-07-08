@@ -62,26 +62,26 @@ internal static unsafe class LibUring
     // --- ring lifecycle ---------------------------------------------------
 
     [DllImport(Lib, SetLastError = false)]
-    internal static extern int io_uring_queue_init(uint entries, void* ring, uint flags);
+    internal static extern int io_uring_queue_init(uint entries, IoUringOpaque* ring, uint flags);
 
     [DllImport(Lib, SetLastError = false)]
-    internal static extern void io_uring_queue_exit(void* ring);
+    internal static extern void io_uring_queue_exit(IoUringOpaque* ring);
 
     // --- submission -------------------------------------------------------
     // These touch only the userspace SQ ring, so suppressing the GC
     // transition is safe and removes real overhead on the hot path.
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern IoUringSqe* io_uring_get_sqe(void* ring);
+    internal static extern IoUringSqe* io_uring_get_sqe(IoUringOpaque* ring);
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern void io_uring_prep_recv(IoUringSqe* sqe, int sockfd, void* buf, nuint len, int flags);
+    internal static extern void io_uring_prep_recv(IoUringSqe* sqe, int sockfd, byte* buf, nuint len, int flags);
 
     // Multishot recv: stays armed and posts a CQE (each carrying a provided
     // buffer) per arrival, until EOF/error/buffer exhaustion. buf/len are
     // ignored — buffers come from the group named by sqe_set_buf_group.
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern void io_uring_prep_recv_multishot(IoUringSqe* sqe, int sockfd, void* buf, nuint len, int flags);
+    internal static extern void io_uring_prep_recv_multishot(IoUringSqe* sqe, int sockfd, byte* buf, nuint len, int flags);
 
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_sqe_set_flags(IoUringSqe* sqe, uint flags);
@@ -90,13 +90,13 @@ internal static unsafe class LibUring
     internal static extern void io_uring_sqe_set_buf_group(IoUringSqe* sqe, int bgid);
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern void io_uring_prep_send(IoUringSqe* sqe, int sockfd, void* buf, nuint len, int flags);
+    internal static extern void io_uring_prep_send(IoUringSqe* sqe, int sockfd, byte* buf, nuint len, int flags);
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern void io_uring_prep_accept(IoUringSqe* sqe, int fd, void* addr, uint* addrlen, int flags);
+    internal static extern void io_uring_prep_accept(IoUringSqe* sqe, int fd, byte* addr, uint* addrlen, int flags);
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern void io_uring_prep_multishot_accept(IoUringSqe* sqe, int fd, void* addr, uint* addrlen, int flags);
+    internal static extern void io_uring_prep_multishot_accept(IoUringSqe* sqe, int fd, byte* addr, uint* addrlen, int flags);
 
     [DllImport(Lib), SuppressGCTransition]
     internal static extern void io_uring_prep_close(IoUringSqe* sqe, int fd);
@@ -125,9 +125,9 @@ internal static unsafe class LibUring
     // and submit_and_wait blocks — so NO SuppressGCTransition here.
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern int io_uring_submit(void* ring);
+    internal static extern int io_uring_submit(IoUringOpaque* ring);
 
-    internal static int io_uring_submit_and_wait(void* ring, uint waitNr)
+    internal static int io_uring_submit_and_wait(IoUringOpaque* ring, uint waitNr)
     {
         return waitNr is 0
             ? io_uring_submit_and_wait_nonblocking(ring, waitNr)
@@ -136,10 +136,10 @@ internal static unsafe class LibUring
         // don't use SuppressGCTransition if we're going to block/sleep in unmanaged code - it could
         // prevent GC indefinitely
         [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait))]
-        static extern int io_uring_submit_and_wait_blocking(void* ring, uint waitNr);
+        static extern int io_uring_submit_and_wait_blocking(IoUringOpaque* ring, uint waitNr);
 
         [DllImport(Lib, EntryPoint = nameof(io_uring_submit_and_wait)), SuppressGCTransition]
-        static extern int io_uring_submit_and_wait_nonblocking(void* ring, uint waitNr);
+        static extern int io_uring_submit_and_wait_nonblocking(IoUringOpaque* ring, uint waitNr);
     }
     
     
@@ -147,14 +147,14 @@ internal static unsafe class LibUring
     // --- completion -------------------------------------------------------
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern int io_uring_peek_cqe(void* ring, IoUringCqe** cqePtr);
+    internal static extern int io_uring_peek_cqe(IoUringOpaque* ring, IoUringCqe** cqePtr);
     
     // Fetches up to 'count' CQE pointer addresses in a single memory read
     [DllImport(Lib, EntryPoint = "io_uring_peek_batch_cqe", CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint io_uring_peek_batch_cqe( void* ring, IoUringCqe** cqePtrs, uint count);
+    public static extern uint io_uring_peek_batch_cqe( IoUringOpaque* ring, IoUringCqe** cqePtrs, uint count);
 
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern void io_uring_cq_advance(void* ring, uint nr);
+    internal static extern void io_uring_cq_advance(IoUringOpaque* ring, uint nr);
 
     // --- provided buffer rings (multishot recv) ---------------------------
     // A buf ring is a kernel-shared SPSC array of {addr,len,bid} the kernel
@@ -162,15 +162,15 @@ internal static unsafe class LibUring
     // the ring; add/advance publish buffers back to the kernel for reuse.
 
     [DllImport(Lib)]
-    internal static extern IoUringBufRing* io_uring_setup_buf_ring(void* ring, uint nentries, int bgid, uint flags, int* ret);
+    internal static extern IoUringBufRing* io_uring_setup_buf_ring(IoUringOpaque* ring, uint nentries, int bgid, uint flags, int* ret);
 
     [DllImport(Lib)]
-    internal static extern int io_uring_free_buf_ring(void* ring, IoUringBufRing* br, uint nentries, int bgid);
+    internal static extern int io_uring_free_buf_ring(IoUringOpaque* ring, IoUringBufRing* br, uint nentries, int bgid);
 
     // Stage one buffer into the ring at (tail + buf_offset). Touches only the
     // shared ring memory, so the GC transition is pure overhead here.
     [DllImport(Lib), SuppressGCTransition]
-    internal static extern void io_uring_buf_ring_add(IoUringBufRing* br, void* addr, uint len, ushort bid, int mask, int buf_offset);
+    internal static extern void io_uring_buf_ring_add(IoUringBufRing* br, byte* addr, uint len, ushort bid, int mask, int buf_offset);
 
     // Publish `count` staged buffers by advancing the ring tail.
     [DllImport(Lib), SuppressGCTransition]
@@ -207,4 +207,9 @@ internal struct IoUringSqe
 internal struct IoUringBufRing
 {
     // Intentionally empty: liburing owns the layout; we pass the pointer back.
+}
+
+[StructLayout(LayoutKind.Sequential, Size = LibUring.RingStructSize)]
+internal struct IoUringOpaque
+{
 }

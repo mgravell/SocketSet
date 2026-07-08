@@ -37,7 +37,7 @@ internal sealed unsafe class EchoServer : IDisposable
     private readonly BufferPool _pool;
     private readonly Connection[] _conns;
 
-    private void* _ring;
+    private IoUringOpaque* _ring;
     private int _listenFd = -1;
     private volatile bool _running;
     private uint _nextPeer; 
@@ -93,7 +93,7 @@ internal sealed unsafe class EchoServer : IDisposable
         // the shard's own loop thread. The eventfd and listener stay in
         // Initialize(): shard 0 may Wake() a peer's eventfd before that peer's
         // Run() has started, so the eventfd must already exist process-wide.
-        _ring = NativeMemory.AlignedAlloc(RingStructSize, 64);
+        _ring = (IoUringOpaque*) NativeMemory.AlignedAlloc(RingStructSize, 64);
         NativeMemory.Clear(_ring, RingStructSize);
 
         int initRc = io_uring_queue_init(RingEntries, _ring, flags: IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
@@ -160,7 +160,7 @@ internal sealed unsafe class EchoServer : IDisposable
                 }
             }
 
-            if (count < MaxBatch) break; // incomplete read; don't bother reading again
+            if (count < MaxBatch) break; // incomplete read; avoid a pointless extra read
         }
     }
 
