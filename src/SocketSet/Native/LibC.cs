@@ -1,4 +1,5 @@
-﻿using System.Buffers.Binary;
+﻿#if NET // io_uring is a Linux + modern-.NET backend; compiled out of the netfx fallback build.
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 
 namespace SocketSets.Native;
@@ -320,3 +321,4 @@ internal static unsafe partial class LibC
         public unsafe fixed ulong resv[3];
     }
 }
+#endif

@@ -5,7 +5,7 @@ namespace SmokeTest;
 public class EchoServer(SocketSetOptions options) : SocketSet(options)
 {
     /// <summary>Size of the initial payload a client fires on connect to start the ping-pong.</summary>
-    public int GreetingSize { get; init; } = 512;
+    public int GreetingSize { get; set; } = 512;
 
     private long _echoed;      // bytes echoed by the server side
     private long _roundTrip;   // bytes received back by the client side (a completed round trip)
