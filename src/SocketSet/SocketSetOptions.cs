@@ -8,4 +8,8 @@ public class SocketSetOptions
     public int EntriesPerShard { get; set; } = 4096;
     public int BufferPageSize { get; set; } = 4096;
     public int BufferPagesPerShard { get; set; } = 256;
+
+    /// <summary>Pre-allocated, pre-pinned outbound buffers per shard. Each in-flight
+    /// send holds one; sized to bound concurrent responses.</summary>
+    public int WriteBuffersPerShard { get; set; } = 1024;
 }

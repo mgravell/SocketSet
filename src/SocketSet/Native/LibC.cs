@@ -16,7 +16,10 @@ internal static unsafe partial class LibC
     internal const int SO_REUSEPORT = 15;
     internal const int TCP_NODELAY = 1;
     
-    public const int EAGAIN = 11, EINTR = 4, EBUSY = 16;
+    public const int EAGAIN = 11, EINTR = 4, EBUSY = 16, ENOBUFS = 105;
+
+    // send()/recv() message flags
+    internal const int MSG_NOSIGNAL = 0x4000; // don't raise SIGPIPE on a broken pipe; report -EPIPE instead
 
     [SuppressGCTransition]
     [LibraryImport(Lib, SetLastError = true)]
@@ -167,11 +170,21 @@ internal static unsafe partial class LibC
     // Shared Kernel Opcode and Flag Configuration Constants
     // =========================================================================
 
-    // io_uring Core Opcodes
-    public const uint IORING_REGISTER_EVENTFD = 2; // Added
+    // io_uring register opcodes (linux/io_uring.h enum io_uring_register_op)
+    public const uint IORING_REGISTER_EVENTFD = 4;
+
+    // io_uring operation opcodes (linux/io_uring.h enum io_uring_op). These are
+    // ordinals into that enum; getting them wrong silently issues the wrong op.
+    public const byte IORING_OP_ACCEPT = 13;
+    public const byte IORING_OP_CONNECT = 16;
+    public const byte IORING_OP_CLOSE = 19;
     public const byte IORING_OP_READ = 22;
     public const byte IORING_OP_SEND = 26;
-    public const byte IORING_OP_ACCEPT = 28;
+    public const byte IORING_OP_RECV = 27;
+
+    // ioprio multishot modifiers
+    public const ushort IORING_ACCEPT_MULTISHOT = 1 << 0;
+    public const ushort IORING_RECV_MULTISHOT = 1 << 1;
 
     // io_uring Setup Flags
     public const uint IORING_SETUP_SINGLE_ISSUER = 1U << 12; // Locks ring to single loop thread (Linux 6.0+)
@@ -182,8 +195,9 @@ internal static unsafe partial class LibC
 
     // SQE / CQE Bitwise Modifiers
     public const byte IOSQE_BUFFER_SELECT = 1 << 5; // Directs SQE to pull from auto-provided buffers
-    public const uint IORING_CQE_F_MORE = 1U << 0; // Validates if Multishot Accept remains armed
-    public const uint IORING_CQE_F_BUFFER = 1U << 16; // Signifies presence of a kernel buffer ID allocation
+    public const uint IORING_CQE_F_BUFFER = 1U << 0; // cqe.flags: upper 16 bits carry the selected buffer id
+    public const uint IORING_CQE_F_MORE = 1U << 1; // cqe.flags: parent (multishot) SQE will emit more CQEs
+    public const int IORING_CQE_BUFFER_SHIFT = 16; // shift to extract the buffer id from cqe.flags
 
     // Kernel Buffer Ring Registration
     public const uint IORING_REGISTER_PBUF_RING = 22; // Provided buffer ring tracking identifier (Linux 5.19+)
@@ -284,10 +298,13 @@ internal static unsafe partial class LibC
         public ushort resv;
     }
 
+    // Kernel overlays this header with io_uring_buf[0] via a union: 'tail' occupies
+    // the same two bytes as io_uring_buf.resv, so the header is exactly 16 bytes and
+    // 'tail' sits at offset 14. resv1 MUST be 8 bytes (__u64) for that to hold.
     [StructLayout(LayoutKind.Sequential)]
     internal struct io_uring_buf_ring
     {
-        public uint resv1;
+        public ulong resv1;
         public uint resv2;
         public ushort resv3;
         public ushort tail;

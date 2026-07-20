@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using SocketSets.Native;
 
 namespace SocketSets.IoUring;
@@ -72,24 +73,27 @@ internal readonly unsafe struct RawIOUringRing : IDisposable
         Unsafe.AsRef(in this) = default; // nuke from orbit
     }
 
-    public void Push(in LibC.io_uring_sqe sqe)
+    /// <summary>
+    /// Try to place one SQE. Returns false (without faulting) when the submission
+    /// queue is full, so the caller can defer the work instead of crashing the loop.
+    /// </summary>
+    public bool TryPush(in LibC.io_uring_sqe sqe)
     {
         // 1. Read local tail and volatile head
         uint tail = *SqTail;
         uint head = Volatile.Read(ref *SqHead);
-    
-        // 2. Correct full check: distance equals total ring capacity
-        if (tail - head >= (SqMask + 1)) ThrowFull();
-    
+
+        // 2. Full check: distance equals total ring capacity
+        if (tail - head >= (SqMask + 1)) return false;
+
         // 3. Write SQE and array entry
         uint index = tail & SqMask;
         Sqes[index] = sqe;
         SqArray[index] = index;
-    
+
         // 4. Release barrier: ensures SQE data is visible before kernel sees updated tail
         Volatile.Write(ref *SqTail, tail + 1);
-    
-        static void ThrowFull() => throw new InvalidOperationException("Submission queue is full.");
+        return true;
     }
 
     public uint Push(ConcurrentQueue<LibC.io_uring_sqe> sqes)
@@ -134,6 +138,13 @@ internal readonly unsafe struct RawIOUringRing : IDisposable
     }
 }
 
+/// <summary>
+/// A kernel-provided buffer ring (IORING_REGISTER_PBUF_RING). Receives select a
+/// buffer automatically via IOSQE_BUFFER_SELECT; the completion reports which
+/// buffer id was used and we hand it back to the kernel with <see cref="ReleaseBuffer"/>.
+/// The ring header aliases io_uring_buf[0] exactly as the kernel expects: buffer
+/// entries live at offset 0 and the tail is the resv field of entry 0.
+/// </summary>
 internal unsafe struct ManagedBufferPool : IDisposable
 {
     private readonly uint _entries;
@@ -141,15 +152,17 @@ internal unsafe struct ManagedBufferPool : IDisposable
     private readonly void* _ringMemory;
     private readonly byte* _dataSlab;
     private readonly LibC.io_uring_buf_ring* _bufRing;
-    private readonly LibC.io_uring_buf* _bufsArray;
+    private readonly LibC.io_uring_buf* _bufs;
     private readonly nuint _ringAllocSize;
     private readonly nuint _dataAllocSize;
 
     public ushort GroupId { get; init; } = 1;
+    public int BufferSize => (int)_bufSize;
 
     public ManagedBufferPool(int ringFd, int entries = 256, int bufSize = 4096)
     {
-        _entries = (uint)entries; // Must be power of 2
+        if ((entries & (entries - 1)) != 0) throw new ArgumentException("entries must be a power of two", nameof(entries));
+        _entries = (uint)entries;
         _bufSize = (uint)bufSize;
 
         const int PROT_READ = 0x1;
@@ -157,23 +170,28 @@ internal unsafe struct ManagedBufferPool : IDisposable
         const int MAP_ANONYMOUS = 0x20;
         const int MAP_SHARED = 0x01;
 
-        _ringAllocSize = (nuint)(sizeof(LibC.io_uring_buf_ring) + (sizeof(LibC.io_uring_buf) * _entries));
+        // The ring is exactly one io_uring_buf slot per entry; the header shares
+        // slot 0 with the kernel (see io_uring_buf_ring's union). No extra slot.
+        _ringAllocSize = (nuint)(sizeof(LibC.io_uring_buf) * _entries);
         _ringMemory = LibC.mmap(null, _ringAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
         _dataAllocSize = _entries * _bufSize;
         _dataSlab = (byte*)LibC.mmap(null, _dataAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
-        _bufRing = (LibC.io_uring_buf_ring*)_ringMemory;
-        _bufsArray = (LibC.io_uring_buf*)((byte*)_ringMemory + sizeof(LibC.io_uring_buf_ring));
+        _bufRing = (LibC.io_uring_buf_ring*)_ringMemory; // used only for ->tail
+        _bufs = (LibC.io_uring_buf*)_ringMemory;         // buffer entries (bufs[0] aliases the header)
 
         for (ushort i = 0; i < _entries; i++)
         {
-            _bufsArray[i].addr = (ulong)(_dataSlab + (i * _bufSize));
-            _bufsArray[i].len = _bufSize;
-            _bufsArray[i].bid = i;
+            _bufs[i].addr = (ulong)(_dataSlab + (i * _bufSize));
+            _bufs[i].len = _bufSize;
+            _bufs[i].bid = i;
+            _bufs[i].resv = 0;
         }
 
-        _bufRing->tail = (ushort)_entries;
+        // Publish all buffers as available. tail aliases bufs[0].resv (offset 14),
+        // so this leaves bufs[0].addr/len/bid intact.
+        Volatile.Write(ref _bufRing->tail, (ushort)_entries);
 
         var reg = new LibC.io_uring_buf_reg
         {
@@ -184,22 +202,22 @@ internal unsafe struct ManagedBufferPool : IDisposable
         };
 
         int res = LibC.io_uring_register(LibC.SYS_io_uring_register, ringFd, LibC.IORING_REGISTER_PBUF_RING, &reg, 1);
-        if (res < 0) throw new InvalidOperationException($"PBUF Registration failed: {res}");
+        if (res < 0) throw new InvalidOperationException($"PBUF registration failed: {res} (errno {Marshal.GetLastPInvokeError()})");
     }
 
     public byte* GetBufferAddress(ushort bid) => _dataSlab + (bid * _bufSize);
 
+    /// <summary>Return a consumed buffer to the kernel. Loop-thread only (single consumer).</summary>
     public void ReleaseBuffer(ushort bid)
     {
-        ushort currentTail = _bufRing->tail;
         uint mask = _entries - 1;
-
-        LibC.io_uring_buf* targetSlot = &_bufsArray[currentTail & mask];
-        targetSlot->addr = (ulong)(_dataSlab + (bid * _bufSize));
-        targetSlot->len = _bufSize;
-        targetSlot->bid = bid;
-
-        _bufRing->tail = (ushort)(currentTail + 1);
+        ushort tail = _bufRing->tail; // we are the only writer, plain read is fine
+        LibC.io_uring_buf* slot = &_bufs[tail & mask];
+        slot->addr = (ulong)(_dataSlab + (bid * _bufSize));
+        slot->len = _bufSize;
+        slot->bid = bid;
+        // Release-store the tail so the kernel sees the populated slot first.
+        Volatile.Write(ref _bufRing->tail, (ushort)(tail + 1));
     }
 
     public void Dispose()
@@ -207,6 +225,60 @@ internal unsafe struct ManagedBufferPool : IDisposable
         if (_ringMemory == null) return;
         LibC.munmap(_ringMemory, _ringAllocSize);
         LibC.munmap(_dataSlab, _dataAllocSize);
+        Unsafe.AsRef(in this) = default;
+    }
+}
+
+/// <summary>
+/// Library-owned, pre-pinned outbound buffers. The caller leases a slot, writes
+/// into it, and the send completion releases it. This is the model RIO/DK need
+/// (the transport owns the memory registered with the NIC); io_uring does not
+/// strictly require it, but sharing the model keeps the surface uniform. All
+/// access is single-threaded (the shard's loop thread), so the free list needs
+/// no synchronisation.
+/// </summary>
+internal unsafe struct WriteBufferPool : IDisposable
+{
+    private readonly byte* _slab;
+    private readonly int _count;
+    private readonly int _bufSize;
+    private readonly int[] _free;
+    private int _freeTop; // number of free indices in [0.._freeTop)
+
+    public int BufferSize => _bufSize;
+
+    public WriteBufferPool(int count, int bufSize)
+    {
+        _count = count;
+        _bufSize = bufSize;
+        _slab = (byte*)NativeMemory.AllocZeroed((nuint)count * (nuint)bufSize);
+        _free = new int[count];
+        for (int i = 0; i < count; i++) _free[i] = i;
+        _freeTop = count;
+    }
+
+    public bool TryLease(out int index, out byte* ptr)
+    {
+        if (_freeTop == 0)
+        {
+            index = -1;
+            ptr = null;
+            return false;
+        }
+
+        index = _free[--_freeTop];
+        ptr = _slab + ((long)index * _bufSize);
+        return true;
+    }
+
+    public void Release(int index) => _free[_freeTop++] = index;
+
+    public byte* Address(int index) => _slab + ((long)index * _bufSize);
+
+    public void Dispose()
+    {
+        if (_slab == null) return;
+        NativeMemory.Free(_slab);
         Unsafe.AsRef(in this) = default;
     }
 }

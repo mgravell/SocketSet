@@ -1,289 +1,575 @@
-﻿using System.Collections.Concurrent;
-using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Net;
 using System.Runtime.InteropServices;
 using SocketSets.Native;
 
 namespace SocketSets.IoUring;
 
+/// <summary>
+/// A single-threaded io_uring event loop. Exactly one thread (the loop thread)
+/// ever touches the ring, which is why we can run with SINGLE_ISSUER +
+/// DEFER_TASKRUN. Work that originates on other threads (<see cref="Listen"/>,
+/// <see cref="Connect"/>) is not submitted directly; it is enqueued and the loop
+/// is woken via an eventfd that the ring itself is reading.
+/// </summary>
 internal sealed class IoUringShard : SocketSetShard
 {
-    private readonly object?[] _userTokens;
-    private readonly int[] _fds;
-    private uint _clientStart;
-    private RawIOUringRing _ring;
-    private int _eventFd;
-    private ManagedBufferPool _readBuffer;
-    private readonly ConcurrentQueue<LibC.io_uring_sqe> _pending = [];
+    private const int AddrStride = 128; // per-slot sockaddr storage (covers sockaddr_in and sockaddr_un)
 
-    public IoUringShard(SocketSetOptions options)
+    private enum Op : byte
     {
-        _fds = new int[options.SocketsPerShard];
-        _userTokens = new object?[options.SocketsPerShard];
-
-        // defer _ring - it needs to be created by the IO thread
+        Wake = 0,
+        Accept = 1,
+        Connect = 2,
+        Recv = 3,
+        Send = 4,
     }
 
-    private uint InitClient(int fd, object? userToken)
+    private struct WriteState
     {
-        if (fd is 0) Throw();
+        public uint Slot;
+        public int Fd;
+        public int Sent;
+        public int Total;
+    }
+
+    // --- slot table (1-based ids; id 0 == "none") ---
+    private readonly int[] _fds;
+    private readonly object?[] _userTokens;
+    private readonly byte[] _slotFlags; // SocketSet.SocketFlags per slot
+    private uint _clientStart;
+
+    // --- options snapshot ---
+    private readonly int _socketsPerShard;
+    private readonly int _entriesPerShard;
+    private readonly int _readPages;
+    private readonly int _readPageSize;
+    private readonly int _writeCount;
+    private readonly int _writeBufSize;
+
+    // --- created on the loop thread in Initialize() ---
+    private RawIOUringRing _ring;
+    private ManagedBufferPool _readBuffer;
+    private WriteBufferPool _writeBuffer;
+    private WriteState[] _writeState = [];
+    private volatile bool _ringReady;
+
+    // --- cross-thread wakeup ---
+    private readonly int _eventFd;
+    private unsafe ulong* _wakeBuf;
+
+    // --- native, stable storage the kernel reads asynchronously ---
+    private unsafe byte* _connectAddrs;
+
+    private readonly ConcurrentQueue<LibC.io_uring_sqe> _pending = [];
+    private readonly List<int> _listeners = [];
+    private uint _unsubmittedCount;
+
+    public unsafe IoUringShard(SocketSetOptions options)
+    {
+        _socketsPerShard = options.SocketsPerShard;
+        _entriesPerShard = options.EntriesPerShard;
+        _readPages = options.BufferPagesPerShard;
+        _readPageSize = options.BufferPageSize;
+        _writeCount = options.WriteBuffersPerShard;
+        _writeBufSize = options.BufferPageSize;
+
+        _fds = new int[_socketsPerShard];
+        _userTokens = new object?[_socketsPerShard];
+        _slotFlags = new byte[_socketsPerShard];
+
+        // Stable native storage the kernel dereferences after we return.
+        _connectAddrs = (byte*)NativeMemory.AllocZeroed((nuint)_socketsPerShard * AddrStride);
+        _wakeBuf = (ulong*)NativeMemory.AllocZeroed(sizeof(ulong));
+
+        // Create the eventfd up-front (a plain syscall, thread-independent) so that
+        // Listen/Connect can Poke() safely even before the loop has built the ring.
+        // EFD_NONBLOCK makes io_uring arm a poll instead of blocking a worker.
+        _eventFd = LibC.eventfd(0, 0x800 /* EFD_NONBLOCK */);
+        if (_eventFd < 0) throw new InvalidOperationException("Failed to allocate shard eventfd");
+
+        // _ring/_readBuffer/_writeBuffer are deferred; they must be created by the loop thread.
+    }
+
+    // =====================================================================
+    // Slot table
+    // =====================================================================
+
+    private uint InitClient(int fd, object? userToken, byte flags)
+    {
+        if (fd <= 0) Throw();
         var fds = _fds;
         var offset = Interlocked.Increment(ref _clientStart);
         for (int i = 0; i < fds.Length; i++)
         {
             var index = (uint)((i + offset) % fds.Length);
-            if (index is uint.MaxValue) continue; // reserved
             if (Interlocked.CompareExchange(ref fds[index], fd, 0) is 0)
             {
+                _slotFlags[index] = flags;
                 Volatile.Write(ref _userTokens[index], userToken);
-                return index + 1; // we'll return 1 when we mean "the first", so: index 0
+                return index + 1; // 1-based
             }
         }
 
-        return 0; // failure
+        return 0; // table full
 
         static void Throw() => throw new ArgumentOutOfRangeException(nameof(fd), "Invalid socket handle");
     }
 
-    private int GetClient(uint id, out object? userToken)
+    private int GetFd(uint slot) => slot == 0 ? 0 : Volatile.Read(ref _fds[slot - 1]);
+
+    private SocketSet.SocketFlags GetFlags(uint slot) => (SocketSet.SocketFlags)_slotFlags[slot - 1];
+
+    private void CloseClient(uint slot)
     {
-        var index = id - 1;
-        userToken = Volatile.Read(ref _userTokens[index]);
-        return Volatile.Read(ref _fds[index]);
+        if (slot == 0) return;
+        uint idx = slot - 1;
+        int fd = Interlocked.Exchange(ref _fds[idx], 0);
+        Volatile.Write(ref _userTokens[idx], null);
+        _slotFlags[idx] = 0;
+        if (fd > 0) LibC.close(fd);
     }
 
-    private void ResetClient(uint id)
-    {
-        // reset the user-token first so we don't fight with InitClient
-        var index = id - 1;
-        Volatile.Write(ref _userTokens[index], null);
-        Volatile.Write(ref _fds[index], 0);
-    }
+    // =====================================================================
+    // Public entry points (called from arbitrary threads)
+    // =====================================================================
 
     public override void Listen(EndPoint endpoint, object? userToken, bool local)
     {
         int fd = IoUringFactory.Bind(endpoint);
-        var id = InitClient(fd, userToken);
+        lock (_listeners) _listeners.Add(fd);
+        EnqueueAccept(fd, local);
     }
+
+    public override unsafe void Connect(EndPoint endpoint, object? userToken)
+    {
+        if (endpoint is not IPEndPoint ip)
+            throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported yet.");
+
+        int fd = LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
+        if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
+
+        int one = 1;
+        LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
+
+        uint slot = InitClient(fd, userToken, 0);
+        if (slot == 0)
+        {
+            LibC.close(fd);
+            throw new InvalidOperationException("Shard socket table is full.");
+        }
+
+        // Build sockaddr_in into this slot's stable native storage.
+        byte* addrPtr = _connectAddrs + (nint)(slot - 1) * AddrStride;
+        var sa = (LibC.SockAddrIn*)addrPtr;
+        sa->sin_family = LibC.AF_INET;
+        sa->sin_port = LibC.Htons((ushort)ip.Port);
+        var bytes = ip.Address.GetAddressBytes(); // 4 bytes, already network order
+        byte* dst = (byte*)&sa->sin_addr;
+        dst[0] = bytes[0];
+        dst[1] = bytes[1];
+        dst[2] = bytes[2];
+        dst[3] = bytes[3];
+
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_CONNECT,
+            fd = fd,
+            addr = (ulong)addrPtr,
+            off = 16, // sizeof(sockaddr_in)
+            user_data = Pack(Op.Connect, slot),
+        };
+        Enqueue(sqe);
+    }
+
+    private void EnqueueAccept(int listenerFd, bool local)
+    {
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_ACCEPT,
+            fd = listenerFd,
+            ioprio = LibC.IORING_ACCEPT_MULTISHOT,
+            user_data = Pack(Op.Accept, (uint)listenerFd, local ? 1u : 0u),
+        };
+        Enqueue(sqe);
+    }
+
+    private void Enqueue(in LibC.io_uring_sqe sqe)
+    {
+        _pending.Enqueue(sqe);
+        Poke();
+    }
+
+    private unsafe void Poke()
+    {
+        if (!_ringReady) return; // loop drains _pending on its first pass anyway
+        ulong one = 1;
+        LibC.write(_eventFd, &one, sizeof(ulong));
+    }
+
+    protected override void OnStop() => Poke(); // wake the loop so it observes !IsActive
+
+    // =====================================================================
+    // Loop-thread submission helpers
+    // =====================================================================
+
+    private void Submit(in LibC.io_uring_sqe sqe)
+    {
+        // Fast path: place directly in the SQ. If the ring is momentarily full
+        // (a completion batch can generate more SQEs than capacity), defer to the
+        // pending queue rather than fault — it is drained at the top of every loop
+        // iteration, once io_uring_enter has freed SQ slots. Loop-thread only, but
+        // _pending is concurrent so the enqueue is safe regardless.
+        if (_ring.TryPush(sqe)) _unsubmittedCount++;
+        else _pending.Enqueue(sqe);
+    }
+
+    private unsafe void ArmWake()
+    {
+        Submit(new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_READ,
+            fd = _eventFd,
+            addr = (ulong)_wakeBuf,
+            len = sizeof(ulong),
+            user_data = Pack(Op.Wake, 0),
+        });
+    }
+
+    private void ArmRecv(uint slot, int fd)
+    {
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_RECV,
+            fd = fd,
+            len = (uint)_readBuffer.BufferSize,
+            flags = LibC.IOSQE_BUFFER_SELECT,
+            buf_index = _readBuffer.GroupId, // buf_index aliases buf_group
+            user_data = Pack(Op.Recv, slot),
+        };
+        Submit(sqe);
+    }
+
+    private unsafe void SubmitSend(uint slot, int fd, int writeIndex, byte* data, int len)
+    {
+        _writeState[writeIndex] = new WriteState { Slot = slot, Fd = fd, Sent = 0, Total = len };
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_SEND,
+            fd = fd,
+            addr = (ulong)data,
+            len = (uint)len,
+            user_data = Pack(Op.Send, slot, (uint)writeIndex),
+        };
+        sqe.rw_flags.rw_flags = LibC.MSG_NOSIGNAL;
+        Submit(sqe);
+    }
+
+    /// <summary>Copy <paramref name="len"/> bytes from a read buffer into a leased write
+    /// buffer and send it. Closes the connection if no write buffer is available.</summary>
+    private unsafe void SendResponse(uint slot, int fd, byte* src, int len)
+    {
+        if ((GetFlags(slot) & SocketSet.SocketFlags.SendClosed) != 0) return;
+        if (!_writeBuffer.TryLease(out int wi, out byte* wp))
+        {
+            // Pool exhausted: the safe thing is to drop the connection rather than stall it.
+            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
+            CloseClient(slot);
+            return;
+        }
+
+        Buffer.MemoryCopy(src, wp, _writeBuffer.BufferSize, len);
+        SubmitSend(slot, fd, wi, wp, len);
+    }
+
+    // =====================================================================
+    // Initialization / teardown
+    // =====================================================================
 
     private unsafe void Initialize()
     {
-        // 1. Fire up our memory-mapped ring structures
-        var options = Parent.Options;
-        _ring = new RawIOUringRing((uint)options.EntriesPerShard);
-        _readBuffer = new ManagedBufferPool(_ring.RingFd, entries: options.BufferPagesPerShard,
-            bufSize: options.BufferPageSize);
-
-        // 2. Instantiate a UNIQUE non-blocking eventfd for this shard
-        _eventFd = LibC.eventfd(0, 0x800);
-        if (_eventFd < 0) throw new InvalidOperationException("Failed to allocate shard eventfd");
-
-        // 3. Register the eventfd directly with this specific ring.
-        // The kernel now explicitly maps this file descriptor to this ring context!
-        var pinned = _eventFd;
-        int registrationResult = LibC.io_uring_register(
-            LibC.SYS_io_uring_register,
-            _ring.RingFd,
-            LibC.IORING_REGISTER_EVENTFD,
-            &pinned, // Pointer to our eventfd integer handle (address only needed for this call)
-            1 // Number of descriptors being registered
-        );
-
-        if (registrationResult < 0)
-        {
-            throw new InvalidOperationException($"Failed to register eventfd to ring: {Marshal.GetLastPInvokeError()}");
-        }
+        _ring = new RawIOUringRing((uint)_entriesPerShard);
+        _readBuffer = new ManagedBufferPool(_ring.RingFd, entries: _readPages, bufSize: _readPageSize);
+        _writeBuffer = new WriteBufferPool(_writeCount, _writeBufSize);
+        _writeState = new WriteState[_writeCount];
+        _ringReady = true;
     }
 
-    private uint _unsubmittedCount;
-
-    private unsafe uint ProcessAvailableCompletions()
+    private unsafe void Cleanup()
     {
-        uint head = *_ring.CqHead;
-        uint tail = Volatile.Read(ref *_ring.CqTail);
-        uint count = 0;
-        while (head != tail)
+        _ringReady = false;
+        lock (_listeners)
         {
-            LibC.io_uring_cqe* cqe = &_ring.Cqes[head & _ring.CqMask];
-            var (contextId, op) = UnpackUserData(cqe->user_data);
-            int result = cqe->res;
-
-            switch (op)
-            {
-                case IOUringOperation.AcceptLocal:
-                case IOUringOperation.AcceptRoundRobin:
-                    if (result >= 0)
-                    {
-                        ushort newClientId = (ushort)result;
-                        var client = new IOUringSocket(newClientId);
-                        _clients.TryAdd(newClientId, client);
-
-                        engine.OnAccept(client);
-                        PushAutoSelectReadSqe(result);
-                        submitRequired = true;
-                    }
-
-                    if ((cqe->flags & LinuxSyscall.IORING_CQE_F_MORE) == 0)
-                    {
-                        PushMultishotAcceptSqe();
-                        submitRequired = true;
-                    }
-
-                    break;
-
-                case IOUringOperation.Read:
-                    if (result > 0)
-                    {
-                        ushort assignedBid = (ushort)(cqe->flags >> 16);
-                        byte* nativeBufferPtr = _readBuffer.GetBufferAddress(assignedBid);
-                        ReadOnlySpan<byte> payload = new ReadOnlySpan<byte>(nativeBufferPtr, result);
-
-                        if (_clients.TryGetValue(contextId, out var client))
-                        {
-                            engine.OnRead(client, payload);
-                        }
-
-                        _readBuffer.ReleaseBuffer(assignedBid);
-                        PushAutoSelectReadSqe(contextId);
-                        submitRequired = true;
-                    }
-                    else
-                    {
-                        // Socket EOF closed or broken connection state
-                        _clients.TryRemove(contextId, out _);
-                        LinuxSyscall.close(contextId);
-                    }
-
-                    break;
-            }
-
-            count++;
-            head++;
+            foreach (var fd in _listeners) LibC.close(fd);
+            _listeners.Clear();
         }
-        
-        // Release semantics: updates the head so the kernel sees it safely
-        Volatile.Write(ref *_ring.CqHead, head);
 
-        return count;
-    }
-
-    private unsafe void Flush() // flush at least some of the queue
-    {
-        if (_unsubmittedCount is 0) return;
-
-        bool waitForCompletion = false;
-        while (true)
+        for (int i = 0; i < _fds.Length; i++)
         {
-            Thread.MemoryBarrier();
-
-            int result;
-            if (waitForCompletion)
-            {
-                result = LibC.io_uring_enter_nonblocking(
-                    LibC.SYS_io_uring_enter, _ring.RingFd, _unsubmittedCount,
-                    min_complete: 0, flags: LibC.IORING_ENTER_GETEVENTS,
-                    sig: null, sigsz: 0);
-                waitForCompletion = false;
-            }
-            else
-            {
-                result = LibC.io_uring_enter_blocking(
-                    LibC.SYS_io_uring_enter, _ring.RingFd, _unsubmittedCount,
-                    min_complete: 1, flags: LibC.IORING_ENTER_GETEVENTS,
-                    sig: null, sigsz: 0);
-            }
-
-            if (result <= 0)
-            {
-                switch (result)
-                {
-                    case 0: // bypassed completions (race)
-                    case -LibC.EINTR: // interrupt signal, might not need to block
-                        ProcessAvailableCompletions();
-                        break;
-                    case -LibC.EBUSY:
-                    case -LibC.EAGAIN:
-                        // kernel couldn't make progress; try to make space before retrying
-                        waitForCompletion = ProcessAvailableCompletions() is 0;
-                        goto case 0;
-                    default:
-                        Throw(result);
-
-                        static void Throw(int err) =>
-                            throw new InvalidOperationException($"Error code {err} when submitting queue");
-
-                        break;
-                }
-            }
-            else
-            {
-                Debug.Assert(result <= _unsubmittedCount, $"Unexpected result in {nameof(Flush)}");
-                _unsubmittedCount -= (uint)result;
-                return; // we don't guarantee to flush everything, just something
-            }
+            int fd = Interlocked.Exchange(ref _fds[i], 0);
+            if (fd > 0) LibC.close(fd);
         }
+
+        _readBuffer.Dispose();
+        _writeBuffer.Dispose();
+        _ring.Dispose();
+
+        if (_eventFd > 0) LibC.close(_eventFd);
+        if (_connectAddrs != null) { NativeMemory.Free(_connectAddrs); _connectAddrs = null; }
+        if (_wakeBuf != null) { NativeMemory.Free(_wakeBuf); _wakeBuf = null; }
     }
 
     protected override unsafe void OnRun()
     {
-        Initialize(); // this needs to happen from the same thread as our IO loop
+        Initialize();
+        ArmWake();
 
-        // Allocate our eventfd read target on the stack.
-        // Stack addresses are implicitly pinned for the entire duration of this loop method.
-        ulong localEventBuffer = 0;
-
-        while (IsActive)
+        try
         {
-            // clear the wave event
-            LibC.read(_eventFd, &localEventBuffer, sizeof(ulong));
-            
-            // check for anything pending
-            if (!_pending.IsEmpty)
+            while (IsActive)
             {
-                _unsubmittedCount += _ring.Push(_pending);
-            }
+                // Fold any cross-thread submissions into the ring.
+                if (!_pending.IsEmpty)
+                    _unsubmittedCount += _ring.Push(_pending);
 
-            // 1. Sleep cleanly here. 
-            // Wakes up if a network operation completes OR if Poke() writes to our registered eventfd.
-            int sleepResult = LibC.io_uring_enter_blocking(
-                LibC.SYS_io_uring_enter, _ring.RingFd,
-                to_submit: _unsubmittedCount,
-                min_complete: 1,
-                flags: LibC.IORING_ENTER_GETEVENTS,
-                sig: null, sigsz: 0);
-            
-            if (sleepResult < 0)
-            {
-                switch (sleepResult)
+                // Submit everything queued and block until at least one completion.
+                int res = LibC.io_uring_enter_blocking(
+                    LibC.SYS_io_uring_enter, _ring.RingFd,
+                    to_submit: _unsubmittedCount, min_complete: 1,
+                    flags: LibC.IORING_ENTER_GETEVENTS, sig: null, sigsz: 0);
+
+                if (res < 0)
                 {
-                    case -LibC.EINTR:
-                        continue; // (Interrupted system call), loop again safely
-                    case -LibC.EBUSY:
-                    case -LibC.EAGAIN:
-                        break; // fine, we're about to process pending anyway
-                    default:
-                        Throw(sleepResult);
-                        
-                        static void Throw(int err) =>
-                            throw new InvalidOperationException($"Error code {err} when submitting queue");
-                        break;
+                    int err = Marshal.GetLastPInvokeError();
+                    switch (err)
+                    {
+                        case LibC.EINTR:
+                        case LibC.EAGAIN:
+                        case LibC.EBUSY:
+                            break; // transient; drain whatever is ready and retry
+                        default:
+                            throw new InvalidOperationException($"io_uring_enter failed: errno {err}");
+                    }
                 }
+                else
+                {
+                    _unsubmittedCount -= (uint)res;
+                }
+
+                ProcessAvailableCompletions();
             }
-            else
-            {
-                _unsubmittedCount -= (uint)sleepResult;
-            }
-            ProcessAvailableCompletions();
+        }
+        finally
+        {
+            Cleanup();
         }
     }
 
-    public void AcceptMultishot(int fd, bool local)
+    // =====================================================================
+    // Completion processing
+    // =====================================================================
+
+    private unsafe void ProcessAvailableCompletions()
     {
-        LibC.io_uring_sqe sqe = default;
-        sqe.opcode = LinuxSyscall.IORING_OP_ACCEPT;
-        sqe.fd = fd;
-        sqe.ioprio = 1; // Setting ioprio to 1 acts as IORING_ACCEPT_MULTISHOT
-        sqe.user_data = PackUserData(0, local ? IOUringOperation.AcceptLocal : IOUringOperation.AcceptRoundRobin);
-        Push(sqe);
+        uint head = *_ring.CqHead;
+        uint tail = Volatile.Read(ref *_ring.CqTail);
+
+        while (head != tail)
+        {
+            LibC.io_uring_cqe* cqe = &_ring.Cqes[head & _ring.CqMask];
+            var (op, id, aux) = Unpack(cqe->user_data);
+            int res = cqe->res;
+            uint flags = cqe->flags;
+            head++; // advance our local view before dispatching (handlers may submit)
+
+            switch (op)
+            {
+                case Op.Wake:
+                    ArmWake(); // re-arm; _pending is drained at the top of the loop
+                    break;
+
+                case Op.Accept:
+                    HandleAccept(res, flags, listenerFd: (int)id, local: aux != 0);
+                    break;
+
+                case Op.Connect:
+                    HandleConnect(res, slot: id);
+                    break;
+
+                case Op.Recv:
+                    HandleRecv(res, flags, slot: id);
+                    break;
+
+                case Op.Send:
+                    HandleSend(res, slot: id, writeIndex: (int)aux);
+                    break;
+            }
+        }
+
+        // Release-store our consumed head so the kernel can reuse CQ slots.
+        Volatile.Write(ref *_ring.CqHead, head);
     }
+
+    private unsafe void HandleAccept(int res, uint flags, int listenerFd, bool local)
+    {
+        if (res >= 0)
+        {
+            int newFd = res;
+            bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
+            Span<byte> span = leased ? new Span<byte>(wp, _writeBuffer.BufferSize) : default;
+
+            object? token = null;
+            var ctx = new SocketSet.AcceptContext(SocketSet.SocketFlags.None, ref token, span);
+            Parent.OnAccept(ref ctx);
+
+            uint slot = InitClient(newFd, token, (byte)ctx.Flags);
+            if (slot == 0)
+            {
+                if (leased) _writeBuffer.Release(wi);
+                LibC.close(newFd);
+            }
+            else
+            {
+                if ((ctx.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
+                    ArmRecv(slot, newFd);
+
+                int sb = ctx.SendBytes;
+                if (leased && sb > 0) SubmitSend(slot, newFd, wi, wp, sb);
+                else if (leased) _writeBuffer.Release(wi);
+            }
+        }
+
+        // Multishot accept re-arms itself while IORING_CQE_F_MORE is set; re-issue when it clears.
+        if ((flags & LibC.IORING_CQE_F_MORE) == 0)
+            EnqueueAccept(listenerFd, local);
+    }
+
+    private unsafe void HandleConnect(int res, uint slot)
+    {
+        int fd = GetFd(slot);
+        if (res == 0 && fd != 0)
+        {
+            bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
+            Span<byte> span = leased ? new Span<byte>(wp, _writeBuffer.BufferSize) : default;
+
+            object? token = Volatile.Read(ref _userTokens[slot - 1]);
+            var ctx = new SocketSet.ConnectContext(SocketSet.SocketFlags.None, ref token, span);
+            Parent.OnConnect(ref ctx);
+            Volatile.Write(ref _userTokens[slot - 1], token);
+            _slotFlags[slot - 1] = (byte)ctx.Flags;
+
+            if ((ctx.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
+                ArmRecv(slot, fd);
+
+            int sb = ctx.SendBytes;
+            if (leased && sb > 0) SubmitSend(slot, fd, wi, wp, sb);
+            else if (leased) _writeBuffer.Release(wi);
+        }
+        else
+        {
+            CloseClient(slot);
+        }
+    }
+
+    private unsafe void HandleRecv(int res, uint flags, uint slot)
+    {
+        bool hasBuf = (flags & LibC.IORING_CQE_F_BUFFER) != 0;
+        ushort bid = (ushort)(flags >> LibC.IORING_CQE_BUFFER_SHIFT);
+        int fd = GetFd(slot);
+
+        if (res > 0)
+        {
+            if (fd != 0)
+            {
+                byte* rp = _readBuffer.GetBufferAddress(bid);
+                object? token = Volatile.Read(ref _userTokens[slot - 1]);
+                var ctx = new SocketSet.ReceiveContext(
+                    GetFlags(slot), ref token,
+                    new Span<byte>(rp, _readBuffer.BufferSize), res);
+                Parent.OnReceive(ref ctx);
+                Volatile.Write(ref _userTokens[slot - 1], token);
+                _slotFlags[slot - 1] = (byte)ctx.Flags;
+
+                int rb = ctx.ResponseBytes;
+                if (rb > 0) SendResponse(slot, fd, rp, rb); // copies out of rp before we release it
+            }
+
+            if (hasBuf) _readBuffer.ReleaseBuffer(bid);
+
+            // Single-shot recv: re-arm unless input was closed or the slot went away.
+            if (GetFd(slot) != 0 && (GetFlags(slot) & SocketSet.SocketFlags.ReceiveClosed) == 0)
+                ArmRecv(slot, fd);
+        }
+        else if (res == -LibC.ENOBUFS)
+        {
+            // No buffer was available; nothing was consumed. Re-arm — buffers free up.
+            if (fd != 0) ArmRecv(slot, fd);
+        }
+        else
+        {
+            // res == 0 (peer EOF) or a negative errno.
+            if (hasBuf) _readBuffer.ReleaseBuffer(bid);
+            CloseClient(slot);
+        }
+    }
+
+    private unsafe void HandleSend(int res, uint slot, int writeIndex)
+    {
+        ref WriteState ws = ref _writeState[writeIndex];
+
+        if (res < 0)
+        {
+            _writeBuffer.Release(writeIndex);
+            CloseClient(slot);
+            return;
+        }
+
+        ws.Sent += res;
+        if (ws.Sent < ws.Total && res > 0)
+        {
+            // Partial write: resubmit the remainder from the same buffer.
+            byte* p = _writeBuffer.Address(writeIndex) + ws.Sent;
+            int remaining = ws.Total - ws.Sent;
+            var sqe = new LibC.io_uring_sqe
+            {
+                opcode = LibC.IORING_OP_SEND,
+                fd = ws.Fd,
+                addr = (ulong)p,
+                len = (uint)remaining,
+                user_data = Pack(Op.Send, slot, (uint)writeIndex),
+            };
+            sqe.rw_flags.rw_flags = LibC.MSG_NOSIGNAL;
+            Submit(sqe);
+            return;
+        }
+
+        _writeBuffer.Release(writeIndex);
+
+        if (ws.Sent < ws.Total)
+        {
+            // res == 0 with bytes still outstanding: treat as a dead peer.
+            CloseClient(slot);
+            return;
+        }
+
+        if (GetFd(slot) != 0)
+        {
+            object? token = Volatile.Read(ref _userTokens[slot - 1]);
+            var ctx = new SocketSet.WriteContext(GetFlags(slot), ref token);
+            Parent.OnWrite(ref ctx);
+            Volatile.Write(ref _userTokens[slot - 1], token);
+            _slotFlags[slot - 1] = (byte)ctx.Flags;
+        }
+    }
+
+    // =====================================================================
+    // user_data packing: [op:8][aux:24][id:32]
+    // =====================================================================
+
+    private static ulong Pack(Op op, uint id, uint aux = 0)
+        => ((ulong)(byte)op << 56) | ((ulong)(aux & 0xFFFFFF) << 32) | id;
+
+    private static (Op op, uint id, uint aux) Unpack(ulong ud)
+        => ((Op)(byte)(ud >> 56), (uint)ud, (uint)((ud >> 32) & 0xFFFFFF));
 }

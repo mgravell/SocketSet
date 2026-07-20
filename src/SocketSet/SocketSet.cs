@@ -86,24 +86,26 @@ public abstract partial class SocketSet : IDisposable
     public void Connect(EndPoint endpoint, object? userToken = null)
         => RoundRobin().Connect(endpoint, userToken);
 
-    protected virtual void OnAccept(ref AcceptContext ctx)
+    protected internal virtual void OnAccept(ref AcceptContext ctx)
     {
     }
 
-    protected virtual void OnReceive(ref ReceiveContext ctx)
+    protected internal virtual void OnReceive(ref ReceiveContext ctx)
     {
     }
 
-    protected virtual void OnWrite(ref WriteContext ctx)
+    protected internal virtual void OnWrite(ref WriteContext ctx)
     {
     }
 
-    protected virtual void OnConnect(ref ConnectContext ctx)
+    protected internal virtual void OnConnect(ref ConnectContext ctx)
     {
     }
 
-    protected ref struct AcceptContext(SocketFlags flags, ref object? userToken)
+    protected internal ref struct AcceptContext(SocketFlags flags, ref object? userToken, Span<byte> buffer)
     {
+        private readonly Span<byte> _buffer = buffer;
+
         /// <summary>
         /// Disable writing, for one-way (client-to-server) transports.
         /// </summary>
@@ -115,16 +117,37 @@ public abstract partial class SocketSet : IDisposable
         public void CloseInput() => _flags |= SocketFlags.ReceiveClosed;
 
         /// <summary>
-        /// The object associated with the socket. 
+        /// A library-owned outbound buffer. Write an initial payload here and set
+        /// <see cref="SendBytes"/> to have it sent as soon as the socket is accepted.
+        /// </summary>
+        public Span<byte> SendBuffer => _buffer;
+
+        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send. 0 = send nothing.</summary>
+        public int SendBytes
+        {
+            get => field;
+            set
+            {
+                if (value < 0 | value > _buffer.Length) throw new ArgumentOutOfRangeException(nameof(SendBytes));
+                field = value;
+            }
+        }
+
+        /// <summary>
+        /// The object associated with the socket.
         /// </summary>
         public readonly ref object? UserToken => ref _userToken;
+
+        public readonly SocketFlags Flags => _flags;
 
         private readonly ref object? _userToken = ref userToken;
         private SocketFlags _flags = flags;
     }
 
-    protected ref struct ConnectContext(SocketFlags flags, ref object? userToken)
+    protected internal ref struct ConnectContext(SocketFlags flags, ref object? userToken, Span<byte> buffer)
     {
+        private readonly Span<byte> _buffer = buffer;
+
         /// <summary>
         /// Disable writing, for one-way (client-to-server) transports.
         /// </summary>
@@ -136,9 +159,28 @@ public abstract partial class SocketSet : IDisposable
         public void CloseInput() => _flags |= SocketFlags.ReceiveClosed;
 
         /// <summary>
-        /// The object associated with the socket. 
+        /// A library-owned outbound buffer. Write an initial handshake/greeting here and set
+        /// <see cref="SendBytes"/> to have it sent as soon as the connection completes.
+        /// </summary>
+        public Span<byte> SendBuffer => _buffer;
+
+        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send. 0 = send nothing.</summary>
+        public int SendBytes
+        {
+            get => field;
+            set
+            {
+                if (value < 0 | value > _buffer.Length) throw new ArgumentOutOfRangeException(nameof(SendBytes));
+                field = value;
+            }
+        }
+
+        /// <summary>
+        /// The object associated with the socket.
         /// </summary>
         public readonly ref object? UserToken => ref _userToken;
+
+        public readonly SocketFlags Flags => _flags;
 
         private readonly ref object? _userToken = ref userToken;
         private SocketFlags _flags = flags;
@@ -150,7 +192,7 @@ public abstract partial class SocketSet : IDisposable
     /// that reuses same buffer that underpins <see cref="Payload"/>, meaning that the
     /// received payload will be overwritten. 
     /// </summary>
-    protected ref struct ReceiveContext(SocketFlags flags, ref object? userToken, Span<byte> buffer, int bytes)
+    protected internal ref struct ReceiveContext(SocketFlags flags, ref object? userToken, Span<byte> buffer, int bytes)
     {
         private readonly Span<byte> _buffer = buffer;
         public int PayloadBytes => bytes;
@@ -200,7 +242,7 @@ public abstract partial class SocketSet : IDisposable
     /// <summary>Indicates that a write has completed. The implementation will handle partial
     /// writes internally, so this indicates a complete write.</summary>
     /// <param name="userToken"></param>
-    protected ref struct WriteContext(SocketFlags flags, ref object? userToken)
+    protected internal ref struct WriteContext(SocketFlags flags, ref object? userToken)
     {
         public SocketFlags Flags => _flags;
 
