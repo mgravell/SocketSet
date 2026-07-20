@@ -9,11 +9,15 @@ int clientCount = 0;
 int seconds = 0; // 0 == run until Ctrl+C
 string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespace)
 int size = 512; // ping-pong message size
+string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
 {
     switch (args[i])
     {
+        case "--cpus" when i + 1 < args.Length:
+            cpus = args[i + 1];
+            break;
         case ("-c" or "--client") when i + 1 < args.Length && int.TryParse(args[i + 1], out var tmp):
             clientCount = tmp;
             break;
@@ -58,7 +62,36 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -p / --pin B      pin worker threads to CPUs, true|false (default true)");
     Console.WriteLine("  -e / --entries N  io_uring SQ entries per shard (default 4096; lower if RLIMIT_MEMLOCK is tight)");
     Console.WriteLine("  -m / --managed    force the portable managed-socket fallback (default auto-detects)");
+    Console.WriteLine("  --cpus SPEC       pin this process to CPUs (e.g. 0-5 or 0,2,4) — covers shards, thread pool and GC");
     return;
+}
+
+if (cpus is not null) PinToCpus(cpus);
+
+// Constrain the whole process (io_uring shard threads, the managed thread pool, and GC
+// alike) to a CPU set. Doing it here — before the SocketSet spins anything up — gives a
+// single self-contained way to hand each role a fixed core budget for A/B benchmarking.
+static void PinToCpus(string spec)
+{
+    long mask = 0;
+    foreach (var part in spec.Split(','))
+    {
+        var range = part.Split('-');
+        int lo = int.Parse(range[0]);
+        int hi = range.Length > 1 ? int.Parse(range[range.Length - 1]) : lo;
+        for (int c = lo; c <= hi; c++) mask |= 1L << c;
+    }
+
+    try
+    {
+        using var proc = Process.GetCurrentProcess();
+        proc.ProcessorAffinity = (IntPtr)mask;
+        Console.WriteLine($"pinned to CPUs {spec} (mask 0x{mask:x})");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"warning: could not set CPU affinity ({ex.GetType().Name}: {ex.Message}); launch under taskset instead");
+    }
 }
 
 if (size > options.BufferPageSize)

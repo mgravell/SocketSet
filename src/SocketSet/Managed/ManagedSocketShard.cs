@@ -9,6 +9,11 @@ namespace SocketSets.Managed;
 /// thread: accept/receive/send completions run on thread-pool threads. Handlers may
 /// therefore fire concurrently across connections — the same contract as the io_uring
 /// backend (which fires concurrently across shards), so user callbacks must be thread-safe.
+///
+/// Each SocketAsyncEventArgs is a strongly-typed subclass that carries its own state as
+/// fields and overrides OnCompleted to dispatch straight back into the shard — no Completed
+/// event delegate, no boxing into UserToken, no base.OnCompleted. This is the shape an
+/// optimized SAEA server uses, so the backend is a fair comparison rather than a naive one.
 /// </summary>
 internal sealed unsafe class ManagedSocketShard : SocketSetShard
 {
@@ -50,51 +55,36 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         listener.Listen(512);
         lock (_listeners) _listeners.Add(listener);
 
-        var acceptArgs = new SocketAsyncEventArgs { UserToken = new AcceptState(listener, defaultToken) };
-        acceptArgs.Completed += OnAcceptCompleted;
-        StartAccept(acceptArgs);
+        StartAccept(new AcceptArgs(this, listener, defaultToken));
     }
 
-    private sealed class AcceptState(Socket listener, object? defaultToken)
+    private void StartAccept(AcceptArgs args)
     {
-        public Socket Listener { get; } = listener;
-        public object? DefaultToken { get; } = defaultToken;
-    }
-
-    private void OnAcceptCompleted(object? sender, SocketAsyncEventArgs args)
-    {
-        if (ProcessAccept(args)) StartAccept(args);
-    }
-
-    private void StartAccept(SocketAsyncEventArgs args)
-    {
-        var state = (AcceptState)args.UserToken!;
         while (true)
         {
             args.AcceptSocket = null; // must be cleared before reuse
             bool pending;
-            try { pending = state.Listener.AcceptAsync(args); }
+            try { pending = args.Listener.AcceptAsync(args); }
             catch (ObjectDisposedException) { return; }
-            if (pending) return;             // OnAcceptCompleted will fire
+            if (pending) return;              // AcceptArgs.OnCompleted will fire
             if (!ProcessAccept(args)) return; // synchronous completion; loop unless told to stop
         }
     }
 
     /// <returns>true to keep accepting, false to stop (listener closed).</returns>
-    private bool ProcessAccept(SocketAsyncEventArgs args)
+    private bool ProcessAccept(AcceptArgs args)
     {
         if (args.SocketError == SocketError.OperationAborted) return false;
 
         if (args.SocketError == SocketError.Success && args.AcceptSocket is { } sock)
         {
-            var state = (AcceptState)args.UserToken!;
             MaybeNoDelay(sock);
-            var conn = Register(sock, state.DefaultToken);
+            var conn = Register(sock, args.DefaultToken);
 
             int sendBytes;
             fixed (byte* buf = conn.SendBuffer)
             {
-                var ctx = new SocketSet.AcceptContext(SocketSet.SocketFlags.None, state.DefaultToken, buf, _bufferSize);
+                var ctx = new SocketSet.AcceptContext(SocketSet.SocketFlags.None, args.DefaultToken, buf, _bufferSize);
                 Parent.OnAccept(ref ctx);
                 conn.UserToken = ctx.UserToken;
                 conn.Flags = ctx.Flags;
@@ -116,11 +106,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     {
         var target = Normalize(endpoint);
         var socket = NewSocket(target);
-        var args = new SocketAsyncEventArgs { RemoteEndPoint = target, UserToken = userToken };
-        args.Completed += OnConnectCompleted;
+        var args = new ConnectArgs(this, userToken) { RemoteEndPoint = target };
         try
         {
-            if (!socket.ConnectAsync(args)) OnConnectCompleted(socket, args);
+            if (!socket.ConnectAsync(args)) CompleteConnect(args);
         }
         catch
         {
@@ -129,11 +118,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         }
     }
 
-    private void OnConnectCompleted(object? sender, SocketAsyncEventArgs args)
+    private void CompleteConnect(ConnectArgs args)
     {
-        var socket = args.ConnectSocket ?? sender as Socket;
-        object? token = args.UserToken;
-
+        var socket = args.ConnectSocket;
         if (args.SocketError != SocketError.Success || socket is null)
         {
             if (socket is not null) SafeDispose(socket);
@@ -142,6 +129,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         }
 
         MaybeNoDelay(socket);
+        var token = args.Token;
         var conn = Register(socket, token);
 
         int sendBytes;
@@ -164,12 +152,6 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Receive
     // =====================================================================
 
-    private void OnReceiveCompleted(object? sender, SocketAsyncEventArgs args)
-    {
-        var conn = (Connection)args.UserToken!;
-        if (ProcessReceive(conn)) PumpReceive(conn);
-    }
-
     private void PumpReceive(Connection conn)
     {
         while (true)
@@ -178,7 +160,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             bool pending;
             try { pending = conn.Socket.ReceiveAsync(conn.RecvArgs); }
             catch (ObjectDisposedException) { return; }
-            if (pending) return;             // OnReceiveCompleted will fire
+            if (pending) return;               // ConnArgs.OnCompleted will fire
             if (!ProcessReceive(conn)) return; // synchronous completion; loop unless stopping
         }
     }
@@ -212,12 +194,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     }
 
     // =====================================================================
-    // Send (with partial-write handling)
+    // Send (serialized per connection, with partial-write handling)
     // =====================================================================
 
     /// <summary>Copy <paramref name="length"/> bytes from <paramref name="source"/> and
     /// enqueue them for sending. Safe to call from any completion thread; the send is
-    /// serialized per connection.</summary>
+    /// serialized per connection so a SAEA is never reused mid-flight and the byte stream
+    /// keeps its order.</summary>
     private void QueueSend(Connection conn, byte[] source, int length)
     {
         var data = new byte[length];
@@ -231,9 +214,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         PumpSend(conn);
     }
 
-    private void OnSendCompleted(object? sender, SocketAsyncEventArgs args)
+    // Async send completion (from ConnArgs.OnCompleted).
+    private void AdvanceSend(Connection conn)
     {
-        var conn = (Connection)args.UserToken!;
+        var args = conn.SendArgs;
         if (args.SocketError != SocketError.Success) { Close(conn); return; }
         conn.SendOffset += args.BytesTransferred;
         if (conn.CurrentSend is { } data && conn.SendOffset >= data.Length) CompleteCurrentSend(conn);
@@ -259,7 +243,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             bool pending;
             try { pending = conn.Socket.SendAsync(conn.SendArgs); }
             catch (ObjectDisposedException) { return; }
-            if (pending) return; // OnSendCompleted resumes the chain
+            if (pending) return; // ConnArgs.OnCompleted resumes the chain
 
             if (conn.SendArgs.SocketError != SocketError.Success) { Close(conn); return; }
             conn.SendOffset += conn.SendArgs.BytesTransferred;
@@ -282,11 +266,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
     private Connection Register(Socket socket, object? token)
     {
-        var conn = new Connection(socket, _bufferSize) { UserToken = token };
-        conn.RecvArgs.UserToken = conn;
-        conn.RecvArgs.Completed += OnReceiveCompleted;
-        conn.SendArgs.UserToken = conn;
-        conn.SendArgs.Completed += OnSendCompleted;
+        var conn = new Connection(this, socket, _bufferSize) { UserToken = token };
         _connections[conn] = 0;
         return conn;
     }
@@ -350,25 +330,79 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         try { s.Dispose(); } catch { /* best effort */ }
     }
 
-    private sealed class Connection(Socket socket, int bufferSize)
+    // ---------------------------------------------------------------------
+    // Strongly-typed SocketAsyncEventArgs subclasses (state as fields; direct dispatch).
+    // ---------------------------------------------------------------------
+
+    private sealed class AcceptArgs(ManagedSocketShard shard, Socket listener, object? defaultToken) : SocketAsyncEventArgs
     {
-        public readonly Socket Socket = socket;
+        public readonly ManagedSocketShard Shard = shard;
+        public readonly Socket Listener = listener;
+        public readonly object? DefaultToken = defaultToken;
+
+        protected override void OnCompleted(SocketAsyncEventArgs e)
+        {
+            if (Shard.ProcessAccept(this)) Shard.StartAccept(this);
+        }
+    }
+
+    private sealed class ConnectArgs(ManagedSocketShard shard, object? token) : SocketAsyncEventArgs
+    {
+        public readonly ManagedSocketShard Shard = shard;
+        public readonly object? Token = token;
+
+        protected override void OnCompleted(SocketAsyncEventArgs e) => Shard.CompleteConnect(this);
+    }
+
+    // One instance per direction per connection (recv + send are full-duplex, so each
+    // needs its own SAEA). LastOperation is stable per instance, so the dispatch is a
+    // single check rather than a delegate call.
+    private sealed class ConnArgs(ManagedSocketShard shard) : SocketAsyncEventArgs
+    {
+        public readonly ManagedSocketShard Shard = shard;
+        public Connection Conn = null!; // set once, immediately after the owning Connection is built
+
+        protected override void OnCompleted(SocketAsyncEventArgs e)
+        {
+            switch (LastOperation)
+            {
+                case SocketAsyncOperation.Receive:
+                    if (Shard.ProcessReceive(Conn)) Shard.PumpReceive(Conn);
+                    break;
+                case SocketAsyncOperation.Send:
+                    Shard.AdvanceSend(Conn);
+                    break;
+            }
+        }
+    }
+
+    private sealed class Connection
+    {
+        public readonly Socket Socket;
         public object? UserToken;
         public SocketSet.SocketFlags Flags;
 
-        public readonly byte[] RecvBuffer = new byte[bufferSize];
-        public readonly byte[] SendBuffer = new byte[bufferSize]; // scratch the handler writes into
-        public readonly SocketAsyncEventArgs RecvArgs = new();
-        public readonly SocketAsyncEventArgs SendArgs = new();
+        public readonly byte[] RecvBuffer;
+        public readonly byte[] SendBuffer; // scratch the handler writes into
+        public readonly ConnArgs RecvArgs;
+        public readonly ConnArgs SendArgs;
 
-        // A SocketAsyncEventArgs cannot be reused while its operation is in flight, and
-        // concurrent sends on one socket could reorder the byte stream — so sends are
-        // serialized per connection through this queue. Only one SendAsync is ever
-        // outstanding; CurrentSend/SendOffset belong to that single active chain.
+        // Sends are serialized per connection: a SAEA can't be reused mid-flight, and
+        // concurrent sends on one socket could reorder the byte stream. Only one SendAsync
+        // is ever outstanding; CurrentSend/SendOffset belong to that single active chain.
         public readonly object SendGate = new();
         public bool SendInFlight;
         public readonly Queue<byte[]> SendQueue = new();
         public byte[]? CurrentSend;
         public int SendOffset;
+
+        public Connection(ManagedSocketShard shard, Socket socket, int bufferSize)
+        {
+            Socket = socket;
+            RecvBuffer = new byte[bufferSize];
+            SendBuffer = new byte[bufferSize];
+            RecvArgs = new ConnArgs(shard) { Conn = this };
+            SendArgs = new ConnArgs(shard) { Conn = this };
+        }
     }
 }
