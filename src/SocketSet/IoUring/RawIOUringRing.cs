@@ -120,9 +120,18 @@ internal readonly unsafe struct RawIOUringRing : IDisposable
         Volatile.Write(ref *SqTail, tail);
         return count;
     }
-    
 
-    public bool IsFull() => *SqTail - Volatile.Read(ref *SqHead) >= (SqMask + 1);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool IsSubmissionQueueFull() => *SqTail - Volatile.Read(ref *SqHead) >= (SqMask + 1);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool IsCompletionQueueAvailable()
+    {
+        // fetch sequence is deliberate for instruction ordering; do not one-line this
+        uint head = *CqHead;
+        uint tail = Volatile.Read(ref *CqTail);
+        return head != tail;
+    }
 }
 
 internal unsafe struct ManagedBufferPool : IDisposable

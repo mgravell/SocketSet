@@ -18,7 +18,7 @@ for (int i = 0; i < args.Length; i++)
 }
 
 var endpoint = new IPEndPoint(IPAddress.Loopback, 10000);
-using var set = new Echo(new());
+using var set = new EchoServer(new());
 if (server)
 {
     set.Listen(endpoint);
