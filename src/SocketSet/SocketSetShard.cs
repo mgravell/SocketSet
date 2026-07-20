@@ -36,35 +36,65 @@ public abstract class SocketSetShard
 
     internal void Run()
     {
+        if (_parent.Options.PinWorkerThreads && OperatingSystem.IsLinux())
+        {
+            LibC.PinCurrentThreadToCpu(_shard % Environment.ProcessorCount);
+        }
+
+        bool initialized = false;
         try
         {
-            if (_parent.Options.PinWorkerThreads)
+            // Init must run on this worker thread (the ring is single-issuer). Signal
+            // the parent's startup gate exactly once, whether we succeed or throw, so
+            // construction can block until every shard has reported.
+            try
             {
-                if (OperatingSystem.IsLinux())
-                {
-                    LibC.PinCurrentThreadToCpu(_shard % Environment.ProcessorCount);
-                }
+                OnInitialize();
+                initialized = true;
             }
-            OnRun();
+            finally
+            {
+                _parent.SignalStartupComplete();
+            }
+
+            OnRun(); // the event loop; reached only if init succeeded
         }
         catch (Exception ex)
         {
-            // A shard dying (e.g. io_uring_setup ENOMEM under RLIMIT_MEMLOCK) must never
-            // be silent: a dead shard silently drops any work routed to it.
-            Console.Error.WriteLine($"[shard {_shard} FAULTED] {ex.Message}");
-            try
+            if (!initialized)
             {
-                _parent?.OnWorkerFaulted(ex);
+                // Handed to the constructor, which fails fast with an AggregateException.
+                _parent.RecordStartupFault(ex);
             }
-            catch (Exception etTu)
+            else
             {
-                Debug.WriteLine(etTu.Message);
+                // A shard dying mid-run must never be silent: it drops the work routed to it.
+                Console.Error.WriteLine($"[shard {_shard} FAULTED] {ex.Message}");
+                try { _parent.OnWorkerFaulted(ex); }
+                catch (Exception etTu) { Debug.WriteLine(etTu.Message); }
             }
         }
-        _isActive = false;
+        finally
+        {
+            try { OnShutdown(); }
+            catch (Exception ex) { Debug.WriteLine(ex.Message); }
+            _isActive = false;
+        }
+    }
+
+    /// <summary>Runs on the worker thread before the event loop. Throwing here fails
+    /// construction: the parent collects the exception and fails fast.</summary>
+    protected virtual void OnInitialize()
+    {
     }
 
     protected abstract void OnRun();
+
+    /// <summary>Runs on the worker thread as it exits (after a clean stop, a mid-run
+    /// fault, or a failed init). Must tolerate partially-initialized state.</summary>
+    protected virtual void OnShutdown()
+    {
+    }
 
     public virtual void Listen(EndPoint endpoint, object? userToken, bool local) // local == keep on this shard
         => throw new NotSupportedException($"{nameof(Listen)} on {endpoint.GetType().Name} is not supported.");

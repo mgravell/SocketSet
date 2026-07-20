@@ -353,54 +353,55 @@ internal sealed class IoUringShard : SocketSetShard
         if (_wakeBuf != null) { NativeMemory.Free(_wakeBuf); _wakeBuf = null; }
     }
 
+    // Allocation only (io_uring_setup, mmap, buffer-pool registration). Runs on the
+    // worker thread, before the parent's startup gate is signalled, so an ENOMEM here
+    // (e.g. RLIMIT_MEMLOCK) fails construction rather than silently killing the shard.
+    protected override void OnInitialize() => Initialize();
+
     protected override unsafe void OnRun()
     {
-        Initialize();
+        // Arm the wake read here rather than in OnInitialize: it writes an SQE, which is
+        // submission-side work that belongs to the issuer (this) thread.
         ArmWake();
 
-        try
+        while (IsActive)
         {
-            while (IsActive)
+            // Adopt any connections handed off from another shard's listener.
+            while (_incoming.TryDequeue(out var inbound))
+                AdoptAccepted(inbound.Fd, inbound.Token);
+
+            // Fold any cross-thread submissions into the ring.
+            if (!_pending.IsEmpty)
+                _ring.Push(_pending);
+
+            // Submit everything currently in the SQ and block until at least one
+            // completion. to_submit is read live from the ring (SqTail - SqHead) so
+            // it always matches exactly what is unconsumed — no hand-tracked counter
+            // to drift and strand SQEs unsubmitted.
+            int res = LibC.io_uring_enter_blocking(
+                LibC.SYS_io_uring_enter, _ring.RingFd,
+                to_submit: _ring.SqReady, min_complete: 1,
+                flags: LibC.IORING_ENTER_GETEVENTS, sig: null, sigsz: 0);
+
+            if (res < 0)
             {
-                // Adopt any connections handed off from another shard's listener.
-                while (_incoming.TryDequeue(out var inbound))
-                    AdoptAccepted(inbound.Fd, inbound.Token);
-
-                // Fold any cross-thread submissions into the ring.
-                if (!_pending.IsEmpty)
-                    _ring.Push(_pending);
-
-                // Submit everything currently in the SQ and block until at least one
-                // completion. to_submit is read live from the ring (SqTail - SqHead) so
-                // it always matches exactly what is unconsumed — no hand-tracked counter
-                // to drift and strand SQEs unsubmitted.
-                int res = LibC.io_uring_enter_blocking(
-                    LibC.SYS_io_uring_enter, _ring.RingFd,
-                    to_submit: _ring.SqReady, min_complete: 1,
-                    flags: LibC.IORING_ENTER_GETEVENTS, sig: null, sigsz: 0);
-
-                if (res < 0)
+                int err = Marshal.GetLastPInvokeError();
+                switch (err)
                 {
-                    int err = Marshal.GetLastPInvokeError();
-                    switch (err)
-                    {
-                        case LibC.EINTR:
-                        case LibC.EAGAIN:
-                        case LibC.EBUSY:
-                            break; // transient; drain whatever is ready and retry
-                        default:
-                            throw new InvalidOperationException($"io_uring_enter failed: errno {err}");
-                    }
+                    case LibC.EINTR:
+                    case LibC.EAGAIN:
+                    case LibC.EBUSY:
+                        break; // transient; drain whatever is ready and retry
+                    default:
+                        throw new InvalidOperationException($"io_uring_enter failed: errno {err}");
                 }
-
-                ProcessAvailableCompletions();
             }
-        }
-        finally
-        {
-            Cleanup();
+
+            ProcessAvailableCompletions();
         }
     }
+
+    protected override void OnShutdown() => Cleanup();
 
     // =====================================================================
     // Completion processing

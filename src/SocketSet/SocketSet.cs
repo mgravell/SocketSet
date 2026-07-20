@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 
@@ -9,6 +10,15 @@ public abstract partial class SocketSet : IDisposable
     public SocketSetOptions Options { get; }
     private SocketSetShard[] _shards;
     private uint _next;
+
+    // Startup handshake: each shard signals the gate once it has attempted its own
+    // (worker-thread-bound) initialization, recording any failure. The constructor
+    // blocks on the gate so it can fail fast rather than return a set with silently
+    // dead shards that would swallow the work routed to them.
+    private readonly CountdownEvent _startupGate;
+    private readonly ConcurrentBag<Exception> _startupFaults = [];
+
+    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(30);
 
     protected SocketSet(SocketSetOptions options)
     {
@@ -23,6 +33,7 @@ public abstract partial class SocketSet : IDisposable
         }
 
         _shards = arr;
+        _startupGate = new CountdownEvent(arr.Length);
 
         // start once init'd
         // ReSharper disable once VirtualMemberCallInConstructor
@@ -35,7 +46,25 @@ public abstract partial class SocketSet : IDisposable
             thread.Name = $"{name} worker {i}";
             thread.Start(arr[i]);
         }
+
+        // Block until every shard has reported (success or failure), then surface any
+        // startup failures as a construction-time exception.
+        if (!_startupGate.Wait(StartupTimeout))
+        {
+            Dispose();
+            throw new TimeoutException($"{name}: shards did not finish initializing within {StartupTimeout.TotalSeconds:0}s.");
+        }
+
+        if (!_startupFaults.IsEmpty)
+        {
+            Dispose();
+            throw new AggregateException($"{name}: one or more shards failed to initialize.", _startupFaults);
+        }
     }
+
+    internal void SignalStartupComplete() => _startupGate.Signal();
+
+    internal void RecordStartupFault(Exception ex) => _startupFaults.Add(ex);
 
     public virtual string Name => GetType().Name;
 
