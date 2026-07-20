@@ -13,6 +13,7 @@ int seconds = 0; // 0 == run until Ctrl+C
 string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespace)
 int size = 512; // message size
 int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.MaxValue = unbounded
+bool poke = false; // server echoes out-of-band via Connection.Send from a background thread
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 string host = "127.0.0.1"; // client connect target (server always binds Any)
 int port = 10000;
@@ -56,6 +57,9 @@ for (int i = 0; i < args.Length; i++)
         case "--pipeline":
             window = int.MaxValue; // unbounded (deadlock-prone on a symmetric echo — for comparison)
             break;
+        case "--poke":
+            poke = true;
+            break;
         case "--window" when i + 1 < args.Length && int.TryParse(args[i + 1], out var w):
             window = Math.Max(1, w);
             break;
@@ -85,6 +89,7 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --cpus SPEC       pin this process to CPUs (e.g. 0-5 or 0,2,4) — covers shards, thread pool and GC");
     Console.WriteLine("  --window N        client keeps up to N messages in flight (1=ping/pong default, N=bounded pipeline)");
     Console.WriteLine("  --pipeline        unbounded in-flight (throughput, but can wedge a symmetric echo; use --window instead)");
+    Console.WriteLine("  --poke            server echoes out-of-band via Connection.Send from a background thread");
     return;
 }
 
@@ -143,11 +148,11 @@ if (uds is not null) Console.WriteLine("note: UDS not supported on this target f
 listenEp = new IPEndPoint(IPAddress.Any, port);
 connectEp = new IPEndPoint(IPAddress.Parse(host), port);
 #endif
-using var set = new EchoServer(options) { GreetingSize = size, Window = window };
+using var set = new EchoServer(options) { GreetingSize = size, Window = window, PokeMode = poke };
 string mode = window == 1 ? "ping/pong" : window == int.MaxValue ? "pipeline(unbounded)" : $"pipeline(window={window})";
 Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +
-    $"mode={mode} size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
+    $"mode={mode} size={size} shards={options.Shards} pin={options.PinWorkerThreads} poke={poke}");
 
 if (server)
 {

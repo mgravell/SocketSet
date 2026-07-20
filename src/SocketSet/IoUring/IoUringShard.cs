@@ -37,10 +37,9 @@ internal sealed class IoUringShard : SocketSetShard
         public int Total;
     }
 
-    // --- slot table (1-based ids; id 0 == "none") ---
-    private readonly int[] _fds;
-    private readonly object?[] _userTokens;
-    private readonly byte[] _slotFlags; // SocketSet.SocketFlags per slot
+    // --- slot table (1-based ids; id 0 == "none"). Connections are pooled: one instance per
+    // slot, reused across connection lifetimes so accept/connect never allocates. ---
+    private readonly IoUringConnection[] _conns;
     private uint _clientStart;
 
     // --- options snapshot ---
@@ -79,6 +78,11 @@ internal sealed class IoUringShard : SocketSetShard
     // Bound listener fd -> the default UserToken to seed into each AcceptContext.
     private readonly ConcurrentDictionary<int, object?> _listeners = new();
 
+    // Out-of-band sends marshaled from arbitrary threads onto the loop thread. The generation
+    // is captured at enqueue and re-checked on drain so a send for a since-closed (and possibly
+    // reused) slot is dropped rather than delivered to the wrong connection.
+    private readonly ConcurrentQueue<(uint Slot, uint Generation, byte[] Data)> _external = [];
+
     public unsafe IoUringShard(SocketSetOptions options)
     {
         _socketsPerShard = options.SocketsPerShard;
@@ -88,9 +92,9 @@ internal sealed class IoUringShard : SocketSetShard
         _writeCount = options.WriteBuffersPerShard;
         _writeBufSize = options.BufferPageSize;
 
-        _fds = new int[_socketsPerShard];
-        _userTokens = new object?[_socketsPerShard];
-        _slotFlags = new byte[_socketsPerShard];
+        _conns = new IoUringConnection[_socketsPerShard];
+        for (int i = 0; i < _conns.Length; i++)
+            _conns[i] = new IoUringConnection(this, (uint)i + 1);
 
         // Stable native storage the kernel dereferences after we return.
         _connectAddrs = (byte*)NativeMemory.AllocZeroed((nuint)_socketsPerShard * AddrStride);
@@ -109,38 +113,50 @@ internal sealed class IoUringShard : SocketSetShard
     // Slot table
     // =====================================================================
 
-    private uint InitClient(int fd, object? userToken, byte flags)
+    private IoUringConnection Conn(uint slot) => _conns[slot - 1];
+
+    /// <summary>Claim a free slot for <paramref name="fd"/>. Lock-free (CAS on the pooled
+    /// connection's Fd), so callable from the loop thread (accept) or an arbitrary thread
+    /// (connect). Returns null if the table is full.</summary>
+    private IoUringConnection? InitClient(int fd, object? userToken, SocketSet.SocketFlags flags)
     {
         if (fd <= 0) Throw();
-        var fds = _fds;
-        var offset = Interlocked.Increment(ref _clientStart);
-        for (int i = 0; i < fds.Length; i++)
+        var conns = _conns;
+        var offset = (uint)Interlocked.Increment(ref _clientStart);
+        for (int i = 0; i < conns.Length; i++)
         {
-            var index = (uint)((i + offset) % fds.Length);
-            if (Interlocked.CompareExchange(ref fds[index], fd, 0) is 0)
+            var conn = conns[(i + offset) % (uint)conns.Length];
+            if (Interlocked.CompareExchange(ref conn.Fd, fd, 0) is 0)
             {
-                _slotFlags[index] = flags;
-                Volatile.Write(ref _userTokens[index], userToken);
-                return index + 1; // 1-based
+                conn.UserToken = userToken;
+                conn.Flags = flags;
+                conn.SendBusy = false;
+                conn.Pending?.Clear();
+                // Publish a fresh generation last: any out-of-band send captured against the
+                // previous tenant now mismatches and is dropped rather than misdelivered.
+                Volatile.Write(ref conn.Generation, conn.Generation + 1);
+                return conn;
             }
         }
 
-        return 0; // table full
+        return null; // table full
 
         static void Throw() => throw new ArgumentOutOfRangeException(nameof(fd), "Invalid socket handle");
     }
 
-    private int GetFd(uint slot) => slot == 0 ? 0 : Volatile.Read(ref _fds[slot - 1]);
+    private int GetFd(uint slot) => slot == 0 ? 0 : Volatile.Read(ref _conns[slot - 1].Fd);
 
-    private SocketSet.SocketFlags GetFlags(uint slot) => (SocketSet.SocketFlags)_slotFlags[slot - 1];
+    private SocketSet.SocketFlags GetFlags(uint slot) => _conns[slot - 1].Flags;
 
     private void CloseClient(uint slot)
     {
         if (slot == 0) return;
-        uint idx = slot - 1;
-        int fd = Interlocked.Exchange(ref _fds[idx], 0);
-        Volatile.Write(ref _userTokens[idx], null);
-        _slotFlags[idx] = 0;
+        var conn = _conns[slot - 1];
+        int fd = Interlocked.Exchange(ref conn.Fd, 0);
+        conn.UserToken = null;
+        conn.Flags = 0;
+        conn.SendBusy = false;
+        conn.Pending?.Clear();
         if (fd > 0) LibC.close(fd);
     }
 
@@ -165,12 +181,13 @@ internal sealed class IoUringShard : SocketSetShard
         };
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
 
-        uint slot = InitClient(fd, userToken, 0);
-        if (slot == 0)
+        var conn = InitClient(fd, userToken, SocketSet.SocketFlags.None);
+        if (conn is null)
         {
             LibC.close(fd);
             throw new InvalidOperationException("Shard socket table is full.");
         }
+        uint slot = conn.Slot;
 
         // Build the target sockaddr into this slot's stable native storage; the
         // kernel dereferences it asynchronously once the CONNECT SQE is submitted.
@@ -240,6 +257,14 @@ internal sealed class IoUringShard : SocketSetShard
     internal void EnqueueInbound(int fd, object? defaultToken)
     {
         _incoming.Enqueue((fd, defaultToken));
+        Poke();
+    }
+
+    /// <summary>Marshal an out-of-band send onto the loop thread (called from
+    /// <see cref="IoUringConnection.Send"/>, i.e. any thread). The bytes are already copied.</summary>
+    internal void SubmitExternal(uint slot, uint generation, byte[] data)
+    {
+        _external.Enqueue((slot, generation, data));
         Poke();
     }
 
@@ -347,6 +372,57 @@ internal sealed class IoUringShard : SocketSetShard
     }
 
     // =====================================================================
+    // Out-of-band send (loop thread; drained from _external each iteration)
+    // =====================================================================
+
+    private void PumpExternal(uint slot, uint generation, byte[] data)
+    {
+        var conn = _conns[slot - 1];
+        // Slot reused (or closing) since the send was queued: drop it rather than misdeliver.
+        if (conn.Generation != generation) return;
+        int fd = conn.Fd;
+        if (fd == 0 || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0) return;
+
+        // Chunk to the write-buffer size; segments queue in order so the stream stays ordered.
+        int offset = 0;
+        while (offset < data.Length)
+        {
+            int len = Math.Min(_writeBufSize, data.Length - offset);
+            EnqueueSend(conn, fd, new ArraySegment<byte>(data, offset, len));
+            offset += len;
+        }
+    }
+
+    /// <summary>Submit <paramref name="seg"/> now if the connection's send pipe is idle, else queue
+    /// it behind the in-flight send. Only one send is ever in flight per connection.</summary>
+    private void EnqueueSend(IoUringConnection conn, int fd, ArraySegment<byte> seg)
+    {
+        if (conn.SendBusy)
+        {
+            (conn.Pending ??= new()).Enqueue(seg);
+            return;
+        }
+
+        conn.SendBusy = true;
+        SubmitSegment(conn.Slot, fd, seg);
+    }
+
+    /// <summary>Lease a write buffer, copy <paramref name="seg"/> into it, and send. Assumes the
+    /// caller has already claimed the connection's single in-flight send slot (SendBusy).</summary>
+    private unsafe void SubmitSegment(uint slot, int fd, ArraySegment<byte> seg)
+    {
+        if (!_writeBuffer.TryLease(out int wi, out byte* wp))
+        {
+            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
+            CloseClient(slot);
+            return;
+        }
+
+        Marshal.Copy(seg.Array!, seg.Offset, (IntPtr)wp, seg.Count);
+        SubmitSend(slot, fd, wi, wp, seg.Count);
+    }
+
+    // =====================================================================
     // Initialization / teardown
     // =====================================================================
 
@@ -371,9 +447,9 @@ internal sealed class IoUringShard : SocketSetShard
         foreach (var fd in _listeners.Keys) LibC.close(fd);
         _listeners.Clear();
 
-        for (int i = 0; i < _fds.Length; i++)
+        for (int i = 0; i < _conns.Length; i++)
         {
-            int fd = Interlocked.Exchange(ref _fds[i], 0);
+            int fd = Interlocked.Exchange(ref _conns[i].Fd, 0);
             if (fd > 0) LibC.close(fd);
         }
 
@@ -402,6 +478,10 @@ internal sealed class IoUringShard : SocketSetShard
             // Adopt any connections handed off from another shard's listener.
             while (_incoming.TryDequeue(out var inbound))
                 AdoptAccepted(inbound.Fd, inbound.Token);
+
+            // Issue any out-of-band sends marshaled in from other threads.
+            while (_external.TryDequeue(out var ext))
+                PumpExternal(ext.Slot, ext.Generation, ext.Data);
 
             // Fold any cross-thread submissions into the ring.
             if (!_pending.IsEmpty)
@@ -520,47 +600,44 @@ internal sealed class IoUringShard : SocketSetShard
         int one = 1;
         LibC.setsockopt(newFd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
 
-        bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
-
-        var ctx = new SocketSet.AcceptContext(
-            SocketSet.SocketFlags.None, userToken, wp, leased ? _writeBuffer.BufferSize : 0);
-        Parent.OnAccept(ref ctx);
-
-        uint slot = InitClient(newFd, ctx.UserToken, (byte)ctx.Flags);
-        if (slot == 0)
+        // Claim the slot first so the connection identity exists before OnAccept sees it; the
+        // handler mutates UserToken/Flags on it directly (no copy-out).
+        var conn = InitClient(newFd, userToken, SocketSet.SocketFlags.None);
+        if (conn is null)
         {
-            if (leased) _writeBuffer.Release(wi);
             LibC.close(newFd);
             return;
         }
+        uint slot = conn.Slot;
 
-        if ((ctx.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
+        bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
+        var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
+        Parent.OnAccept(ref ctx);
+
+        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
             ArmRecv(slot, newFd);
 
         int sb = ctx.SendBytes;
-        if (leased && sb > 0) SubmitSend(slot, newFd, wi, wp, sb);
+        if (leased && sb > 0) { conn.SendBusy = true; SubmitSend(slot, newFd, wi, wp, sb); }
         else if (leased) _writeBuffer.Release(wi);
     }
 
     private unsafe void HandleConnect(int res, uint slot)
     {
-        int fd = GetFd(slot);
+        var conn = _conns[slot - 1];
+        int fd = conn.Fd;
         if (res == 0 && fd != 0)
         {
+            // UserToken was seeded by Connect()'s InitClient; the handler may replace it in-place.
             bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
-
-            object? token = Volatile.Read(ref _userTokens[slot - 1]);
-            var ctx = new SocketSet.ConnectContext(
-                SocketSet.SocketFlags.None, token, wp, leased ? _writeBuffer.BufferSize : 0);
+            var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
             Parent.OnConnect(ref ctx);
-            Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
-            _slotFlags[slot - 1] = (byte)ctx.Flags;
 
-            if ((ctx.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
+            if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
                 ArmRecv(slot, fd);
 
             int sb = ctx.SendBytes;
-            if (leased && sb > 0) SubmitSend(slot, fd, wi, wp, sb);
+            if (leased && sb > 0) { conn.SendBusy = true; SubmitSend(slot, fd, wi, wp, sb); }
             else if (leased) _writeBuffer.Release(wi);
         }
         else
@@ -604,16 +681,26 @@ internal sealed class IoUringShard : SocketSetShard
     /// buffer <paramref name="bid"/> was borrowed for an in-flight send (caller must not release it).</summary>
     private unsafe bool DeliverReceive(uint slot, int fd, ushort bid, int res)
     {
+        var conn = _conns[slot - 1];
         byte* rp = _readBuffer.GetBufferAddress(bid);
-        object? token = Volatile.Read(ref _userTokens[slot - 1]);
-        var ctx = new SocketSet.ReceiveContext(GetFlags(slot), token, rp, _readBuffer.BufferSize, res);
+        var ctx = new SocketSet.ReceiveContext(conn, rp, _readBuffer.BufferSize, res);
         Parent.OnReceive(ref ctx);
-        Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
-        _slotFlags[slot - 1] = (byte)ctx.Flags;
 
         int rb = ctx.ResponseBytes;
-        if (rb <= 0 || (GetFlags(slot) & SocketSet.SocketFlags.SendClosed) != 0) return false;
+        if (rb <= 0 || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0) return false;
 
+        if (conn.SendBusy)
+        {
+            // A send is already in flight (e.g. an out-of-band Send, or a still-draining pipeline):
+            // serialize behind it by copying the response out and queueing. The read buffer is not
+            // borrowed, so the caller releases it as usual.
+            var copy = new byte[rb];
+            Marshal.Copy((IntPtr)rp, copy, 0, rb);
+            (conn.Pending ??= new()).Enqueue(new ArraySegment<byte>(copy, 0, rb));
+            return false;
+        }
+
+        conn.SendBusy = true;
         if (_borrowedBids < _maxBorrowedBids)
         {
             // No-copy echo: send straight from the read buffer, holding it until the send done.
@@ -666,19 +753,25 @@ internal sealed class IoUringShard : SocketSetShard
         }
 
         int fd = GetFd(slot);
-        if (fd == 0) { _writeBuffer.Release(writeIndex); return; }
+        if (fd == 0) { _writeBuffer.Release(writeIndex); return; } // closed: SendBusy already reset
 
         // Full write completed. Offer the now-free buffer to OnWrite: a handler can pipeline
         // the next message straight back into it (no release/re-lease). Only if it declines
         // do we hand the buffer back to the pool.
+        var conn = _conns[slot - 1];
         byte* wp = _writeBuffer.Address(writeIndex);
-        object? token = Volatile.Read(ref _userTokens[slot - 1]);
-        var ctx = new SocketSet.WriteContext(GetFlags(slot), token, wp, _writeBuffer.BufferSize);
+        var ctx = new SocketSet.WriteContext(conn, wp, _writeBuffer.BufferSize);
         Parent.OnWrite(ref ctx);
-        Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
-        _slotFlags[slot - 1] = (byte)ctx.Flags;
 
         int next = ctx.SendBytes;
+        if (next == 0 && conn.Pending is { Count: > 0 } pending)
+        {
+            // Nothing pipelined, but an out-of-band send is queued: reuse this same buffer for it.
+            var seg = pending.Dequeue();
+            Marshal.Copy(seg.Array!, seg.Offset, (IntPtr)wp, seg.Count);
+            next = seg.Count;
+        }
+
         if (next > 0)
         {
             _writeState[writeIndex] = new WriteState { Slot = slot, Fd = fd, Sent = 0, Total = next };
@@ -691,11 +784,12 @@ internal sealed class IoUringShard : SocketSetShard
                 user_data = Pack(Op.Send, slot, (uint)writeIndex),
             };
             sqe.rw_flags.rw_flags = LibC.MSG_NOSIGNAL;
-            Submit(sqe);
+            Submit(sqe); // SendBusy stays set
         }
         else
         {
             _writeBuffer.Release(writeIndex);
+            conn.SendBusy = false;
         }
     }
 
@@ -739,26 +833,35 @@ internal sealed class IoUringShard : SocketSetShard
         }
 
         int fd = GetFd(slot);
-        if (fd == 0) { _readBuffer.ReleaseBuffer(bid); _borrowedBids--; return; }
+        if (fd == 0) { _readBuffer.ReleaseBuffer(bid); _borrowedBids--; return; } // closed: SendBusy reset
 
         // Full echo sent. Fire OnWrite offering the read buffer for a pipelined follow-up (drives
         // the window state machine); if the handler declines, return the buffer to the ring.
+        var conn = _conns[slot - 1];
         byte* rp = _readBuffer.GetBufferAddress(bid);
-        object? token = Volatile.Read(ref _userTokens[slot - 1]);
-        var ctx = new SocketSet.WriteContext(GetFlags(slot), token, rp, _readBuffer.BufferSize);
+        var ctx = new SocketSet.WriteContext(conn, rp, _readBuffer.BufferSize);
         Parent.OnWrite(ref ctx);
-        Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
-        _slotFlags[slot - 1] = (byte)ctx.Flags;
 
         int next = ctx.SendBytes;
         if (next > 0)
         {
-            // Keep reusing the same read buffer — still borrowed, no new copy.
+            // Keep reusing the same read buffer — still borrowed, no new copy. SendBusy stays set.
             SubmitSendBid(slot, fd, bid, next);
+            return;
+        }
+
+        // No pipelined follow-up: return the borrowed read buffer to the ring.
+        _readBuffer.ReleaseBuffer(bid); _borrowedBids--;
+
+        if (conn.Pending is { Count: > 0 } pending)
+        {
+            // An out-of-band send is queued: it needs a write buffer (the read buffer is gone).
+            var seg = pending.Dequeue();
+            SubmitSegment(slot, fd, seg); // SendBusy stays set
         }
         else
         {
-            _readBuffer.ReleaseBuffer(bid); _borrowedBids--;
+            conn.SendBusy = false;
         }
     }
 

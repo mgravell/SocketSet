@@ -153,28 +153,25 @@ public abstract partial class SocketSet : IDisposable
     {
     }
 
-    // The contexts store the backing buffer as a raw pointer + length rather than a
-    // Span<byte> field. Reasons: (1) the transports already own native/pinned memory
-    // (io_uring provided buffers, the write pool), so a pointer is the natural currency;
-    // (2) it keeps the token a plain by-value object? rather than a `ref` field, which
-    // would require runtime byref-field support (.NET 7+) and rule out netfx. The
-    // user-facing surface is still Span<byte>, materialized on demand. The token is
-    // copied in by the transport and read back out after the callback returns.
+    // Each context carries the Connection (the per-connection identity, which owns UserToken and
+    // the send/recv-closed Flags) plus, where relevant, a raw pointer + length into a
+    // backend-owned buffer (io_uring provided/write buffers, the managed scratch). The buffer is
+    // surfaced as Span<byte> on demand. Because UserToken and Flags live on the Connection, the
+    // handler mutates it directly — nothing is copied in or out across the callback.
 
-    protected internal unsafe ref struct AcceptContext(SocketFlags flags, object? userToken, byte* buffer, int bufferLength)
+    protected internal unsafe ref struct AcceptContext(Connection connection, byte* buffer, int bufferLength)
     {
         private readonly byte* _buffer = buffer;
         private readonly int _bufferLength = bufferLength;
-        private SocketFlags _flags = flags;
 
-        /// <summary>The object associated with the socket.</summary>
-        public object? UserToken { get; set; } = userToken;
+        /// <summary>The connection being accepted; carries <see cref="Connection.UserToken"/>.</summary>
+        public readonly Connection Connection => connection;
 
         /// <summary>Disable writing, for one-way (client-to-server) transports.</summary>
-        public void CloseOutput() => _flags |= SocketFlags.SendClosed;
+        public readonly void CloseOutput() => connection.Flags |= SocketFlags.SendClosed;
 
         /// <summary>Disable reading, for one-way (server-to-client) transports.</summary>
-        public void CloseInput() => _flags |= SocketFlags.ReceiveClosed;
+        public readonly void CloseInput() => connection.Flags |= SocketFlags.ReceiveClosed;
 
         /// <summary>
         /// A library-owned outbound buffer. Write an initial payload here and set
@@ -193,23 +190,22 @@ public abstract partial class SocketSet : IDisposable
             }
         }
 
-        public readonly SocketFlags Flags => _flags;
+        public readonly SocketFlags Flags => connection.Flags;
     }
 
-    protected internal unsafe ref struct ConnectContext(SocketFlags flags, object? userToken, byte* buffer, int bufferLength)
+    protected internal unsafe ref struct ConnectContext(Connection connection, byte* buffer, int bufferLength)
     {
         private readonly byte* _buffer = buffer;
         private readonly int _bufferLength = bufferLength;
-        private SocketFlags _flags = flags;
 
-        /// <summary>The object associated with the socket.</summary>
-        public object? UserToken { get; set; } = userToken;
+        /// <summary>The connection just established; carries <see cref="Connection.UserToken"/>.</summary>
+        public readonly Connection Connection => connection;
 
         /// <summary>Disable writing, for one-way (client-to-server) transports.</summary>
-        public void CloseOutput() => _flags |= SocketFlags.SendClosed;
+        public readonly void CloseOutput() => connection.Flags |= SocketFlags.SendClosed;
 
         /// <summary>Disable reading, for one-way (server-to-client) transports.</summary>
-        public void CloseInput() => _flags |= SocketFlags.ReceiveClosed;
+        public readonly void CloseInput() => connection.Flags |= SocketFlags.ReceiveClosed;
 
         /// <summary>
         /// A library-owned outbound buffer. Write an initial handshake/greeting here and set
@@ -228,7 +224,7 @@ public abstract partial class SocketSet : IDisposable
             }
         }
 
-        public readonly SocketFlags Flags => _flags;
+        public readonly SocketFlags Flags => connection.Flags;
     }
 
     /// <summary>
@@ -237,14 +233,13 @@ public abstract partial class SocketSet : IDisposable
     /// that reuses same buffer that underpins <see cref="Payload"/>, meaning that the
     /// received payload will be overwritten.
     /// </summary>
-    protected internal unsafe ref struct ReceiveContext(SocketFlags flags, object? userToken, byte* buffer, int bufferLength, int bytes)
+    protected internal unsafe ref struct ReceiveContext(Connection connection, byte* buffer, int bufferLength, int bytes)
     {
         private readonly byte* _buffer = buffer;
         private readonly int _bufferLength = bufferLength;
-        private SocketFlags _flags = flags;
 
-        /// <summary>The object associated with the socket.</summary>
-        public object? UserToken { get; set; } = userToken;
+        /// <summary>The connection that received data; carries <see cref="Connection.UserToken"/>.</summary>
+        public readonly Connection Connection => connection;
 
         public readonly int PayloadBytes => bytes;
         public readonly ReadOnlySpan<byte> Payload => new(_buffer, bytes);
@@ -274,12 +269,12 @@ public abstract partial class SocketSet : IDisposable
             }
         }
 
-        public readonly SocketFlags Flags => _flags | (bytes is 0 ? SocketFlags.ReceiveClosed : 0);
+        public readonly SocketFlags Flags => connection.Flags | (bytes is 0 ? SocketFlags.ReceiveClosed : 0);
 
         /// <summary>
         /// Disable further reads.
         /// </summary>
-        public void CloseInput() => _flags |= SocketFlags.ReceiveClosed;
+        public readonly void CloseInput() => connection.Flags |= SocketFlags.ReceiveClosed;
     }
 
     /// <summary>
@@ -290,14 +285,13 @@ public abstract partial class SocketSet : IDisposable
     /// freed buffer. Still one write in flight per connection: the next is issued only once
     /// this one has completed.
     /// </summary>
-    protected internal unsafe ref struct WriteContext(SocketFlags flags, object? userToken, byte* buffer, int bufferLength)
+    protected internal unsafe ref struct WriteContext(Connection connection, byte* buffer, int bufferLength)
     {
         private readonly byte* _buffer = buffer;
         private readonly int _bufferLength = bufferLength;
-        private SocketFlags _flags = flags;
 
-        /// <summary>The object associated with the socket.</summary>
-        public object? UserToken { get; set; } = userToken;
+        /// <summary>The connection whose write completed; carries <see cref="Connection.UserToken"/>.</summary>
+        public readonly Connection Connection => connection;
 
         /// <summary>The buffer just written, now free; write the next payload here to pipeline.</summary>
         public readonly Span<byte> SendBuffer => new(_buffer, _bufferLength);
@@ -313,12 +307,12 @@ public abstract partial class SocketSet : IDisposable
             }
         }
 
-        public readonly SocketFlags Flags => _flags;
+        public readonly SocketFlags Flags => connection.Flags;
 
         /// <summary>
         /// Disable further writes.
         /// </summary>
-        public void CloseOutput() => _flags |= SocketFlags.SendClosed;
+        public readonly void CloseOutput() => connection.Flags |= SocketFlags.SendClosed;
     }
 
     [Flags]

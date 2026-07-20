@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using SocketSets;
 
 namespace SmokeTest;
@@ -6,6 +7,35 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
 {
     /// <summary>Fixed message size the client sends.</summary>
     public int GreetingSize { get; set; } = 512;
+
+    /// <summary>
+    /// When set, the server echoes out-of-band: instead of replying inline from OnReceive, it
+    /// hands the payload + <see cref="Connection"/> to a background thread that calls
+    /// <see cref="Connection.Send"/>. This exercises the cross-thread "poke a write" path (and its
+    /// per-connection send serialization) rather than the inline response path.
+    /// </summary>
+    public bool PokeMode { get; set; }
+
+    private readonly BlockingCollection<(Connection Conn, byte[] Data)> _pokes = new();
+    private int _pokeStarted;
+
+    private void EnsurePokeWorker()
+    {
+        if (Interlocked.CompareExchange(ref _pokeStarted, 1, 0) != 0) return;
+        var t = new Thread(() =>
+        {
+            foreach (var (conn, data) in _pokes.GetConsumingEnumerable())
+                conn.Send(data); // out-of-band: marshaled onto the owning IO context
+        })
+        { IsBackground = true, Name = "poke-writer" };
+        t.Start();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _pokes.CompleteAdding();
+        base.Dispose(disposing);
+    }
 
     /// <summary>
     /// Client send window: how many messages may be outstanding (sent, not yet echoed back).
@@ -33,7 +63,7 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
     {
         Interlocked.Increment(ref _connected);
         var client = new Client(Window, GreetingSize);
-        ctx.UserToken = client;
+        ctx.Connection.UserToken = client;
 
         // Prime the pipe with the first message.
         int n = client.Writable();
@@ -49,13 +79,22 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
         Interlocked.Increment(ref _recvOps);
         Interlocked.Add(ref _recvBytes, ctx.PayloadBytes);
 
-        if (ReferenceEquals(ctx.UserToken, ServerToken))
+        if (ReferenceEquals(ctx.Connection.UserToken, ServerToken))
         {
-            // Server: echo straight back (data already in the buffer).
             Interlocked.Add(ref _echoed, ctx.PayloadBytes);
-            ctx.ResponseBytes = ctx.PayloadBytes;
+            if (PokeMode)
+            {
+                // Out-of-band echo: copy the payload out and let a background thread Send it.
+                EnsurePokeWorker();
+                _pokes.Add((ctx.Connection, ctx.Payload.ToArray()));
+            }
+            else
+            {
+                // Inline echo (data already in the buffer).
+                ctx.ResponseBytes = ctx.PayloadBytes;
+            }
         }
-        else if (ctx.UserToken is Client client)
+        else if (ctx.Connection.UserToken is Client client)
         {
             // Client: count the reply, then — if the write pipe went idle at the window
             // limit — restart it now that a slot has freed. (Racy with OnWrite; Client locks.)
@@ -72,7 +111,7 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
     protected override void OnWrite(ref WriteContext ctx)
     {
         // Client only: on write-complete, send the next message if the window has room.
-        if (ctx.UserToken is Client client)
+        if (ctx.Connection.UserToken is Client client)
         {
             int n = client.Writable();
             if (n > 0)

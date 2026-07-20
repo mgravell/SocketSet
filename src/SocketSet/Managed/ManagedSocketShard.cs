@@ -19,7 +19,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 {
     private int _bufferSize;
     private readonly List<Socket> _listeners = [];
-    private readonly ConcurrentDictionary<Connection, byte> _connections = [];
+    private readonly ConcurrentDictionary<ManagedConnection, byte> _connections = [];
 
     public ManagedSocketShard(SocketSetOptions options) => _bufferSize = options.BufferPageSize;
 
@@ -84,10 +84,8 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             int sendBytes;
             fixed (byte* buf = conn.SendBuffer)
             {
-                var ctx = new SocketSet.AcceptContext(SocketSet.SocketFlags.None, args.DefaultToken, buf, _bufferSize);
+                var ctx = new SocketSet.AcceptContext(conn, buf, _bufferSize);
                 Parent.OnAccept(ref ctx);
-                conn.UserToken = ctx.UserToken;
-                conn.Flags = ctx.Flags;
                 sendBytes = ctx.SendBytes;
             }
 
@@ -135,10 +133,8 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         int sendBytes;
         fixed (byte* buf = conn.SendBuffer)
         {
-            var ctx = new SocketSet.ConnectContext(SocketSet.SocketFlags.None, token, buf, _bufferSize);
+            var ctx = new SocketSet.ConnectContext(conn, buf, _bufferSize);
             Parent.OnConnect(ref ctx);
-            conn.UserToken = ctx.UserToken;
-            conn.Flags = ctx.Flags;
             sendBytes = ctx.SendBytes;
         }
 
@@ -152,7 +148,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Receive
     // =====================================================================
 
-    private void PumpReceive(Connection conn)
+    private void PumpReceive(ManagedConnection conn)
     {
         while (true)
         {
@@ -171,7 +167,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     }
 
     /// <returns>true to keep receiving, false to stop (closed / input shut).</returns>
-    private bool ProcessReceive(Connection conn)
+    private bool ProcessReceive(ManagedConnection conn)
     {
         var args = conn.RecvArgs;
         int n = args.BytesTransferred;
@@ -184,10 +180,8 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         int response;
         fixed (byte* buf = conn.RecvBuffer)
         {
-            var ctx = new SocketSet.ReceiveContext(conn.Flags, conn.UserToken, buf, _bufferSize, n);
+            var ctx = new SocketSet.ReceiveContext(conn, buf, _bufferSize, n);
             Parent.OnReceive(ref ctx);
-            conn.UserToken = ctx.UserToken;
-            conn.Flags = ctx.Flags;
             response = ctx.ResponseBytes;
         }
 
@@ -208,7 +202,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     /// no per-send allocation — copying only if the source isn't already that buffer. Only a
     /// genuine overlap (a new send requested while one is in flight) allocates, to preserve
     /// ordering. Sends stay serialized: one SAEA operation in flight at a time.</summary>
-    private void BeginSend(Connection conn, byte[] source, int length)
+    private void BeginSend(ManagedConnection conn, byte[] source, int length)
     {
         lock (conn.SendGate)
         {
@@ -231,7 +225,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     }
 
     // Async send completion (from ConnArgs.OnCompleted).
-    private void AdvanceSend(Connection conn)
+    private void AdvanceSend(ManagedConnection conn)
     {
         if (conn.SendArgs.SocketError != SocketError.Success) { Close(conn); return; }
         conn.SendOffset += conn.SendArgs.BytesTransferred;
@@ -239,7 +233,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         PumpSend(conn);
     }
 
-    private void PumpSend(Connection conn)
+    private void PumpSend(ManagedConnection conn)
     {
         while (true)
         {
@@ -262,15 +256,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     /// <summary>One app-requested write finished: fire OnWrite (which may pipeline the next
     /// straight into the scratch buffer), then pick what to send next.</summary>
     /// <returns>true if another buffer is queued (CurrentBuffer set), false if now idle.</returns>
-    private bool CompleteAndAdvance(Connection conn)
+    private bool CompleteAndAdvance(ManagedConnection conn)
     {
         int next;
         fixed (byte* buf = conn.SendBuffer)
         {
-            var ctx = new SocketSet.WriteContext(conn.Flags, conn.UserToken, buf, conn.SendBuffer.Length);
+            var ctx = new SocketSet.WriteContext(conn, buf, conn.SendBuffer.Length);
             Parent.OnWrite(ref ctx);
-            conn.UserToken = ctx.UserToken;
-            conn.Flags = ctx.Flags;
             next = ctx.SendBytes;
         }
 
@@ -306,19 +298,20 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     }
 
     // =====================================================================
-    // Connection lifecycle / helpers
+    // ManagedConnection lifecycle / helpers
     // =====================================================================
 
-    private Connection Register(Socket socket, object? token)
+    private ManagedConnection Register(Socket socket, object? token)
     {
-        var conn = new Connection(this, socket, _bufferSize) { UserToken = token };
+        var conn = new ManagedConnection(this, socket, _bufferSize) { UserToken = token };
         _connections[conn] = 0;
         return conn;
     }
 
-    private void Close(Connection conn)
+    private void Close(ManagedConnection conn)
     {
         if (!_connections.TryRemove(conn, out _)) return; // already closed
+        conn.Closed = true; // out-of-band Send now returns false
         try { conn.Socket.Shutdown(SocketShutdown.Both); } catch { /* best effort */ }
         SafeDispose(conn.Socket);
         // Deliberately do NOT dispose RecvArgs/SendArgs here: a receive or send may still be
@@ -408,7 +401,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     private sealed class ConnArgs(ManagedSocketShard shard) : SocketAsyncEventArgs
     {
         public readonly ManagedSocketShard Shard = shard;
-        public Connection Conn = null!; // set once, immediately after the owning Connection is built
+        public ManagedConnection Conn = null!; // set once, immediately after the owning ManagedConnection is built
 
         protected override void OnCompleted(SocketAsyncEventArgs e)
         {
@@ -434,11 +427,11 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         }
     }
 
-    private sealed class Connection
+    private sealed class ManagedConnection : Connection // UserToken + Flags come from the base
     {
+        public readonly ManagedSocketShard Shard;
         public readonly Socket Socket;
-        public object? UserToken;
-        public SocketSet.SocketFlags Flags;
+        public volatile bool Closed;
 
         public readonly byte[] RecvBuffer;
         public readonly byte[] SendBuffer; // scratch the handler writes into
@@ -457,13 +450,23 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         public int CurrentLength;
         public int SendOffset;
 
-        public Connection(ManagedSocketShard shard, Socket socket, int bufferSize)
+        public ManagedConnection(ManagedSocketShard shard, Socket socket, int bufferSize)
         {
+            Shard = shard;
             Socket = socket;
             RecvBuffer = new byte[bufferSize];
             SendBuffer = new byte[bufferSize];
             RecvArgs = new ConnArgs(shard) { Conn = this };
             SendArgs = new ConnArgs(shard) { Conn = this };
+        }
+
+        /// <summary>Out-of-band send: copy the data and hand it to the (thread-safe) send queue.
+        /// BeginSend locks the send gate, so this is safe from any thread.</summary>
+        public override bool Send(ReadOnlySpan<byte> data)
+        {
+            if (Closed) return false;
+            Shard.BeginSend(this, data.ToArray(), data.Length);
+            return true;
         }
     }
 }
