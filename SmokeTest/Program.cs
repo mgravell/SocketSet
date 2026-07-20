@@ -14,6 +14,8 @@ string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespac
 int size = 512; // message size
 int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.MaxValue = unbounded
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
+string host = "127.0.0.1"; // client connect target (server always binds Any)
+int port = 10000;
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
 {
@@ -57,6 +59,12 @@ for (int i = 0; i < args.Length; i++)
         case "--window" when i + 1 < args.Length && int.TryParse(args[i + 1], out var w):
             window = Math.Max(1, w);
             break;
+        case "--host" when i + 1 < args.Length:
+            host = args[i + 1];
+            break;
+        case "--port" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pt):
+            port = pt;
+            break;
     }
 }
 
@@ -66,6 +74,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -s / --server     run the echo server");
     Console.WriteLine("  -c / --client N   open N client connections that ping-pong");
     Console.WriteLine("  -t / --seconds S  stop after S seconds (default: run until Ctrl+C)");
+    Console.WriteLine("  --host IP         client connect target (default 127.0.0.1; server always binds Any)");
+    Console.WriteLine("  --port N          TCP port (default 10000)");
     Console.WriteLine("  -u / --uds name   use a Unix domain socket (e.g. @foo for abstract) instead of TCP");
     Console.WriteLine("  -z / --size N     ping-pong message size in bytes (default 512)");
     Console.WriteLine("  -n / --shards N   number of shards / worker threads (default 4)");
@@ -115,12 +125,23 @@ if (size > options.BufferPageSize)
     size = options.BufferPageSize;
 }
 
-EndPoint endpoint;
+// The server always binds Any (so it accepts on the LAN, not just loopback); the client
+// dials --host. UDS is local-only, so it uses one endpoint for both.
+EndPoint listenEp, connectEp;
 #if NET
-endpoint = uds is null ? new IPEndPoint(IPAddress.Loopback, 10000) : new UnixDomainSocketEndPoint(uds);
+if (uds is not null)
+{
+    listenEp = connectEp = new UnixDomainSocketEndPoint(uds);
+}
+else
+{
+    listenEp = new IPEndPoint(IPAddress.Any, port);
+    connectEp = new IPEndPoint(IPAddress.Parse(host), port);
+}
 #else
 if (uds is not null) Console.WriteLine("note: UDS not supported on this target framework; falling back to TCP");
-endpoint = new IPEndPoint(IPAddress.Loopback, 10000);
+listenEp = new IPEndPoint(IPAddress.Any, port);
+connectEp = new IPEndPoint(IPAddress.Parse(host), port);
 #endif
 using var set = new EchoServer(options) { GreetingSize = size, Window = window };
 string mode = window == 1 ? "ping/pong" : window == int.MaxValue ? "pipeline(unbounded)" : $"pipeline(window={window})";
@@ -130,15 +151,15 @@ Console.WriteLine(
 
 if (server)
 {
-    set.Listen(endpoint, EchoServer.ServerToken);
-    Console.WriteLine($"listening on {endpoint}");
+    set.Listen(listenEp, EchoServer.ServerToken);
+    Console.WriteLine($"listening on {listenEp}");
 }
 
 for (int i = 0; i < clientCount; i++)
 {
-    set.Connect(endpoint);
+    set.Connect(connectEp);
 }
-if (clientCount > 0) Console.WriteLine($"opened {clientCount} client connection(s)");
+if (clientCount > 0) Console.WriteLine($"opened {clientCount} client connection(s) to {connectEp}");
 
 using var stop = new ManualResetEventSlim(false);
 Console.CancelKeyPress += (_, e) =>
