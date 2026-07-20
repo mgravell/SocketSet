@@ -1,11 +1,13 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.Sockets;
 using SmokeTest;
 using SocketSets;
 
 bool server = false;
 int clientCount = 0;
 int seconds = 0; // 0 == run until Ctrl+C
+string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespace)
 for (int i = 0; i < args.Length; i++)
 {
     switch (args[i])
@@ -20,24 +22,30 @@ for (int i = 0; i < args.Length; i++)
         case ("-t" or "--seconds") when i + 1 < args.Length && int.TryParse(args[i + 1], out var secs):
             seconds = secs;
             break;
+        case ("-u" or "--uds") when i + 1 < args.Length:
+            uds = args[i + 1];
+            break;
     }
 }
 
 if (!server && clientCount == 0)
 {
-    Console.WriteLine("usage: SmokeTest -s [-c N] [-t seconds]");
-    Console.WriteLine("  -s / --server     run the echo server (listens on all shards, reuse-port)");
+    Console.WriteLine("usage: SmokeTest -s [-c N] [-t seconds] [-u name]");
+    Console.WriteLine("  -s / --server     run the echo server");
     Console.WriteLine("  -c / --client N   open N client connections that ping-pong");
     Console.WriteLine("  -t / --seconds S  stop after S seconds (default: run until Ctrl+C)");
+    Console.WriteLine("  -u / --uds name   use a Unix domain socket (e.g. @foo for abstract) instead of TCP");
     return;
 }
 
-var endpoint = new IPEndPoint(IPAddress.Loopback, 10000);
+EndPoint endpoint = uds is null
+    ? new IPEndPoint(IPAddress.Loopback, 10000)
+    : new UnixDomainSocketEndPoint(uds);
 using var set = new EchoServer(new SocketSetOptions());
 
 if (server)
 {
-    set.Listen(endpoint);
+    set.Listen(endpoint, EchoServer.ServerToken);
     Console.WriteLine($"listening on {endpoint}");
 }
 

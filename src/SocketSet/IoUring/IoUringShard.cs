@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using SocketSets.Native;
 
@@ -63,7 +64,15 @@ internal sealed class IoUringShard : SocketSetShard
     private unsafe byte* _connectAddrs;
 
     private readonly ConcurrentQueue<LibC.io_uring_sqe> _pending = [];
-    private readonly List<int> _listeners = [];
+
+    // Accepted fds handed to this shard by another shard's single listener (UDS /
+    // any non-reuse-port listener). Drained on the loop thread, then adopted here.
+    // The default accept token travels with the fd since the target shard has no
+    // listener of its own to look it up on.
+    private readonly ConcurrentQueue<(int Fd, object? Token)> _incoming = [];
+
+    // Bound listener fd -> the default UserToken to seed into each AcceptContext.
+    private readonly ConcurrentDictionary<int, object?> _listeners = new();
     private uint _unsubmittedCount;
 
     public unsafe IoUringShard(SocketSetOptions options)
@@ -138,20 +147,19 @@ internal sealed class IoUringShard : SocketSetShard
     public override void Listen(EndPoint endpoint, object? userToken, bool local)
     {
         int fd = IoUringFactory.Bind(endpoint);
-        lock (_listeners) _listeners.Add(fd);
+        _listeners[fd] = userToken; // default token for connections accepted here
         EnqueueAccept(fd, local);
     }
 
     public override unsafe void Connect(EndPoint endpoint, object? userToken)
     {
-        if (endpoint is not IPEndPoint ip)
-            throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported yet.");
-
-        int fd = LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
+        int fd = endpoint switch
+        {
+            IPEndPoint => LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP),
+            UnixDomainSocketEndPoint => LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0),
+            _ => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported."),
+        };
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
-
-        int one = 1;
-        LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
 
         uint slot = InitClient(fd, userToken, 0);
         if (slot == 0)
@@ -160,24 +168,45 @@ internal sealed class IoUringShard : SocketSetShard
             throw new InvalidOperationException("Shard socket table is full.");
         }
 
-        // Build sockaddr_in into this slot's stable native storage.
+        // Build the target sockaddr into this slot's stable native storage; the
+        // kernel dereferences it asynchronously once the CONNECT SQE is submitted.
         byte* addrPtr = _connectAddrs + (nint)(slot - 1) * AddrStride;
-        var sa = (LibC.SockAddrIn*)addrPtr;
-        sa->sin_family = LibC.AF_INET;
-        sa->sin_port = LibC.Htons((ushort)ip.Port);
-        var bytes = ip.Address.GetAddressBytes(); // 4 bytes, already network order
-        byte* dst = (byte*)&sa->sin_addr;
-        dst[0] = bytes[0];
-        dst[1] = bytes[1];
-        dst[2] = bytes[2];
-        dst[3] = bytes[3];
+        uint addrLen;
+        switch (endpoint)
+        {
+            case IPEndPoint ip:
+            {
+                int one = 1;
+                LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
+                var sa = (LibC.SockAddrIn*)addrPtr;
+                *sa = default; // clear any stale bytes from a prior tenant of this slot
+                sa->sin_family = LibC.AF_INET;
+                sa->sin_port = LibC.Htons((ushort)ip.Port);
+                var bytes = ip.Address.GetAddressBytes(); // 4 bytes, already network order
+                byte* dst = (byte*)&sa->sin_addr;
+                dst[0] = bytes[0];
+                dst[1] = bytes[1];
+                dst[2] = bytes[2];
+                dst[3] = bytes[3];
+                addrLen = 16; // sizeof(sockaddr_in)
+                break;
+            }
+            case UnixDomainSocketEndPoint uds:
+                // SockAddrUn.Init zeroes the struct and maps a leading '@' to the
+                // abstract namespace ('\0'); addrLen bounds the abstract name.
+                addrLen = LibC.SockAddrUn.Init((LibC.SockAddrUn*)addrPtr, uds.ToString());
+                break;
+            default:
+                LibC.close(fd);
+                throw new NotSupportedException(endpoint.GetType().Name);
+        }
 
         var sqe = new LibC.io_uring_sqe
         {
             opcode = LibC.IORING_OP_CONNECT,
             fd = fd,
             addr = (ulong)addrPtr,
-            off = 16, // sizeof(sockaddr_in)
+            off = addrLen,
             user_data = Pack(Op.Connect, slot),
         };
         Enqueue(sqe);
@@ -198,6 +227,15 @@ internal sealed class IoUringShard : SocketSetShard
     private void Enqueue(in LibC.io_uring_sqe sqe)
     {
         _pending.Enqueue(sqe);
+        Poke();
+    }
+
+    /// <summary>Adopt an fd accepted on another shard's single listener. Cross-thread;
+    /// the fd is process-global so any shard's ring can drive it. The default accept
+    /// token is carried across since the target shard has no listener to look it up.</summary>
+    internal void EnqueueInbound(int fd, object? defaultToken)
+    {
+        _incoming.Enqueue((fd, defaultToken));
         Poke();
     }
 
@@ -299,11 +337,8 @@ internal sealed class IoUringShard : SocketSetShard
     private unsafe void Cleanup()
     {
         _ringReady = false;
-        lock (_listeners)
-        {
-            foreach (var fd in _listeners) LibC.close(fd);
-            _listeners.Clear();
-        }
+        foreach (var fd in _listeners.Keys) LibC.close(fd);
+        _listeners.Clear();
 
         for (int i = 0; i < _fds.Length; i++)
         {
@@ -329,6 +364,10 @@ internal sealed class IoUringShard : SocketSetShard
         {
             while (IsActive)
             {
+                // Adopt any connections handed off from another shard's listener.
+                while (_incoming.TryDequeue(out var inbound))
+                    AdoptAccepted(inbound.Fd, inbound.Token);
+
                 // Fold any cross-thread submissions into the ring.
                 if (!_pending.IsEmpty)
                     _unsubmittedCount += _ring.Push(_pending);
@@ -411,38 +450,56 @@ internal sealed class IoUringShard : SocketSetShard
         Volatile.Write(ref *_ring.CqHead, head);
     }
 
-    private unsafe void HandleAccept(int res, uint flags, int listenerFd, bool local)
+    private void HandleAccept(int res, uint flags, int listenerFd, bool local)
     {
         if (res >= 0)
         {
             int newFd = res;
-            bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
-            Span<byte> span = leased ? new Span<byte>(wp, _writeBuffer.BufferSize) : default;
-
-            object? token = null;
-            var ctx = new SocketSet.AcceptContext(SocketSet.SocketFlags.None, ref token, span);
-            Parent.OnAccept(ref ctx);
-
-            uint slot = InitClient(newFd, token, (byte)ctx.Flags);
-            if (slot == 0)
+            object? defaultToken = _listeners.TryGetValue(listenerFd, out var t) ? t : null;
+            if (local)
             {
-                if (leased) _writeBuffer.Release(wi);
-                LibC.close(newFd);
+                // reuse-port: each shard has its own listener, so it is already balanced.
+                AdoptAccepted(newFd, defaultToken);
             }
             else
             {
-                if ((ctx.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
-                    ArmRecv(slot, newFd);
-
-                int sb = ctx.SendBytes;
-                if (leased && sb > 0) SubmitSend(slot, newFd, wi, wp, sb);
-                else if (leased) _writeBuffer.Release(wi);
+                // Single listener (e.g. UDS): all accepts land on this one shard, so
+                // bounce each connection onto a round-robin shard to spread the load.
+                var target = (IoUringShard)Parent.RoundRobin();
+                target.EnqueueInbound(newFd, defaultToken);
             }
         }
 
         // Multishot accept re-arms itself while IORING_CQE_F_MORE is set; re-issue when it clears.
         if ((flags & LibC.IORING_CQE_F_MORE) == 0)
             EnqueueAccept(listenerFd, local);
+    }
+
+    /// <summary>Run OnAccept, allocate a slot, arm the first receive and fire any
+    /// initial send — all on the loop thread that will own this connection. The
+    /// handler sees <paramref name="userToken"/> pre-seeded and may replace it.</summary>
+    private unsafe void AdoptAccepted(int newFd, object? userToken) 
+    {
+        bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
+        Span<byte> span = leased ? new Span<byte>(wp, _writeBuffer.BufferSize) : default;
+
+        var ctx = new SocketSet.AcceptContext(SocketSet.SocketFlags.None, ref userToken, span);
+        Parent.OnAccept(ref ctx);
+
+        uint slot = InitClient(newFd, userToken, (byte)ctx.Flags);
+        if (slot == 0)
+        {
+            if (leased) _writeBuffer.Release(wi);
+            LibC.close(newFd);
+            return;
+        }
+
+        if ((ctx.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
+            ArmRecv(slot, newFd);
+
+        int sb = ctx.SendBytes;
+        if (leased && sb > 0) SubmitSend(slot, newFd, wi, wp, sb);
+        else if (leased) _writeBuffer.Release(wi);
     }
 
     private unsafe void HandleConnect(int res, uint slot)

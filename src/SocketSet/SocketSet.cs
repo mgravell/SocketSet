@@ -61,7 +61,7 @@ public abstract partial class SocketSet : IDisposable
         Debug.WriteLine(exception.Message);
     }
 
-    private SocketSetShard RoundRobin()
+    internal SocketSetShard RoundRobin()
     {
         var arr = _shards;
         return arr[Interlocked.Increment(ref _next) % arr.Length];

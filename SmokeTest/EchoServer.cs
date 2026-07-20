@@ -15,11 +15,8 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
     public long RoundTripBytes => Interlocked.Read(ref _roundTrip);
     public long Connected => Interlocked.Read(ref _connected);
 
-    protected override void OnAccept(ref AcceptContext ctx)
-    {
-        // Server-accepted sockets: the server just echoes, so tag them with the sentinel.
-        ctx.UserToken = ServerSentinel;
-    }
+    // No OnAccept override: accepted sockets inherit the default token passed to
+    // Listen (ServerToken), which is all the server needs to recognise them.
 
     protected override void OnConnect(ref ConnectContext ctx)
     {
@@ -36,7 +33,7 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
 
     protected override void OnReceive(ref ReceiveContext ctx)
     {
-        if (ReferenceEquals(ctx.UserToken, ServerSentinel))
+        if (ReferenceEquals(ctx.UserToken, ServerToken))
         {
             // Server: echo the payload straight back (data is already in the buffer).
             Interlocked.Add(ref _echoed, ctx.PayloadBytes);
@@ -58,5 +55,6 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
         public void OnReceived(int count) => Interlocked.Add(ref _received, count);
     }
 
-    private static readonly object ServerSentinel = new();
+    /// <summary>Default token for server-accepted sockets; passed to <see cref="SocketSet.Listen"/>.</summary>
+    public static readonly object ServerToken = new();
 }
