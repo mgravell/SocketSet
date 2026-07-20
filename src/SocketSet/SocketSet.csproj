@@ -2,6 +2,7 @@
 
     <PropertyGroup>
         <TargetFrameworks>net10.0;net472</TargetFrameworks>
+        <LangVersion>14.0</LangVersion>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -9,5 +10,11 @@
         <InvariantGlobalization>true</InvariantGlobalization>
         <RootNamespace>SocketSets</RootNamespace>
     </PropertyGroup>
+
+    <!-- .NET Framework lacks Span<T>/BinaryPrimitives in the box; pull them in via NuGet. -->
+    <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'">
+        <PackageReference Include="System.Buffers" Version="4.6.1" />
+        <PackageReference Include="System.Memory" Version="4.6.3" />
+    </ItemGroup>
 
 </Project>

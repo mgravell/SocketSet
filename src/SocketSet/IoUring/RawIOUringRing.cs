@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+﻿#if NET // io_uring is a Linux + modern-.NET backend; compiled out of the netfx fallback build.
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -287,3 +288,4 @@ internal unsafe struct WriteBufferPool : IDisposable
         Unsafe.AsRef(in this) = default;
     }
 }
+#endif

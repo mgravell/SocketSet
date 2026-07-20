@@ -1,6 +1,8 @@
 ﻿using System.Diagnostics;
 using System.Net;
+#if NET
 using SocketSets.Native;
+#endif
 
 namespace SocketSets;
 
@@ -11,12 +13,25 @@ public abstract class SocketSetShard
     private int _shard;
 
     protected SocketSet Parent => _parent;
-    
-    protected bool IsActive => _isActive; 
+
+    /// <summary>This shard's index within the set.</summary>
+    protected int Shard => _shard;
+
+    protected bool IsActive => _isActive;
+
     public void Stop()
     {
+        if (!_isActive) return;
         _isActive = false;
         OnStop();
+
+        // Threaded backends run OnShutdown in Run()'s finally when the pump loop exits
+        // (OnStop wakes it). Callback-driven backends have no such loop, so shut down here.
+        if (!_parent.Options.Factory.UsesWorkerThreads)
+        {
+            try { OnShutdown(); }
+            catch (Exception ex) { Debug.WriteLine(ex.Message); }
+        }
     }
 
     protected virtual void OnStop()
@@ -36,10 +51,14 @@ public abstract class SocketSetShard
 
     internal void Run()
     {
+#if NET
+        // Thread pinning is Linux-only (sched_setaffinity) and lives in the io_uring
+        // side of the build; the netfx fallback doesn't pin.
         if (_parent.Options.PinWorkerThreads && OperatingSystem.IsLinux())
         {
             LibC.PinCurrentThreadToCpu(_shard % Environment.ProcessorCount);
         }
+#endif
 
         bool initialized = false;
         try
@@ -82,7 +101,12 @@ public abstract class SocketSetShard
         }
     }
 
-    /// <summary>Runs on the worker thread before the event loop. Throwing here fails
+    /// <summary>Callback-driven backends initialize inline on the constructing thread
+    /// (no pump thread). Exceptions propagate to the constructor, which fails fast.</summary>
+    internal void InitializeInline() => OnInitialize();
+
+    /// <summary>Runs before the event loop (on the pump thread for threaded backends, or
+    /// on the constructing thread for callback-driven ones). Throwing here fails
     /// construction: the parent collects the exception and fails fast.</summary>
     protected virtual void OnInitialize()
     {

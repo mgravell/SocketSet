@@ -1,3 +1,4 @@
+#if NET // io_uring is a Linux + modern-.NET backend; compiled out of the netfx fallback build.
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Net;
@@ -479,12 +480,12 @@ internal sealed class IoUringShard : SocketSetShard
     private unsafe void AdoptAccepted(int newFd, object? userToken) 
     {
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
-        Span<byte> span = leased ? new Span<byte>(wp, _writeBuffer.BufferSize) : default;
 
-        var ctx = new SocketSet.AcceptContext(SocketSet.SocketFlags.None, ref userToken, span);
+        var ctx = new SocketSet.AcceptContext(
+            SocketSet.SocketFlags.None, userToken, wp, leased ? _writeBuffer.BufferSize : 0);
         Parent.OnAccept(ref ctx);
 
-        uint slot = InitClient(newFd, userToken, (byte)ctx.Flags);
+        uint slot = InitClient(newFd, ctx.UserToken, (byte)ctx.Flags);
         if (slot == 0)
         {
             if (leased) _writeBuffer.Release(wi);
@@ -506,12 +507,12 @@ internal sealed class IoUringShard : SocketSetShard
         if (res == 0 && fd != 0)
         {
             bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
-            Span<byte> span = leased ? new Span<byte>(wp, _writeBuffer.BufferSize) : default;
 
             object? token = Volatile.Read(ref _userTokens[slot - 1]);
-            var ctx = new SocketSet.ConnectContext(SocketSet.SocketFlags.None, ref token, span);
+            var ctx = new SocketSet.ConnectContext(
+                SocketSet.SocketFlags.None, token, wp, leased ? _writeBuffer.BufferSize : 0);
             Parent.OnConnect(ref ctx);
-            Volatile.Write(ref _userTokens[slot - 1], token);
+            Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
             _slotFlags[slot - 1] = (byte)ctx.Flags;
 
             if ((ctx.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
@@ -523,7 +524,6 @@ internal sealed class IoUringShard : SocketSetShard
         }
         else
         {
-            if (res != 0) Console.Error.WriteLine($"[connect fail] slot={slot} fd={fd} res={res}");
             CloseClient(slot);
         }
     }
@@ -541,10 +541,9 @@ internal sealed class IoUringShard : SocketSetShard
                 byte* rp = _readBuffer.GetBufferAddress(bid);
                 object? token = Volatile.Read(ref _userTokens[slot - 1]);
                 var ctx = new SocketSet.ReceiveContext(
-                    GetFlags(slot), ref token,
-                    new Span<byte>(rp, _readBuffer.BufferSize), res);
+                    GetFlags(slot), token, rp, _readBuffer.BufferSize, res);
                 Parent.OnReceive(ref ctx);
-                Volatile.Write(ref _userTokens[slot - 1], token);
+                Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
                 _slotFlags[slot - 1] = (byte)ctx.Flags;
 
                 int rb = ctx.ResponseBytes;
@@ -612,9 +611,9 @@ internal sealed class IoUringShard : SocketSetShard
         if (GetFd(slot) != 0)
         {
             object? token = Volatile.Read(ref _userTokens[slot - 1]);
-            var ctx = new SocketSet.WriteContext(GetFlags(slot), ref token);
+            var ctx = new SocketSet.WriteContext(GetFlags(slot), token);
             Parent.OnWrite(ref ctx);
-            Volatile.Write(ref _userTokens[slot - 1], token);
+            Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
             _slotFlags[slot - 1] = (byte)ctx.Flags;
         }
     }
@@ -629,3 +628,4 @@ internal sealed class IoUringShard : SocketSetShard
     private static (Op op, uint id, uint aux) Unpack(ulong ud)
         => ((Op)(byte)(ud >> 56), (uint)ud, (uint)((ud >> 32) & 0xFFFFFF));
 }
+#endif

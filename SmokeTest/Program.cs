@@ -39,6 +39,10 @@ for (int i = 0; i < args.Length; i++)
         case ("-e" or "--entries") when i + 1 < args.Length && int.TryParse(args[i + 1], out var ent):
             options.EntriesPerShard = ent;
             break;
+        case "-m":
+        case "--managed":
+            options.Factory = SocketSetFactory.Managed;
+            break;
     }
 }
 
@@ -53,6 +57,7 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -n / --shards N   number of shards / worker threads (default 4)");
     Console.WriteLine("  -p / --pin B      pin worker threads to CPUs, true|false (default true)");
     Console.WriteLine("  -e / --entries N  io_uring SQ entries per shard (default 4096; lower if RLIMIT_MEMLOCK is tight)");
+    Console.WriteLine("  -m / --managed    force the portable managed-socket fallback (default auto-detects)");
     return;
 }
 
@@ -63,12 +68,17 @@ if (size > options.BufferPageSize)
     size = options.BufferPageSize;
 }
 
-EndPoint endpoint = uds is null
-    ? new IPEndPoint(IPAddress.Loopback, 10000)
-    : new UnixDomainSocketEndPoint(uds);
+EndPoint endpoint;
+#if NET
+endpoint = uds is null ? new IPEndPoint(IPAddress.Loopback, 10000) : new UnixDomainSocketEndPoint(uds);
+#else
+if (uds is not null) Console.WriteLine("note: UDS not supported on this target framework; falling back to TCP");
+endpoint = new IPEndPoint(IPAddress.Loopback, 10000);
+#endif
 using var set = new EchoServer(options) { GreetingSize = size };
 Console.WriteLine(
-    $"transport={(uds is null ? "tcp" : "uds")} size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
+    $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +
+    $"size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
 
 if (server)
 {

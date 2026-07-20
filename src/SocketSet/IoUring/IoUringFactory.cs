@@ -1,4 +1,5 @@
-﻿using System.ComponentModel;
+﻿#if NET // io_uring is a Linux + modern-.NET backend; compiled out of the netfx fallback build.
+using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -15,6 +16,40 @@ internal sealed class IoUringFactory : SocketSetFactory
     }
 
     public override SocketSetShard CreateShard(SocketSetOptions options) => new IoUringShard(options);
+
+    /// <summary>
+    /// True only if this host can actually run the io_uring backend with the features we
+    /// need. We don't parse kernel version strings — we respect the disable sysctl and
+    /// then definitively probe by creating a throwaway ring with the exact setup flags we
+    /// use (SINGLE_ISSUER | DEFER_TASKRUN, ~6.1+). Anything less falls back to managed.
+    /// </summary>
+    internal static unsafe bool IsSupported()
+    {
+        if (!OperatingSystem.IsLinux()) return false;
+
+        // /proc/sys/kernel/io_uring_disabled: 1 = disabled for unprivileged, 2 = fully off.
+        try
+        {
+            var disabled = System.IO.File.ReadAllText("/proc/sys/kernel/io_uring_disabled").Trim();
+            if (disabled is "1" or "2") return false;
+        }
+        catch
+        {
+            // Knob absent (older kernel) — not disabled; fall through to the probe.
+        }
+
+        try
+        {
+            LibC.io_uring_params p = default;
+            p.flags = LibC.IORING_SETUP_SINGLE_ISSUER | LibC.IORING_SETUP_DEFER_TASKRUN;
+            nint fd = LibC.io_uring_setup(LibC.SYS_io_uring_setup, 2, &p);
+            if (fd < 0) return false;
+            LibC.close((int)fd);
+            return true;
+        }
+        catch (DllNotFoundException) { return false; }
+        catch (EntryPointNotFoundException) { return false; }
+    }
 
     public static int Bind(EndPoint endpoint) => endpoint switch
         {
@@ -76,3 +111,4 @@ internal sealed class IoUringFactory : SocketSetFactory
         return fd;
     }
 }
+#endif
