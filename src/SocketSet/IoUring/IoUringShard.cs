@@ -477,8 +477,13 @@ internal sealed class IoUringShard : SocketSetShard
     /// <summary>Run OnAccept, allocate a slot, arm the first receive and fire any
     /// initial send — all on the loop thread that will own this connection. The
     /// handler sees <paramref name="userToken"/> pre-seeded and may replace it.</summary>
-    private unsafe void AdoptAccepted(int newFd, object? userToken) 
+    private unsafe void AdoptAccepted(int newFd, object? userToken)
     {
+        // Set TCP_NODELAY explicitly rather than relying on the accepted socket inheriting
+        // it from the listener. Harmless on AF_UNIX (setsockopt just fails, ignored).
+        int one = 1;
+        LibC.setsockopt(newFd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
+
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
 
         var ctx = new SocketSet.AcceptContext(

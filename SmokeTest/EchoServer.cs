@@ -18,10 +18,16 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
     private long _echoed;      // bytes echoed by the server side
     private long _roundTrip;   // bytes received back by the client side
     private long _connected;
+    private long _recvOps;     // number of OnReceive completions (either role)
+    private long _recvBytes;   // total bytes delivered across those completions
 
     public long Echoed => Interlocked.Read(ref _echoed);
     public long RoundTripBytes => Interlocked.Read(ref _roundTrip);
     public long Connected => Interlocked.Read(ref _connected);
+    public long RecvOps => Interlocked.Read(ref _recvOps);
+    public long RecvBytes => Interlocked.Read(ref _recvBytes);
+    /// <summary>Average bytes per receive completion — how much the stack coalesced per read.</summary>
+    public double AvgRecvSize => RecvOps == 0 ? 0 : (double)RecvBytes / RecvOps;
 
     protected override void OnConnect(ref ConnectContext ctx)
     {
@@ -40,6 +46,9 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
 
     protected override void OnReceive(ref ReceiveContext ctx)
     {
+        Interlocked.Increment(ref _recvOps);
+        Interlocked.Add(ref _recvBytes, ctx.PayloadBytes);
+
         if (ReferenceEquals(ctx.UserToken, ServerToken))
         {
             // Server: echo straight back (data already in the buffer).
