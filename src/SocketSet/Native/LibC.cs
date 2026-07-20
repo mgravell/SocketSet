@@ -1,13 +1,8 @@
-using System.Buffers.Binary;
+﻿using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 
-namespace FastNet.Native;
+namespace SocketSets.Native;
 
-/// <summary>
-/// Minimal libc socket surface for the listener. Connection sockets are
-/// produced by io_uring's accept, so we only need enough here to create,
-/// bind and listen — the data path never touches libc.
-/// </summary>
 internal static unsafe partial class LibC
 {
     private const string Lib = "libc";
@@ -20,6 +15,8 @@ internal static unsafe partial class LibC
     internal const int SO_REUSEADDR = 2;
     internal const int SO_REUSEPORT = 15;
     internal const int TCP_NODELAY = 1;
+    
+    public const int EAGAIN = 11, EINTR = 4, EBUSY = 16;
 
     [SuppressGCTransition]
     [LibraryImport(Lib, SetLastError = true)]
@@ -44,11 +41,23 @@ internal static unsafe partial class LibC
 
     [SuppressGCTransition]
     [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int close(int fd);
+
+    [SuppressGCTransition]
+    [LibraryImport(Lib, SetLastError = true)]
     internal static partial int sched_setaffinity(int pid, nuint cpusetsize, void* mask);
 
-    public const int EFD_NONBLOCK = 0x00000800;
-    public const uint POLLIN = 0x0001;
-    public const int EAGAIN = 11, EINTR = 4, EBUSY = 16;
+    [SuppressGCTransition]
+    [LibraryImport(Lib, EntryPoint = "eventfd", SetLastError = true)]
+    public static partial int eventfd(uint initval, int flags);
+    
+    [SuppressGCTransition]
+    [LibraryImport(Lib, EntryPoint = "write", SetLastError = true)]
+    public static unsafe partial nint write(int fd, void* buf, nuint count);
+
+    [SuppressGCTransition]
+    [LibraryImport(Lib, EntryPoint = "read", SetLastError = true)]
+    public static unsafe partial nint read(int fd, void* buf, nuint count);
 
     /// <summary>Host-to-network byte order for a 16-bit port.</summary>
     internal static ushort Htons(ushort value)
@@ -95,23 +104,22 @@ internal static unsafe partial class LibC
         public ushort sun_family;
         public fixed byte sun_path[108];
 
-        /// <summary>
-        /// Fill in an abstract-namespace address for <paramref name="name"/> and
-        /// return the exact address length bind() expects: family + leading NUL +
-        /// the name bytes (ASCII).
-        /// </summary>
-        public static uint InitAbstract(SockAddrUn* addr, string name)
+        public static uint Init(SockAddrUn* addr, string name)
         {
             *addr = default;
-            addr->sun_family = LibC.AF_UNIX;
-            // sun_path[0] stays NUL (the abstract marker); name starts at [1].
+            addr->sun_family = AF_UNIX;
+
             for (int i = 0; i < name.Length; i++)
-                addr->sun_path[1 + i] = (byte)name[i];
-            return (uint)(sizeof(ushort) + 1 + name.Length);
+            {
+                // interpret @abc as abstract
+                addr->sun_path[i] = (byte)(i is 0 & name[i] is '@' ? '\0' : name[i]);
+            }
+
+            return (uint)(sizeof(ushort) + name.Length);
         }
     }
-
-    // =========================================================================
+    
+        // =========================================================================
     // Raw Linux x86_64 Syscall Numbers (Bypasses glibc version tracking)
     // =========================================================================
     public const int SYS_io_uring_setup = 425;
@@ -154,23 +162,7 @@ internal static unsafe partial class LibC
     [SuppressGCTransition]
     [LibraryImport("libc", EntryPoint = "munmap", SetLastError = true)]
     public static partial int munmap(void* addr, nuint length);
-
-    [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
-    public static partial int close(int fd);
-
-    [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "eventfd", SetLastError = true)]
-    public static partial int eventfd(uint initval, int flags);
-
-    [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "write", SetLastError = true)]
-    public static partial nint write(int fd, void* buf, nuint count);
-
-    [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "read", SetLastError = true)]
-    public static partial nint read(int fd, void* buf, nuint count);
-
+    
     // =========================================================================
     // Shared Kernel Opcode and Flag Configuration Constants
     // =========================================================================

@@ -347,7 +347,7 @@ internal sealed unsafe class EchoServer : IDisposable
         // by every socket accept() returns from this listener.
         LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
 
-        var addr = new SockAddrIn
+        var addr = new LibC.SockAddrIn
         {
             sin_family = LibC.AF_INET,
             sin_port = LibC.Htons((ushort)port),
@@ -369,8 +369,8 @@ internal sealed unsafe class EchoServer : IDisposable
         // No SO_REUSEPORT/REUSEADDR: an abstract address is freed as soon as the
         // last holder closes, so there is nothing to reuse or clean up. No
         // TCP_NODELAY either — AF_UNIX has no Nagle.
-        SockAddrUn addr;
-        uint len = SockAddrUn.InitAbstract(&addr, name);
+        LibC.SockAddrUn addr;
+        uint len = LibC.SockAddrUn.InitAbstract(&addr, name);
         if (LibC.bind(fd, &addr, len) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), $"bind(AF_UNIX) failed for shard {shard}");
         if (LibC.listen(fd, 512) < 0)

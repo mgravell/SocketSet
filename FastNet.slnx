@@ -1,8 +1,10 @@
 <Solution>
   <Folder Name="/bench/">
     <Project Path="bench/Bench.csproj" />
+    <Project Path="SmokeTest/SmokeTest.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/FastNet/FastNet.csproj" />
+    <Project Path="src/SocketSet/SocketSet.csproj" />
   </Folder>
 </Solution>

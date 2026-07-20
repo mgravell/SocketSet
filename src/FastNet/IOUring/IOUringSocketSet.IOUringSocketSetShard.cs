@@ -1,4 +1,5 @@
-﻿using System.Runtime.InteropServices;using FastNet.IOUring;
+﻿/*
+using System.Runtime.InteropServices;using FastNet.IOUring;
 using FastNet.Native;
 using static FastNet.Native.LibUring;
 namespace FastNet.IOUring;
@@ -72,3 +73,4 @@ internal sealed unsafe partial class IOUringSocketSet : SocketSet
         }
     }
 }
+*/
