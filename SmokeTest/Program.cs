@@ -8,6 +8,8 @@ bool server = false;
 int clientCount = 0;
 int seconds = 0; // 0 == run until Ctrl+C
 string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespace)
+int size = 512; // ping-pong message size
+var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
 {
     switch (args[i])
@@ -25,23 +27,48 @@ for (int i = 0; i < args.Length; i++)
         case ("-u" or "--uds") when i + 1 < args.Length:
             uds = args[i + 1];
             break;
+        case ("-z" or "--size") when i + 1 < args.Length && int.TryParse(args[i + 1], out var sz):
+            size = sz;
+            break;
+        case ("-n" or "--shards") when i + 1 < args.Length && int.TryParse(args[i + 1], out var sh):
+            options.Shards = sh;
+            break;
+        case ("-p" or "--pin") when i + 1 < args.Length && bool.TryParse(args[i + 1], out var pin):
+            options.PinWorkerThreads = pin;
+            break;
+        case ("-e" or "--entries") when i + 1 < args.Length && int.TryParse(args[i + 1], out var ent):
+            options.EntriesPerShard = ent;
+            break;
     }
 }
 
 if (!server && clientCount == 0)
 {
-    Console.WriteLine("usage: SmokeTest -s [-c N] [-t seconds] [-u name]");
+    Console.WriteLine("usage: SmokeTest -s [-c N] [-t seconds] [-u name] [-z bytes] [-n shards] [-p true|false]");
     Console.WriteLine("  -s / --server     run the echo server");
     Console.WriteLine("  -c / --client N   open N client connections that ping-pong");
     Console.WriteLine("  -t / --seconds S  stop after S seconds (default: run until Ctrl+C)");
     Console.WriteLine("  -u / --uds name   use a Unix domain socket (e.g. @foo for abstract) instead of TCP");
+    Console.WriteLine("  -z / --size N     ping-pong message size in bytes (default 512)");
+    Console.WriteLine("  -n / --shards N   number of shards / worker threads (default 4)");
+    Console.WriteLine("  -p / --pin B      pin worker threads to CPUs, true|false (default true)");
+    Console.WriteLine("  -e / --entries N  io_uring SQ entries per shard (default 4096; lower if RLIMIT_MEMLOCK is tight)");
     return;
+}
+
+if (size > options.BufferPageSize)
+{
+    // The response rides in a single read/write buffer page; keep the demo honest.
+    Console.WriteLine($"note: clamping --size {size} to buffer page size {options.BufferPageSize}");
+    size = options.BufferPageSize;
 }
 
 EndPoint endpoint = uds is null
     ? new IPEndPoint(IPAddress.Loopback, 10000)
     : new UnixDomainSocketEndPoint(uds);
-using var set = new EchoServer(new SocketSetOptions());
+using var set = new EchoServer(options) { GreetingSize = size };
+Console.WriteLine(
+    $"transport={(uds is null ? "tcp" : "uds")} size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
 
 if (server)
 {

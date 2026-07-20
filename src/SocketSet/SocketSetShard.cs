@@ -49,6 +49,9 @@ public abstract class SocketSetShard
         }
         catch (Exception ex)
         {
+            // A shard dying (e.g. io_uring_setup ENOMEM under RLIMIT_MEMLOCK) must never
+            // be silent: a dead shard silently drops any work routed to it.
+            Console.Error.WriteLine($"[shard {_shard} FAULTED] {ex.Message}");
             try
             {
                 _parent?.OnWorkerFaulted(ex);

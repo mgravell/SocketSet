@@ -73,7 +73,6 @@ internal sealed class IoUringShard : SocketSetShard
 
     // Bound listener fd -> the default UserToken to seed into each AcceptContext.
     private readonly ConcurrentDictionary<int, object?> _listeners = new();
-    private uint _unsubmittedCount;
 
     public unsafe IoUringShard(SocketSetOptions options)
     {
@@ -259,8 +258,7 @@ internal sealed class IoUringShard : SocketSetShard
         // pending queue rather than fault — it is drained at the top of every loop
         // iteration, once io_uring_enter has freed SQ slots. Loop-thread only, but
         // _pending is concurrent so the enqueue is safe regardless.
-        if (_ring.TryPush(sqe)) _unsubmittedCount++;
-        else _pending.Enqueue(sqe);
+        if (!_ring.TryPush(sqe)) _pending.Enqueue(sqe);
     }
 
     private unsafe void ArmWake()
@@ -370,12 +368,15 @@ internal sealed class IoUringShard : SocketSetShard
 
                 // Fold any cross-thread submissions into the ring.
                 if (!_pending.IsEmpty)
-                    _unsubmittedCount += _ring.Push(_pending);
+                    _ring.Push(_pending);
 
-                // Submit everything queued and block until at least one completion.
+                // Submit everything currently in the SQ and block until at least one
+                // completion. to_submit is read live from the ring (SqTail - SqHead) so
+                // it always matches exactly what is unconsumed — no hand-tracked counter
+                // to drift and strand SQEs unsubmitted.
                 int res = LibC.io_uring_enter_blocking(
                     LibC.SYS_io_uring_enter, _ring.RingFd,
-                    to_submit: _unsubmittedCount, min_complete: 1,
+                    to_submit: _ring.SqReady, min_complete: 1,
                     flags: LibC.IORING_ENTER_GETEVENTS, sig: null, sigsz: 0);
 
                 if (res < 0)
@@ -390,10 +391,6 @@ internal sealed class IoUringShard : SocketSetShard
                         default:
                             throw new InvalidOperationException($"io_uring_enter failed: errno {err}");
                     }
-                }
-                else
-                {
-                    _unsubmittedCount -= (uint)res;
                 }
 
                 ProcessAvailableCompletions();
@@ -525,6 +522,7 @@ internal sealed class IoUringShard : SocketSetShard
         }
         else
         {
+            if (res != 0) Console.Error.WriteLine($"[connect fail] slot={slot} fd={fd} res={res}");
             CloseClient(slot);
         }
     }

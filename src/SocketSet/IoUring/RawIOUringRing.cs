@@ -33,7 +33,7 @@ internal readonly unsafe struct RawIOUringRing : IDisposable
         // Configure the kernel flags for isolated thread execution
         p.flags = LibC.IORING_SETUP_SINGLE_ISSUER | LibC.IORING_SETUP_DEFER_TASKRUN;
         nint fd = LibC.io_uring_setup(LibC.SYS_io_uring_setup, entries, &p);
-        if (fd < 0) throw new InvalidOperationException("Failed io_uring_setup");
+        if (fd < 0) throw new InvalidOperationException($"Failed io_uring_setup (errno {Marshal.GetLastPInvokeError()})");
         RingFd = (int)fd;
 
         const int PROT_READ = 0x1;
@@ -124,6 +124,11 @@ internal readonly unsafe struct RawIOUringRing : IDisposable
         Volatile.Write(ref *SqTail, tail);
         return count;
     }
+
+    /// <summary>Number of SQEs written but not yet consumed by the kernel — the exact
+    /// value to pass as io_uring_enter's to_submit. Derived from the ring, so it can't
+    /// drift the way a hand-maintained counter can.</summary>
+    public uint SqReady => *SqTail - Volatile.Read(ref *SqHead);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsSubmissionQueueFull() => *SqTail - Volatile.Read(ref *SqHead) >= (SqMask + 1);
