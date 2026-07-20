@@ -282,14 +282,36 @@ public abstract partial class SocketSet : IDisposable
         public void CloseInput() => _flags |= SocketFlags.ReceiveClosed;
     }
 
-    /// <summary>Indicates that a write has completed. The implementation will handle partial
-    /// writes internally, so this indicates a complete write.</summary>
-    protected internal ref struct WriteContext(SocketFlags flags, object? userToken)
+    /// <summary>
+    /// Indicates that a write has <em>fully</em> completed (implementations coalesce partial
+    /// writes, so this never fires for a partial). To pipeline — keep the write pipe full
+    /// without waiting for a reply — write the next payload into <see cref="SendBuffer"/> and
+    /// set <see cref="SendBytes"/>; the implementation sends it immediately, reusing the just
+    /// freed buffer. Still one write in flight per connection: the next is issued only once
+    /// this one has completed.
+    /// </summary>
+    protected internal unsafe ref struct WriteContext(SocketFlags flags, object? userToken, byte* buffer, int bufferLength)
     {
+        private readonly byte* _buffer = buffer;
+        private readonly int _bufferLength = bufferLength;
         private SocketFlags _flags = flags;
 
         /// <summary>The object associated with the socket.</summary>
         public object? UserToken { get; set; } = userToken;
+
+        /// <summary>The buffer just written, now free; write the next payload here to pipeline.</summary>
+        public readonly Span<byte> SendBuffer => new(_buffer, _bufferLength);
+
+        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send next. 0 = send nothing.</summary>
+        public int SendBytes
+        {
+            get => field;
+            set
+            {
+                if (value < 0 | value > _bufferLength) throw new ArgumentOutOfRangeException(nameof(SendBytes));
+                field = value;
+            }
+        }
 
         public readonly SocketFlags Flags => _flags;
 

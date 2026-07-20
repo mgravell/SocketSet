@@ -8,7 +8,8 @@ bool server = false;
 int clientCount = 0;
 int seconds = 0; // 0 == run until Ctrl+C
 string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespace)
-int size = 512; // ping-pong message size
+int size = 512; // message size
+bool pipeline = false; // false = ping/pong (latency), true = pipeline (throughput)
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
@@ -47,6 +48,9 @@ for (int i = 0; i < args.Length; i++)
         case "--managed":
             options.Factory = SocketSetFactory.Managed;
             break;
+        case "--pipeline":
+            pipeline = true;
+            break;
     }
 }
 
@@ -63,6 +67,7 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -e / --entries N  io_uring SQ entries per shard (default 4096; lower if RLIMIT_MEMLOCK is tight)");
     Console.WriteLine("  -m / --managed    force the portable managed-socket fallback (default auto-detects)");
     Console.WriteLine("  --cpus SPEC       pin this process to CPUs (e.g. 0-5 or 0,2,4) — covers shards, thread pool and GC");
+    Console.WriteLine("  --pipeline        client sends the next msg on write-complete (throughput) vs on echo (latency)");
     return;
 }
 
@@ -108,10 +113,10 @@ endpoint = uds is null ? new IPEndPoint(IPAddress.Loopback, 10000) : new UnixDom
 if (uds is not null) Console.WriteLine("note: UDS not supported on this target framework; falling back to TCP");
 endpoint = new IPEndPoint(IPAddress.Loopback, 10000);
 #endif
-using var set = new EchoServer(options) { GreetingSize = size };
+using var set = new EchoServer(options) { GreetingSize = size, Pipeline = pipeline };
 Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +
-    $"size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
+    $"mode={(pipeline ? "pipeline" : "ping/pong")} size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
 
 if (server)
 {

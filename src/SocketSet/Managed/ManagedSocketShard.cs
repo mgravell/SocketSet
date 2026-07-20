@@ -92,7 +92,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             }
 
             if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) PumpReceive(conn);
-            if (sendBytes > 0) QueueSend(conn, conn.SendBuffer, sendBytes);
+            if (sendBytes > 0) BeginSend(conn, conn.SendBuffer, sendBytes);
         }
 
         return true;
@@ -145,7 +145,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         args.Dispose(); // connect SAEA no longer needed
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) PumpReceive(conn);
-        if (sendBytes > 0) QueueSend(conn, conn.SendBuffer, sendBytes);
+        if (sendBytes > 0) BeginSend(conn, conn.SendBuffer, sendBytes);
     }
 
     // =====================================================================
@@ -186,9 +186,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             response = ctx.ResponseBytes;
         }
 
-        // QueueSend copies the reply out, so it's safe to re-arm the receive afterwards.
+        // BeginSend copies the reply into the send buffer, so re-arming the receive
+        // (which reuses RecvBuffer) afterwards is safe.
         if (response > 0)
-            QueueSend(conn, conn.RecvBuffer, response);
+            BeginSend(conn, conn.RecvBuffer, response);
 
         return (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0;
     }
@@ -197,19 +198,29 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Send (serialized per connection, with partial-write handling)
     // =====================================================================
 
-    /// <summary>Copy <paramref name="length"/> bytes from <paramref name="source"/> and
-    /// enqueue them for sending. Safe to call from any completion thread; the send is
-    /// serialized per connection so a SAEA is never reused mid-flight and the byte stream
-    /// keeps its order.</summary>
-    private void QueueSend(Connection conn, byte[] source, int length)
+    /// <summary>Begin (or queue) a send of <paramref name="length"/> bytes from
+    /// <paramref name="source"/>. When the connection is idle we reuse its scratch buffer —
+    /// no per-send allocation — copying only if the source isn't already that buffer. Only a
+    /// genuine overlap (a new send requested while one is in flight) allocates, to preserve
+    /// ordering. Sends stay serialized: one SAEA operation in flight at a time.</summary>
+    private void BeginSend(Connection conn, byte[] source, int length)
     {
-        var data = new byte[length];
-        Buffer.BlockCopy(source, 0, data, 0, length);
         lock (conn.SendGate)
         {
-            conn.SendQueue.Enqueue(data);
-            if (conn.SendInFlight) return; // the active chain will drain it
+            if (conn.SendInFlight)
+            {
+                var copy = new byte[length];
+                Buffer.BlockCopy(source, 0, copy, 0, length);
+                conn.Overflow.Enqueue(copy);
+                return;
+            }
+
             conn.SendInFlight = true;
+            if (!ReferenceEquals(source, conn.SendBuffer))
+                Buffer.BlockCopy(source, 0, conn.SendBuffer, 0, length);
+            conn.CurrentBuffer = conn.SendBuffer;
+            conn.CurrentLength = length;
+            conn.SendOffset = 0;
         }
         PumpSend(conn);
     }
@@ -217,10 +228,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Async send completion (from ConnArgs.OnCompleted).
     private void AdvanceSend(Connection conn)
     {
-        var args = conn.SendArgs;
-        if (args.SocketError != SocketError.Success) { Close(conn); return; }
-        conn.SendOffset += args.BytesTransferred;
-        if (conn.CurrentSend is { } data && conn.SendOffset >= data.Length) CompleteCurrentSend(conn);
+        if (conn.SendArgs.SocketError != SocketError.Success) { Close(conn); return; }
+        conn.SendOffset += conn.SendArgs.BytesTransferred;
+        if (conn.SendOffset >= conn.CurrentLength && !CompleteAndAdvance(conn)) return;
         PumpSend(conn);
     }
 
@@ -228,18 +238,8 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     {
         while (true)
         {
-            if (conn.CurrentSend is null)
-            {
-                lock (conn.SendGate)
-                {
-                    if (conn.SendQueue.Count == 0) { conn.SendInFlight = false; return; }
-                    conn.CurrentSend = conn.SendQueue.Dequeue();
-                    conn.SendOffset = 0;
-                }
-            }
-
-            var data = conn.CurrentSend;
-            conn.SendArgs.SetBuffer(data, conn.SendOffset, data.Length - conn.SendOffset);
+            var data = conn.CurrentBuffer!;
+            conn.SendArgs.SetBuffer(data, conn.SendOffset, conn.CurrentLength - conn.SendOffset);
             bool pending;
             try { pending = conn.Socket.SendAsync(conn.SendArgs); }
             catch (ObjectDisposedException) { return; }
@@ -247,17 +247,54 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
             if (conn.SendArgs.SocketError != SocketError.Success) { Close(conn); return; }
             conn.SendOffset += conn.SendArgs.BytesTransferred;
-            if (conn.SendOffset >= data.Length) CompleteCurrentSend(conn);
+            if (conn.SendOffset >= conn.CurrentLength && !CompleteAndAdvance(conn)) return;
         }
     }
 
-    private void CompleteCurrentSend(Connection conn)
+    /// <summary>One app-requested write finished: fire OnWrite (which may pipeline the next
+    /// straight into the scratch buffer), then pick what to send next.</summary>
+    /// <returns>true if another buffer is queued (CurrentBuffer set), false if now idle.</returns>
+    private bool CompleteAndAdvance(Connection conn)
     {
-        conn.CurrentSend = null;
-        var ctx = new SocketSet.WriteContext(conn.Flags, conn.UserToken);
-        Parent.OnWrite(ref ctx);
-        conn.UserToken = ctx.UserToken;
-        conn.Flags = ctx.Flags;
+        int next;
+        fixed (byte* buf = conn.SendBuffer)
+        {
+            var ctx = new SocketSet.WriteContext(conn.Flags, conn.UserToken, buf, conn.SendBuffer.Length);
+            Parent.OnWrite(ref ctx);
+            conn.UserToken = ctx.UserToken;
+            conn.Flags = ctx.Flags;
+            next = ctx.SendBytes;
+        }
+
+        lock (conn.SendGate)
+        {
+            if (conn.Overflow.Count > 0)
+            {
+                // Earlier-queued responses go first; a pipelined write joins the tail.
+                if (next > 0)
+                {
+                    var copy = new byte[next];
+                    Buffer.BlockCopy(conn.SendBuffer, 0, copy, 0, next);
+                    conn.Overflow.Enqueue(copy);
+                }
+                conn.CurrentBuffer = conn.Overflow.Dequeue();
+                conn.CurrentLength = conn.CurrentBuffer.Length;
+                conn.SendOffset = 0;
+                return true;
+            }
+
+            if (next > 0)
+            {
+                conn.CurrentBuffer = conn.SendBuffer; // reuse the scratch — no allocation
+                conn.CurrentLength = next;
+                conn.SendOffset = 0;
+                return true;
+            }
+
+            conn.SendInFlight = false;
+            conn.CurrentBuffer = null;
+            return false;
+        }
     }
 
     // =====================================================================
@@ -389,11 +426,14 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
         // Sends are serialized per connection: a SAEA can't be reused mid-flight, and
         // concurrent sends on one socket could reorder the byte stream. Only one SendAsync
-        // is ever outstanding; CurrentSend/SendOffset belong to that single active chain.
+        // is ever outstanding. The steady state reuses SendBuffer (CurrentBuffer points at
+        // it); Overflow holds copies only for the rare case of a send requested while one is
+        // already in flight. CurrentBuffer/CurrentLength/SendOffset belong to the active chain.
         public readonly object SendGate = new();
         public bool SendInFlight;
-        public readonly Queue<byte[]> SendQueue = new();
-        public byte[]? CurrentSend;
+        public readonly Queue<byte[]> Overflow = new();
+        public byte[]? CurrentBuffer;
+        public int CurrentLength;
         public int SendOffset;
 
         public Connection(ManagedSocketShard shard, Socket socket, int bufferSize)

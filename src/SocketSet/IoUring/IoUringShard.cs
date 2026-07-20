@@ -599,22 +599,45 @@ internal sealed class IoUringShard : SocketSetShard
             return;
         }
 
-        _writeBuffer.Release(writeIndex);
-
         if (ws.Sent < ws.Total)
         {
             // res == 0 with bytes still outstanding: treat as a dead peer.
+            _writeBuffer.Release(writeIndex);
             CloseClient(slot);
             return;
         }
 
-        if (GetFd(slot) != 0)
+        int fd = GetFd(slot);
+        if (fd == 0) { _writeBuffer.Release(writeIndex); return; }
+
+        // Full write completed. Offer the now-free buffer to OnWrite: a handler can pipeline
+        // the next message straight back into it (no release/re-lease). Only if it declines
+        // do we hand the buffer back to the pool.
+        byte* wp = _writeBuffer.Address(writeIndex);
+        object? token = Volatile.Read(ref _userTokens[slot - 1]);
+        var ctx = new SocketSet.WriteContext(GetFlags(slot), token, wp, _writeBuffer.BufferSize);
+        Parent.OnWrite(ref ctx);
+        Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
+        _slotFlags[slot - 1] = (byte)ctx.Flags;
+
+        int next = ctx.SendBytes;
+        if (next > 0)
         {
-            object? token = Volatile.Read(ref _userTokens[slot - 1]);
-            var ctx = new SocketSet.WriteContext(GetFlags(slot), token);
-            Parent.OnWrite(ref ctx);
-            Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
-            _slotFlags[slot - 1] = (byte)ctx.Flags;
+            _writeState[writeIndex] = new WriteState { Slot = slot, Fd = fd, Sent = 0, Total = next };
+            var sqe = new LibC.io_uring_sqe
+            {
+                opcode = LibC.IORING_OP_SEND,
+                fd = fd,
+                addr = (ulong)wp,
+                len = (uint)next,
+                user_data = Pack(Op.Send, slot, (uint)writeIndex),
+            };
+            sqe.rw_flags.rw_flags = LibC.MSG_NOSIGNAL;
+            Submit(sqe);
+        }
+        else
+        {
+            _writeBuffer.Release(writeIndex);
         }
     }
 
