@@ -4,6 +4,9 @@ using System.Net.Sockets;
 using SmokeTest;
 using SocketSets;
 
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+    Console.Error.WriteLine("### UNHANDLED ###\n" + e.ExceptionObject);
+
 bool server = false;
 int clientCount = 0;
 int seconds = 0; // 0 == run until Ctrl+C
@@ -94,7 +97,7 @@ static void PinToCpus(string spec)
     try
     {
         using var proc = Process.GetCurrentProcess();
-#pragma warning disable CA1416 - checked
+#pragma warning disable CA1416 // checked
         proc.ProcessorAffinity = (IntPtr)mask;
 #pragma warning restore CA1416
         Console.WriteLine($"pinned to CPUs {spec} (mask 0x{mask:x})");

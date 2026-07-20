@@ -156,10 +156,15 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     {
         while (true)
         {
-            conn.RecvArgs.SetBuffer(conn.RecvBuffer, 0, _bufferSize);
             bool pending;
-            try { pending = conn.Socket.ReceiveAsync(conn.RecvArgs); }
-            catch (ObjectDisposedException) { return; }
+            try
+            {
+                // SetBuffer is inside the guard too: a concurrent Close can dispose the
+                // socket between iterations, and touching it must fail gracefully, not throw.
+                conn.RecvArgs.SetBuffer(conn.RecvBuffer, 0, _bufferSize);
+                pending = conn.Socket.ReceiveAsync(conn.RecvArgs);
+            }
+            catch (ObjectDisposedException) { return; } // connection closed under us
             if (pending) return;               // ConnArgs.OnCompleted will fire
             if (!ProcessReceive(conn)) return; // synchronous completion; loop unless stopping
         }
@@ -239,10 +244,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         while (true)
         {
             var data = conn.CurrentBuffer!;
-            conn.SendArgs.SetBuffer(data, conn.SendOffset, conn.CurrentLength - conn.SendOffset);
             bool pending;
-            try { pending = conn.Socket.SendAsync(conn.SendArgs); }
-            catch (ObjectDisposedException) { return; }
+            try
+            {
+                conn.SendArgs.SetBuffer(data, conn.SendOffset, conn.CurrentLength - conn.SendOffset);
+                pending = conn.Socket.SendAsync(conn.SendArgs);
+            }
+            catch (ObjectDisposedException) { return; } // connection closed under us
             if (pending) return; // ConnArgs.OnCompleted resumes the chain
 
             if (conn.SendArgs.SocketError != SocketError.Success) { Close(conn); return; }
@@ -313,8 +321,11 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         if (!_connections.TryRemove(conn, out _)) return; // already closed
         try { conn.Socket.Shutdown(SocketShutdown.Both); } catch { /* best effort */ }
         SafeDispose(conn.Socket);
-        conn.RecvArgs.Dispose();
-        conn.SendArgs.Dispose();
+        // Deliberately do NOT dispose RecvArgs/SendArgs here: a receive or send may still be
+        // in flight, and disposing a SocketAsyncEventArgs with a pending operation makes that
+        // operation's completion throw ObjectDisposedException on a thread-pool thread — an
+        // unhandled crash. Disposing the socket aborts the pending ops; the SAEAs are then
+        // unreferenced and reclaimed by GC (their finalizer frees the native resources).
     }
 
     private static void MaybeNoDelay(Socket s)
@@ -401,14 +412,24 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
         protected override void OnCompleted(SocketAsyncEventArgs e)
         {
-            switch (LastOperation)
+            // Backstop: completions run on thread-pool threads, so any exception escaping
+            // here is an unhandled process-level crash. A connection torn down mid-flight
+            // can still surface a disposed-object error; swallow it and close cleanly.
+            try
             {
-                case SocketAsyncOperation.Receive:
-                    if (Shard.ProcessReceive(Conn)) Shard.PumpReceive(Conn);
-                    break;
-                case SocketAsyncOperation.Send:
-                    Shard.AdvanceSend(Conn);
-                    break;
+                switch (LastOperation)
+                {
+                    case SocketAsyncOperation.Receive:
+                        if (Shard.ProcessReceive(Conn)) Shard.PumpReceive(Conn);
+                        break;
+                    case SocketAsyncOperation.Send:
+                        Shard.AdvanceSend(Conn);
+                        break;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                Shard.Close(Conn);
             }
         }
     }
