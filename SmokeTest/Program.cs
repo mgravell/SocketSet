@@ -9,7 +9,7 @@ int clientCount = 0;
 int seconds = 0; // 0 == run until Ctrl+C
 string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespace)
 int size = 512; // message size
-bool pipeline = false; // false = ping/pong (latency), true = pipeline (throughput)
+int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.MaxValue = unbounded
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
@@ -49,7 +49,10 @@ for (int i = 0; i < args.Length; i++)
             options.Factory = SocketSetFactory.Managed;
             break;
         case "--pipeline":
-            pipeline = true;
+            window = int.MaxValue; // unbounded (deadlock-prone on a symmetric echo — for comparison)
+            break;
+        case "--window" when i + 1 < args.Length && int.TryParse(args[i + 1], out var w):
+            window = Math.Max(1, w);
             break;
     }
 }
@@ -67,7 +70,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -e / --entries N  io_uring SQ entries per shard (default 4096; lower if RLIMIT_MEMLOCK is tight)");
     Console.WriteLine("  -m / --managed    force the portable managed-socket fallback (default auto-detects)");
     Console.WriteLine("  --cpus SPEC       pin this process to CPUs (e.g. 0-5 or 0,2,4) — covers shards, thread pool and GC");
-    Console.WriteLine("  --pipeline        client sends the next msg on write-complete (throughput) vs on echo (latency)");
+    Console.WriteLine("  --window N        client keeps up to N messages in flight (1=ping/pong default, N=bounded pipeline)");
+    Console.WriteLine("  --pipeline        unbounded in-flight (throughput, but can wedge a symmetric echo; use --window instead)");
     return;
 }
 
@@ -90,7 +94,9 @@ static void PinToCpus(string spec)
     try
     {
         using var proc = Process.GetCurrentProcess();
+#pragma warning disable CA1416 - checked
         proc.ProcessorAffinity = (IntPtr)mask;
+#pragma warning restore CA1416
         Console.WriteLine($"pinned to CPUs {spec} (mask 0x{mask:x})");
     }
     catch (Exception ex)
@@ -113,10 +119,11 @@ endpoint = uds is null ? new IPEndPoint(IPAddress.Loopback, 10000) : new UnixDom
 if (uds is not null) Console.WriteLine("note: UDS not supported on this target framework; falling back to TCP");
 endpoint = new IPEndPoint(IPAddress.Loopback, 10000);
 #endif
-using var set = new EchoServer(options) { GreetingSize = size, Pipeline = pipeline };
+using var set = new EchoServer(options) { GreetingSize = size, Window = window };
+string mode = window == 1 ? "ping/pong" : window == int.MaxValue ? "pipeline(unbounded)" : $"pipeline(window={window})";
 Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +
-    $"mode={(pipeline ? "pipeline" : "ping/pong")} size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
+    $"mode={mode} size={size} shards={options.Shards} pin={options.PinWorkerThreads}");
 
 if (server)
 {

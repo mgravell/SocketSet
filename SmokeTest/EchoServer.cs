@@ -4,77 +4,123 @@ namespace SmokeTest;
 
 public class EchoServer(SocketSetOptions options) : SocketSet(options)
 {
-    /// <summary>Size of the initial payload a client fires on connect to start the exchange.</summary>
+    /// <summary>Fixed message size the client sends.</summary>
     public int GreetingSize { get; set; } = 512;
 
     /// <summary>
-    /// false (default): ping/pong — the client sends the next message only after receiving the
-    /// echo (latency-bound). true: pipeline — the client sends the next as soon as the previous
-    /// write completes, without waiting for the reply (throughput-bound; models a multiplexed
-    /// client such as SE.Redis).
+    /// Client send window: how many messages may be outstanding (sent, not yet echoed back).
+    /// 1 = ping/pong (latency-bound). N = bounded pipeline (keeps up to N in flight without
+    /// waiting for each reply). int.MaxValue = unbounded pipeline (throughput, but a symmetric
+    /// echo can saturate socket buffers and wedge — that's the point of bounding it).
     /// </summary>
-    public bool Pipeline { get; set; }
+    public int Window { get; set; } = 1;
 
     private long _echoed;      // bytes echoed by the server side
-    private long _roundTrip;   // bytes received back by the client side (a completed round trip)
+    private long _roundTrip;   // bytes received back by the client side
     private long _connected;
 
     public long Echoed => Interlocked.Read(ref _echoed);
     public long RoundTripBytes => Interlocked.Read(ref _roundTrip);
     public long Connected => Interlocked.Read(ref _connected);
 
-    // No OnAccept override: accepted sockets inherit the default token passed to
-    // Listen (ServerToken), which is all the server needs to recognise them.
-
     protected override void OnConnect(ref ConnectContext ctx)
     {
         Interlocked.Increment(ref _connected);
-        ctx.UserToken = new Client();
+        var client = new Client(Window, GreetingSize);
+        ctx.UserToken = client;
 
-        // Kick off the exchange: write a greeting into the library-owned buffer and
-        // ask for it to be sent as soon as the connection is established.
-        var buffer = ctx.SendBuffer;
-        int n = Math.Min(GreetingSize, buffer.Length);
-        buffer.Slice(0, n).Fill((byte)'x');
-        ctx.SendBytes = n;
+        // Prime the pipe with the first message.
+        int n = client.Writable();
+        if (n > 0)
+        {
+            ctx.SendBuffer.Slice(0, n).Fill((byte)'x');
+            ctx.SendBytes = n;
+        }
     }
 
     protected override void OnReceive(ref ReceiveContext ctx)
     {
         if (ReferenceEquals(ctx.UserToken, ServerToken))
         {
-            // Server: echo the payload straight back (data is already in the buffer).
+            // Server: echo straight back (data already in the buffer).
             Interlocked.Add(ref _echoed, ctx.PayloadBytes);
             ctx.ResponseBytes = ctx.PayloadBytes;
         }
         else if (ctx.UserToken is Client client)
         {
-            // Client: count the round trip. In ping/pong, bounce it back to drive the next
-            // exchange; in pipeline mode, sends are driven by OnWrite instead.
-            client.OnReceived(ctx.PayloadBytes);
+            // Client: count the reply, then — if the write pipe went idle at the window
+            // limit — restart it now that a slot has freed. (Racy with OnWrite; Client locks.)
             Interlocked.Add(ref _roundTrip, ctx.PayloadBytes);
-            if (!Pipeline) ctx.ResponseBytes = ctx.PayloadBytes;
+            int n = client.Replied(ctx.PayloadBytes);
+            if (n > 0)
+            {
+                ctx.RawBuffer.Slice(0, n).Fill((byte)'x');
+                ctx.ResponseBytes = n;
+            }
         }
     }
 
     protected override void OnWrite(ref WriteContext ctx)
     {
-        // Pipeline mode only: as soon as a client write completes, send the next message —
-        // don't wait for the echo. The server never self-drives; it echoes on receive.
-        if (Pipeline && ctx.UserToken is Client)
+        // Client only: on write-complete, send the next message if the window has room.
+        if (ctx.UserToken is Client client)
         {
-            var buffer = ctx.SendBuffer;
-            int n = Math.Min(GreetingSize, buffer.Length);
-            buffer.Slice(0, n).Fill((byte)'x');
-            ctx.SendBytes = n;
+            int n = client.Writable();
+            if (n > 0)
+            {
+                ctx.SendBuffer.Slice(0, n).Fill((byte)'x');
+                ctx.SendBytes = n;
+            }
         }
     }
 
-    public class Client
+    /// <summary>
+    /// Per-connection send-window bookkeeping. Exactly one write is ever in flight (matching
+    /// the transport), and at most <c>window</c> messages are outstanding on the wire. The
+    /// lock makes the "pipe idle + room → claim a send" decision atomic, so OnWrite (write
+    /// completed) and OnReceive (reply freed a slot) can't both send, nor both stall.
+    /// </summary>
+    public sealed class Client(int window, int size)
     {
-        private int _sent, _received;
-        public void OnSent(int count) => Interlocked.Add(ref _sent, count);
-        public void OnReceived(int count) => Interlocked.Add(ref _received, count);
+        private readonly long _windowBytes = Math.Max(1L, window) * size;
+        private readonly int _size = size;
+        private readonly object _gate = new();
+        private long _outstanding; // bytes sent but not yet echoed back
+        private bool _writeIdle = true;
+
+        /// <summary>The write pipe is free (connect / write-complete). Returns the bytes to
+        /// send next, or 0 to leave the pipe idle at the window limit.</summary>
+        public int Writable()
+        {
+            lock (_gate)
+            {
+                if (_outstanding + _size <= _windowBytes)
+                {
+                    _outstanding += _size;
+                    _writeIdle = false;
+                    return _size;
+                }
+                _writeIdle = true;
+                return 0;
+            }
+        }
+
+        /// <summary>A reply arrived. Returns the bytes to send to refill the pipe if it had
+        /// gone idle and a slot is now free, else 0.</summary>
+        public int Replied(int bytes)
+        {
+            lock (_gate)
+            {
+                _outstanding -= bytes;
+                if (_writeIdle && _outstanding + _size <= _windowBytes)
+                {
+                    _outstanding += _size;
+                    _writeIdle = false;
+                    return _size;
+                }
+                return 0;
+            }
+        }
     }
 
     /// <summary>Default token for server-accepted sockets; passed to <see cref="SocketSet.Listen"/>.</summary>
