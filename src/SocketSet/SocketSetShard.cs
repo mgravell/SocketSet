@@ -56,7 +56,7 @@ public abstract class SocketSetShard
         // side of the build; the netfx fallback doesn't pin.
         if (_parent.Options.PinWorkerThreads && OperatingSystem.IsLinux())
         {
-            LibC.PinCurrentThreadToCpu(_shard % Environment.ProcessorCount);
+            LibC.PinCurrentThreadToNthAllowedCpu(_shard);
         }
 #endif
 

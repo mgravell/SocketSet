@@ -52,6 +52,10 @@ internal static unsafe partial class LibC
     internal static partial int sched_setaffinity(int pid, nuint cpusetsize, void* mask);
 
     [SuppressGCTransition]
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int sched_getaffinity(int pid, nuint cpusetsize, void* mask);
+
+    [SuppressGCTransition]
     [LibraryImport(Lib, EntryPoint = "eventfd", SetLastError = true)]
     public static partial int eventfd(uint initval, int flags);
     
@@ -80,6 +84,39 @@ internal static unsafe partial class LibC
         mask[cpu >> 3] = (byte)(1 << (cpu & 7));
         fixed (byte* p = mask)
             return sched_setaffinity(0, (nuint)SetBytes, p) == 0;
+    }
+
+    /// <summary>
+    /// Pin the calling thread to the <paramref name="index"/>-th CPU within the process's
+    /// <em>current allowed set</em> (from sched_getaffinity), wrapping if there are fewer CPUs
+    /// than shards. This composes with an externally-applied affinity (taskset / --cpus): with
+    /// the process restricted to CPUs 6–11, shard 0 pins to 6, shard 1 to 7, and so on — rather
+    /// than the absolute <c>index % nproc</c>, which would ignore the restriction and collide.
+    /// </summary>
+    internal static bool PinCurrentThreadToNthAllowedCpu(int index)
+    {
+        const int SetBytes = 128;
+        Span<byte> mask = stackalloc byte[SetBytes];
+        mask.Clear();
+        fixed (byte* p = mask)
+        {
+            if (sched_getaffinity(0, (nuint)SetBytes, p) != 0) return false;
+        }
+
+        int allowed = 0;
+        for (int cpu = 0; cpu < SetBytes * 8; cpu++)
+            if ((mask[cpu >> 3] & (1 << (cpu & 7))) != 0) allowed++;
+        if (allowed == 0) return false;
+
+        int target = index % allowed;
+        int chosen = -1, seen = 0;
+        for (int cpu = 0; cpu < SetBytes * 8; cpu++)
+        {
+            if ((mask[cpu >> 3] & (1 << (cpu & 7))) == 0) continue;
+            if (seen++ == target) { chosen = cpu; break; }
+        }
+
+        return PinCurrentThreadToCpu(chosen);
     }
 
     /// <summary>Kernel sockaddr_in (16 bytes), IPv4.</summary>

@@ -25,7 +25,8 @@ internal sealed class IoUringShard : SocketSetShard
         Accept = 1,
         Connect = 2,
         Recv = 3,
-        Send = 4,
+        Send = 4,     // send from a write-pool buffer (aux = write index)
+        SendBid = 5,  // no-copy echo: send straight from a read (provided) buffer (aux = bid)
     }
 
     private struct WriteState
@@ -54,7 +55,10 @@ internal sealed class IoUringShard : SocketSetShard
     private RawIOUringRing _ring;
     private ManagedBufferPool _readBuffer;
     private WriteBufferPool _writeBuffer;
-    private WriteState[] _writeState = [];
+    private WriteState[] _writeState = [];       // per write-pool index (Op.Send)
+    private WriteState[] _bidState = [];         // per bid, for no-copy echoes (Op.SendBid)
+    private int _borrowedBids;                   // read buffers currently held by in-flight writes
+    private int _maxBorrowedBids;                // cap; above it echoes fall back to lease+copy
     private volatile bool _ringReady;
 
     // --- cross-thread wakeup ---
@@ -276,10 +280,14 @@ internal sealed class IoUringShard : SocketSetShard
 
     private void ArmRecv(uint slot, int fd)
     {
+        // Multishot: one SQE yields many recv completions (each selecting a provided buffer),
+        // so we don't re-submit per message. It stays armed while IORING_CQE_F_MORE is set and
+        // must be re-armed only when that clears (error / buffer exhaustion).
         var sqe = new LibC.io_uring_sqe
         {
             opcode = LibC.IORING_OP_RECV,
             fd = fd,
+            ioprio = LibC.IORING_RECV_MULTISHOT,
             len = (uint)_readBuffer.BufferSize,
             flags = LibC.IOSQE_BUFFER_SELECT,
             buf_index = _readBuffer.GroupId, // buf_index aliases buf_group
@@ -298,6 +306,24 @@ internal sealed class IoUringShard : SocketSetShard
             addr = (ulong)data,
             len = (uint)len,
             user_data = Pack(Op.Send, slot, (uint)writeIndex),
+        };
+        sqe.rw_flags.rw_flags = LibC.MSG_NOSIGNAL;
+        Submit(sqe);
+    }
+
+    /// <summary>No-copy echo: send <paramref name="len"/> bytes straight from read buffer
+    /// <paramref name="bid"/>. The buffer stays out of the provided-buffer ring until the send
+    /// completes (see <see cref="HandleSendBid"/>), so the caller must not release it.</summary>
+    private unsafe void SubmitSendBid(uint slot, int fd, ushort bid, int len)
+    {
+        _bidState[bid] = new WriteState { Slot = slot, Fd = fd, Sent = 0, Total = len };
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_SEND,
+            fd = fd,
+            addr = (ulong)_readBuffer.GetBufferAddress(bid),
+            len = (uint)len,
+            user_data = Pack(Op.SendBid, slot, bid),
         };
         sqe.rw_flags.rw_flags = LibC.MSG_NOSIGNAL;
         Submit(sqe);
@@ -330,6 +356,12 @@ internal sealed class IoUringShard : SocketSetShard
         _readBuffer = new ManagedBufferPool(_ring.RingFd, entries: _readPages, bufSize: _readPageSize);
         _writeBuffer = new WriteBufferPool(_writeCount, _writeBufSize);
         _writeState = new WriteState[_writeCount];
+        _bidState = new WriteState[_readPages];
+        // How many read buffers the write path may hold at once. Default (0) = half the pool,
+        // scaling with it. Hard-cap at three-quarters so at least a quarter of the ring always
+        // stays free for receives — starving it triggers -ENOBUFS and multishot re-arm thrash.
+        int cap = Parent.Options.MaxBorrowedReadBuffers;
+        _maxBorrowedBids = Math.Min(cap > 0 ? cap : _readPages / 2, _readPages * 3 / 4);
         _ringReady = true;
     }
 
@@ -442,6 +474,10 @@ internal sealed class IoUringShard : SocketSetShard
                 case Op.Send:
                     HandleSend(res, slot: id, writeIndex: (int)aux);
                     break;
+
+                case Op.SendBid:
+                    HandleSendBid(res, slot: id, bid: (ushort)aux);
+                    break;
             }
         }
 
@@ -537,33 +573,23 @@ internal sealed class IoUringShard : SocketSetShard
     {
         bool hasBuf = (flags & LibC.IORING_CQE_F_BUFFER) != 0;
         ushort bid = (ushort)(flags >> LibC.IORING_CQE_BUFFER_SHIFT);
+        bool more = (flags & LibC.IORING_CQE_F_MORE) != 0;
         int fd = GetFd(slot);
 
         if (res > 0)
         {
-            if (fd != 0)
-            {
-                byte* rp = _readBuffer.GetBufferAddress(bid);
-                object? token = Volatile.Read(ref _userTokens[slot - 1]);
-                var ctx = new SocketSet.ReceiveContext(
-                    GetFlags(slot), token, rp, _readBuffer.BufferSize, res);
-                Parent.OnReceive(ref ctx);
-                Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
-                _slotFlags[slot - 1] = (byte)ctx.Flags;
+            // DeliverReceive may borrow the buffer for a no-copy echo; if so it owns releasing it.
+            bool borrowed = fd != 0 && DeliverReceive(slot, fd, bid, res);
+            if (hasBuf && !borrowed) _readBuffer.ReleaseBuffer(bid);
 
-                int rb = ctx.ResponseBytes;
-                if (rb > 0) SendResponse(slot, fd, rp, rb); // copies out of rp before we release it
-            }
-
-            if (hasBuf) _readBuffer.ReleaseBuffer(bid);
-
-            // Single-shot recv: re-arm unless input was closed or the slot went away.
-            if (GetFd(slot) != 0 && (GetFlags(slot) & SocketSet.SocketFlags.ReceiveClosed) == 0)
+            // Multishot stays armed while F_MORE is set; re-arm only when it clears.
+            if (!more && GetFd(slot) != 0 && (GetFlags(slot) & SocketSet.SocketFlags.ReceiveClosed) == 0)
                 ArmRecv(slot, fd);
         }
         else if (res == -LibC.ENOBUFS)
         {
-            // No buffer was available; nothing was consumed. Re-arm — buffers free up.
+            // Provided-buffer ring was empty, so the multishot ended; re-arm — buffers free as
+            // borrowed ones are returned on send completion.
             if (fd != 0) ArmRecv(slot, fd);
         }
         else
@@ -572,6 +598,33 @@ internal sealed class IoUringShard : SocketSetShard
             if (hasBuf) _readBuffer.ReleaseBuffer(bid);
             CloseClient(slot);
         }
+    }
+
+    /// <summary>Dispatch OnReceive and, if it set a response, send it. Returns true iff the read
+    /// buffer <paramref name="bid"/> was borrowed for an in-flight send (caller must not release it).</summary>
+    private unsafe bool DeliverReceive(uint slot, int fd, ushort bid, int res)
+    {
+        byte* rp = _readBuffer.GetBufferAddress(bid);
+        object? token = Volatile.Read(ref _userTokens[slot - 1]);
+        var ctx = new SocketSet.ReceiveContext(GetFlags(slot), token, rp, _readBuffer.BufferSize, res);
+        Parent.OnReceive(ref ctx);
+        Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
+        _slotFlags[slot - 1] = (byte)ctx.Flags;
+
+        int rb = ctx.ResponseBytes;
+        if (rb <= 0 || (GetFlags(slot) & SocketSet.SocketFlags.SendClosed) != 0) return false;
+
+        if (_borrowedBids < _maxBorrowedBids)
+        {
+            // No-copy echo: send straight from the read buffer, holding it until the send done.
+            _borrowedBids++;
+            SubmitSendBid(slot, fd, bid, rb);
+            return true;
+        }
+
+        // Over the borrow cap: lease+copy so the read-buffer ring keeps draining.
+        SendResponse(slot, fd, rp, rb);
+        return false;
     }
 
     private unsafe void HandleSend(int res, uint slot, int writeIndex)
@@ -643,6 +696,69 @@ internal sealed class IoUringShard : SocketSetShard
         else
         {
             _writeBuffer.Release(writeIndex);
+        }
+    }
+
+    // Completion of a no-copy echo (Op.SendBid). Mirrors HandleSend but the "buffer" is a read
+    // (provided) buffer held out of the ring; on final completion we return it and drop the borrow.
+    private unsafe void HandleSendBid(int res, uint slot, ushort bid)
+    {
+        ref WriteState ws = ref _bidState[bid];
+
+        if (res < 0)
+        {
+            _readBuffer.ReleaseBuffer(bid); _borrowedBids--;
+            CloseClient(slot);
+            return;
+        }
+
+        ws.Sent += res;
+        if (ws.Sent < ws.Total && res > 0)
+        {
+            // Partial: resubmit the remainder from the same read buffer (still borrowed).
+            byte* p = _readBuffer.GetBufferAddress(bid) + ws.Sent;
+            var sqe = new LibC.io_uring_sqe
+            {
+                opcode = LibC.IORING_OP_SEND,
+                fd = ws.Fd,
+                addr = (ulong)p,
+                len = (uint)(ws.Total - ws.Sent),
+                user_data = Pack(Op.SendBid, slot, bid),
+            };
+            sqe.rw_flags.rw_flags = LibC.MSG_NOSIGNAL;
+            Submit(sqe);
+            return;
+        }
+
+        if (ws.Sent < ws.Total)
+        {
+            // res == 0 with bytes outstanding: dead peer.
+            _readBuffer.ReleaseBuffer(bid); _borrowedBids--;
+            CloseClient(slot);
+            return;
+        }
+
+        int fd = GetFd(slot);
+        if (fd == 0) { _readBuffer.ReleaseBuffer(bid); _borrowedBids--; return; }
+
+        // Full echo sent. Fire OnWrite offering the read buffer for a pipelined follow-up (drives
+        // the window state machine); if the handler declines, return the buffer to the ring.
+        byte* rp = _readBuffer.GetBufferAddress(bid);
+        object? token = Volatile.Read(ref _userTokens[slot - 1]);
+        var ctx = new SocketSet.WriteContext(GetFlags(slot), token, rp, _readBuffer.BufferSize);
+        Parent.OnWrite(ref ctx);
+        Volatile.Write(ref _userTokens[slot - 1], ctx.UserToken);
+        _slotFlags[slot - 1] = (byte)ctx.Flags;
+
+        int next = ctx.SendBytes;
+        if (next > 0)
+        {
+            // Keep reusing the same read buffer — still borrowed, no new copy.
+            SubmitSendBid(slot, fd, bid, next);
+        }
+        else
+        {
+            _readBuffer.ReleaseBuffer(bid); _borrowedBids--;
         }
     }
 
