@@ -14,6 +14,7 @@ string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespac
 int size = 512; // message size
 int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.MaxValue = unbounded
 bool poke = false; // server echoes out-of-band via Connection.Send from a background thread
+int verify = 0;    // >0: run the out-of-band Send content-verification harness with this payload size
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 string host = "127.0.0.1"; // client connect target (server always binds Any)
 int port = 10000;
@@ -60,6 +61,9 @@ for (int i = 0; i < args.Length; i++)
         case "--poke":
             poke = true;
             break;
+        case "--verify" when i + 1 < args.Length && int.TryParse(args[i + 1], out var vp):
+            verify = Math.Max(1, vp);
+            break;
         case "--window" when i + 1 < args.Length && int.TryParse(args[i + 1], out var w):
             window = Math.Max(1, w);
             break;
@@ -70,6 +74,33 @@ for (int i = 0; i < args.Length; i++)
             port = pt;
             break;
     }
+}
+
+if (verify > 0)
+{
+    RunVerify(options, verify, port);
+    return;
+}
+
+static void RunVerify(SocketSetOptions opts, int payloadLen, int port)
+{
+    const int seg = 7000; // multi-segment chunk size for the sequence send (straddles page boundaries)
+    using var set = new SendVerify(opts, payloadLen, seg);
+    var ep = new IPEndPoint(IPAddress.Loopback, port);
+    set.Listen(ep);
+    set.Connect(ep);
+    Console.WriteLine($"verify: backend={opts.Factory.GetType().Name} payload={payloadLen} seg={seg} expected={set.Expected}");
+
+    var sw = Stopwatch.StartNew();
+    while (set.ServerConn is null && sw.Elapsed < TimeSpan.FromSeconds(5)) Thread.Sleep(5);
+    if (set.ServerConn is null) { Console.WriteLine("verify: FAIL (no connection accepted)"); return; }
+
+    set.FireSends();
+
+    while (set.Received < set.Expected && sw.Elapsed < TimeSpan.FromSeconds(15)) Thread.Sleep(10);
+
+    bool ok = set.Received == set.Expected && set.Mismatches == 0;
+    Console.WriteLine($"verify: received={set.Received}/{set.Expected} mismatches={set.Mismatches} => {(ok ? "PASS" : "FAIL")}");
 }
 
 if (!server && clientCount == 0)
@@ -90,6 +121,7 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --window N        client keeps up to N messages in flight (1=ping/pong default, N=bounded pipeline)");
     Console.WriteLine("  --pipeline        unbounded in-flight (throughput, but can wedge a symmetric echo; use --window instead)");
     Console.WriteLine("  --poke            server echoes out-of-band via Connection.Send from a background thread");
+    Console.WriteLine("  --verify N        run the out-of-band Send correctness harness with an N-byte payload");
     return;
 }
 

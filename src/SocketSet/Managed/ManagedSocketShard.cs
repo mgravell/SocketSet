@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -208,9 +209,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         {
             if (conn.SendInFlight)
             {
-                var copy = new byte[length];
+                // Overlap: park a copy (pooled) so the in-flight send keeps ordering.
+                var copy = ArrayPool<byte>.Shared.Rent(length);
                 Buffer.BlockCopy(source, 0, copy, 0, length);
-                conn.Overflow.Enqueue(copy);
+                conn.Overflow.Enqueue((copy, length, true));
                 return;
             }
 
@@ -219,6 +221,29 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
                 Buffer.BlockCopy(source, 0, conn.SendBuffer, 0, length);
             conn.CurrentBuffer = conn.SendBuffer;
             conn.CurrentLength = length;
+            conn.CurrentPooled = false;
+            conn.SendOffset = 0;
+        }
+        PumpSend(conn);
+    }
+
+    /// <summary>Send from a caller-provided <paramref name="rented"/> ArrayPool buffer (out-of-band
+    /// path). The send path owns it and returns it to the pool once the write completes. Thread-safe
+    /// (locks the send gate); handles arbitrary sizes since it doesn't reuse the one-page scratch.</summary>
+    private void BeginSendOwned(ManagedConnection conn, byte[] rented, int length)
+    {
+        lock (conn.SendGate)
+        {
+            if (conn.SendInFlight)
+            {
+                conn.Overflow.Enqueue((rented, length, true));
+                return;
+            }
+
+            conn.SendInFlight = true;
+            conn.CurrentBuffer = rented;
+            conn.CurrentLength = length;
+            conn.CurrentPooled = true;
             conn.SendOffset = 0;
         }
         PumpSend(conn);
@@ -258,6 +283,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     /// <returns>true if another buffer is queued (CurrentBuffer set), false if now idle.</returns>
     private bool CompleteAndAdvance(ManagedConnection conn)
     {
+        // The just-finished send is done with its buffer; recycle it if it was pooled.
+        if (conn.CurrentPooled)
+        {
+            ArrayPool<byte>.Shared.Return(conn.CurrentBuffer!);
+            conn.CurrentPooled = false;
+        }
+
         int next;
         fixed (byte* buf = conn.SendBuffer)
         {
@@ -270,15 +302,17 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         {
             if (conn.Overflow.Count > 0)
             {
-                // Earlier-queued responses go first; a pipelined write joins the tail.
+                // Earlier-queued responses go first; a pipelined write joins the tail (pooled).
                 if (next > 0)
                 {
-                    var copy = new byte[next];
+                    var copy = ArrayPool<byte>.Shared.Rent(next);
                     Buffer.BlockCopy(conn.SendBuffer, 0, copy, 0, next);
-                    conn.Overflow.Enqueue(copy);
+                    conn.Overflow.Enqueue((copy, next, true));
                 }
-                conn.CurrentBuffer = conn.Overflow.Dequeue();
-                conn.CurrentLength = conn.CurrentBuffer.Length;
+                var (b, l, pooled) = conn.Overflow.Dequeue();
+                conn.CurrentBuffer = b;
+                conn.CurrentLength = l;
+                conn.CurrentPooled = pooled;
                 conn.SendOffset = 0;
                 return true;
             }
@@ -287,6 +321,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             {
                 conn.CurrentBuffer = conn.SendBuffer; // reuse the scratch — no allocation
                 conn.CurrentLength = next;
+                conn.CurrentPooled = false;
                 conn.SendOffset = 0;
                 return true;
             }
@@ -445,10 +480,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         // already in flight. CurrentBuffer/CurrentLength/SendOffset belong to the active chain.
         public readonly object SendGate = new();
         public bool SendInFlight;
-        public readonly Queue<byte[]> Overflow = new();
+        // Queued sends waiting behind the in-flight one. Pooled buffers (out-of-band sends, and
+        // overlap copies) carry Pooled=true and are returned to ArrayPool once fully sent.
+        public readonly Queue<(byte[] Buf, int Len, bool Pooled)> Overflow = new();
         public byte[]? CurrentBuffer;
         public int CurrentLength;
         public int SendOffset;
+        public bool CurrentPooled; // CurrentBuffer came from ArrayPool → return it when the send completes
 
         public ManagedConnection(ManagedSocketShard shard, Socket socket, int bufferSize)
         {
@@ -460,12 +498,28 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             SendArgs = new ConnArgs(shard) { Conn = this };
         }
 
-        /// <summary>Out-of-band send: copy the data and hand it to the (thread-safe) send queue.
-        /// BeginSend locks the send gate, so this is safe from any thread.</summary>
+        /// <summary>Out-of-band send from any thread: copy the data into a pooled buffer the send
+        /// path takes ownership of (returned to the pool when the write completes) and hand it to
+        /// the thread-safe send queue. A single copy — the caller's span, straight into the buffer
+        /// the socket sends from (not the one-page echo scratch, so arbitrary sizes are fine).</summary>
         public override bool Send(ReadOnlySpan<byte> data)
         {
             if (Closed) return false;
-            Shard.BeginSend(this, data.ToArray(), data.Length);
+            int len = data.Length;
+            var buf = ArrayPool<byte>.Shared.Rent(len);
+            data.CopyTo(buf);
+            Shard.BeginSendOwned(this, buf, len);
+            return true;
+        }
+
+        public override bool Send(in ReadOnlySequence<byte> data)
+        {
+            if (Closed) return false;
+            if (data.IsSingleSegment) return Send(data.First.Span);
+            int len = checked((int)data.Length);
+            var buf = ArrayPool<byte>.Shared.Rent(len);
+            data.CopyTo(buf);
+            Shard.BeginSendOwned(this, buf, len);
             return true;
         }
     }

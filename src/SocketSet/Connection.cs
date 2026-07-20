@@ -1,3 +1,5 @@
+using System.Buffers;
+
 namespace SocketSets;
 
 /// <summary>
@@ -26,4 +28,17 @@ public abstract class Connection
     /// the connection is already closed (or the send could not be accepted).
     /// </summary>
     public abstract bool Send(ReadOnlySpan<byte> data);
+
+    /// <summary>
+    /// Queue a multi-segment <paramref name="data"/> to be sent on this connection, callable from
+    /// any thread (see <see cref="Send(ReadOnlySpan{byte})"/> for the threading/copy contract). A
+    /// single-segment sequence proxies straight to the span overload; a multi-segment one is, by
+    /// default, flattened into one buffer. Backends that can scatter-gather (io_uring writev)
+    /// override this to send the segments without concatenating.
+    /// </summary>
+    public virtual bool Send(in ReadOnlySequence<byte> data)
+    {
+        if (data.IsSingleSegment) return Send(data.First.Span);
+        return Send(new ReadOnlySpan<byte>(data.ToArray()));
+    }
 }

@@ -213,6 +213,7 @@ internal static unsafe partial class LibC
 
     // io_uring operation opcodes (linux/io_uring.h enum io_uring_op). These are
     // ordinals into that enum; getting them wrong silently issues the wrong op.
+    public const byte IORING_OP_WRITEV = 2;
     public const byte IORING_OP_ACCEPT = 13;
     public const byte IORING_OP_CONNECT = 16;
     public const byte IORING_OP_CLOSE = 19;
