@@ -1,9 +1,9 @@
 #if NET // io_uring is a Linux + modern-.NET backend; compiled out of the netfx fallback build.
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SocketSets.Native;
 
@@ -39,19 +39,6 @@ internal sealed class IoUringShard : SocketSetShard
         public int Total;
     }
 
-    // Tracks one in-flight writev (a large out-of-band send spread over several write-pool pages).
-    private unsafe struct WriteVState
-    {
-        public uint Slot;
-        public int Fd;
-        public LibC.iovec* Iov;   // native iovec array (TotalIov entries); freed on completion
-        public int[] Pages;       // leased write-pool page indices, parallel to Iov; released on completion
-        public int TotalIov;
-        public int Cursor;        // first not-yet-fully-sent iovec (advanced on partial writes)
-        public long Sent;
-        public long Total;
-    }
-
     // --- slot table (1-based ids; id 0 == "none"). Connections are pooled: one instance per
     // slot, reused across connection lifetimes so accept/connect never allocates. ---
     private readonly IoUringConnection[] _conns;
@@ -64,14 +51,18 @@ internal sealed class IoUringShard : SocketSetShard
     private readonly int _readPageSize;
     private readonly int _writeCount;
     private readonly int _writeBufSize;
+    private readonly int _obWriteCount;
 
     // --- created on the loop thread in Initialize() ---
     private RawIOUringRing _ring;
     private ManagedBufferPool _readBuffer;
     private WriteBufferPool _writeBuffer;
+    // Out-of-band write pool: leased from arbitrary threads (the IBufferWriter/Flush path), so guarded
+    // by _obGate. Kept distinct from _writeBuffer so the IO-thread echo path never takes a lock.
+    private WriteBufferPool _obWriteBuffer;
+    private readonly object _obGate = new();
     private WriteState[] _writeState = [];       // per write-pool index (Op.Send)
     private WriteState[] _bidState = [];         // per bid, for no-copy echoes (Op.SendBid)
-    private WriteVState[] _writeVState = [];     // per write-pool index (keyed by first page; Op.WriteV)
     private int _borrowedBids;                   // read buffers currently held by in-flight writes
     private int _maxBorrowedBids;                // cap; above it echoes fall back to lease+copy
     private volatile bool _ringReady;
@@ -94,11 +85,11 @@ internal sealed class IoUringShard : SocketSetShard
     // Bound listener fd -> the default UserToken to seed into each AcceptContext.
     private readonly ConcurrentDictionary<int, object?> _listeners = new();
 
-    // Out-of-band sends marshaled from arbitrary threads onto the loop thread. Data is a pooled
-    // (ArrayPool) scratch buffer of at least Len bytes; the loop returns it once the bytes are
-    // copied out into the native write pages. The generation is captured at enqueue and re-checked
-    // on drain so a send for a since-closed (and possibly reused) slot is dropped, not misdelivered.
-    private readonly ConcurrentQueue<(uint Slot, uint Generation, byte[] Data, int Len)> _external = [];
+    // Flushed out-of-band writes marshaled from arbitrary threads onto the loop thread. The chain's
+    // buffers were leased by the writing thread (OOB pool pages and/or ArrayPool overflow). The
+    // generation is captured at enqueue and re-checked on drain so a flush for a since-closed (and
+    // possibly reused) slot is dropped, not misdelivered.
+    private readonly ConcurrentQueue<(uint Slot, uint Generation, List<OutSeg> Chain)> _flush = [];
 
     public unsafe IoUringShard(SocketSetOptions options)
     {
@@ -108,6 +99,7 @@ internal sealed class IoUringShard : SocketSetShard
         _readPageSize = options.BufferPageSize;
         _writeCount = options.WriteBuffersPerShard;
         _writeBufSize = options.BufferPageSize;
+        _obWriteCount = options.OutOfBandWriteBuffersPerShard;
 
         _conns = new IoUringConnection[_socketsPerShard];
         for (int i = 0; i < _conns.Length; i++)
@@ -129,8 +121,6 @@ internal sealed class IoUringShard : SocketSetShard
     // =====================================================================
     // Slot table
     // =====================================================================
-
-    private IoUringConnection Conn(uint slot) => _conns[slot - 1];
 
     /// <summary>Claim a free slot for <paramref name="fd"/>. Lock-free (CAS on the pooled
     /// connection's Fd), so callable from the loop thread (accept) or an arbitrary thread
@@ -175,11 +165,12 @@ internal sealed class IoUringShard : SocketSetShard
         conn.SendBusy = false;
         if (conn.Pending is { } pending)
         {
-            // Hand any queued out-of-band scratch buffers back to the pool before dropping the queue.
+            // Release any queued flushed-chain buffers (echo segments are plain arrays, just dropped).
+            // An in-flight WriteV, if any, is released by its own completion (which sees fd == 0).
             while (pending.Count > 0)
             {
-                var (_, poolReturn) = pending.Dequeue();
-                if (poolReturn is not null) ArrayPool<byte>.Shared.Return(poolReturn);
+                var job = pending.Dequeue();
+                if (job.Chain is not null) ReleaseChainBuffers(job.Chain);
             }
         }
         if (fd > 0) LibC.close(fd);
@@ -285,13 +276,34 @@ internal sealed class IoUringShard : SocketSetShard
         Poke();
     }
 
-    /// <summary>Marshal an out-of-band send onto the loop thread (called from
-    /// <see cref="IoUringConnection.Send"/>, i.e. any thread). The bytes are already copied.</summary>
-    internal void SubmitExternal(uint slot, uint generation, byte[] data, int len)
+    /// <summary>Marshal a flushed out-of-band write chain onto the loop thread (called from
+    /// <see cref="IoUringConnection.Flush"/>, i.e. any thread). The chain's buffers are already
+    /// filled and owned by the loop from here on.</summary>
+    internal void SubmitFlush(uint slot, uint generation, List<OutSeg> chain)
     {
-        _external.Enqueue((slot, generation, data, len));
+        _flush.Enqueue((slot, generation, chain));
         Poke();
     }
+
+    // --- out-of-band write pool (thread-safe; used by the IBufferWriter path) ---
+
+    /// <summary>Page size of the write pools (bytes).</summary>
+    internal int WritePageSize => _writeBufSize;
+
+    /// <summary>Lease a pinned out-of-band write page. Thread-safe; callable from any thread.</summary>
+    internal unsafe bool LeaseOutOfBand(out int index, out byte* ptr)
+    {
+        lock (_obGate) return _obWriteBuffer.TryLease(out index, out ptr);
+    }
+
+    /// <summary>Return a pinned out-of-band write page. Thread-safe.</summary>
+    internal void ReleaseOutOfBand(int index)
+    {
+        lock (_obGate) _obWriteBuffer.Release(index);
+    }
+
+    /// <summary>Native address of an out-of-band write page (pure arithmetic on a stable slab).</summary>
+    internal unsafe byte* OutOfBandAddress(int index) => _obWriteBuffer.Address(index);
 
     private unsafe void Poke()
     {
@@ -397,85 +409,72 @@ internal sealed class IoUringShard : SocketSetShard
     }
 
     // =====================================================================
-    // Out-of-band send (loop thread; drained from _external each iteration)
+    // Out-of-band writes (loop thread; flushed chains drained from _flush each iteration)
     // =====================================================================
 
-    private void PumpExternal(uint slot, uint generation, byte[] data, int total)
+    private const int IovMax = 1024; // UIO_MAXIOV: writev rejects iovcnt above this with -EINVAL
+
+    private void PumpFlush(uint slot, uint generation, List<OutSeg> chain)
     {
         var conn = _conns[slot - 1];
-        // Slot reused (or closing) since the send was queued: drop it rather than misdeliver.
+        // Slot reused (or closing) since the flush was queued: drop it rather than misdeliver.
         if (conn.Generation != generation || conn.Fd == 0 || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
         {
-            ArrayPool<byte>.Shared.Return(data);
+            ReleaseChainBuffers(chain);
             return;
         }
         int fd = conn.Fd;
 
-        // Fast path: an idle send pipe + a payload spanning several pages → one writev over the
-        // pages, rather than a train of serialized page-sized sends. TrySubmitWriteV copies the
-        // whole payload into native pages, so the scratch is free the moment it returns.
-        if (!conn.SendBusy && total > _writeBufSize && TrySubmitWriteV(conn, fd, data, total))
+        // One writev is capped at IovMax iovecs; split a larger chain into ordered sub-chains that
+        // serialize through the per-connection send queue.
+        if (chain.Count <= IovMax)
         {
-            ArrayPool<byte>.Shared.Return(data);
+            DispatchChain(conn, fd, chain);
             return;
         }
-
-        // Otherwise chunk to the write-buffer size; segments queue in order so the stream stays
-        // ordered (also the fallback when the pool can't spare enough pages for a single writev).
-        // Tag the last segment with the scratch so it is returned to the pool once fully copied out.
-        int offset = 0;
-        while (offset < total)
-        {
-            int len = Math.Min(_writeBufSize, total - offset);
-            bool last = offset + len >= total;
-            EnqueueSend(conn, fd, new ArraySegment<byte>(data, offset, len), last ? data : null);
-            offset += len;
-        }
+        for (int start = 0; start < chain.Count; start += IovMax)
+            DispatchChain(conn, fd, chain.GetRange(start, Math.Min(IovMax, chain.Count - start)));
     }
 
-    /// <summary>Spread <paramref name="data"/> across ceil(len/pageSize) leased write pages and send
-    /// them all in one IORING_OP_WRITEV. Returns false (leasing nothing) if the pool can't spare the
-    /// pages, so the caller can fall back to chunked sends. Assumes the send pipe is idle.</summary>
-    private const int IovMax = 1024; // UIO_MAXIOV: writev rejects iovcnt above this with -EINVAL
-
-    private unsafe bool TrySubmitWriteV(IoUringConnection conn, int fd, byte[] data, int total)
+    private void DispatchChain(IoUringConnection conn, int fd, List<OutSeg> chain)
     {
-        int k = (total + _writeBufSize - 1) / _writeBufSize;
-        if (k > IovMax) return false; // too many segments for one writev; caller chunks instead
-
-        var pages = new int[k];
-        var ptrs = new byte*[k];
-        for (int i = 0; i < k; i++)
+        if (conn.SendBusy)
         {
-            if (!_writeBuffer.TryLease(out pages[i], out ptrs[i]))
-            {
-                for (int j = 0; j < i; j++) _writeBuffer.Release(pages[j]); // unwind partial lease
-                return false;
-            }
+            (conn.Pending ??= new()).Enqueue(new PendingJob { Chain = chain });
+            return;
         }
-
-        var iov = (LibC.iovec*)NativeMemory.Alloc((nuint)k * (nuint)sizeof(LibC.iovec));
-        int offset = 0;
-        for (int i = 0; i < k; i++)
-        {
-            int len = Math.Min(_writeBufSize, total - offset);
-            Marshal.Copy(data, offset, (IntPtr)ptrs[i], len);
-            iov[i].iov_base = ptrs[i];
-            iov[i].iov_len = (nuint)len;
-            offset += len;
-        }
-
-        // Key the state by the first page index (unique while leased) and pack it as aux.
-        _writeVState[pages[0]] = new WriteVState
-        {
-            Slot = conn.Slot, Fd = fd, Iov = iov, Pages = pages, TotalIov = k, Cursor = 0, Sent = 0, Total = total,
-        };
         conn.SendBusy = true;
-        SubmitWriteV(conn.Slot, fd, iov, k, (uint)pages[0]);
-        return true;
+        SubmitChain(conn, fd, chain);
     }
 
-    private unsafe void SubmitWriteV(uint slot, int fd, LibC.iovec* iov, int count, uint key)
+    /// <summary>Send a flushed chain as one IORING_OP_WRITEV: pool-page segments contribute their
+    /// native address; POH overflow segments their (stable, pinned) array address. State lives on the
+    /// connection (one send in flight at a time). Assumes SendBusy is already claimed.</summary>
+    private unsafe void SubmitChain(IoUringConnection conn, int fd, List<OutSeg> chain)
+    {
+        int n = chain.Count;
+        var iov = (LibC.iovec*)NativeMemory.Alloc((nuint)n * (nuint)sizeof(LibC.iovec));
+        long total = 0;
+        for (int i = 0; i < n; i++)
+        {
+            var seg = chain[i];
+            iov[i].iov_base = seg.Page >= 0 ? OutOfBandAddress(seg.Page) : PinnedAddress(seg.Managed!);
+            iov[i].iov_len = (nuint)seg.Length;
+            total += seg.Length;
+        }
+
+        conn.WriteV = new WriteVState
+        {
+            Iov = iov, TotalIov = n, Cursor = 0, Sent = 0, Total = total, Chain = chain,
+        };
+        SubmitWriteV(conn.Slot, fd, iov, n);
+    }
+
+    // Address of a pinned-heap (POH) array's data — stable because POH arrays are never moved.
+    private static unsafe byte* PinnedAddress(byte[] arr) =>
+        (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(arr));
+
+    private unsafe void SubmitWriteV(uint slot, int fd, LibC.iovec* iov, int count)
     {
         Submit(new LibC.io_uring_sqe
         {
@@ -484,42 +483,54 @@ internal sealed class IoUringShard : SocketSetShard
             addr = (ulong)iov,
             len = (uint)count,
             off = ulong.MaxValue, // -1: not a positioned write (plain writev, as for a socket)
-            user_data = Pack(Op.WriteV, slot, key),
+            user_data = Pack(Op.WriteV, slot),
         });
     }
 
-    /// <summary>Submit <paramref name="seg"/> now if the connection's send pipe is idle, else queue
-    /// it behind the in-flight send. Only one send is ever in flight per connection. If
-    /// <paramref name="poolReturn"/> is non-null it is returned to <see cref="ArrayPool{T}"/> once
-    /// this segment's bytes have been copied into a write page.</summary>
-    private void EnqueueSend(IoUringConnection conn, int fd, ArraySegment<byte> seg, byte[]? poolReturn)
+    // Release a flushed chain's buffers without having submitted it (dropped before send).
+    private void ReleaseChainBuffers(List<OutSeg> chain)
     {
-        if (conn.SendBusy)
-        {
-            (conn.Pending ??= new()).Enqueue((seg, poolReturn));
-            return;
-        }
-
-        conn.SendBusy = true;
-        SubmitSegment(conn.Slot, fd, seg, poolReturn);
+        foreach (var seg in chain)
+            if (seg.Page >= 0) ReleaseOutOfBand(seg.Page); // POH overflow buffers just drop
     }
 
-    /// <summary>Lease a write buffer, copy <paramref name="seg"/> into it, and send. Assumes the
-    /// caller has already claimed the connection's single in-flight send slot (SendBusy). Returns
-    /// <paramref name="poolReturn"/> (if any) to the array pool once the bytes are copied.</summary>
-    private unsafe void SubmitSegment(uint slot, int fd, ArraySegment<byte> seg, byte[]? poolReturn)
+    // Release an in-flight writev's resources on completion: free the iovec array and return the pool
+    // pages (POH overflow segments are just dropped for GC).
+    private unsafe void ReleaseWriteV(IoUringConnection conn)
     {
+        ref var ws = ref conn.WriteV;
+        if (ws.Iov != null) NativeMemory.Free(ws.Iov);
+        if (ws.Chain is { } chain)
+        {
+            foreach (var seg in chain)
+                if (seg.Page >= 0) ReleaseOutOfBand(seg.Page);
+        }
+        conn.WriteV = default;
+    }
+
+    // Submit a queued job (leasing fresh IO-pool buffers for a segment). SendBusy stays set.
+    private unsafe void SubmitPendingJob(IoUringConnection conn, uint slot, int fd, in PendingJob job)
+    {
+        if (job.Chain is not null)
+        {
+            SubmitChain(conn, fd, job.Chain);
+            return;
+        }
         if (!_writeBuffer.TryLease(out int wi, out byte* wp))
         {
-            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
-            if (poolReturn is not null) ArrayPool<byte>.Shared.Return(poolReturn);
             CloseClient(slot);
             return;
         }
-
+        var seg = job.Seg;
         Marshal.Copy(seg.Array!, seg.Offset, (IntPtr)wp, seg.Count);
-        if (poolReturn is not null) ArrayPool<byte>.Shared.Return(poolReturn);
         SubmitSend(slot, fd, wi, wp, seg.Count);
+    }
+
+    // Pick the next queued job, or go idle. SendBusy stays set iff a job was dispatched.
+    private void DrainNext(IoUringConnection conn, uint slot, int fd)
+    {
+        if (conn.Pending is { Count: > 0 } pending) SubmitPendingJob(conn, slot, fd, pending.Dequeue());
+        else conn.SendBusy = false;
     }
 
     // =====================================================================
@@ -531,8 +542,8 @@ internal sealed class IoUringShard : SocketSetShard
         _ring = new RawIOUringRing((uint)_entriesPerShard);
         _readBuffer = new ManagedBufferPool(_ring.RingFd, entries: _readPages, bufSize: _readPageSize);
         _writeBuffer = new WriteBufferPool(_writeCount, _writeBufSize);
+        _obWriteBuffer = new WriteBufferPool(_obWriteCount, _writeBufSize);
         _writeState = new WriteState[_writeCount];
-        _writeVState = new WriteVState[_writeCount];
         _bidState = new WriteState[_readPages];
         // How many read buffers the write path may hold at once. Default (0) = half the pool,
         // scaling with it. Hard-cap at three-quarters so at least a quarter of the ring always
@@ -556,6 +567,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         _readBuffer.Dispose();
         _writeBuffer.Dispose();
+        lock (_obGate) _obWriteBuffer.Dispose();
         _ring.Dispose();
 
         if (_eventFd > 0) LibC.close(_eventFd);
@@ -580,9 +592,9 @@ internal sealed class IoUringShard : SocketSetShard
             while (_incoming.TryDequeue(out var inbound))
                 AdoptAccepted(inbound.Fd, inbound.Token);
 
-            // Issue any out-of-band sends marshaled in from other threads.
-            while (_external.TryDequeue(out var ext))
-                PumpExternal(ext.Slot, ext.Generation, ext.Data, ext.Len);
+            // Issue any out-of-band writes flushed in from other threads.
+            while (_flush.TryDequeue(out var f))
+                PumpFlush(f.Slot, f.Generation, f.Chain);
 
             // Fold any cross-thread submissions into the ring.
             if (!_pending.IsEmpty)
@@ -661,7 +673,7 @@ internal sealed class IoUringShard : SocketSetShard
                     break;
 
                 case Op.WriteV:
-                    HandleWriteV(res, slot: id, key: (int)aux);
+                    HandleWriteV(res, slot: id);
                     break;
             }
         }
@@ -801,7 +813,7 @@ internal sealed class IoUringShard : SocketSetShard
             // borrowed, so the caller releases it as usual.
             var copy = new byte[rb];
             Marshal.Copy((IntPtr)rp, copy, 0, rb);
-            (conn.Pending ??= new()).Enqueue((new ArraySegment<byte>(copy, 0, rb), null));
+            (conn.Pending ??= new()).Enqueue(new PendingJob { Seg = new ArraySegment<byte>(copy, 0, rb) });
             return false;
         }
 
@@ -876,11 +888,17 @@ internal sealed class IoUringShard : SocketSetShard
         int next = ctx.SendBytes;
         if (next == 0 && conn.Pending is { Count: > 0 } pending)
         {
-            // Nothing pipelined, but an out-of-band send is queued: reuse this same buffer for it.
-            var (seg, poolReturn) = pending.Dequeue();
-            Marshal.Copy(seg.Array!, seg.Offset, (IntPtr)wp, seg.Count);
-            if (poolReturn is not null) ArrayPool<byte>.Shared.Return(poolReturn);
-            next = seg.Count;
+            var job = pending.Dequeue();
+            if (job.Chain is not null)
+            {
+                // A flushed out-of-band chain is next: it has its own buffers, so free this page.
+                _writeBuffer.Release(writeIndex);
+                SubmitChain(conn, fd, job.Chain); // SendBusy stays set
+                return;
+            }
+            // A queued echo segment: reuse this just-freed page for it.
+            Marshal.Copy(job.Seg.Array!, job.Seg.Offset, (IntPtr)wp, job.Seg.Count);
+            next = job.Seg.Count;
         }
 
         if (next > 0)
@@ -961,31 +979,23 @@ internal sealed class IoUringShard : SocketSetShard
             return;
         }
 
-        // No pipelined follow-up: return the borrowed read buffer to the ring.
+        // No pipelined follow-up: return the borrowed read buffer to the ring, then drain the next.
         _readBuffer.ReleaseBuffer(bid); _borrowedBids--;
-
-        if (conn.Pending is { Count: > 0 } pending)
-        {
-            // An out-of-band send is queued: it needs a write buffer (the read buffer is gone).
-            var (seg, poolReturn) = pending.Dequeue();
-            SubmitSegment(slot, fd, seg, poolReturn); // SendBusy stays set
-        }
-        else
-        {
-            conn.SendBusy = false;
-        }
+        DrainNext(conn, slot, fd);
     }
 
-    // Completion of a scatter-gather send (Op.WriteV). Handles partial writev by advancing through
-    // the iovec array and resubmitting the remainder; on full completion, reuses the first page as
-    // the OnWrite scratch (via the shared tail) and returns the rest to the pool.
-    private unsafe void HandleWriteV(int res, uint slot, int key)
+    // Completion of a scatter-gather out-of-band send (Op.WriteV). Handles partial writev by advancing
+    // through the iovec array and resubmitting the remainder; on full completion releases the chain
+    // and drains the next queued job. Out-of-band flushes deliberately do not fire OnWrite.
+    private unsafe void HandleWriteV(int res, uint slot)
     {
-        ref WriteVState ws = ref _writeVState[key];
+        var conn = _conns[slot - 1];
+        ref var ws = ref conn.WriteV;
+        int fd = GetFd(slot);
 
         if (res < 0)
         {
-            ReleaseWriteV(ref ws);
+            ReleaseWriteV(conn);
             CloseClient(slot);
             return;
         }
@@ -993,8 +1003,9 @@ internal sealed class IoUringShard : SocketSetShard
         ws.Sent += res;
         if (ws.Sent < ws.Total && res > 0)
         {
+            if (fd == 0) { ReleaseWriteV(conn); return; } // closed under us; SendBusy already reset
             // Partial writev: skip the iovecs fully drained by this completion and trim the one it
-            // stopped inside, then resubmit from there (state + key unchanged).
+            // stopped inside, then resubmit from there (state unchanged).
             long consume = res;
             int c = ws.Cursor;
             while (consume > 0)
@@ -1009,38 +1020,22 @@ internal sealed class IoUringShard : SocketSetShard
                 }
             }
             ws.Cursor = c;
-            SubmitWriteV(slot, ws.Fd, ws.Iov + c, ws.TotalIov - c, (uint)key);
+            SubmitWriteV(slot, fd, ws.Iov + c, ws.TotalIov - c);
             return;
         }
 
         if (ws.Sent < ws.Total)
         {
             // res == 0 with bytes outstanding: dead peer.
-            ReleaseWriteV(ref ws);
+            ReleaseWriteV(conn);
             CloseClient(slot);
             return;
         }
 
-        // Full payload sent. Keep the first page as the OnWrite scratch (still leased); free the
-        // iovec array and release the rest, then run the shared completion tail.
-        int fd = GetFd(slot);
-        int scratch = ws.Pages[0];
-        int totalIov = ws.TotalIov;
-        int[] pages = ws.Pages;
-        NativeMemory.Free(ws.Iov);
-        for (int i = 1; i < totalIov; i++) _writeBuffer.Release(pages[i]);
-        ws = default; // clear the state slot (keyed by scratch) before reusing scratch as a normal send
-
-        if (fd == 0) { _writeBuffer.Release(scratch); return; } // closed: SendBusy already reset
-        CompleteWrite(_conns[slot - 1], slot, fd, scratch);
-    }
-
-    // Free a writev's native iovec array and return all its pages to the pool.
-    private unsafe void ReleaseWriteV(ref WriteVState ws)
-    {
-        if (ws.Iov != null) NativeMemory.Free(ws.Iov);
-        for (int i = 0; i < ws.TotalIov; i++) _writeBuffer.Release(ws.Pages[i]);
-        ws = default;
+        // Full payload sent.
+        ReleaseWriteV(conn);
+        if (fd == 0) return; // closed: SendBusy already reset by CloseClient
+        DrainNext(conn, slot, fd);
     }
 
     // =====================================================================

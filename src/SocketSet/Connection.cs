@@ -7,12 +7,20 @@ namespace SocketSets;
 /// socket. The backend creates it and hands it to every callback through the context types, so it
 /// is the stable per-connection identity: no separate handle is needed. It carries the
 /// application's <see cref="UserToken"/> for the connection's whole lifetime (set it once, read it
-/// from any callback) and is the target for out-of-band sends via <see cref="Send"/>.
+/// from any callback) and is the sink for out-of-band writes.
 ///
-/// Backends subclass this to hang their own per-connection state on it (fd/slot for io_uring, the
-/// socket + SAEAs for managed), which also consolidates what used to be parallel per-slot arrays.
+/// A connection is an <see cref="IBufferWriter{T}"/>: write outbound bytes with
+/// <see cref="GetSpan"/>/<see cref="Advance"/> (they land directly in library-owned, backend-pinned
+/// buffers — no intermediate copy) and then <see cref="Flush"/> to hand the accumulated buffers to
+/// the IO loop as a single (scatter-gather) send. This is callable from any thread; one writer at a
+/// time per connection (the caller serializes its own writes, as a multiplexer does). The
+/// <see cref="Send(System.ReadOnlySpan{byte})"/> helpers are sugar over write-then-flush.
+///
+/// Backends subclass this to hang their own per-connection state on it (fd/slot + write accumulator
+/// for io_uring, the socket + SAEAs for managed), which also consolidates what used to be parallel
+/// per-slot arrays.
 /// </summary>
-public abstract class Connection
+public abstract class Connection : IBufferWriter<byte>
 {
     /// <summary>Application state associated with this connection for its lifetime. Set it in
     /// OnAccept/OnConnect (or later) and read it from any callback; the library never touches it.</summary>
@@ -21,24 +29,61 @@ public abstract class Connection
     /// <summary>Send/receive-closed state, mutated through the context Close* methods.</summary>
     internal SocketSet.SocketFlags Flags;
 
-    /// <summary>
-    /// Queue <paramref name="data"/> to be sent on this connection, callable from any thread — the
-    /// send is marshaled onto the owning IO context, so it is safe to call outside a callback. The
-    /// bytes are copied, so the span need not stay valid after the call returns. Returns false if
-    /// the connection is already closed (or the send could not be accepted).
-    /// </summary>
-    public abstract bool Send(ReadOnlySpan<byte> data);
+    // --- IBufferWriter<byte>: write directly into library-owned outbound buffers, then Flush ---
+
+    /// <summary>Get a span to write outbound bytes into. It lands in a library-owned buffer; write up
+    /// to <c>span.Length</c> bytes, call <see cref="Advance"/>, and repeat until done, then
+    /// <see cref="Flush"/>. <paramref name="sizeHint"/> is advisory — the returned span may be smaller
+    /// (loop) or larger.</summary>
+    public abstract Span<byte> GetSpan(int sizeHint = 0);
+
+    /// <inheritdoc cref="GetSpan"/>
+    public abstract Memory<byte> GetMemory(int sizeHint = 0);
+
+    /// <summary>Commit <paramref name="count"/> bytes written into the last <see cref="GetSpan"/>/
+    /// <see cref="GetMemory"/> buffer.</summary>
+    public abstract void Advance(int count);
+
+    /// <summary>Hand everything written since the last flush to the IO loop as one send (a
+    /// scatter-gather write when it spans multiple buffers). Safe to call from any thread; the
+    /// submission is marshaled onto the owning IO context. Returns false if the connection is
+    /// closed (buffers are dropped in that case).</summary>
+    public abstract bool Flush();
 
     /// <summary>
-    /// Queue a multi-segment <paramref name="data"/> to be sent on this connection, callable from
-    /// any thread (see <see cref="Send(ReadOnlySpan{byte})"/> for the threading/copy contract). A
-    /// single-segment sequence proxies straight to the span overload; a multi-segment one is, by
-    /// default, flattened into one buffer. Backends that can scatter-gather (io_uring writev)
-    /// override this to send the segments without concatenating.
+    /// Write <paramref name="data"/> and flush it as one send — sugar over
+    /// <see cref="GetSpan"/>/<see cref="Advance"/>/<see cref="Flush"/>. Callable from any thread; the
+    /// bytes are copied into library buffers, so the span need not stay valid after the call. Returns
+    /// false if the connection is closed.
+    /// </summary>
+    public virtual bool Send(ReadOnlySpan<byte> data)
+    {
+        WriteAll(data);
+        return Flush();
+    }
+
+    /// <summary>
+    /// Write a multi-segment <paramref name="data"/> and flush it as one (scatter-gather) send. Each
+    /// segment is written straight into library buffers — no concatenation. See
+    /// <see cref="Send(System.ReadOnlySpan{byte})"/> for the threading/copy contract.
     /// </summary>
     public virtual bool Send(in ReadOnlySequence<byte> data)
     {
-        if (data.IsSingleSegment) return Send(data.First.Span);
-        return Send(new ReadOnlySpan<byte>(data.ToArray()));
+        var position = data.Start;
+        while (data.TryGet(ref position, out ReadOnlyMemory<byte> mem))
+            WriteAll(mem.Span);
+        return Flush();
+    }
+
+    private void WriteAll(ReadOnlySpan<byte> data)
+    {
+        while (!data.IsEmpty)
+        {
+            var dst = GetSpan(data.Length);
+            int n = Math.Min(dst.Length, data.Length);
+            data.Slice(0, n).CopyTo(dst);
+            Advance(n);
+            data = data.Slice(n);
+        }
     }
 }

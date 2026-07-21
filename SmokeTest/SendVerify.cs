@@ -19,7 +19,7 @@ public sealed class SendVerify(SocketSetOptions options, int payloadLen, int seg
 
     public long Received => Interlocked.Read(ref _received);
     public int Mismatches => Volatile.Read(ref _mismatches);
-    public long Expected => 2L * payloadLen; // one span send + one sequence send
+    public long Expected => 3L * payloadLen; // span send + sequence send + GetMemory-driven write
     public Connection? ServerConn => _serverConn;
 
     private static readonly object ServerToken = new();
@@ -54,12 +54,27 @@ public sealed class SendVerify(SocketSetOptions options, int payloadLen, int seg
         Interlocked.Add(ref _received, payload.Length);
     }
 
-    /// <summary>Fire the two out-of-band sends (called from the main thread once connected).</summary>
+    /// <summary>Fire the out-of-band sends (called from the main thread once connected).</summary>
     public void FireSends()
     {
         var conn = _serverConn!;
-        conn.Send(new ReadOnlySpan<byte>(_pattern));                 // contiguous → multi-page writev
-        conn.Send(BuildSequence(_pattern, segSize));                // multi-segment → flatten + writev
+        conn.Send(new ReadOnlySpan<byte>(_pattern));   // contiguous → GetSpan loop → writev
+        conn.Send(BuildSequence(_pattern, segSize));   // multi-segment → GetSpan loop → writev
+        WriteViaMemory(conn, _pattern);                // exercises GetMemory + the MemoryManager path
+    }
+
+    private static void WriteViaMemory(Connection conn, byte[] data)
+    {
+        int off = 0;
+        while (off < data.Length)
+        {
+            var mem = conn.GetMemory(1);
+            int n = Math.Min(mem.Length, data.Length - off);
+            data.AsSpan(off, n).CopyTo(mem.Span);
+            conn.Advance(n);
+            off += n;
+        }
+        conn.Flush();
     }
 
     private static ReadOnlySequence<byte> BuildSequence(byte[] data, int segSize)

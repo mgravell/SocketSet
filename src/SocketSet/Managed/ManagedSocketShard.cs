@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 
 namespace SocketSets.Managed;
 
@@ -488,6 +489,14 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         public int SendOffset;
         public bool CurrentPooled; // CurrentBuffer came from ArrayPool → return it when the send completes
 
+        // --- IBufferWriter accumulation (single-writer until Flush) ---
+        // One growing ArrayPool buffer (no pinning needed — a SAEA sends straight from a byte[]).
+        // Flush hands it to the serialized send path (BeginSendOwned), which returns it to the pool
+        // once sent. The echo path never touches this — it uses the SendBuffer scratch.
+        private byte[]? _wbuf;
+        private int _wpos;
+        private ManagedWriteMemoryManager? _wmgr; // backs GetMemory; invalidated when _wbuf is recycled
+
         public ManagedConnection(ManagedSocketShard shard, Socket socket, int bufferSize)
         {
             Shard = shard;
@@ -498,29 +507,112 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             SendArgs = new ConnArgs(shard) { Conn = this };
         }
 
-        /// <summary>Out-of-band send from any thread: copy the data into a pooled buffer the send
-        /// path takes ownership of (returned to the pool when the write completes) and hand it to
-        /// the thread-safe send queue. A single copy — the caller's span, straight into the buffer
-        /// the socket sends from (not the one-page echo scratch, so arbitrary sizes are fine).</summary>
-        public override bool Send(ReadOnlySpan<byte> data)
+        // --- IBufferWriter<byte> (out-of-band writes; Send(span/seq) is the base sugar over these) ---
+
+        public override Span<byte> GetSpan(int sizeHint = 0)
         {
-            if (Closed) return false;
-            int len = data.Length;
-            var buf = ArrayPool<byte>.Shared.Rent(len);
-            data.CopyTo(buf);
+            EnsureWrite(sizeHint <= 0 ? 1 : sizeHint);
+            return _wbuf.AsSpan(_wpos);
+        }
+
+        public override Memory<byte> GetMemory(int sizeHint = 0)
+        {
+            EnsureWrite(sizeHint <= 0 ? 1 : sizeHint);
+            // Wrap the growing buffer so a Memory handed out throws (not silently aliases a recycled
+            // ArrayPool buffer) once we grow past it or flush. Fresh manager per buffer-epoch.
+            _wmgr ??= new ManagedWriteMemoryManager(_wbuf!);
+            return _wmgr.Memory.Slice(_wpos, _wbuf!.Length - _wpos);
+        }
+
+        public override void Advance(int count) => _wpos += count;
+
+        public override bool Flush()
+        {
+            if (Closed) { ResetWriter(returnBuf: true); return false; }
+            byte[]? buf = _wbuf;
+            int len = _wpos;
+            // Detach before handing the buffer to the (thread-safe) send path.
+            _wbuf = null;
+            _wpos = 0;
+            InvalidateWriteMemory();
+            if (buf is null || len == 0)
+            {
+                if (buf is not null) ArrayPool<byte>.Shared.Return(buf);
+                return true;
+            }
+            // BeginSendOwned takes ownership of buf and returns it to the pool once fully sent.
             Shard.BeginSendOwned(this, buf, len);
             return true;
         }
 
-        public override bool Send(in ReadOnlySequence<byte> data)
+        private void EnsureWrite(int want)
         {
-            if (Closed) return false;
-            if (data.IsSingleSegment) return Send(data.First.Span);
-            int len = checked((int)data.Length);
-            var buf = ArrayPool<byte>.Shared.Rent(len);
-            data.CopyTo(buf);
-            Shard.BeginSendOwned(this, buf, len);
-            return true;
+            if (_wbuf is null)
+            {
+                _wbuf = ArrayPool<byte>.Shared.Rent(Math.Max(want, SendBuffer.Length));
+                _wpos = 0;
+                return;
+            }
+            if (_wbuf.Length - _wpos >= want) return;
+
+            // Grow: rent a bigger buffer (amortized doubling), copy what we have, recycle the old.
+            int size = Math.Max(_wbuf.Length * 2, _wpos + want);
+            var bigger = ArrayPool<byte>.Shared.Rent(size);
+            Buffer.BlockCopy(_wbuf, 0, bigger, 0, _wpos);
+            InvalidateWriteMemory(); // the old buffer is about to be recycled
+            ArrayPool<byte>.Shared.Return(_wbuf);
+            _wbuf = bigger;
         }
+
+        private void ResetWriter(bool returnBuf)
+        {
+            InvalidateWriteMemory();
+            if (returnBuf && _wbuf is not null) ArrayPool<byte>.Shared.Return(_wbuf);
+            _wbuf = null;
+            _wpos = 0;
+        }
+
+        private void InvalidateWriteMemory()
+        {
+            if (_wmgr is { } m) { m.Invalidate(); _wmgr = null; }
+        }
+    }
+
+    /// <summary>Fronts the managed writer's current ArrayPool buffer as a <see cref="Memory{T}"/>.
+    /// A fresh instance per buffer-epoch, <see cref="Invalidate"/>d when that buffer is grown past or
+    /// flushed (then returned to the pool); a <see cref="Memory{T}"/> kept past that point throws
+    /// rather than aliasing a recycled/reused array. No pointers, so this compiles on netfx too.</summary>
+    private sealed class ManagedWriteMemoryManager(byte[] array) : MemoryManager<byte>
+    {
+        private bool _valid = true;
+
+        public void Invalidate() => _valid = false;
+
+        public override Span<byte> GetSpan()
+        {
+            if (!_valid) ThrowStale();
+            return array;
+        }
+
+        public override unsafe MemoryHandle Pin(int elementIndex = 0)
+        {
+            if (!_valid) ThrowStale();
+            var handle = GCHandle.Alloc(array, GCHandleType.Pinned);
+            return new MemoryHandle((byte*)handle.AddrOfPinnedObject() + elementIndex, handle);
+        }
+
+        public override void Unpin() { }
+
+        protected override void Dispose(bool disposing) => _valid = false;
+
+        protected override bool TryGetArray(out ArraySegment<byte> segment)
+        {
+            if (_valid) { segment = new ArraySegment<byte>(array); return true; }
+            segment = default;
+            return false;
+        }
+
+        private static void ThrowStale() => throw new ObjectDisposedException(nameof(ManagedWriteMemoryManager),
+            "This Memory is stale: writer buffers are valid only until the next grow or Flush.");
     }
 }
