@@ -229,6 +229,17 @@ internal sealed class IoUringShard : SocketSetShard
         EnqueueAccept(fd, local);
     }
 
+    public override void ListenHandle(nint handle, object? userToken)
+    {
+        // Inherited/handed-over listener: it's a single fd (not reuse-port multi-bound), so this one
+        // shard drives the accept and bounces each connection round-robin (local: false), exactly like
+        // the UDS single-listener path. Assumed already bound + listen()ed by the caller.
+        int fd = checked((int)handle);
+        if (fd <= 0) throw new ArgumentOutOfRangeException(nameof(handle), "Invalid socket handle.");
+        _listeners[fd] = userToken;
+        EnqueueAccept(fd, local: false);
+    }
+
     public override unsafe void Connect(EndPoint endpoint, object? userToken)
     {
         int fd = endpoint switch

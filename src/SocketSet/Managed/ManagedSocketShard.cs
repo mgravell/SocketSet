@@ -60,6 +60,18 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         StartAccept(new AcceptArgs(this, listener, defaultToken));
     }
 
+#if NET
+    public override void ListenHandle(nint handle, object? defaultToken)
+    {
+        // Wrap the handed-over handle (must already be bound + listening); we own it now. The raw-handle
+        // Socket ctor is .NET 5+, so netfx falls through to the base NotSupported — there's no clean
+        // public way to wrap a bare handle on .NET Framework.
+        var listener = new Socket(new SafeSocketHandle(handle, ownsHandle: true));
+        lock (_listeners) _listeners.Add(listener);
+        StartAccept(new AcceptArgs(this, listener, defaultToken));
+    }
+#endif
+
     private void StartAccept(AcceptArgs args)
     {
         while (true)

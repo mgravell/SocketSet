@@ -125,4 +125,9 @@ public abstract class SocketSetShard
 
     public virtual void Connect(EndPoint endpoint, object? userToken)
         => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported.");
+
+    /// <summary>Accept on an already-listening socket handle on this shard (see
+    /// <see cref="SocketSet.ListenHandle"/>). The set takes ownership of the handle.</summary>
+    public virtual void ListenHandle(nint handle, object? userToken)
+        => throw new NotSupportedException($"{nameof(ListenHandle)} is not supported by this backend.");
 }

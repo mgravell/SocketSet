@@ -14,6 +14,7 @@ string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespac
 int size = 512; // message size
 int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.MaxValue = unbounded
 bool poke = false; // server echoes out-of-band via Connection.Send from a background thread
+bool adopt = false; // bind+listen a socket ourselves, then hand its handle to ListenHandle (socket-activation style)
 int verify = 0;    // >0: run the out-of-band Send content-verification harness with this payload size
 int closeAfter = 0; // >0: each client sends this many messages then closes (graceful-drain test)
 int loops = 1;      // drain test: repeat this many connect→drain cycles (0 = forever, until Ctrl+C)
@@ -63,6 +64,9 @@ for (int i = 0; i < args.Length; i++)
             break;
         case "--poke":
             poke = true;
+            break;
+        case "--adopt":
+            adopt = true;
             break;
         case "--verify" when i + 1 < args.Length && int.TryParse(args[i + 1], out var vp):
             verify = Math.Max(1, vp);
@@ -136,6 +140,7 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --window N        client keeps up to N messages in flight (1=ping/pong default, N=bounded pipeline)");
     Console.WriteLine("  --pipeline        unbounded in-flight (throughput, but can wedge a symmetric echo; use --window instead)");
     Console.WriteLine("  --poke            server echoes out-of-band via Connection.Send from a background thread");
+    Console.WriteLine("  --adopt           bind the listener here and hand its handle to ListenHandle (socket-activation style)");
     Console.WriteLine("  --verify N        run the out-of-band Send correctness harness with an N-byte payload");
     Console.WriteLine("  --close-after N   each client sends N messages then closes (graceful-drain lifecycle test)");
     Console.WriteLine("  --loops N         repeat the drain cycle N times (0 = forever); a socket-churn soak");
@@ -206,7 +211,32 @@ Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +
     $"mode={mode} size={size} shards={options.Shards} pin={options.PinWorkerThreads} poke={poke}");
 
-if (server)
+#if NET
+if (server && adopt)
+{
+    // Socket-activation style: bind+listen a socket here, then hand its raw handle to the set and
+    // relinquish ownership (SetHandleAsInvalid, so .NET won't also close the fd the set now owns).
+    // NOTE: the address is the caller's to get right — e.g. .NET binds a UDS path literally, whereas
+    // io_uring Connect maps a leading '@' to the abstract namespace; use TCP or a filesystem UDS path.
+    var lsock = new Socket(listenEp.AddressFamily, SocketType.Stream,
+        listenEp is IPEndPoint ? ProtocolType.Tcp : ProtocolType.Unspecified);
+    if (listenEp is IPEndPoint) lsock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+    lsock.Bind(listenEp);
+    lsock.Listen(512);
+    nint h = lsock.Handle;
+    lsock.SafeHandle.SetHandleAsInvalid(); // hand the fd to the set; don't let this wrapper close it
+    set.ListenHandle(h, EchoServer.ServerToken);
+    Console.WriteLine($"adopted listener handle {h} on {listenEp}");
+}
+else
+#endif
+if (server && adopt)
+{
+    Console.WriteLine("note: --adopt requires .NET 5+ (SafeSocketHandle); falling back to Listen");
+    set.Listen(listenEp, EchoServer.ServerToken);
+    Console.WriteLine($"listening on {listenEp}");
+}
+else if (server)
 {
     set.Listen(listenEp, EchoServer.ServerToken);
     Console.WriteLine($"listening on {listenEp}");

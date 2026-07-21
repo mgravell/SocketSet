@@ -137,6 +137,18 @@ public abstract partial class SocketSet : IDisposable
     public void Connect(EndPoint endpoint, object? userToken = null)
         => RoundRobin().Connect(endpoint, userToken);
 
+    /// <summary>
+    /// Start accepting on an already-bound-and-listening socket handle (an fd on Linux/io_uring, a
+    /// <see cref="System.Net.Sockets.Socket"/> handle on the managed backend) instead of binding one
+    /// — e.g. a socket-activation / systemd-inherited listener, or one handed over for a zero-downtime
+    /// restart. (Mirrors Kestrel's <c>ListenHandle</c>.) Since it is a single handle (not reuse-port
+    /// multi-bound), one shard drives the accept and spreads connections across shards.
+    /// <paramref name="userToken"/> becomes the default <see cref="Connection.UserToken"/> for
+    /// connections accepted on it. The set takes ownership of the handle and closes it on teardown.
+    /// </summary>
+    public void ListenHandle(nint handle, object? userToken = null)
+        => RoundRobin().ListenHandle(handle, userToken);
+
     protected internal virtual void OnAccept(ref AcceptContext ctx)
     {
     }
