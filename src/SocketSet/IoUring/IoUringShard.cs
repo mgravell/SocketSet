@@ -162,19 +162,18 @@ internal sealed class IoUringShard : SocketSetShard
 
     private SocketSet.SocketFlags GetFlags(uint slot) => _conns[slot - 1].Flags;
 
+    /// <summary>Begin tearing a connection down (loop thread). Idempotent. Fires OnClosed now, but
+    /// does NOT close the fd or free the slot yet — it forces the in-flight ops to drain (shutdown +
+    /// ASYNC_CANCEL) and the slot is finalized only once they have (see <see cref="TryFinalize"/>), so
+    /// no stale completion can ever land on a re-tenanted slot.</summary>
     private void CloseClient(uint slot)
     {
         if (slot == 0) return;
         var conn = _conns[slot - 1];
-        // CloseClient runs only on the loop thread (sequential), so a plain read + late publish is
-        // safe against other CloseClients. The subtlety is InitClient, which runs on arbitrary threads
-        // (Connect) and CAS-claims a slot when Fd == 0 — so we must NOT zero Fd until teardown is
-        // complete, or a racing Connect could re-tenant the slot mid-teardown and have our OnClosed /
-        // Opened=false land on the new tenant (leaking its live count → wedged connection).
-        int fd = Volatile.Read(ref conn.Fd);
-        if (fd == 0) return; // already torn down — do OnClosed / cleanup exactly once
+        if (conn.Fd == 0 || conn.Closing) return; // not open / already tearing down
+        conn.Closing = true;
 
-        // Notify the app while the identity is still valid (UserToken readable), if it saw it open.
+        // Notify the app once, while the identity is valid, if it saw the connection open.
         if (conn.Opened)
         {
             conn.Opened = false;
@@ -182,13 +181,26 @@ internal sealed class IoUringShard : SocketSetShard
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
         }
 
-        conn.UserToken = null;
-        conn.Flags = 0;
-        conn.SendBusy = false;
+        // Force the drain: shutdown(RDWR) sends the FIN and EOFs the armed recv; ASYNC_CANCEL(FD|ALL)
+        // cancels the recv + any in-flight send so nothing lingers. The fd stays open (cancel matches
+        // by fd) and the slot stays claimed until every op is reaped.
+        LibC.shutdown(conn.Fd, LibC.SHUT_RDWR);
+        if (conn.RecvArmed || conn.SendBusy)
+        {
+            conn.CancelPending = true;
+            SubmitCancel(conn.Fd, slot);
+        }
+        TryFinalize(conn, slot); // nothing in flight → finalize immediately
+    }
+
+    // Finalize once all in-flight ops for a closing slot have drained: close the fd, release any
+    // queued buffers, and publish the slot as free LAST (only now may a racing InitClient claim it).
+    private void TryFinalize(IoUringConnection conn, uint slot)
+    {
+        if (!conn.Closing || conn.RecvArmed || conn.SendBusy || conn.CancelPending) return;
+
         if (conn.Pending is { } pending)
         {
-            // Release any queued flushed-chain buffers (echo segments are plain arrays, just dropped).
-            // An in-flight WriteV, if any, is released by its own completion (which sees Fd == 0).
             while (pending.Count > 0)
             {
                 var job = pending.Dequeue();
@@ -196,14 +208,14 @@ internal sealed class IoUringShard : SocketSetShard
             }
         }
 
-        // shutdown() before close(): an armed multishot recv pins the socket's struct file, so a bare
-        // close() wouldn't send a FIN and the peer would never see EOF. shutdown(RDWR) forces the FIN
-        // and completes the pending recv (EOF), releasing io_uring's file reference; close() then reaps.
-        LibC.shutdown(fd, LibC.SHUT_RDWR);
-        LibC.close(fd);
-
-        // Publish the slot as free LAST — only now may a racing InitClient claim it.
-        Volatile.Write(ref conn.Fd, 0);
+        int fd = conn.Fd;
+        conn.UserToken = null;
+        conn.Flags = 0;
+        conn.SendBusy = false;
+        conn.RecvArmed = false;
+        conn.Closing = false;
+        if (fd > 0) LibC.close(fd);
+        Volatile.Write(ref conn.Fd, 0); // publish free last
     }
 
     // =====================================================================
@@ -384,6 +396,7 @@ internal sealed class IoUringShard : SocketSetShard
         // Multishot: one SQE yields many recv completions (each selecting a provided buffer),
         // so we don't re-submit per message. It stays armed while IORING_CQE_F_MORE is set and
         // must be re-armed only when that clears (error / buffer exhaustion).
+        _conns[slot - 1].RecvArmed = true; // an in-flight recv op now exists for this slot
         var sqe = new LibC.io_uring_sqe
         {
             opcode = LibC.IORING_OP_RECV,
@@ -394,6 +407,19 @@ internal sealed class IoUringShard : SocketSetShard
             buf_index = _readBuffer.GroupId, // buf_index aliases buf_group
             user_data = Pack(Op.Recv, slot),
         };
+        Submit(sqe);
+    }
+
+    // Cancel every in-flight op on a fd (teardown). CANCEL_FD matches by fd; CANCEL_ALL gets them all.
+    private void SubmitCancel(int fd, uint slot)
+    {
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_ASYNC_CANCEL,
+            fd = fd,
+            user_data = Pack(Op.Cancel, slot),
+        };
+        sqe.rw_flags.rw_flags = (int)(LibC.IORING_ASYNC_CANCEL_FD | LibC.IORING_ASYNC_CANCEL_ALL);
         Submit(sqe);
     }
 
@@ -434,11 +460,14 @@ internal sealed class IoUringShard : SocketSetShard
     /// buffer and send it. Closes the connection if no write buffer is available.</summary>
     private unsafe void SendResponse(uint slot, int fd, byte* src, int len)
     {
-        if ((GetFlags(slot) & SocketSet.SocketFlags.SendClosed) != 0) return;
+        // The caller claimed the send slot (SendBusy) before deciding borrow-vs-copy; if we bail here
+        // without actually submitting a send, release it so teardown doesn't wait on a phantom send.
+        if ((GetFlags(slot) & SocketSet.SocketFlags.SendClosed) != 0) { _conns[slot - 1].SendBusy = false; return; }
         if (!_writeBuffer.TryLease(out int wi, out byte* wp))
         {
             // Pool exhausted: the safe thing is to drop the connection rather than stall it.
             System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
+            _conns[slot - 1].SendBusy = false;
             CloseClient(slot);
             return;
         }
@@ -570,6 +599,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         if (!_writeBuffer.TryLease(out int wi, out byte* wp))
         {
+            conn.SendBusy = false; // no send actually issued — don't strand teardown on it
             CloseClient(slot);
             return;
         }
@@ -744,6 +774,10 @@ internal sealed class IoUringShard : SocketSetShard
                 case Op.WriteV:
                     HandleWriteV(res, slot: id);
                     break;
+
+                case Op.Cancel:
+                    HandleCancel(slot: id);
+                    break;
             }
         }
 
@@ -845,30 +879,43 @@ internal sealed class IoUringShard : SocketSetShard
 
     private unsafe void HandleRecv(int res, uint flags, uint slot)
     {
+        var conn = _conns[slot - 1];
         bool hasBuf = (flags & LibC.IORING_CQE_F_BUFFER) != 0;
         ushort bid = (ushort)(flags >> LibC.IORING_CQE_BUFFER_SHIFT);
         bool more = (flags & LibC.IORING_CQE_F_MORE) != 0;
-        int fd = GetFd(slot);
 
+        // Whenever the multishot doesn't continue, its in-flight op has ended (a re-arm below starts a
+        // fresh one). This is what TryFinalize waits on during teardown.
+        if (!more) conn.RecvArmed = false;
+
+        if (conn.Closing)
+        {
+            // Draining: release any buffer, don't deliver or re-arm; finalize once fully drained.
+            if (hasBuf) _readBuffer.ReleaseBuffer(bid);
+            TryFinalize(conn, slot);
+            return;
+        }
+
+        int fd = conn.Fd; // live (not closing) → valid; defer-recycle means no stale completions
         if (res > 0)
         {
             // DeliverReceive may borrow the buffer for a no-copy echo; if so it owns releasing it.
-            bool borrowed = fd != 0 && DeliverReceive(slot, fd, bid, res);
+            bool borrowed = DeliverReceive(slot, fd, bid, res);
             if (hasBuf && !borrowed) _readBuffer.ReleaseBuffer(bid);
 
             // Multishot stays armed while F_MORE is set; re-arm only when it clears.
-            if (!more && GetFd(slot) != 0 && (GetFlags(slot) & SocketSet.SocketFlags.ReceiveClosed) == 0)
+            if (!more && !conn.Closing && (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
                 ArmRecv(slot, fd);
         }
         else if (res == -LibC.ENOBUFS)
         {
             // Provided-buffer ring was empty, so the multishot ended; re-arm — buffers free as
             // borrowed ones are returned on send completion.
-            if (fd != 0) ArmRecv(slot, fd);
+            ArmRecv(slot, fd);
         }
         else
         {
-            // res == 0 (peer EOF) or a negative errno.
+            // res == 0 (peer EOF) or a negative errno → begin teardown.
             if (hasBuf) _readBuffer.ReleaseBuffer(bid);
             CloseClient(slot);
         }
@@ -913,11 +960,23 @@ internal sealed class IoUringShard : SocketSetShard
 
     private unsafe void HandleSend(int res, uint slot, int writeIndex)
     {
+        var conn = _conns[slot - 1];
         ref WriteState ws = ref _writeState[writeIndex];
+
+        if (conn.Closing)
+        {
+            // Draining (this send was cancelled/errored/completed): free its buffer, clear the send
+            // slot, finalize once fully drained.
+            _writeBuffer.Release(writeIndex);
+            conn.SendBusy = false;
+            TryFinalize(conn, slot);
+            return;
+        }
 
         if (res < 0)
         {
             _writeBuffer.Release(writeIndex);
+            conn.SendBusy = false;
             CloseClient(slot);
             return;
         }
@@ -925,7 +984,7 @@ internal sealed class IoUringShard : SocketSetShard
         ws.Sent += res;
         if (ws.Sent < ws.Total && res > 0)
         {
-            // Partial write: resubmit the remainder from the same buffer.
+            // Partial write: resubmit the remainder from the same buffer (still one send in flight).
             byte* p = _writeBuffer.Address(writeIndex) + ws.Sent;
             int remaining = ws.Total - ws.Sent;
             var sqe = new LibC.io_uring_sqe
@@ -945,18 +1004,12 @@ internal sealed class IoUringShard : SocketSetShard
         {
             // res == 0 with bytes still outstanding: treat as a dead peer.
             _writeBuffer.Release(writeIndex);
+            conn.SendBusy = false;
             CloseClient(slot);
             return;
         }
 
-        int fd = GetFd(slot);
-        if (fd == 0)
-        {
-            _writeBuffer.Release(writeIndex);
-            return;
-        } // closed: SendBusy already reset
-
-        CompleteWrite(_conns[slot - 1], slot, fd, writeIndex);
+        CompleteWrite(conn, slot, conn.Fd, writeIndex);
     }
 
     /// <summary>A send from write page <paramref name="writeIndex"/> fully completed. Offer the
@@ -1011,12 +1064,24 @@ internal sealed class IoUringShard : SocketSetShard
     // (provided) buffer held out of the ring; on final completion we return it and drop the borrow.
     private unsafe void HandleSendBid(int res, uint slot, ushort bid)
     {
+        var conn = _conns[slot - 1];
         ref WriteState ws = ref _bidState[bid];
+
+        if (conn.Closing)
+        {
+            // Draining: return the borrowed read buffer, clear the send slot, finalize when drained.
+            _readBuffer.ReleaseBuffer(bid);
+            _borrowedBids--;
+            conn.SendBusy = false;
+            TryFinalize(conn, slot);
+            return;
+        }
 
         if (res < 0)
         {
             _readBuffer.ReleaseBuffer(bid);
             _borrowedBids--;
+            conn.SendBusy = false;
             CloseClient(slot);
             return;
         }
@@ -1044,21 +1109,15 @@ internal sealed class IoUringShard : SocketSetShard
             // res == 0 with bytes outstanding: dead peer.
             _readBuffer.ReleaseBuffer(bid);
             _borrowedBids--;
+            conn.SendBusy = false;
             CloseClient(slot);
             return;
         }
 
-        int fd = GetFd(slot);
-        if (fd == 0)
-        {
-            _readBuffer.ReleaseBuffer(bid);
-            _borrowedBids--;
-            return;
-        } // closed: SendBusy reset
+        int fd = conn.Fd;
 
         // Full echo sent. Fire OnWrite offering the read buffer for a pipelined follow-up (drives
         // the window state machine); if the handler declines, return the buffer to the ring.
-        var conn = _conns[slot - 1];
         byte* rp = _readBuffer.GetBufferAddress(bid);
         var ctx = new SocketSet.WriteContext(conn, rp, _readBuffer.BufferSize);
         Parent.OnWrite(ref ctx);
@@ -1084,24 +1143,28 @@ internal sealed class IoUringShard : SocketSetShard
     {
         var conn = _conns[slot - 1];
         ref var ws = ref conn.WriteV;
-        int fd = GetFd(slot);
+
+        if (conn.Closing)
+        {
+            // Draining: release the chain, clear the send slot, finalize once fully drained.
+            ReleaseWriteV(conn);
+            conn.SendBusy = false;
+            TryFinalize(conn, slot);
+            return;
+        }
 
         if (res < 0)
         {
             ReleaseWriteV(conn);
+            conn.SendBusy = false;
             CloseClient(slot);
             return;
         }
 
+        int fd = conn.Fd;
         ws.Sent += res;
         if (ws.Sent < ws.Total && res > 0)
         {
-            if (fd == 0)
-            {
-                ReleaseWriteV(conn);
-                return;
-            } // closed under us; SendBusy already reset
-
             // Partial writev: skip the iovecs fully drained by this completion and trim the one it
             // stopped inside, then resubmit from there (state unchanged).
             long consume = res;
@@ -1131,14 +1194,23 @@ internal sealed class IoUringShard : SocketSetShard
         {
             // res == 0 with bytes outstanding: dead peer.
             ReleaseWriteV(conn);
+            conn.SendBusy = false;
             CloseClient(slot);
             return;
         }
 
         // Full payload sent.
         ReleaseWriteV(conn);
-        if (fd == 0) return; // closed: SendBusy already reset by CloseClient
         DrainNext(conn, slot, fd);
+    }
+
+    // Completion of the teardown ASYNC_CANCEL. The cancelled ops post their own -ECANCELED
+    // completions (which clear RecvArmed/SendBusy); this just clears the cancel itself.
+    private void HandleCancel(uint slot)
+    {
+        var conn = _conns[slot - 1];
+        conn.CancelPending = false;
+        TryFinalize(conn, slot);
     }
 
     // =====================================================================

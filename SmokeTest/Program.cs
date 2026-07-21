@@ -232,6 +232,7 @@ if (closeAfter > 0 && churn > 0)
 
     long connected = 0;
     var csw = Stopwatch.StartNew();
+    double churnSecs = 0;
     long nextReport = 1;
     while (csw.Elapsed < TimeSpan.FromSeconds(churn) && !churnStop.IsSet)
     {
@@ -248,6 +249,7 @@ if (closeAfter > 0 && churn > 0)
         }
         Thread.Sleep(1);
     }
+    churnSecs = csw.Elapsed.TotalSeconds;
 
     // Stop connecting and let everything drain. The real invariant is live -> 0: every connection the
     // app saw open, it must see closed. (closed == 2 × connected only holds with a table big enough
@@ -265,8 +267,10 @@ if (closeAfter > 0 && churn > 0)
     int openFds = -1;
     try { openFds = System.IO.Directory.GetFileSystemEntries("/proc/self/fd").Length; } catch { }
     bool ok = liveEnd == 0;
+    double rate = churnSecs > 0 ? connected / churnSecs : 0;
     Console.WriteLine(
-        $"churn: done — connected={connected:n0} closed={set.Closed:n0} live={liveEnd} " +
+        $"churn: done — connected={connected:n0} in {churnSecs:0.0}s = {rate:n0} conn/s " +
+        $"(≈{rate * 2:n0} sockets/s open+close) closed={set.Closed:n0} live={liveEnd} " +
         $"(client={set.LiveClient} server={set.LiveServer}) open-fds={openFds} " +
         $"round-trips={set.RoundTripBytes:n0} => {(ok ? "PASS" : "FAIL (wedged)")}");
     return;

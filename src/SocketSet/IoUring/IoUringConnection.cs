@@ -104,6 +104,14 @@ internal sealed unsafe class IoUringConnection : Connection
     /// <summary>Bumped on each allocation; guards writes against slot reuse (ABA).</summary>
     public uint Generation;
 
+    // Teardown state (loop-thread only). The slot is NOT recycled (Fd stays non-zero) until every
+    // in-flight op has been reaped — so a completion can never land on a re-tenanted slot. The only
+    // ops in flight at close time are the multishot recv (RecvArmed) and at most one send (SendBusy),
+    // plus the teardown ASYNC_CANCEL (CancelPending); when all three are clear the slot finalizes.
+    public bool Closing;
+    public bool RecvArmed;
+    public bool CancelPending;
+
     // --- loop-thread-only send state ---
     // A stream socket must not have two SENDs racing (they can reorder), so at most one send is in
     // flight per connection. Follow-ups — pipelined echoes and flushed writes alike — wait here.
