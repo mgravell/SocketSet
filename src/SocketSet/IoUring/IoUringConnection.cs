@@ -17,9 +17,58 @@ internal struct OutSeg
     public int Length;
 }
 
+/// <summary>An ordered set of committed segments making up one flushed message. The first segment is
+/// stored inline (<see cref="First"/>) and the rest, if any, spill to <see cref="Rest"/> — so the
+/// dominant single-segment message carries no <see cref="List{T}"/> allocation at all.
+/// <see cref="Count"/> is the total (1 + Rest.Count when non-empty; 0 means "no chain").</summary>
+internal struct OutChain
+{
+    // The first segment stays inline (First) and the rest, if any, spill to Rest — so the dominant
+    // single-segment message allocates no list. First/Rest are private-by-convention: everything
+    // outside this struct goes through Count / the indexer / Add / CopyTo, so the inline storage can
+    // be widened later (manual _seg0.._segK-1 fields, or [InlineArray] on net8+) to keep 2..K-segment
+    // flushes allocation-free — without touching any caller — if a profile ever shows it hot.
+    public OutSeg First;
+    public List<OutSeg>? Rest;
+    public int Count;
+
+    public readonly OutSeg this[int i] => i == 0 ? First : Rest![i - 1];
+
+    /// <summary>Append a committed segment — the first stays inline, the rest spill to the list.</summary>
+    public void Add(in OutSeg seg)
+    {
+        if (Count == 0) First = seg;
+        else (Rest ??= new()).Add(seg);
+        Count++;
+    }
+
+    /// <summary>Append <paramref name="src"/>[<paramref name="start"/> .. start+<paramref name="len"/>)
+    /// to this chain, without linearizing the source — the range's first element becomes this chain's
+    /// inline <see cref="First"/> (when empty) and the remainder is bulk-copied from the source's list
+    /// span. (Source index <c>j &gt; 0</c> maps to <c>Rest[j-1]</c>, so the remainder starts at
+    /// <c>Rest[start]</c> in both the start==0 and start&gt;0 cases.)</summary>
+    public void Add(in OutChain src, int start, int len)
+    {
+        if (len == 0) return;
+        Add(src[start]); // establishes First when this chain is empty, else appends
+        if (len > 1) AppendToRest(CollectionsMarshal.AsSpan(src.Rest).Slice(start, len - 1));
+    }
+
+    // Bulk-append segments to Rest. Precondition: Count >= 1 (First already set), which Add(in OutSeg)
+    // above guarantees before this is reached.
+    private void AppendToRest(ReadOnlySpan<OutSeg> segs)
+    {
+        var rest = Rest ??= new();
+        int at = rest.Count;
+        CollectionsMarshal.SetCount(rest, at + segs.Length);
+        segs.CopyTo(CollectionsMarshal.AsSpan(rest)[at..]);
+        Count += segs.Length;
+    }
+}
+
 /// <summary>State of one in-flight scatter-gather send (Op.WriteV). Lives on the connection since at
-/// most one send is in flight at a time. On completion the pool pages are released, the managed
-/// segments' pins are freed and their buffers returned, and the native iovec array is freed.</summary>
+/// most one send is in flight at a time. On completion the pool pages are released, the POH overflow
+/// segments dropped, and the native iovec array freed.</summary>
 internal unsafe struct WriteVState
 {
     public LibC.iovec* Iov;   // native iovec array (TotalIov entries)
@@ -27,7 +76,7 @@ internal unsafe struct WriteVState
     public int Cursor;        // first not-fully-sent iovec (advanced on partial writes)
     public long Sent;
     public long Total;
-    public List<OutSeg> Chain;    // segments backing the iovecs (to release on completion)
+    public OutChain Chain;    // segments backing the iovecs (to release on completion)
 }
 
 /// <summary>
@@ -63,7 +112,9 @@ internal sealed unsafe class IoUringConnection : Connection
     public WriteVState WriteV; // the in-flight scatter-gather send, if any (Chain != null while active)
 
     // --- IBufferWriter accumulation (single-writer until Flush) ---
-    private List<OutSeg>? _segs;   // committed segments for the message being built
+    // Committed segments of the message being built (first inline, rest in a list — a single-segment
+    // message allocates no list). Detached and handed to the loop on Flush.
+    private OutChain _chain;
     private int _curPage = -1;     // current segment: pool page index, or -1 if managed / none
     private byte[]? _curManaged;   // current segment's managed buffer (when _curPage < 0)
     private byte* _curBase;        // native base of the current pool page (valid iff _curPage >= 0)
@@ -104,9 +155,9 @@ internal sealed unsafe class IoUringConnection : Connection
     {
         if (Volatile.Read(ref Fd) == 0) { DiscardWriter(); return false; }
         CommitCurrent();
-        if (_segs is not { Count: > 0 }) return true; // nothing written since the last flush
-        var chain = _segs;
-        _segs = null;
+        if (_chain.Count == 0) return true; // nothing written since the last flush
+        var chain = _chain;
+        _chain = default;
         Shard.SubmitFlush(Slot, Volatile.Read(ref Generation), chain);
         return true;
     }
@@ -154,7 +205,7 @@ internal sealed unsafe class IoUringConnection : Connection
         if (_curCap == 0) return;
         if (_curPos > 0)
         {
-            (_segs ??= new()).Add(new OutSeg { Page = _curPage, Managed = _curManaged, Length = _curPos });
+            _chain.Add(new OutSeg { Page = _curPage, Managed = _curManaged, Length = _curPos });
         }
         else
         {
@@ -172,11 +223,8 @@ internal sealed unsafe class IoUringConnection : Connection
     private void DiscardWriter()
     {
         CommitCurrent();
-        if (_segs is { } segs)
-        {
-            foreach (var seg in segs) ReleaseSeg(seg);
-            segs.Clear();
-        }
+        for (int i = 0; i < _chain.Count; i++) ReleaseSeg(_chain[i]);
+        _chain = default;
     }
 
     internal void ReleaseSeg(in OutSeg seg)
@@ -244,10 +292,10 @@ internal sealed unsafe class IoUringConnection : Connection
 }
 
 /// <summary>A queued send waiting behind the in-flight one: either a single-buffer echo response
-/// (<see cref="Seg"/>) or a flushed out-of-band <see cref="Chain"/>.</summary>
+/// (<see cref="Seg"/>, when <c>Chain.Count == 0</c>) or a flushed out-of-band <see cref="Chain"/>.</summary>
 internal struct PendingJob
 {
     public ArraySegment<byte> Seg;
-    public List<OutSeg>? Chain;
+    public OutChain Chain; // Count > 0 => this is a flushed chain; otherwise Seg is the echo response
 }
 #endif
