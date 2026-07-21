@@ -153,6 +153,18 @@ public abstract partial class SocketSet : IDisposable
     {
     }
 
+    /// <summary>
+    /// A connection has been torn down — peer close (EOF), a transport error, or a local
+    /// <see cref="Connection.Close"/>. Fires exactly once, on the owning IO thread, and only for a
+    /// connection the application actually saw open (i.e. paired with an <see cref="OnAccept"/> or
+    /// <see cref="OnConnect"/>). The fd is already closed by the time this runs; it is a notification
+    /// for bookkeeping (the <paramref name="connection"/>'s <see cref="Connection.UserToken"/> is
+    /// still readable). After it returns the connection is recycled — do not retain it.
+    /// </summary>
+    protected internal virtual void OnClosed(Connection connection)
+    {
+    }
+
     // Each context carries the Connection (the per-connection identity, which owns UserToken and
     // the send/recv-closed Flags) plus, where relevant, a raw pointer + length into a
     // backend-owned buffer (io_uring provided/write buffers, the managed scratch). The buffer is

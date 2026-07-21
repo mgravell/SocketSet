@@ -87,6 +87,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             fixed (byte* buf = conn.SendBuffer)
             {
                 var ctx = new SocketSet.AcceptContext(conn, buf, _bufferSize);
+                conn.Opened = true; // app now sees it open → pairs with OnClosed
                 Parent.OnAccept(ref ctx);
                 sendBytes = ctx.SendBytes;
             }
@@ -136,6 +137,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         fixed (byte* buf = conn.SendBuffer)
         {
             var ctx = new SocketSet.ConnectContext(conn, buf, _bufferSize);
+            conn.Opened = true; // app now sees it open → pairs with OnClosed
             Parent.OnConnect(ref ctx);
             sendBytes = ctx.SendBytes;
         }
@@ -346,8 +348,17 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
     private void Close(ManagedConnection conn)
     {
-        if (!_connections.TryRemove(conn, out _)) return; // already closed
+        if (!_connections.TryRemove(conn, out _)) return; // already closed (idempotent)
         conn.Closed = true; // out-of-band Send now returns false
+
+        // Notify the app once, while the identity is valid, if it ever saw the connection open.
+        if (conn.Opened)
+        {
+            conn.Opened = false;
+            try { Parent.OnClosed(conn); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
+        }
+
         try { conn.Socket.Shutdown(SocketShutdown.Both); } catch { /* best effort */ }
         SafeDispose(conn.Socket);
         // Deliberately do NOT dispose RecvArgs/SendArgs here: a receive or send may still be
@@ -506,6 +517,8 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             RecvArgs = new ConnArgs(shard) { Conn = this };
             SendArgs = new ConnArgs(shard) { Conn = this };
         }
+
+        public override void Close() => Shard.Close(this); // idempotent (TryRemove-gated); any thread
 
         // --- IBufferWriter<byte> (out-of-band writes; Send(span/seq) is the base sugar over these) ---
 

@@ -15,6 +15,9 @@ int size = 512; // message size
 int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.MaxValue = unbounded
 bool poke = false; // server echoes out-of-band via Connection.Send from a background thread
 int verify = 0;    // >0: run the out-of-band Send content-verification harness with this payload size
+int closeAfter = 0; // >0: each client sends this many messages then closes (graceful-drain test)
+int loops = 1;      // drain test: repeat this many connect→drain cycles (0 = forever, until Ctrl+C)
+int churn = 0;      // >0: overlapping-churn soak for this many seconds (reconnect while teardowns fly)
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 string host = "127.0.0.1"; // client connect target (server always binds Any)
 int port = 10000;
@@ -63,6 +66,18 @@ for (int i = 0; i < args.Length; i++)
             break;
         case "--verify" when i + 1 < args.Length && int.TryParse(args[i + 1], out var vp):
             verify = Math.Max(1, vp);
+            break;
+        case "--close-after" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ca):
+            closeAfter = Math.Max(1, ca);
+            break;
+        case "--loops" when i + 1 < args.Length && int.TryParse(args[i + 1], out var lp):
+            loops = Math.Max(0, lp); // 0 = forever
+            break;
+        case "--churn" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ch):
+            churn = Math.Max(1, ch);
+            break;
+        case "--sockets" when i + 1 < args.Length && int.TryParse(args[i + 1], out var sk):
+            options.SocketsPerShard = Math.Max(1, sk);
             break;
         case "--window" when i + 1 < args.Length && int.TryParse(args[i + 1], out var w):
             window = Math.Max(1, w);
@@ -122,6 +137,11 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --pipeline        unbounded in-flight (throughput, but can wedge a symmetric echo; use --window instead)");
     Console.WriteLine("  --poke            server echoes out-of-band via Connection.Send from a background thread");
     Console.WriteLine("  --verify N        run the out-of-band Send correctness harness with an N-byte payload");
+    Console.WriteLine("  --close-after N   each client sends N messages then closes (graceful-drain lifecycle test)");
+    Console.WriteLine("  --loops N         repeat the drain cycle N times (0 = forever); a socket-churn soak");
+    Console.WriteLine("  --churn S         overlapping-churn soak for S seconds: keep the population topped up so");
+    Console.WriteLine("                    reconnects race in-flight teardowns (stresses slot reuse / ABA)");
+    Console.WriteLine("  --sockets N       sockets per shard (small = tight table = immediate slot reuse under churn)");
     return;
 }
 
@@ -180,7 +200,7 @@ if (uds is not null) Console.WriteLine("note: UDS not supported on this target f
 listenEp = new IPEndPoint(IPAddress.Any, port);
 connectEp = new IPEndPoint(IPAddress.Parse(host), port);
 #endif
-using var set = new EchoServer(options) { GreetingSize = size, Window = window, PokeMode = poke };
+using var set = new EchoServer(options) { GreetingSize = size, Window = window, PokeMode = poke, CloseAfterMessages = closeAfter };
 string mode = window == 1 ? "ping/pong" : window == int.MaxValue ? "pipeline(unbounded)" : $"pipeline(window={window})";
 Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +
@@ -190,6 +210,108 @@ if (server)
 {
     set.Listen(listenEp, EchoServer.ServerToken);
     Console.WriteLine($"listening on {listenEp}");
+}
+
+// Graceful-drain lifecycle test / socket-churn soak: each loop opens the clients, each client sends
+// N messages then closes, the server tears down its side on EOF, and we wait for everything to return
+// to zero live connections before the next loop. Asserts each loop produces exactly 2 closes/client
+// (client side + server-accepted side) and the listener stays up throughout.
+if (closeAfter > 0 && churn > 0)
+{
+    // Overlapping-churn soak: keep ~clientCount connections live for `churn` seconds. As clients hit
+    // their message quota and close, we immediately reconnect into the freed slots — so reconnect
+    // InitClient (an external thread) races the loop thread still reaping the previous tenant's
+    // in-flight ops. With a tight --sockets table the same slots recycle instantly, maximizing the
+    // slot-reuse/ABA stress. A manifested ABA shows as a fault, a wedge (never drains), or a
+    // close-accounting mismatch (closed != 2 × connected).
+    using var churnStop = new ManualResetEventSlim(false);
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; churnStop.Set(); };
+    Console.WriteLine(
+        $"churn: overlapping soak for {churn}s, target ~{clientCount} live, {closeAfter} msg(s)/conn, " +
+        $"sockets/shard={options.SocketsPerShard} shards={options.Shards}");
+
+    long connected = 0;
+    var csw = Stopwatch.StartNew();
+    long nextReport = 1;
+    while (csw.Elapsed < TimeSpan.FromSeconds(churn) && !churnStop.IsSet)
+    {
+        int want = clientCount - (int)set.LiveConnections;
+        for (int j = 0; j < want; j++)
+        {
+            try { set.Connect(connectEp); connected++; }
+            catch { break; } // table momentarily full — back off and let teardowns free slots
+        }
+        if (csw.Elapsed.TotalSeconds >= nextReport)
+        {
+            nextReport = (long)csw.Elapsed.TotalSeconds + 1;
+            Console.WriteLine($"churn: t={csw.Elapsed.TotalSeconds,4:0}s connected={connected:n0} live={set.LiveConnections} closed={set.Closed:n0}");
+        }
+        Thread.Sleep(1);
+    }
+
+    // Stop connecting and let everything drain. The real invariant is live -> 0: every connection the
+    // app saw open, it must see closed. (closed == 2 × connected only holds with a table big enough
+    // that server accepts never drop; a tight --sockets deliberately drops accepts, so we don't assert
+    // on closed there — but live must still reach 0.) Watch the drain to distinguish a wedge from slow.
+    var drain = Stopwatch.StartNew();
+    long lastLive = -1;
+    while (set.LiveConnections != 0 && drain.Elapsed < TimeSpan.FromSeconds(30))
+    {
+        long l = set.LiveConnections;
+        if (l != lastLive) { Console.WriteLine($"churn: draining t={drain.Elapsed.TotalSeconds,4:0}s live={l} (client={set.LiveClient} server={set.LiveServer})"); lastLive = l; }
+        Thread.Sleep(20);
+    }
+    long liveEnd = set.LiveConnections;
+    int openFds = -1;
+    try { openFds = System.IO.Directory.GetFileSystemEntries("/proc/self/fd").Length; } catch { }
+    bool ok = liveEnd == 0;
+    Console.WriteLine(
+        $"churn: done — connected={connected:n0} closed={set.Closed:n0} live={liveEnd} " +
+        $"(client={set.LiveClient} server={set.LiveServer}) open-fds={openFds} " +
+        $"round-trips={set.RoundTripBytes:n0} => {(ok ? "PASS" : "FAIL (wedged)")}");
+    return;
+}
+
+if (closeAfter > 0)
+{
+    using var soakStop = new ManualResetEventSlim(false);
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; soakStop.Set(); };
+    Console.WriteLine(
+        $"soak: {(loops == 0 ? "∞" : loops.ToString())} loop(s) × {clientCount} clients × {closeAfter} msgs " +
+        $"(Ctrl+C to stop); watch live sockets return to 0 each loop");
+
+    long totalSockets = 0;
+    bool failed = false;
+    for (int loop = 1; (loops == 0 || loop <= loops) && !soakStop.IsSet; loop++)
+    {
+        long baseClosed = set.Closed;
+        for (int i = 0; i < clientCount; i++) set.Connect(connectEp);
+
+        // Wait until this loop's connections have all opened AND closed (2 closes per client). Polling
+        // the close-delta (not live count) avoids racing the async connects, which haven't raised the
+        // live count yet right after Connect().
+        var dsw = Stopwatch.StartNew();
+        while (set.Closed - baseClosed < 2L * clientCount && dsw.Elapsed < TimeSpan.FromSeconds(30) && !soakStop.IsSet)
+            Thread.Sleep(2);
+
+        long delta = set.Closed - baseClosed;
+        long live = set.LiveConnections;
+        totalSockets += delta;
+        bool ok = live == 0 && delta == 2L * clientCount;
+        if (!ok)
+        {
+            failed = true;
+            Console.WriteLine($"soak: loop {loop} FAIL — live={live} closed-this-loop={delta} (expect {2L * clientCount})");
+            break;
+        }
+        if (loop == 1 || loop % 50 == 0 || loops != 0 && loop == loops)
+            Console.WriteLine($"soak: loop {loop} ok — total sockets churned={totalSockets:n0} live=0");
+    }
+
+    Console.WriteLine(
+        $"soak: done — {totalSockets:n0} sockets churned, final live={set.LiveConnections}, " +
+        $"listener {(set.LiveConnections == 0 ? "clean" : "LEAK")} => {(failed ? "FAIL" : "PASS")}");
+    return;
 }
 
 for (int i = 0; i < clientCount; i++)

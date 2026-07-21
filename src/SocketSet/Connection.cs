@@ -29,6 +29,19 @@ public abstract class Connection : IBufferWriter<byte>
     /// <summary>Send/receive-closed state, mutated through the context Close* methods.</summary>
     internal SocketSet.SocketFlags Flags;
 
+    /// <summary>True once the app has seen this connection open (OnAccept/OnConnect fired); gates
+    /// <see cref="SocketSet.OnClosed"/> so it pairs with an open and never fires for a connection the
+    /// app never saw (e.g. a failed connect). Backend-managed on the owning IO thread.</summary>
+    internal bool Opened;
+
+    /// <summary>
+    /// Request that this connection be closed, callable from any thread — the teardown is marshaled
+    /// onto the owning IO context, which retracts everything associated with the socket.
+    /// Idempotent; <see cref="SocketSet.OnClosed"/> fires once when it is actually torn down. After
+    /// Close, further <see cref="Send(System.ReadOnlySpan{byte})"/>/<see cref="Flush"/> are no-ops.
+    /// </summary>
+    public abstract void Close();
+
     // --- IBufferWriter<byte>: write directly into library-owned outbound buffers, then Flush ---
 
     /// <summary>Get a span to write outbound bytes into. It lands in a library-owned buffer; write up

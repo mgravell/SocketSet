@@ -29,6 +29,7 @@ internal sealed class IoUringShard : SocketSetShard
         Send = 4, // send from a write-pool buffer (aux = write index)
         SendBid = 5, // no-copy echo: send straight from a read (provided) buffer (aux = bid)
         WriteV = 6, // scatter-gather send of a large payload across N write-pool pages (aux = first page index)
+        Cancel = 7, // IORING_OP_ASYNC_CANCEL(CANCEL_FD|ALL) issued during teardown to drain in-flight ops
     }
 
     private struct WriteState
@@ -92,6 +93,10 @@ internal sealed class IoUringShard : SocketSetShard
     // generation is captured at enqueue and re-checked on drain so a flush for a since-closed (and
     // possibly reused) slot is dropped, not misdelivered.
     private readonly ConcurrentQueue<(uint Slot, uint Generation, OutChain Chain)> _flush = [];
+
+    // Close requests marshaled from arbitrary threads onto the loop thread. Generation-guarded so a
+    // request can't retract a slot that has since been closed and re-tenanted.
+    private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
 
     public unsafe IoUringShard(SocketSetOptions options)
     {
@@ -161,14 +166,29 @@ internal sealed class IoUringShard : SocketSetShard
     {
         if (slot == 0) return;
         var conn = _conns[slot - 1];
-        int fd = Interlocked.Exchange(ref conn.Fd, 0);
+        // CloseClient runs only on the loop thread (sequential), so a plain read + late publish is
+        // safe against other CloseClients. The subtlety is InitClient, which runs on arbitrary threads
+        // (Connect) and CAS-claims a slot when Fd == 0 — so we must NOT zero Fd until teardown is
+        // complete, or a racing Connect could re-tenant the slot mid-teardown and have our OnClosed /
+        // Opened=false land on the new tenant (leaking its live count → wedged connection).
+        int fd = Volatile.Read(ref conn.Fd);
+        if (fd == 0) return; // already torn down — do OnClosed / cleanup exactly once
+
+        // Notify the app while the identity is still valid (UserToken readable), if it saw it open.
+        if (conn.Opened)
+        {
+            conn.Opened = false;
+            try { Parent.OnClosed(conn); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
+        }
+
         conn.UserToken = null;
         conn.Flags = 0;
         conn.SendBusy = false;
         if (conn.Pending is { } pending)
         {
             // Release any queued flushed-chain buffers (echo segments are plain arrays, just dropped).
-            // An in-flight WriteV, if any, is released by its own completion (which sees fd == 0).
+            // An in-flight WriteV, if any, is released by its own completion (which sees Fd == 0).
             while (pending.Count > 0)
             {
                 var job = pending.Dequeue();
@@ -176,7 +196,14 @@ internal sealed class IoUringShard : SocketSetShard
             }
         }
 
-        if (fd > 0) LibC.close(fd);
+        // shutdown() before close(): an armed multishot recv pins the socket's struct file, so a bare
+        // close() wouldn't send a FIN and the peer would never see EOF. shutdown(RDWR) forces the FIN
+        // and completes the pending recv (EOF), releasing io_uring's file reference; close() then reaps.
+        LibC.shutdown(fd, LibC.SHUT_RDWR);
+        LibC.close(fd);
+
+        // Publish the slot as free LAST — only now may a racing InitClient claim it.
+        Volatile.Write(ref conn.Fd, 0);
     }
 
     // =====================================================================
@@ -286,6 +313,14 @@ internal sealed class IoUringShard : SocketSetShard
     internal void SubmitFlush(uint slot, uint generation, in OutChain chain)
     {
         _flush.Enqueue((slot, generation, chain));
+        Poke();
+    }
+
+    /// <summary>Marshal a close request onto the loop thread (called from
+    /// <see cref="IoUringConnection.Close"/>, i.e. any thread).</summary>
+    internal void SubmitClose(uint slot, uint generation)
+    {
+        _closes.Enqueue((slot, generation));
         Poke();
     }
 
@@ -623,6 +658,13 @@ internal sealed class IoUringShard : SocketSetShard
             while (_flush.TryDequeue(out var f))
                 PumpFlush(f.Slot, f.Generation, f.Chain);
 
+            // Honour any close requests marshaled in from other threads.
+            while (_closes.TryDequeue(out var c))
+            {
+                var conn = _conns[c.Slot - 1];
+                if (conn.Generation == c.Generation && conn.Fd != 0) CloseClient(c.Slot);
+            }
+
             // Fold any cross-thread submissions into the ring.
             if (!_pending.IsEmpty)
                 _ring.Push(_pending);
@@ -757,6 +799,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
+        conn.Opened = true; // app now sees it open → pairs with OnClosed
         Parent.OnAccept(ref ctx);
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
@@ -780,6 +823,7 @@ internal sealed class IoUringShard : SocketSetShard
             // UserToken was seeded by Connect()'s InitClient; the handler may replace it in-place.
             bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
             var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
+            conn.Opened = true; // app now sees it open → pairs with OnClosed
             Parent.OnConnect(ref ctx);
 
             if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)

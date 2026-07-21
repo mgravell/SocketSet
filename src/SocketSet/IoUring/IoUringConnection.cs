@@ -128,6 +128,13 @@ internal sealed unsafe class IoUringConnection : Connection
         Slot = slot;
     }
 
+    public override void Close()
+    {
+        // Marshal onto the loop thread (generation-guarded there) — safe from any thread, including
+        // from inside a callback (the request is honoured on the next loop pass).
+        if (Volatile.Read(ref Fd) != 0) Shard.SubmitClose(Slot, Volatile.Read(ref Generation));
+    }
+
     public override Span<byte> GetSpan(int sizeHint = 0)
     {
         EnsureRoom(sizeHint <= 0 ? 1 : sizeHint);

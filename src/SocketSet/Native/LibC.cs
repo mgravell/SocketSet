@@ -47,6 +47,15 @@ internal static unsafe partial class LibC
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int close(int fd);
 
+    internal const int SHUT_RDWR = 2;
+
+    // Force a FIN and unblock any in-flight io_uring recv on this fd. Needed before close(): an armed
+    // (multishot) recv pins the underlying struct file, so close() alone would drop the fd-table slot
+    // without sending a FIN — the socket would linger and the peer would never see EOF.
+    [SuppressGCTransition]
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int shutdown(int fd, int how);
+
     [SuppressGCTransition]
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int sched_setaffinity(int pid, nuint cpusetsize, void* mask);
@@ -215,11 +224,17 @@ internal static unsafe partial class LibC
     // ordinals into that enum; getting them wrong silently issues the wrong op.
     public const byte IORING_OP_WRITEV = 2;
     public const byte IORING_OP_ACCEPT = 13;
+    public const byte IORING_OP_ASYNC_CANCEL = 14;
     public const byte IORING_OP_CONNECT = 16;
     public const byte IORING_OP_CLOSE = 19;
     public const byte IORING_OP_READ = 22;
     public const byte IORING_OP_SEND = 26;
     public const byte IORING_OP_RECV = 27;
+
+    // IORING_OP_ASYNC_CANCEL cancel_flags (go in the sqe's op-flags union). CANCEL_FD matches by fd
+    // (not user_data); CANCEL_ALL cancels every matching op, not just the first.
+    public const uint IORING_ASYNC_CANCEL_ALL = 1 << 0;
+    public const uint IORING_ASYNC_CANCEL_FD = 1 << 1;
 
     // ioprio multishot modifiers
     public const ushort IORING_ACCEPT_MULTISHOT = 1 << 0;
