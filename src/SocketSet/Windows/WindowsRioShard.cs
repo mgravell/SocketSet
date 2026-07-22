@@ -35,8 +35,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
     private const uint ReqSend = 2; // NULL context being treated as "no completion")
 
-    private const bool DiagSkipRecv = false; // TEMP diag toggle: skip posting RIOReceive (was for the
-                                             // data-arrival probe; off now for the cross-process test).
 
     internal enum OpKind : int { Accept = 0, Connect = 1 }
 
@@ -101,11 +99,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private readonly ConcurrentQueue<(nint Socket, object? Token)> _incoming = [];
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
 
-    // TEMP blind-bring-up diagnostics: first N events to stderr, then quiet. Remove once RIO flows.
-    private static int _diagN;
-    private static int _probeN;
-    private static void Diag(string m) { if (Interlocked.Increment(ref _diagN) <= 120) Console.Error.WriteLine("[rio] " + m); }
-
     public WindowsRioShard(SocketSetOptions options)
     {
         _socketsPerShard = options.SocketsPerShard;
@@ -148,11 +141,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
         // Register the pinned slabs with RIO (whole slab; a pool index maps to an offset slice).
         _recvBufferId = Win32.RIORegisterBuffer(_recvBuffer.Address(0), (uint)(_recvCount * _recvBufSize));
-        Diag($"RIORegisterBuffer(recv, {_recvCount * _recvBufSize} bytes) => {_recvBufferId:x} err={(_recvBufferId == Win32.RIO_INVALID_BUFFERID ? Win32.WSAGetLastError() : 0)}");
         if (_recvBufferId == Win32.RIO_INVALID_BUFFERID)
             throw new Win32Exception(Win32.WSAGetLastError(), "RIORegisterBuffer(recv) failed");
         _writeBufferId = Win32.RIORegisterBuffer(_writeBuffer.Address(0), (uint)(_writeCount * _writeBufSize));
-        Diag($"RIORegisterBuffer(write, {_writeCount * _writeBufSize} bytes) => {_writeBufferId:x} err={(_writeBufferId == Win32.RIO_INVALID_BUFFERID ? Win32.WSAGetLastError() : 0)}");
         if (_writeBufferId == Win32.RIO_INVALID_BUFFERID)
             throw new Win32Exception(Win32.WSAGetLastError(), "RIORegisterBuffer(write) failed");
 
@@ -174,12 +165,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         PinLoopThread();
 
         // Arm the first RIO notification (must precede any RIO op so the CQ can wake us).
-        Diag($"shard {Shard} OnRun; initial RIONotify rc={Win32.RIONotify(_cq)} (0=OK)");
+        Win32.RIONotify(_cq);
 
         while (IsActive)
         {
             DrainCrossThread();
-            ProbeFionread();
 
             uint removed = 0;
             bool ok = Win32.GetQueuedCompletionStatusExBlocking(_port, _entries, EntryBatch, &removed, Win32.INFINITE, alertable: false);
@@ -188,7 +178,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             for (uint i = 0; i < removed; i++)
             {
                 ref Win32.OVERLAPPED_ENTRY e = ref _entries[i];
-                Diag($"iocp key={(long)e.lpCompletionKey} ov={(nint)e.lpOverlapped:x}");
                 if (e.lpCompletionKey == WakeKey || e.lpOverlapped == null) continue; // wake
                 if (e.lpCompletionKey == RioKey) { DrainRio(); continue; }             // RIO CQ needs draining
 
@@ -220,7 +209,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private uint DrainRioOnce()
     {
         uint n = Win32.RIODequeueCompletion(_cq, _rioResults, RioBatch);
-        Diag($"DrainRio dequeued {n}");
         if (n == Win32.RIO_CORRUPT_CQ)
             throw new InvalidOperationException("RIODequeueCompletion reported a corrupt completion queue.");
         for (uint i = 0; i < n; i++)
@@ -228,7 +216,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             ref Win32.RIORESULT r = ref _rioResults[i];
             uint slot = (uint)r.SocketContext;
             bool failed = r.Status != 0;
-            Diag($"  result slot={slot} ctx={r.RequestContext} ({(r.RequestContext == ReqRecv ? "recv" : "send")}) status={r.Status} bytes={r.BytesTransferred}");
             if (r.RequestContext == ReqRecv) HandleRecv(slot, r.BytesTransferred, failed);
             else HandleSend(slot, r.BytesTransferred, failed);
         }
@@ -282,22 +269,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     internal void EnqueueInbound(nint socket, object? token) { _incoming.Enqueue((socket, token)); Poke(); }
     internal void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
-
-    // TEMP diagnostic: if a socket has readable bytes while its RIO recv is armed but not completing,
-    // RIO receive is broken (data present, not consumed). If this never fires, data isn't arriving.
-    private void ProbeFionread()
-    {
-        int scan = Math.Min(_conns.Length, 32);
-        for (int i = 0; i < scan; i++)
-        {
-            var c = _conns[i];
-            if (c.Socket == 0 || !c.RecvArmed) continue;
-            uint avail = 0;
-            if (Win32.ioctlsocket(c.Socket, Win32.FIONREAD, &avail) == 0 && avail > 0
-                && Interlocked.Increment(ref _probeN) <= 12) // own budget so send-spam can't starve it
-                Console.Error.WriteLine($"[rio] FIONREAD slot={c.Slot} avail={avail} — data is arriving on the recv side");
-        }
-    }
 
     private void DrainCrossThread()
     {
@@ -533,8 +504,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         }
 
         nint listener = st.Listener;
-        int upd = Win32.setsockopt(acc, Win32.SOL_SOCKET, Win32.SO_UPDATE_ACCEPT_CONTEXT, &listener, sizeof(nint));
-        Diag($"SO_UPDATE_ACCEPT_CONTEXT acc={acc:x} rc={upd} err={(upd != 0 ? Win32.WSAGetLastError() : 0)}");
+        Win32.setsockopt(acc, Win32.SOL_SOCKET, Win32.SO_UPDATE_ACCEPT_CONTEXT, &listener, sizeof(nint));
 
         var target = (WindowsRioShard)Parent.RoundRobin();
         target.EnqueueInbound(acc, st.Token);
@@ -595,13 +565,12 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         nint rq = Win32.RIOCreateRequestQueue(conn.Socket, 1, 1, 1, 1, _cq, _cq, (void*)(nuint)conn.Slot);
         if (rq == Win32.RIO_INVALID_RQ)
         {
-            Diag($"RIOCreateRequestQueue FAILED slot={conn.Slot} err={Win32.WSAGetLastError()}");
+            System.Diagnostics.Debug.WriteLine($"RIOCreateRequestQueue failed: {Win32.WSAGetLastError()}");
             return false;
         }
         conn.Rq = rq;
         if (!_recvBuffer.TryLease(out int ri, out _)) return false;
         conn.RecvBuf = ri;
-        Diag($"SetupConnection OK slot={conn.Slot} rq={rq:x}");
         return true;
     }
 
@@ -612,10 +581,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.Offset = (uint)(conn.RecvBuf * _recvBufSize);
         buf.Length = (uint)_recvBufSize;
         conn.RecvArmed = true;
-        if (DiagSkipRecv) { Diag($"ArmReceive slot={conn.Slot} SKIPPED (diag: not posting RIOReceive)"); return; }
-        int rr = Win32.RIOReceive(conn.Rq, &buf, 1, 0, (void*)(nuint)ReqRecv);
-        Diag($"RIOReceive slot={conn.Slot} rc={rr} (nonzero=OK) err={(rr == 0 ? Win32.WSAGetLastError() : 0)}");
-        if (rr == 0)
+        if (Win32.RIOReceive(conn.Rq, &buf, 1, 0, (void*)(nuint)ReqRecv) == 0)
         {
             conn.RecvArmed = false;
             CloseClient(conn.Slot);
@@ -630,9 +596,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.BufferId = _writeBufferId;
         buf.Offset = (uint)(wi * _writeBufSize + off);
         buf.Length = (uint)len;
-        int rs = Win32.RIOSend(conn.Rq, &buf, 1, 0, (void*)(nuint)ReqSend);
-        Diag($"RIOSend slot={slot} len={len} rc={rs} (nonzero=OK) err={(rs == 0 ? Win32.WSAGetLastError() : 0)}");
-        if (rs == 0) FailSend(conn, slot);
+        if (Win32.RIOSend(conn.Rq, &buf, 1, 0, (void*)(nuint)ReqSend) == 0) FailSend(conn, slot);
     }
 
     private void SubmitSendBuffer(RioConnection conn, uint slot, int wi, int len)
