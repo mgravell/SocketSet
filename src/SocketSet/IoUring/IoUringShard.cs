@@ -1,4 +1,5 @@
 #if NET // io_uring is a Linux + modern-.NET backend; compiled out of the netfx fallback build.
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Net;
@@ -205,6 +206,7 @@ internal sealed class IoUringShard : SocketSetShard
             {
                 var job = pending.Dequeue();
                 if (job.Chain.Count > 0) ReleaseChainBuffers(job.Chain);
+                else if (job.Seg.Array is not null) ArrayPool<byte>.Shared.Return(job.Seg.Array); // pooled echo staging
             }
         }
 
@@ -617,6 +619,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         var seg = job.Seg;
         Marshal.Copy(seg.Array!, seg.Offset, (IntPtr)wp, seg.Count);
+        ArrayPool<byte>.Shared.Return(seg.Array!); // copied into the write page; done with the pooled buffer
         SubmitSend(slot, fd, wi, wp, seg.Count);
     }
 
@@ -949,7 +952,10 @@ internal sealed class IoUringShard : SocketSetShard
             // A send is already in flight (e.g. an out-of-band Send, or a still-draining pipeline):
             // serialize behind it by copying the response out and queueing. The read buffer is not
             // borrowed, so the caller releases it as usual.
-            var copy = new byte[rb];
+            // Pooled staging buffer (loop-thread rent/return → per-thread cache): a pipelined echo
+            // doesn't allocate per message. Returned when the job is drained (SubmitPendingJob /
+            // CompleteWrite) or dropped (TryFinalize). Rent may over-size, so Seg carries the true length.
+            var copy = ArrayPool<byte>.Shared.Rent(rb);
             Marshal.Copy((IntPtr)rp, copy, 0, rb);
             (conn.Pending ??= new()).Enqueue(new PendingJob { Seg = new ArraySegment<byte>(copy, 0, rb) });
             return false;
@@ -1048,6 +1054,7 @@ internal sealed class IoUringShard : SocketSetShard
             // A queued echo segment: reuse this just-freed page for it.
             Marshal.Copy(job.Seg.Array!, job.Seg.Offset, (IntPtr)wp, job.Seg.Count);
             next = job.Seg.Count;
+            ArrayPool<byte>.Shared.Return(job.Seg.Array!); // done with the pooled staging buffer
         }
 
         if (next > 0)

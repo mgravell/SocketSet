@@ -1,4 +1,5 @@
 #if NET // Windows IOCP backend; compiled out of the netfx fallback build.
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Net;
@@ -110,6 +111,15 @@ internal sealed unsafe class IocpShard : SocketSetShard
     // slot that has since been closed and re-tenanted.
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
 
+    // Synchronous (FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) recv/send completions that posted no port
+    // packet. Loop-thread-only. Deferred here and drained ITERATIVELY (not by calling the handler
+    // recursively): a saturated connection completes recv→echo→recv→… synchronously and would otherwise
+    // recurse straight into a stack overflow. Bounded per pass (InlineBurst) so one busy or flooding
+    // connection can't starve the port, other connections, or the IsActive/shutdown check.
+    private struct InlineOp { public OpKind Kind; public uint Slot; public uint Bytes; public bool Failed; }
+    private const int InlineBurst = 512;
+    private readonly Queue<InlineOp> _inline = new();
+
     public IocpShard(SocketSetOptions options)
     {
         _socketsPerShard = options.SocketsPerShard;
@@ -170,6 +180,9 @@ internal sealed unsafe class IocpShard : SocketSetShard
         _obWriteBuffer = new PinnedWriteBufferPool(_obWriteCount, _writeBufSize);
         _recvBuffer = new PinnedWriteBufferPool(_recvCount, _recvBufSize);
         _entries = (Win32.OVERLAPPED_ENTRY*)NativeMemory.AllocZeroed(EntryBatch * (nuint)sizeof(Win32.OVERLAPPED_ENTRY));
+        // Op-context OVERLAPPEDs are zeroed once here and never re-zeroed per op: we never set hEvent (it
+        // stays null → IOCP notification), Offset/OffsetHigh are ignored for socket I/O, and the kernel
+        // overwrites Internal/InternalHigh on every completion. So the submit paths set only Kind/Slot/Buf.
         _ops = (IocpOp*)NativeMemory.AllocZeroed((nuint)_opCount * (nuint)sizeof(IocpOp));
         _connectAddrs = (byte*)NativeMemory.AllocZeroed((nuint)_socketsPerShard * AddrStride);
         _portReady = true;
@@ -185,12 +198,20 @@ internal sealed unsafe class IocpShard : SocketSetShard
             // unblocks GQCSEx when new work is enqueued).
             DrainCrossThread();
 
+            // Process synchronous (FILE_SKIP) completions before we consider blocking — a recv/send that
+            // completed inline posts no packet, so leaving one queued while we block would strand it.
+            DrainInline();
+
+            // Block only when there's no pending inline work; otherwise poll (timeout 0, GC-transition
+            // suppressed) so inline bursts interleave with the port and IsActive stays responsive.
             uint removed = 0;
-            bool ok = Win32.GetQueuedCompletionStatusEx(_port, _entries, EntryBatch, &removed, Win32.INFINITE, alertable: false);
+            bool ok = _inline.Count > 0
+                ? Win32.GetQueuedCompletionStatusExNonBlocking(_port, _entries, EntryBatch, &removed, 0, alertable: false)
+                : Win32.GetQueuedCompletionStatusExBlocking(_port, _entries, EntryBatch, &removed, Win32.INFINITE, alertable: false);
             if (!ok)
             {
-                // Port closed during shutdown (ERROR_ABANDONED_WAIT_0) surfaces here; the IsActive
-                // check ends the loop. Anything else is transient — re-check and retry.
+                // WAIT_TIMEOUT (nothing ready on a poll), or the port closed during shutdown
+                // (ERROR_ABANDONED_WAIT_0) — the IsActive check ends the loop. Re-loop either way.
                 continue;
             }
 
@@ -225,6 +246,25 @@ internal sealed unsafe class IocpShard : SocketSetShard
         {
             var conn = _conns[c.Slot - 1];
             if (conn.Generation == c.Generation && conn.Socket != 0) CloseClient(c.Slot);
+        }
+    }
+
+    // Defer a synchronously-completed recv/send (no port packet was posted for it). Loop-thread-only.
+    private void QueueInline(OpKind kind, uint slot, uint bytes, bool failed)
+        => _inline.Enqueue(new InlineOp { Kind = kind, Slot = slot, Bytes = bytes, Failed = failed });
+
+    // Drain deferred synchronous completions iteratively (handlers may enqueue more as they re-arm/echo).
+    // Bounded per pass so the loop periodically re-checks the port and IsActive.
+    private void DrainInline()
+    {
+        for (int budget = InlineBurst; budget > 0 && _inline.Count > 0; budget--)
+        {
+            var io = _inline.Dequeue();
+            switch (io.Kind)
+            {
+                case OpKind.Recv: HandleRecv(io.Slot, io.Bytes, io.Failed); break;
+                case OpKind.Send: HandleSend(io.Slot, io.Bytes, io.Failed); break;
+            }
         }
     }
 
@@ -308,6 +348,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
                 conn.Closing = false;
                 conn.RecvArmed = false;
                 conn.SendBusy = false;
+                conn.SkipOnSuccess = false;
                 conn.RecvBuf = -1;
                 conn.SendBuf = -1;
                 conn.Pending?.Clear();
@@ -355,7 +396,9 @@ internal sealed unsafe class IocpShard : SocketSetShard
 
         if (conn.RecvBuf >= 0) { _recvBuffer.Release(conn.RecvBuf); conn.RecvBuf = -1; }
         if (conn.SendBuf >= 0) { _writeBuffer.Release(conn.SendBuf); conn.SendBuf = -1; }
-        conn.Pending?.Clear();
+        // Return any queued (pooled) echo staging buffers before recycling the slot.
+        if (conn.Pending is { } pending)
+            while (pending.Count > 0) ArrayPool<byte>.Shared.Return(pending.Dequeue().Array!);
         conn.UserToken = null;
         conn.Flags = 0;
         conn.Closing = false;
@@ -464,7 +507,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
 
         // Connect reuses the slot's recv op-ctx (no recv is armed yet); re-armed as a recv on completion.
         IocpOp* op = RecvOp(slot);
-        op->Overlapped = default;
         op->Kind = OpKind.Connect;
         op->Slot = slot;
         op->Buf = 0;
@@ -552,7 +594,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
 
         st.AcceptSocket = acc;
         var op = (AcceptOp*)st.Op;
-        op->Overlapped = default;
         op->Kind = OpKind.Accept;
         // Handle already set at StartAccept.
 
@@ -612,6 +653,11 @@ internal sealed unsafe class IocpShard : SocketSetShard
             return;
         }
 
+        // Handle synchronous recv/send completions inline (skip the completion-port round-trip). If the
+        // flag is rejected, SkipOnSuccess stays false and the socket keeps the always-async model.
+        conn.SkipOnSuccess = Win32.SetFileCompletionNotificationModes(socket,
+            (byte)(Win32.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | Win32.FILE_SKIP_SET_EVENT_ON_HANDLE));
+
         if (!_recvBuffer.TryLease(out int ri, out _))
         {
             // Recv pool exhausted (should not happen: sized to the connection table). Drop the connection.
@@ -639,6 +685,11 @@ internal sealed unsafe class IocpShard : SocketSetShard
         if (failed || conn.Socket == 0) { CloseClient(slot); return; }
 
         Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_UPDATE_CONNECT_CONTEXT, null, 0);
+
+        // Handle synchronous recv/send completions inline (see AdoptAccepted). Set after connect
+        // completed, so ConnectEx itself stayed on the always-async path.
+        conn.SkipOnSuccess = Win32.SetFileCompletionNotificationModes(conn.Socket,
+            (byte)(Win32.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | Win32.FILE_SKIP_SET_EVENT_ON_HANDLE));
 
         if (!_recvBuffer.TryLease(out int ri, out _)) { CloseClient(slot); return; }
         conn.RecvBuf = ri;
@@ -697,8 +748,11 @@ internal sealed unsafe class IocpShard : SocketSetShard
 
         if (conn.SendBusy)
         {
-            // A send is already in flight: copy the response out and queue it behind the current one.
-            var copy = new byte[rb];
+            // A send is already in flight: stash the response and queue it behind the current one. The
+            // staging buffer is pooled (loop-thread rent/return hits the per-thread cache), so a pipelined
+            // echo doesn't allocate per message; it's returned when drained (CompleteWrite) or dropped
+            // (TryFinalize). Rent may over-size, so the ArraySegment carries the true length.
+            var copy = ArrayPool<byte>.Shared.Rent(rb);
             Marshal.Copy((nint)rp, copy, 0, rb);
             (conn.Pending ??= new()).Enqueue(new ArraySegment<byte>(copy, 0, rb));
             return true;
@@ -729,21 +783,29 @@ internal sealed unsafe class IocpShard : SocketSetShard
         conn.SendSent = 0;
         conn.SendTotal = len;
         conn.SendBusy = true;
-        if (!IssueSend(conn, slot, _writeBuffer.Address(wi), len, wi)) FailSend(conn, slot);
+        IssueSend(conn, slot, _writeBuffer.Address(wi), len, wi);
     }
 
-    // Post a WSASend for p[0..len]; op->Buf carries the write-pool index. Returns false on synchronous failure.
-    private bool IssueSend(IocpConnection conn, uint slot, byte* p, int len, int wi)
+    // Post a WSASend for p[0..len]; op->Buf carries the write-pool index. On a synchronous outcome
+    // (success with FILE_SKIP, or any failure) no packet posts, so the completion is deferred inline —
+    // a synchronous failure flows through as HandleSend(failed) → FailSend, same as an async error.
+    private void IssueSend(IocpConnection conn, uint slot, byte* p, int len, int wi)
     {
         IocpOp* op = SendOp(slot);
-        op->Overlapped = default;
         op->Kind = OpKind.Send;
         op->Slot = slot;
         op->Buf = wi;
         Win32.WSABUF b; b.len = (uint)len; b.buf = p;
         uint sent = 0;
         int rc = Win32.WSASend(conn.Socket, &b, 1, &sent, 0, &op->Overlapped, null);
-        return rc != Win32.SOCKET_ERROR || Marshal.GetLastPInvokeError() == Win32.WSA_IO_PENDING;
+        if (rc == 0)
+        {
+            if (conn.SkipOnSuccess) QueueInline(OpKind.Send, slot, sent, failed: false);
+            return;
+        }
+        if (Marshal.GetLastPInvokeError() != Win32.WSA_IO_PENDING)
+            QueueInline(OpKind.Send, slot, 0, failed: true);
+        // WSA_IO_PENDING → an async completion will arrive.
     }
 
     // A send failed synchronously: release its buffer, clear the send slot, tear the connection down.
@@ -775,7 +837,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
             if (bytes == 0) { FailSend(conn, slot); return; } // no progress → dead peer
             // Partial send: resubmit the remainder from the same buffer (still one send in flight).
             byte* p = _writeBuffer.Address(wi) + conn.SendSent;
-            if (!IssueSend(conn, slot, p, conn.SendTotal - conn.SendSent, wi)) FailSend(conn, slot);
+            IssueSend(conn, slot, p, conn.SendTotal - conn.SendSent, wi);
             return;
         }
 
@@ -797,13 +859,14 @@ internal sealed unsafe class IocpShard : SocketSetShard
             var seg = pending.Dequeue();
             Marshal.Copy(seg.Array!, seg.Offset, (nint)wp, seg.Count);
             next = seg.Count;
+            ArrayPool<byte>.Shared.Return(seg.Array!); // done with the pooled staging buffer
         }
 
         if (next > 0)
         {
             conn.SendSent = 0;
             conn.SendTotal = next; // reuse wi; SendBusy stays set
-            if (!IssueSend(conn, slot, wp, next, wi)) FailSend(conn, slot);
+            IssueSend(conn, slot, wp, next, wi);
         }
         else
         {
@@ -817,7 +880,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
     {
         uint slot = conn.Slot;
         IocpOp* op = RecvOp(slot);
-        op->Overlapped = default;
         op->Kind = OpKind.Recv;
         op->Slot = slot;
         op->Buf = conn.RecvBuf;
@@ -826,12 +888,16 @@ internal sealed unsafe class IocpShard : SocketSetShard
         uint flags = 0, recvd = 0;
         conn.RecvArmed = true;
         int rc = Win32.WSARecv(conn.Socket, &b, 1, &recvd, &flags, &op->Overlapped, null);
-        if (rc == Win32.SOCKET_ERROR && Marshal.GetLastPInvokeError() != Win32.WSA_IO_PENDING)
+        if (rc == 0)
         {
-            conn.RecvArmed = false;
-            CloseClient(slot);
+            // Synchronous success: with FILE_SKIP no packet posts, so defer the completion inline.
+            // Without it (SkipOnSuccess false) a packet WILL post — do nothing and let it arrive.
+            if (conn.SkipOnSuccess) QueueInline(OpKind.Recv, slot, recvd, failed: false);
+            return;
         }
-        // rc == 0 (immediate) or WSA_IO_PENDING → a completion is queued.
+        if (Marshal.GetLastPInvokeError() != Win32.WSA_IO_PENDING)
+            QueueInline(OpKind.Recv, slot, 0, failed: true); // synchronous failure never posts a packet
+        // WSA_IO_PENDING → an async completion will arrive.
     }
 
     // Pin the loop thread to a core (best-effort). The base Run() pins on Linux; Windows is done here

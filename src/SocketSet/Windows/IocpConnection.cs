@@ -32,6 +32,12 @@ internal sealed class IocpConnection : Connection
     /// <summary>Bumped on each allocation; guards Close/writes against slot reuse (ABA).</summary>
     public uint Generation;
 
+    /// <summary>True once <c>SetFileCompletionNotificationModes(FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)</c>
+    /// succeeded for this socket. When set, a synchronously-completing recv/send posts no completion
+    /// packet and is handled inline; when clear (flag rejected), the socket falls back to the async
+    /// model (every op posts). Set at accept/connect adoption.</summary>
+    public bool SkipOnSuccess;
+
     // --- teardown state (loop-thread only) ---
     // The slot is NOT recycled (Socket stays non-zero) until every in-flight op has been reaped, so a
     // completion can never land on a re-tenanted slot. closesocket() aborts the pending recv/send; the

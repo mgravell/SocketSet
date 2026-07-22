@@ -39,6 +39,14 @@ internal static unsafe partial class Win32
     internal const int SO_UPDATE_CONNECT_CONTEXT = 0x7010;
     internal const int TCP_NODELAY = 0x0001;
 
+    // --- SetFileCompletionNotificationModes flags ---
+    // Skip queuing a completion packet when an overlapped op completes SYNCHRONOUSLY (returns success,
+    // not PENDING) — the caller handles the result inline. On loopback / warm buffers most recv/send
+    // ops complete synchronously, so this elides the completion-port round-trip that otherwise dominates
+    // small-message cost. SET_EVENT_ON_HANDLE skip is a companion micro-opt (we don't use hEvent).
+    internal const byte FILE_SKIP_COMPLETION_PORT_ON_SUCCESS = 0x1;
+    internal const byte FILE_SKIP_SET_EVENT_ON_HANDLE = 0x2;
+
     // --- ioctls ---
     internal const int SD_BOTH = 2;                            // shutdown(how)
     internal const uint FIONBIO = 0x8004667E;
@@ -205,11 +213,28 @@ internal static unsafe partial class Win32
     [LibraryImport(Kernel32, SetLastError = true)]
     internal static partial nint CreateIoCompletionPort(nint fileHandle, nint existingPort, nuint completionKey, uint concurrentThreads);
 
-    // Blocking (INFINITE-capable) batch dequeue — do NOT SuppressGCTransition (it parks the thread).
+    // Two declarations of the same batch-dequeue import, differing only in GC-transition handling
+    // (mirrors LibC's io_uring_enter_blocking / _nonblocking). The blocking form (INFINITE / non-zero
+    // timeout) parks the thread, so it must NOT SuppressGCTransition — a thread parked inside a
+    // suppressed transition can't be suspended for GC and would stall it.
+    [LibraryImport(Kernel32, EntryPoint = "GetQueuedCompletionStatusEx", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool GetQueuedCompletionStatusExBlocking(nint port, OVERLAPPED_ENTRY* entries, uint count,
+        uint* removed, uint timeoutMs, [MarshalAs(UnmanagedType.Bool)] bool alertable);
+
+    // The non-blocking (timeout 0) poll on the inline-drain path never parks, so it skips the
+    // cooperative→preemptive transition like other short syscalls here.
+    [SuppressGCTransition]
+    [LibraryImport(Kernel32, EntryPoint = "GetQueuedCompletionStatusEx", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool GetQueuedCompletionStatusExNonBlocking(nint port, OVERLAPPED_ENTRY* entries, uint count,
+        uint* removed, uint timeoutMs, [MarshalAs(UnmanagedType.Bool)] bool alertable);
+
+    // Register per-handle completion behaviour (see FILE_SKIP_* flags). Called on a socket before I/O.
+    [SuppressGCTransition]
     [LibraryImport(Kernel32, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    internal static partial bool GetQueuedCompletionStatusEx(nint port, OVERLAPPED_ENTRY* entries, uint count,
-        uint* removed, uint timeoutMs, [MarshalAs(UnmanagedType.Bool)] bool alertable);
+    internal static partial bool SetFileCompletionNotificationModes(nint handle, byte flags);
 
     // The eventfd analog: queue a completion packet verbatim (key + overlapped are passed through, no I/O).
     [SuppressGCTransition]
