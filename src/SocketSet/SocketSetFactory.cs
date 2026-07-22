@@ -1,5 +1,6 @@
 #if NET
 using SocketSets.IoUring;
+using SocketSets.Windows;
 #endif
 using SocketSets.Managed;
 
@@ -14,6 +15,9 @@ public abstract class SocketSetFactory
 #if NET
     /// <summary>io_uring backend (Linux only).</summary>
     public static SocketSetFactory IoUring { get; } = IoUringFactory.Instance;
+
+    /// <summary>Windows IOCP backend (raw Winsock, bypassing managed sockets).</summary>
+    public static SocketSetFactory WindowsIocp { get; } = WindowsIocpFactory.Instance;
 #endif
 
     /// <summary>Portable .NET managed-socket (SAEA) fallback.</summary>
@@ -27,10 +31,18 @@ public abstract class SocketSetFactory
 
     private static SocketSetFactory Detect()
 #if NET
-        => IoUringFactory.IsSupported() ? IoUring : Managed;
+        => WindowsIocp.IsSupported ? WindowsIocp
+         : IoUring.IsSupported ? IoUring
+         : Managed;
 #else
         => Managed;
 #endif
+
+    /// <summary>Whether this backend can actually run on the current host (OS + kernel features).
+    /// Cheap and safe to read on any platform (backends probe lazily); <see cref="CreateShard"/>
+    /// throws <see cref="PlatformNotSupportedException"/> if a backend is chosen where it isn't
+    /// supported, so callers can pre-check here rather than fail at construction.</summary>
+    public abstract bool IsSupported { get; }
 
     public abstract SocketSetShard CreateShard(SocketSetOptions options);
 

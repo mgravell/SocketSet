@@ -181,24 +181,24 @@ internal static unsafe partial class LibC
     // =========================================================================
 
     [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "syscall", SetLastError = true)]
     public static partial nint io_uring_setup(int sysno, uint entries, io_uring_params* p);
 
     // Blocking Variant: Used when thread needs to go to sleep waiting for events. 
     // Do NOT suppress the GC transition here so background GC work can happen while we sleep.
-    [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "syscall", SetLastError = true)]
     public static partial int io_uring_enter_blocking(int sysno, int fd, uint to_submit, uint min_complete, uint flags,
         void* sig, nint sigsz);
 
     // Hot-Path Non-Blocking Variant: Used to quickly flush submissions without sleeping (min_complete = 0).
     // Suppressing GC transition lowers the P/Invoke boundary overhead to near zero.
     [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "syscall", SetLastError = true)]
     public static partial int io_uring_enter_nonblocking(int sysno, int fd, uint to_submit, uint min_complete,
         uint flags, void* sig, nint sigsz);
 
     [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "syscall", SetLastError = true)]
     public static partial int io_uring_register(int sysno, int fd, uint opcode, void* arg, uint nr_args);
 
     // =========================================================================
@@ -206,11 +206,11 @@ internal static unsafe partial class LibC
     // =========================================================================
 
     [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "mmap", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "mmap", SetLastError = true)]
     public static partial void* mmap(void* addr, nuint length, int prot, int flags, int fd, long offset);
 
     [SuppressGCTransition]
-    [LibraryImport("libc", EntryPoint = "munmap", SetLastError = true)]
+    [LibraryImport(Lib, EntryPoint = "munmap", SetLastError = true)]
     public static partial int munmap(void* addr, nuint length);
     
     // =========================================================================

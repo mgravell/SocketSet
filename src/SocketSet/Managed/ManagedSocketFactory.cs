@@ -14,6 +14,8 @@ internal sealed class ManagedSocketFactory : SocketSetFactory
     {
     }
 
+    public override bool IsSupported => true; // the works-everywhere fallback
+
     public override SocketSetShard CreateShard(SocketSetOptions options) => new ManagedSocketShard(options);
 
     public override bool UsesWorkerThreads => false;

@@ -10,12 +10,25 @@ namespace SocketSets.IoUring;
 internal sealed class IoUringFactory : SocketSetFactory
 {
     public static IoUringFactory Instance = new();
-    
+
     private IoUringFactory()
     {
     }
 
-    public override SocketSetShard CreateShard(SocketSetOptions options) => new IoUringShard(options);
+    // Probe once, lazily. The Lazy is created at construction but doesn't run ProbeSupport until
+    // IsSupported is first read — crucial because Instance is built at type-init on every platform
+    // (via SocketSetFactory.IoUring), and the probe's syscall P/Invoke would throw on Windows.
+    private readonly Lazy<bool> _supported = new(ProbeSupport);
+
+    public override bool IsSupported => _supported.Value;
+
+    public override SocketSetShard CreateShard(SocketSetOptions options)
+    {
+        if (!IsSupported)
+            throw new PlatformNotSupportedException(
+                "The io_uring backend requires a Linux kernel with io_uring (SINGLE_ISSUER | DEFER_TASKRUN) support.");
+        return new IoUringShard(options);
+    }
 
     /// <summary>
     /// True only if this host can actually run the io_uring backend with the features we
@@ -23,7 +36,7 @@ internal sealed class IoUringFactory : SocketSetFactory
     /// then definitively probe by creating a throwaway ring with the exact setup flags we
     /// use (SINGLE_ISSUER | DEFER_TASKRUN, ~6.1+). Anything less falls back to managed.
     /// </summary>
-    internal static unsafe bool IsSupported()
+    private static unsafe bool ProbeSupport()
     {
         if (!OperatingSystem.IsLinux()) return false;
 
