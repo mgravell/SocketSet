@@ -144,9 +144,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
         // Register the pinned slabs with RIO (whole slab; a pool index maps to an offset slice).
         _recvBufferId = Win32.RIORegisterBuffer(_recvBuffer.Address(0), (uint)(_recvCount * _recvBufSize));
+        Diag($"RIORegisterBuffer(recv, {_recvCount * _recvBufSize} bytes) => {_recvBufferId:x} err={(_recvBufferId == Win32.RIO_INVALID_BUFFERID ? Win32.WSAGetLastError() : 0)}");
         if (_recvBufferId == Win32.RIO_INVALID_BUFFERID)
             throw new Win32Exception(Win32.WSAGetLastError(), "RIORegisterBuffer(recv) failed");
         _writeBufferId = Win32.RIORegisterBuffer(_writeBuffer.Address(0), (uint)(_writeCount * _writeBufSize));
+        Diag($"RIORegisterBuffer(write, {_writeCount * _writeBufSize} bytes) => {_writeBufferId:x} err={(_writeBufferId == Win32.RIO_INVALID_BUFFERID ? Win32.WSAGetLastError() : 0)}");
         if (_writeBufferId == Win32.RIO_INVALID_BUFFERID)
             throw new Win32Exception(Win32.WSAGetLastError(), "RIORegisterBuffer(write) failed");
 
