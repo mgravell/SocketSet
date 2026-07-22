@@ -458,7 +458,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     private (nint socket, int af, int proto) CreateListener(IPEndPoint ip)
     {
-        nint s = Win32.WSASocketW(Win32.AF_INET, Win32.SOCK_STREAM, Win32.IPPROTO_TCP, null, 0, Win32.WSA_FLAG_OVERLAPPED);
+        // The listener must be REGISTERED_IO-capable too: accepted sockets inherit the listener's
+        // provider characteristics via SO_UPDATE_ACCEPT_CONTEXT, and without it their RIO receives are
+        // accepted at submission but silently never complete.
+        nint s = Win32.WSASocketW(Win32.AF_INET, Win32.SOCK_STREAM, Win32.IPPROTO_TCP, null, 0,
+            Win32.WSA_FLAG_OVERLAPPED | Win32.WSA_FLAG_REGISTERED_IO);
         if (s == Win32.INVALID_SOCKET) throw new Win32Exception(Marshal.GetLastPInvokeError(), "WSASocketW failed");
         int one = 1;
         Win32.setsockopt(s, Win32.SOL_SOCKET, Win32.SO_REUSEADDR, &one, sizeof(int));
@@ -529,7 +533,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         }
 
         nint listener = st.Listener;
-        Win32.setsockopt(acc, Win32.SOL_SOCKET, Win32.SO_UPDATE_ACCEPT_CONTEXT, &listener, sizeof(nint));
+        int upd = Win32.setsockopt(acc, Win32.SOL_SOCKET, Win32.SO_UPDATE_ACCEPT_CONTEXT, &listener, sizeof(nint));
+        Diag($"SO_UPDATE_ACCEPT_CONTEXT acc={acc:x} rc={upd} err={(upd != 0 ? Win32.WSAGetLastError() : 0)}");
 
         var target = (WindowsRioShard)Parent.RoundRobin();
         target.EnqueueInbound(acc, st.Token);

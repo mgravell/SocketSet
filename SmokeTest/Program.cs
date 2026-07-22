@@ -376,17 +376,25 @@ int tick = 0;
 while (!stop.Wait(1000))
 {
     var now = sw.Elapsed;
-    long bytes = set.RoundTripBytes;
-    double dt = (now - lastElapsed).TotalSeconds;
-    double mbps = (bytes - lastBytes) / dt / (1024 * 1024);
-    Console.WriteLine(
-        $"[{now.TotalSeconds,5:0}s] conns={set.Connected} round-trips={bytes,15:n0} bytes " +
-        $"({mbps,8:n1} MiB/s)  echoed={set.Echoed,15:n0}");
-    lastBytes = bytes;
-    lastElapsed = now;
+    // Round-trip throughput is driven by the client side; a server-only process isn't measuring
+    // anything, so don't spam per-second stats there — just hold the socket open for the duration.
+    if (clientCount > 0)
+    {
+        long bytes = set.RoundTripBytes;
+        double dt = (now - lastElapsed).TotalSeconds;
+        double mbps = (bytes - lastBytes) / dt / (1024 * 1024);
+        Console.WriteLine(
+            $"[{now.TotalSeconds,5:0}s] conns={set.Connected} round-trips={bytes,15:n0} bytes " +
+            $"({mbps,8:n1} MiB/s)  echoed={set.Echoed,15:n0}");
+        lastBytes = bytes;
+        lastElapsed = now;
+    }
 
     if (seconds > 0 && ++tick >= seconds) break;
 }
 
-Console.WriteLine($"done: {set.RoundTripBytes:n0} round-trip bytes over {sw.Elapsed.TotalSeconds:0.0}s across {set.Connected} connection(s)");
-Console.WriteLine($"recv: {set.RecvOps:n0} completions, {set.RecvBytes:n0} bytes, avg {set.AvgRecvSize:n0} bytes/recv");
+if (clientCount > 0)
+{
+    Console.WriteLine($"done: {set.RoundTripBytes:n0} round-trip bytes over {sw.Elapsed.TotalSeconds:0.0}s across {set.Connected} connection(s)");
+    Console.WriteLine($"recv: {set.RecvOps:n0} completions, {set.RecvBytes:n0} bytes, avg {set.AvgRecvSize:n0} bytes/recv");
+}
