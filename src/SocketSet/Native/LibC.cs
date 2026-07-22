@@ -261,7 +261,9 @@ internal static unsafe partial class LibC
     // =========================================================================
 
     [StructLayout(LayoutKind.Sequential)]
+#pragma warning disable CS8981 // The type name only contains lower-cased ascii characters. Such names may become reserved for the language.
     public struct iovec
+#pragma warning restore CS8981 // The type name only contains lower-cased ascii characters. Such names may become reserved for the language.
     {
         public void* iov_base;
         public nuint iov_len;

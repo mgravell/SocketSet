@@ -100,7 +100,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     // TEMP blind-bring-up diagnostics: first N events to stderr, then quiet. Remove once RIO flows.
     private static int _diagN;
-    private static void Diag(string m) { if (Interlocked.Increment(ref _diagN) <= 60) Console.Error.WriteLine("[rio] " + m); }
+    private static void Diag(string m) { if (Interlocked.Increment(ref _diagN) <= 120) Console.Error.WriteLine("[rio] " + m); }
 
     public WindowsRioShard(SocketSetOptions options)
     {
@@ -221,6 +221,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             ref Win32.RIORESULT r = ref _rioResults[i];
             uint slot = (uint)r.SocketContext;
             bool failed = r.Status != 0;
+            Diag($"  result slot={slot} ctx={r.RequestContext} ({(r.RequestContext == ReqRecv ? "recv" : "send")}) status={r.Status} bytes={r.BytesTransferred}");
             if (r.RequestContext == ReqRecv) HandleRecv(slot, r.BytesTransferred, failed);
             else HandleSend(slot, r.BytesTransferred, failed);
         }
