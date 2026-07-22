@@ -87,6 +87,8 @@ internal sealed unsafe class IocpShard : SocketSetShard
     private readonly int _recvCount;
     private readonly int _recvBufSize;
     private readonly int _opCount;
+    private readonly int _listenBacklog;
+    private readonly int _acceptConcurrency;
 
     // --- created on the loop thread in OnInitialize() ---
     private nint _port;
@@ -129,6 +131,8 @@ internal sealed unsafe class IocpShard : SocketSetShard
         _recvBufSize = options.BufferPageSize;
         _recvCount = _socketsPerShard;         // one recv buffer per connection (recv is always armed)
         _opCount = _socketsPerShard * 2;       // recv + send per connection
+        _listenBacklog = options.ListenBacklog;
+        _acceptConcurrency = Math.Max(1, Math.Min(options.AcceptConcurrency, _socketsPerShard));
         // Everything native is deferred to OnInitialize (loop thread); the ctor stays inert so the
         // factory can be constructed on any OS.
 
@@ -540,7 +544,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
                 addr.sin_addr = 0; // INADDR_ANY  TODO: honour the actual IP
                 if (Win32.bind(s, &addr, 16) == Win32.SOCKET_ERROR)
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "IP bind() failed");
-                if (Win32.listen(s, 512) == Win32.SOCKET_ERROR)
+                if (Win32.listen(s, _listenBacklog) == Win32.SOCKET_ERROR)
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "IP listen() failed");
                 return (s, Win32.AF_INET, Win32.IPPROTO_TCP);
             }
@@ -553,7 +557,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
                 uint len = Win32.SockAddrUn.Init(&addr, uds.ToString());
                 if (Win32.bind(s, &addr, (int)len) == Win32.SOCKET_ERROR)
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "UDS bind(AF_UNIX) failed");
-                if (Win32.listen(s, 512) == Win32.SOCKET_ERROR)
+                if (Win32.listen(s, _listenBacklog) == Win32.SOCKET_ERROR)
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "UDS listen() failed");
                 return (s, Win32.AF_UNIX, 0);
             }
@@ -562,22 +566,27 @@ internal sealed unsafe class IocpShard : SocketSetShard
         }
     }
 
-    // Allocate an AcceptState for a listener and post the first AcceptEx.
+    // Arm a pool of AcceptConcurrency outstanding AcceptEx on the listener — a backlog of accept
+    // consumers so connect bursts don't serialize on one accept-at-a-time, and one failed re-post
+    // doesn't stall the whole listener. Each completion re-posts its own state (see HandleAccept).
     private void StartAccept(nint listener, int af, int proto, object? token)
     {
-        var st = new AcceptState
+        for (int i = 0; i < _acceptConcurrency; i++)
         {
-            Listener = listener,
-            Token = token,
-            Af = af,
-            Proto = proto,
-            Buf = (nint)NativeMemory.AllocZeroed(AcceptBufSize),
-            Op = (nint)NativeMemory.AllocZeroed((nuint)sizeof(AcceptOp)),
-        };
-        st.Gc = GCHandle.Alloc(st);
-        ((AcceptOp*)st.Op)->Handle = GCHandle.ToIntPtr(st.Gc);
-        lock (_acceptGate) _acceptStates.Add(st);
-        PostAccept(st);
+            var st = new AcceptState
+            {
+                Listener = listener,
+                Token = token,
+                Af = af,
+                Proto = proto,
+                Buf = (nint)NativeMemory.AllocZeroed(AcceptBufSize),
+                Op = (nint)NativeMemory.AllocZeroed((nuint)sizeof(AcceptOp)),
+            };
+            st.Gc = GCHandle.Alloc(st);
+            ((AcceptOp*)st.Op)->Handle = GCHandle.ToIntPtr(st.Gc);
+            lock (_acceptGate) _acceptStates.Add(st);
+            PostAccept(st);
+        }
     }
 
     // Create a fresh accept socket and post AcceptEx into the listener. Called on Listen (any thread)

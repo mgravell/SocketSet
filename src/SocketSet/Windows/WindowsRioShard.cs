@@ -78,6 +78,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private readonly int _writeBufSize;
     private readonly int _recvCount;
     private readonly int _recvBufSize;
+    private readonly int _listenBacklog;
+    private readonly int _acceptConcurrency;
 
     // --- created on the loop thread in OnInitialize ---
     private nint _port;
@@ -106,6 +108,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         _writeBufSize = options.BufferPageSize;
         _recvBufSize = options.BufferPageSize;
         _recvCount = _socketsPerShard; // one recv buffer per connection (recv is always armed)
+        _listenBacklog = options.ListenBacklog;
+        _acceptConcurrency = Math.Max(1, Math.Min(options.AcceptConcurrency, _socketsPerShard));
         _conns = new RioConnection[_socketsPerShard];
         for (int i = 0; i < _conns.Length; i++)
             _conns[i] = new RioConnection(this, (uint)i + 1);
@@ -444,26 +448,32 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         addr.sin_addr = 0;
         if (Win32.bind(s, &addr, 16) == Win32.SOCKET_ERROR)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "bind() failed");
-        if (Win32.listen(s, 512) == Win32.SOCKET_ERROR)
+        if (Win32.listen(s, _listenBacklog) == Win32.SOCKET_ERROR)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "listen() failed");
         return (s, Win32.AF_INET, Win32.IPPROTO_TCP);
     }
 
+    // Arm a pool of AcceptConcurrency outstanding AcceptEx on the listener (see the IocpShard note):
+    // a backlog of accept consumers so connect bursts don't serialize, and a failed re-post on one
+    // doesn't stall the listener. Each completion re-posts its own state (HandleAccept).
     private void StartAccept(nint listener, int af, int proto, object? token)
     {
-        var st = new AcceptState
+        for (int i = 0; i < _acceptConcurrency; i++)
         {
-            Listener = listener,
-            Token = token,
-            Af = af,
-            Proto = proto,
-            Buf = (nint)NativeMemory.AllocZeroed(AcceptBufSize),
-            Op = (nint)NativeMemory.AllocZeroed((nuint)sizeof(AcceptOp)),
-        };
-        st.Gc = GCHandle.Alloc(st);
-        ((AcceptOp*)st.Op)->Handle = GCHandle.ToIntPtr(st.Gc);
-        lock (_acceptGate) _acceptStates.Add(st);
-        PostAccept(st);
+            var st = new AcceptState
+            {
+                Listener = listener,
+                Token = token,
+                Af = af,
+                Proto = proto,
+                Buf = (nint)NativeMemory.AllocZeroed(AcceptBufSize),
+                Op = (nint)NativeMemory.AllocZeroed((nuint)sizeof(AcceptOp)),
+            };
+            st.Gc = GCHandle.Alloc(st);
+            ((AcceptOp*)st.Op)->Handle = GCHandle.ToIntPtr(st.Gc);
+            lock (_acceptGate) _acceptStates.Add(st);
+            PostAccept(st);
+        }
     }
 
     // Accept sockets are created RIO-capable (they become RIO connections after adoption).

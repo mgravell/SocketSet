@@ -68,10 +68,10 @@ internal sealed class IoUringFactory : SocketSetFactory
         catch (EntryPointNotFoundException) { return false; }
     }
 
-    public static int Bind(EndPoint endpoint) => endpoint switch
+    public static int Bind(EndPoint endpoint, int backlog) => endpoint switch
         {
-            IPEndPoint ip => Bind(ip),
-            UnixDomainSocketEndPoint uds => Bind(uds),
+            IPEndPoint ip => Bind(ip, backlog),
+            UnixDomainSocketEndPoint uds => Bind(uds, backlog),
             _ => throw new NotSupportedException(endpoint.GetType().Name)
         };
 
@@ -83,7 +83,7 @@ internal sealed class IoUringFactory : SocketSetFactory
     /// on the listener because Linux propagates it to accepted sockets, which
     /// keeps it off the accept hot path; UDS has no Nagle so the option is N/A.
     /// </summary>
-    private static unsafe int Bind(IPEndPoint ip)
+    private static unsafe int Bind(IPEndPoint ip, int backlog)
     {
         int fd = LibC.socket((ushort)ip.AddressFamily, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
@@ -104,13 +104,13 @@ internal sealed class IoUringFactory : SocketSetFactory
         };
         if (LibC.bind(fd, &addr, 16) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "IP bind() failed");
-        if (LibC.listen(fd, 512) < 0)
+        if (LibC.listen(fd, backlog) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "IP listen() failed");
 
         return fd;
     }
 
-    private static unsafe int Bind(UnixDomainSocketEndPoint uds)
+    private static unsafe int Bind(UnixDomainSocketEndPoint uds, int backlog)
     {
         int fd = LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0);
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), $"socket(AF_UNIX) failed");
@@ -123,7 +123,7 @@ internal sealed class IoUringFactory : SocketSetFactory
         uint len = LibC.SockAddrUn.Init(&addr, uds.ToString());
         if (LibC.bind(fd, &addr, len) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), $"UDS bind(AF_UNIX) failed");
-        if (LibC.listen(fd, 512) < 0)
+        if (LibC.listen(fd, backlog) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), $"UDS listen() failed");
 
         return fd;

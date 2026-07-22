@@ -54,7 +54,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         // MaxShards == 1, so there is only ever one shard here; a single listener binds
         // the endpoint directly — no reuse-port fan-out.
         var listener = Bind(endpoint);
-        listener.Listen(512);
+        listener.Listen(Parent.Options.ListenBacklog);
         lock (_listeners) _listeners.Add(listener);
 
         StartAccept(new AcceptArgs(this, listener, defaultToken));

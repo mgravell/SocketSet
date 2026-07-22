@@ -226,7 +226,7 @@ internal sealed class IoUringShard : SocketSetShard
 
     public override void Listen(EndPoint endpoint, object? userToken, bool local)
     {
-        int fd = IoUringFactory.Bind(endpoint);
+        int fd = IoUringFactory.Bind(endpoint, Parent.Options.ListenBacklog);
         _listeners[fd] = userToken; // default token for connections accepted here
         EnqueueAccept(fd, local);
     }
