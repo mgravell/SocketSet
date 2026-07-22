@@ -30,6 +30,10 @@ internal sealed class IoUringFactory : SocketSetFactory
         return new IoUringShard(options);
     }
 
+    // Reuse-port multi-bind is IP-only: every shard binds the same TCP port and the kernel balances
+    // accepts. AF_UNIX can't multi-bind (a second bind to the path fails), so it stays single-listener.
+    public override bool CanMultiBind(EndPoint endpoint) => endpoint is IPEndPoint;
+
     /// <summary>
     /// True only if this host can actually run the io_uring backend with the features we
     /// need. We don't parse kernel version strings — we respect the disable sysctl and

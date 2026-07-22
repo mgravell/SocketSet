@@ -85,6 +85,66 @@ internal static unsafe partial class Win32
         public byte* buf;  // CHAR*
     }
 
+    /// <summary>sockaddr_in (IPv4, 16 bytes) — same wire layout as elsewhere.</summary>
+    [StructLayout(LayoutKind.Sequential, Size = 16)]
+    internal struct SockAddrIn
+    {
+        public ushort sin_family;
+        public ushort sin_port;   // network byte order
+        public uint sin_addr;     // network byte order; 0 == INADDR_ANY
+        // 8 bytes zero padding (Size = 16)
+    }
+
+    /// <summary>sockaddr_un (Windows AF_UNIX — filesystem path only, no abstract namespace).</summary>
+    [StructLayout(LayoutKind.Sequential, Size = 110)]
+    internal struct SockAddrUn
+    {
+        public ushort sun_family;
+        public fixed byte sun_path[108];
+
+        public static uint Init(SockAddrUn* addr, string path)
+        {
+            *addr = default;
+            addr->sun_family = AF_UNIX;
+            int n = path.Length;
+            for (int i = 0; i < n; i++) addr->sun_path[i] = (byte)path[i]; // filesystem path; NUL-terminated below
+            return (uint)(sizeof(ushort) + n + 1); // include the NUL terminator in the length
+        }
+    }
+
+    /// <summary>Host-to-network byte order for a 16-bit port.</summary>
+    internal static ushort Htons(ushort value)
+        => System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(value); // Windows is always little-endian
+
+    // =====================================================================
+    // AcceptEx / ConnectEx — loaded at runtime via WSAIoctl (they aren't plain exports).
+    // =====================================================================
+
+    // BOOL AcceptEx(listen, accept, outBuf, recvLen, localAddrLen, remoteAddrLen, out bytesRecvd, overlapped)
+    internal static delegate* unmanaged<nint, nint, void*, uint, uint, uint, uint*, OVERLAPPED*, int> AcceptEx;
+    // BOOL ConnectEx(sock, name, namelen, sendBuf, sendLen, out bytesSent, overlapped)
+    internal static delegate* unmanaged<nint, void*, int, void*, uint, uint*, OVERLAPPED*, int> ConnectEx;
+
+    /// <summary>Load the AcceptEx/ConnectEx function pointers (once per process) using any socket.</summary>
+    internal static void LoadExtensions(nint anySocket)
+    {
+        if (AcceptEx != null) return;
+        void* fn;
+        uint bytes;
+
+        Guid acceptGuid = WSAID_ACCEPTEX;
+        if (WSAIoctl(anySocket, SIO_GET_EXTENSION_FUNCTION_POINTER, &acceptGuid, (uint)sizeof(Guid),
+                &fn, (uint)sizeof(void*), &bytes, null, null) != 0)
+            throw new System.ComponentModel.Win32Exception(WSAGetLastError(), "WSAIoctl(AcceptEx) failed");
+        AcceptEx = (delegate* unmanaged<nint, nint, void*, uint, uint, uint, uint*, OVERLAPPED*, int>)fn;
+
+        Guid connectGuid = WSAID_CONNECTEX;
+        if (WSAIoctl(anySocket, SIO_GET_EXTENSION_FUNCTION_POINTER, &connectGuid, (uint)sizeof(Guid),
+                &fn, (uint)sizeof(void*), &bytes, null, null) != 0)
+            throw new System.ComponentModel.Win32Exception(WSAGetLastError(), "WSAIoctl(ConnectEx) failed");
+        ConnectEx = (delegate* unmanaged<nint, void*, int, void*, uint, uint*, OVERLAPPED*, int>)fn;
+    }
+
     // =====================================================================
     // Winsock (ws2_32)
     // =====================================================================

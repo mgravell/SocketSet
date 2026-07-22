@@ -120,9 +120,9 @@ public abstract partial class SocketSet : IDisposable
 
     public void Listen(EndPoint endpoint, object? userToken = null)
     {
-        if (endpoint is IPEndPoint)
+        if (Options.Factory.CanMultiBind(endpoint))
         {
-            // can multi-bind (reuse-port)
+            // Reuse-port: every shard binds its own listener and the kernel balances accepts (io_uring/IP).
             foreach (var shard in _shards)
             {
                 shard.Listen(endpoint, userToken, local: true);
@@ -130,6 +130,9 @@ public abstract partial class SocketSet : IDisposable
         }
         else
         {
+            // Single listener on one shard, which bounces accepted connections round-robin. Because the
+            // shard is chosen round-robin, distinct listen endpoints land on different shards rather than
+            // all piling their accept load onto shard 0.
             RoundRobin().Listen(endpoint, userToken, local: false);
         }
     }

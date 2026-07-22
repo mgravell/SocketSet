@@ -1,3 +1,4 @@
+using System.Net;
 #if NET
 using SocketSets.IoUring;
 using SocketSets.Windows;
@@ -53,6 +54,17 @@ public abstract class SocketSetFactory
     /// itself off the thread pool and wants no threads spun up for it (false).
     /// </summary>
     public virtual bool UsesWorkerThreads => true;
+
+    /// <summary>
+    /// Whether <see cref="SocketSet.Listen"/> should bind <paramref name="endpoint"/> on <em>every</em>
+    /// shard — reuse-port multi-bind, where the kernel load-balances accepts across the per-shard
+    /// listeners — rather than binding it on a single shard that bounces accepted connections
+    /// round-robin. Only io_uring does this (Linux <c>SO_REUSEPORT</c>), and only for IP: Windows has no
+    /// reuse-port, and AF_UNIX can't multi-bind on any platform. Default false (single listener), which
+    /// also naturally spreads multiple <em>distinct</em> listen endpoints across shards instead of
+    /// piling them all on one.
+    /// </summary>
+    public virtual bool CanMultiBind(EndPoint endpoint) => false;
 
     /// <summary>
     /// Upper bound on the number of shards this backend wants, regardless of
