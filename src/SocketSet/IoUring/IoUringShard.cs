@@ -58,11 +58,11 @@ internal sealed class IoUringShard : SocketSetShard
     private RawIOUringRing _ring;
     private ManagedBufferPool _readBuffer;
 
-    private WriteBufferPool _writeBuffer;
+    private PinnedWriteBufferPool _writeBuffer;
 
     // Out-of-band write pool: leased from arbitrary threads (the IBufferWriter/Flush path), so guarded
     // by _obGate. Kept distinct from _writeBuffer so the IO-thread echo path never takes a lock.
-    private WriteBufferPool _obWriteBuffer;
+    private PinnedWriteBufferPool _obWriteBuffer;
     private readonly object _obGate = new();
     private WriteState[] _writeState = []; // per write-pool index (Op.Send)
     private WriteState[] _bidState = []; // per bid, for no-copy echoes (Op.SendBid)
@@ -635,8 +635,8 @@ internal sealed class IoUringShard : SocketSetShard
     {
         _ring = new RawIOUringRing((uint)_entriesPerShard);
         _readBuffer = new ManagedBufferPool(_ring.RingFd, entries: _readPages, bufSize: _readPageSize);
-        _writeBuffer = new WriteBufferPool(_writeCount, _writeBufSize);
-        _obWriteBuffer = new WriteBufferPool(_obWriteCount, _writeBufSize);
+        _writeBuffer = new PinnedWriteBufferPool(_writeCount, _writeBufSize);
+        _obWriteBuffer = new PinnedWriteBufferPool(_obWriteCount, _writeBufSize);
         _writeState = new WriteState[_writeCount];
         _bidState = new WriteState[_readPages];
         // How many read buffers the write path may hold at once. Default (0) = half the pool,

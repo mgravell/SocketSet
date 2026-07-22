@@ -406,6 +406,12 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             MaybeNoDelay(s);
         }
+#if NET
+        else if (endpoint is UnixDomainSocketEndPoint)
+        {
+            UnixSocketFile.PrepareForBind(endpoint.ToString()); // clear a stale filesystem socket file (no-op for abstract)
+        }
+#endif
         s.Bind(target);
         return s;
     }

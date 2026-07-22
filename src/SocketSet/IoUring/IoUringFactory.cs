@@ -101,6 +101,7 @@ internal sealed class IoUringFactory : SocketSetFactory
         // No SO_REUSEPORT/REUSEADDR: an abstract address is freed as soon as the
         // last holder closes, so there is nothing to reuse or clean up. No
         // TCP_NODELAY either — AF_UNIX has no Nagle.
+        UnixSocketFile.PrepareForBind(uds.ToString()); // clear a stale filesystem socket file (no-op for abstract)
         LibC.SockAddrUn addr;
         uint len = LibC.SockAddrUn.Init(&addr, uds.ToString());
         if (LibC.bind(fd, &addr, len) < 0)
