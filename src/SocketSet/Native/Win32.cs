@@ -229,5 +229,15 @@ internal static unsafe partial class Win32
     [SuppressGCTransition]
     [LibraryImport(Kernel32)]
     internal static partial nuint SetThreadAffinityMask(nint thread, nuint mask);
+
+    [SuppressGCTransition]
+    [LibraryImport(Kernel32)]
+    internal static partial nint GetCurrentProcess();
+
+    // Both masks are DWORD_PTR out-params (the CPUs this process, and the whole system, may run on).
+    [SuppressGCTransition]
+    [LibraryImport(Kernel32, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool GetProcessAffinityMask(nint process, nuint* processMask, nuint* systemMask);
 }
 #endif

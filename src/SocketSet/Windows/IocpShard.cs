@@ -835,13 +835,42 @@ internal sealed unsafe class IocpShard : SocketSetShard
     }
 
     // Pin the loop thread to a core (best-effort). The base Run() pins on Linux; Windows is done here
-    // since it needs SetThreadAffinityMask. TODO: intersect with the process affinity mask (the Linux
-    // path already respects an externally-applied set; this simple version doesn't yet).
+    // since it needs SetThreadAffinityMask.
     private void PinLoopThread()
     {
         if (!Parent.Options.PinWorkerThreads || !OperatingSystem.IsWindows()) return;
-        nuint mask = (nuint)1 << (Shard % Environment.ProcessorCount);
-        Win32.SetThreadAffinityMask(Win32.GetCurrentThread(), mask);
+        nuint mask = ChooseAffinityMask();
+        if (mask != 0) Win32.SetThreadAffinityMask(Win32.GetCurrentThread(), mask);
+    }
+
+    // Pick the Shard-th CPU among those the PROCESS is allowed to run on — respecting a restriction
+    // applied via a job object, `start /affinity`, or SetProcessAffinityMask — so pinning stays inside
+    // the permitted set. This matches the Linux path (PinCurrentThreadToNthAllowedCpu), which pins to
+    // the Nth CPU of the inherited cpuset rather than the Nth absolute core. Returns a single-bit mask,
+    // or 0 if the process mask can't be read and no fallback applies (caller then leaves it unpinned).
+    // NOTE: single processor group only (<= 64 CPUs); boxes with more use processor groups, which
+    // SetThreadAffinityMask can't span — a later refinement if we ever run on such hardware.
+    private nuint ChooseAffinityMask()
+    {
+        nuint proc, sys;
+        if (!Win32.GetProcessAffinityMask(Win32.GetCurrentProcess(), &proc, &sys) || proc == 0)
+            return (nuint)1 << (Shard % Environment.ProcessorCount); // can't read it → best-effort absolute
+
+        int bits = sizeof(nuint) * 8;
+        int allowed = 0;
+        for (int b = 0; b < bits; b++)
+            if ((proc & ((nuint)1 << b)) != 0) allowed++;
+        if (allowed == 0) return 0;
+
+        int target = Shard % allowed; // wrap when there are more shards than allowed CPUs
+        int seen = 0;
+        for (int b = 0; b < bits; b++)
+        {
+            if ((proc & ((nuint)1 << b)) == 0) continue;
+            if (seen == target) return (nuint)1 << b;
+            seen++;
+        }
+        return 0;
     }
 }
 #endif
