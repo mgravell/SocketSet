@@ -19,6 +19,9 @@ public abstract class SocketSetFactory
 
     /// <summary>Windows IOCP backend (raw Winsock, bypassing managed sockets).</summary>
     public static SocketSetFactory WindowsIocp { get; } = WindowsIocpFactory.Instance;
+
+    /// <summary>Windows RIO backend (Registered I/O; TCP-only, opt-in — not selected by <see cref="Default"/>).</summary>
+    public static SocketSetFactory WindowsRio { get; } = WindowsRioFactory.Instance;
 #endif
 
     /// <summary>Portable .NET managed-socket (SAEA) fallback.</summary>

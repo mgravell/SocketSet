@@ -29,6 +29,7 @@ internal static unsafe partial class Win32
 
     // --- WSASocketW flags / errors ---
     internal const uint WSA_FLAG_OVERLAPPED = 0x01;
+    internal const uint WSA_FLAG_REGISTERED_IO = 0x100; // required to use a socket with RIO
     internal const int WSA_IO_PENDING = 997;                  // ERROR_IO_PENDING
     internal const int WSAEWOULDBLOCK = 10035;
 

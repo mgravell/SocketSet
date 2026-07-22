@@ -59,6 +59,14 @@ for (int i = 0; i < args.Length; i++)
         case "--managed":
             options.Factory = SocketSetFactory.Managed;
             break;
+#if NET
+        case "--iocp":
+            options.Factory = SocketSetFactory.WindowsIocp;
+            break;
+        case "--rio":
+            options.Factory = SocketSetFactory.WindowsRio;
+            break;
+#endif
         case "--pipeline":
             window = int.MaxValue; // unbounded (deadlock-prone on a symmetric echo — for comparison)
             break;
