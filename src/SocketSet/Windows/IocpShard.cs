@@ -856,10 +856,21 @@ internal sealed unsafe class IocpShard : SocketSetShard
         int next = ctx.SendBytes;
         if (next == 0 && conn.Pending is { Count: > 0 } pending)
         {
-            var seg = pending.Dequeue();
-            Marshal.Copy(seg.Array!, seg.Offset, (nint)wp, seg.Count);
-            next = seg.Count;
-            ArrayPool<byte>.Shared.Return(seg.Array!); // done with the pooled staging buffer
+            // Coalesce as many queued responses as fit into the write page into ONE WSASend. Under
+            // pipelining this is the batching lever: it cuts send syscalls N:1, and — since the peer
+            // then drains a bigger chunk per recv — its recv-op count too (the measured deficit vs the
+            // managed backend). No added latency: it only batches work already waiting. The first item
+            // always fits (a response never exceeds the recv page, which equals this write page), so the
+            // loop never stalls at next == 0.
+            while (pending.Count > 0)
+            {
+                var seg = pending.Peek();
+                if (next + seg.Count > _writeBufSize) break;
+                pending.Dequeue();
+                Marshal.Copy(seg.Array!, seg.Offset, (nint)(wp + next), seg.Count);
+                next += seg.Count;
+                ArrayPool<byte>.Shared.Return(seg.Array!); // done with the pooled staging buffer
+            }
         }
 
         if (next > 0)
