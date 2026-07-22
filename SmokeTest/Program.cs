@@ -100,6 +100,19 @@ for (int i = 0; i < args.Length; i++)
         case "--port" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pt):
             port = pt;
             break;
+
+        // --- scenario aliases: set a bundle of workload-shape defaults for a common test mode. They
+        // only touch the shape knobs (window/size/close/churn), never scale (-c/-n) or backend, and any
+        // explicit flag placed AFTER the alias overrides it (left-to-right parse). ---
+        case "--latency":   // no-pipeline ping/pong, small messages — per-op latency
+            window = 1; size = 64;
+            break;
+        case "--bandwidth": // deep pipe, fat messages — saturation throughput
+            window = 64; size = 4096;
+            break;
+        case "--accept":    // one round-trip per socket then drop + reconnect — accept/connect/teardown churn
+            closeAfter = 1; churn = 10;
+            break;
     }
 }
 
@@ -155,6 +168,11 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --churn S         overlapping-churn soak for S seconds: keep the population topped up so");
     Console.WriteLine("                    reconnects race in-flight teardowns (stresses slot reuse / ABA)");
     Console.WriteLine("  --sockets N       sockets per shard (small = tight table = immediate slot reuse under churn)");
+    Console.WriteLine("  --iocp / --rio    force the Windows IOCP / RIO backend (RIO is TCP-only; default auto-detects)");
+    Console.WriteLine("  scenario aliases (set workload-shape defaults; any later flag overrides them):");
+    Console.WriteLine("  --latency         no-pipeline ping/pong, small messages (window=1, size=64) — per-op latency");
+    Console.WriteLine("  --bandwidth       deep pipe, fat messages (window=64, size=4096) — saturation throughput");
+    Console.WriteLine("  --accept          one round-trip per socket then drop + reconnect (close-after=1, churn=10s)");
     return;
 }
 
