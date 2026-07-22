@@ -35,6 +35,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
     private const uint ReqSend = 2; // NULL context being treated as "no completion")
 
+    private const bool DiagSkipRecv = false; // TEMP diag toggle: skip posting RIOReceive (was for the
+                                             // data-arrival probe; off now for the cross-process test).
+
     internal enum OpKind : int { Accept = 0, Connect = 1 }
 
     // Accept/connect op contexts (IOCP-style; recv/send do NOT use these — they're RIO). Both start with
@@ -100,6 +103,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     // TEMP blind-bring-up diagnostics: first N events to stderr, then quiet. Remove once RIO flows.
     private static int _diagN;
+    private static int _probeN;
     private static void Diag(string m) { if (Interlocked.Increment(ref _diagN) <= 120) Console.Error.WriteLine("[rio] " + m); }
 
     public WindowsRioShard(SocketSetOptions options)
@@ -289,8 +293,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             var c = _conns[i];
             if (c.Socket == 0 || !c.RecvArmed) continue;
             uint avail = 0;
-            if (Win32.ioctlsocket(c.Socket, Win32.FIONREAD, &avail) == 0 && avail > 0)
-                Diag($"FIONREAD slot={c.Slot} avail={avail} — data waiting but recv not completing");
+            if (Win32.ioctlsocket(c.Socket, Win32.FIONREAD, &avail) == 0 && avail > 0
+                && Interlocked.Increment(ref _probeN) <= 12) // own budget so send-spam can't starve it
+                Console.Error.WriteLine($"[rio] FIONREAD slot={c.Slot} avail={avail} — data is arriving on the recv side");
         }
     }
 
@@ -602,6 +607,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.Offset = (uint)(conn.RecvBuf * _recvBufSize);
         buf.Length = (uint)_recvBufSize;
         conn.RecvArmed = true;
+        if (DiagSkipRecv) { Diag($"ArmReceive slot={conn.Slot} SKIPPED (diag: not posting RIOReceive)"); return; }
         int rr = Win32.RIOReceive(conn.Rq, &buf, 1, 0, (void*)(nuint)ReqRecv);
         Diag($"RIOReceive slot={conn.Slot} rc={rr} (nonzero=OK) err={(rr == 0 ? Win32.WSAGetLastError() : 0)}");
         if (rr == 0)
