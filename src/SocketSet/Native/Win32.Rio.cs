@@ -25,8 +25,10 @@ internal static unsafe partial class Win32
     internal const uint RIO_MSG_WAITALL = 0x4;
     internal const uint RIO_MSG_COMMIT_ONLY = 0x8;
 
-    // Sentinels. Handles (CQ/RQ) are pointer-sized; an invalid buffer id is 0xFFFFFFFF.
-    internal static readonly nint RIO_INVALID_BUFFERID = unchecked((nint)(int)0xFFFFFFFF);
+    // Sentinels. Handles (CQ/RQ) are pointer-sized; an invalid buffer id is (RIO_BUFFERID)0xFFFFFFFF —
+    // i.e. ZERO-extended to 0x00000000FFFFFFFF, NOT sign-extended to -1. Getting this wrong makes a
+    // failed RIORegisterBuffer look like success.
+    internal static readonly nint RIO_INVALID_BUFFERID = unchecked((nint)0xFFFFFFFFL);
     internal static readonly nint RIO_INVALID_CQ = 0;
     internal static readonly nint RIO_INVALID_RQ = 0;
     // RIODequeueCompletion returns this (0xFFFFFFFF) if the CQ is corrupt.

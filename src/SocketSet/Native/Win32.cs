@@ -51,6 +51,7 @@ internal static unsafe partial class Win32
     // --- ioctls ---
     internal const int SD_BOTH = 2;                            // shutdown(how)
     internal const uint FIONBIO = 0x8004667E;
+    internal const int FIONREAD = 0x4004667F; // bytes available to read (diagnostic)
     internal const uint SIO_GET_EXTENSION_FUNCTION_POINTER = 0xC8000006;
 
     // WSAID_ACCEPTEX  {b5367df1-cbac-11cf-95ca-00805f48a192}

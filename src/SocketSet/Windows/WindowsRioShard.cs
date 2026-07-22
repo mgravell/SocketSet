@@ -32,8 +32,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private static readonly nuint WakeKey = unchecked((nuint)(-1)); // PQCS wake
     private static readonly nuint RioKey = unchecked((nuint)(-2));  // RIONotify → "drain the CQ"
 
-    private const uint ReqRecv = 0; // RIORESULT.RequestContext discriminator
-    private const uint ReqSend = 1;
+    private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
+    private const uint ReqSend = 2; // NULL context being treated as "no completion")
 
     internal enum OpKind : int { Accept = 0, Connect = 1 }
 
@@ -175,6 +175,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         while (IsActive)
         {
             DrainCrossThread();
+            ProbeFionread();
 
             uint removed = 0;
             bool ok = Win32.GetQueuedCompletionStatusExBlocking(_port, _entries, EntryBatch, &removed, Win32.INFINITE, alertable: false);
@@ -277,6 +278,21 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     internal void EnqueueInbound(nint socket, object? token) { _incoming.Enqueue((socket, token)); Poke(); }
     internal void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
+
+    // TEMP diagnostic: if a socket has readable bytes while its RIO recv is armed but not completing,
+    // RIO receive is broken (data present, not consumed). If this never fires, data isn't arriving.
+    private void ProbeFionread()
+    {
+        int scan = Math.Min(_conns.Length, 32);
+        for (int i = 0; i < scan; i++)
+        {
+            var c = _conns[i];
+            if (c.Socket == 0 || !c.RecvArmed) continue;
+            uint avail = 0;
+            if (Win32.ioctlsocket(c.Socket, Win32.FIONREAD, &avail) == 0 && avail > 0)
+                Diag($"FIONREAD slot={c.Slot} avail={avail} — data waiting but recv not completing");
+        }
+    }
 
     private void DrainCrossThread()
     {
