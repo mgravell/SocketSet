@@ -46,6 +46,10 @@ internal sealed class RioConnection : Connection
     public int SendTotal;
     public Queue<ArraySegment<byte>>? Pending;
 
+    /// <summary>This RQ has deferred (RIO_MSG_DEFER) submissions awaiting a commit; set while queued in
+    /// the shard's per-pass commit list so it's committed (kicked) exactly once at the pass boundary.</summary>
+    public bool CommitPending;
+
     public RioConnection(WindowsRioShard shard, uint slot)
     {
         Shard = shard;

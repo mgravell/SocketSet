@@ -102,6 +102,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private readonly ConcurrentQueue<(nint Socket, object? Token)> _incoming = [];
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
 
+    // Connections with RIO_MSG_DEFER'd submissions awaiting a commit. Loop-thread-only. Flushed at each
+    // drain-pass / loop-iteration boundary — so a connection's recv-rearm + echo-send (and any pipelined
+    // extras in the same pass) collapse into ONE kernel kick, and the flush can't be forgotten.
+    private readonly List<RioConnection> _toCommit = [];
+
     // TEMP: stderr diagnostics for the conns<64 drop investigation. The real drop paths use
     // Debug.WriteLine, which is compiled OUT in Release — so drops were invisible. Remove once resolved.
     public WindowsRioShard(SocketSetOptions options)
@@ -177,6 +182,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         while (IsActive)
         {
             DrainCrossThread();
+            // Kick any deferred submissions (from AdoptAccepted this iteration, or a previous iteration's
+            // HandleConnect) BEFORE blocking — else we'd wait on completions for ops never sent → deadlock.
+            FlushCommits();
 
             uint removed = 0;
             bool ok = Win32.GetQueuedCompletionStatusExBlocking(_port, _entries, EntryBatch, &removed, Win32.INFINITE, alertable: false);
@@ -215,11 +223,14 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         while (true)
         {
             uint n = DrainRioOnce();
+            FlushCommits(); // kick the recv-rearms + echo sends this chunk deferred — bounds their hold
+                            // time to ~one RioBatch (keeps latency tight) while still batching per-RQ.
             if (n == 0)
             {
                 // CQ empty: re-arm race-free (arm, then one more drain to catch the gap).
                 Win32.RIONotify(_cq);
                 if (DrainRioOnce() == 0) return; // nothing slipped into the gap → done
+                FlushCommits();                   // flush anything the gap-drain deferred
                 continue;                         // something arrived; keep going (subject to budget)
             }
             budget -= (int)n;
@@ -230,6 +241,31 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
                 return;
             }
         }
+    }
+
+    // Queue a connection whose RQ has RIO_MSG_DEFER'd submissions for a commit (dedup via CommitPending).
+    private void QueueCommit(RioConnection conn)
+    {
+        if (conn.CommitPending) return;
+        conn.CommitPending = true;
+        _toCommit.Add(conn);
+    }
+
+    // Commit (kick) every queued RQ: one RIO_MSG_COMMIT_ONLY flushes all of that connection's deferred
+    // recv+send requests to the kernel with a single call. MUST run before the loop blocks in GQCSEx, or
+    // deferred ops (whose completions we'd then wait on) never get sent → deadlock.
+    private void FlushCommits()
+    {
+        // AsSpan over the backing array: skips the List indexer's bounds/version checks on this hot
+        // path. Safe — nothing structurally modifies _toCommit mid-loop (RIOSend can't re-enter
+        // QueueCommit; the Clear is after).
+        foreach (var conn in CollectionsMarshal.AsSpan(_toCommit))
+        {
+            conn.CommitPending = false;
+            if (conn.Socket != 0 && conn.Rq != 0)
+                Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
+        }
+        _toCommit.Clear();
     }
 
     private uint DrainRioOnce()
@@ -325,6 +361,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
                 conn.Closing = false;
                 conn.RecvArmed = false;
                 conn.SendBusy = false;
+                conn.CommitPending = false;
                 conn.Rq = 0;
                 conn.RecvBuf = -1;
                 conn.SendBuf = -1;
@@ -623,12 +660,15 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.Offset = (uint)(conn.RecvBuf * _recvBufSize);
         buf.Length = (uint)_recvBufSize;
         conn.RecvArmed = true;
-        if (Win32.RIOReceive(conn.Rq, &buf, 1, 0, (void*)(nuint)ReqRecv) == 0)
+        // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
+        if (Win32.RIOReceive(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqRecv) == 0)
         {
             conn.RecvArmed = false;
             CloseClient(conn.Slot);
+            return;
         }
-        // else: the completion arrives on the CQ.
+        QueueCommit(conn);
+        // else: the completion arrives on the CQ (after the batched commit kicks the RQ).
     }
 
     // Post a RIOSend of write-slab index wi, bytes [off, off+len). Tears the connection down on failure.
@@ -638,7 +678,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.BufferId = _writeBufferId;
         buf.Offset = (uint)(wi * _writeBufSize + off);
         buf.Length = (uint)len;
-        if (Win32.RIOSend(conn.Rq, &buf, 1, 0, (void*)(nuint)ReqSend) == 0) FailSend(conn, slot);
+        // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
+        if (Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend) == 0) { FailSend(conn, slot); return; }
+        QueueCommit(conn);
     }
 
     private void SubmitSendBuffer(RioConnection conn, uint slot, int wi, int len)
