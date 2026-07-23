@@ -448,7 +448,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             Volatile.Write(ref conn.Socket, 0);
             throw new Win32Exception(Win32.WSAGetLastError(), "ConnectEx failed");
         }
-        Diag($"connect issued #{Interlocked.Increment(ref _connIssued)} slot={slot} okc={okc} sync={okc != 0}"); // okc!=0 = ConnectEx completed synchronously
+        Diag($"connect issued #{Interlocked.Increment(ref _connIssued)} shard={Shard} slot={slot} okc={okc}"); // okc!=0 = ConnectEx completed synchronously
     }
 
     private (nint socket, int af, int proto) CreateListener(IPEndPoint ip)
@@ -571,7 +571,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private void HandleConnect(uint slot, bool failed)
     {
         var conn = _conns[slot - 1];
-        Diag($"connect completed #{Interlocked.Increment(ref _connCompleted)} slot={slot} failed={failed}");
+        Diag($"connect completed #{Interlocked.Increment(ref _connCompleted)} shard={Shard} slot={slot} failed={failed}");
         if (failed || conn.Socket == 0)
         {
             Diag($"drop: ConnectEx failed slot={slot} status=0x{(ulong)_ops[slot - 1].Overlapped.Internal:x} socket={conn.Socket}");
