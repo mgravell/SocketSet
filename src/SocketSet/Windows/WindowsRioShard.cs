@@ -27,6 +27,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 {
     private const int EntryBatch = 128;               // IOCP completions per GQCSEx (accept/connect + RIO notify)
     private const int RioBatch = 256;                 // RIO completions per RIODequeueCompletion pass
+    private const int RioDrainBudget = 4096;          // max RIO completions per DrainRio call before yielding to the port loop
     private const int AddrStride = 128;               // per-address storage for AcceptEx
     private const int AcceptBufSize = 2 * AddrStride;
     private static readonly nuint WakeKey = unchecked((nuint)(-1)); // PQCS wake
@@ -199,6 +200,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
                 {
                     case OpKind.Accept: HandleAccept((AcceptOp*)e.lpOverlapped, failed); break;
                     case OpKind.Connect: HandleConnect(op->Slot, failed); break;
+                    default: Diag($"UNEXPECTED port completion kind={(int)op->Kind} key={(long)e.lpCompletionKey}"); break;
                 }
             }
         }
@@ -207,13 +209,31 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     // Drain the RIO completion queue in user mode, re-arming the notification race-free: dequeue to
     // empty, re-arm, then dequeue once more — if that finds work, the arm may have spent its trigger, so
     // loop and re-arm again.
+    // BOUNDED so a busy echo can't monopolize the loop thread. Processing recv completions generates
+    // more send completions on the same CQ, so an unbounded drain never returns to GetQueuedCompletion
+    // StatusEx — which is where accept/CONNECT completions get serviced. Left unbounded, connect
+    // completions arriving after the echo ramps up starve forever (the conns<64 bug). Drain up to a
+    // budget, then re-arm and yield to the OnRun loop; active load re-fires the notify so we come back.
     private void DrainRio()
     {
+        int budget = RioDrainBudget;
         while (true)
         {
-            while (DrainRioOnce() == RioBatch) { }  // dequeue-to-empty (a full batch means "maybe more")
-            Win32.RIONotify(_cq);
-            if (DrainRioOnce() == 0) break;         // nothing slipped into the arm gap → done
+            uint n = DrainRioOnce();
+            if (n == 0)
+            {
+                // CQ empty: re-arm race-free (arm, then one more drain to catch the gap).
+                Win32.RIONotify(_cq);
+                if (DrainRioOnce() == 0) return; // nothing slipped into the gap → done
+                continue;                         // something arrived; keep going (subject to budget)
+            }
+            budget -= (int)n;
+            if (budget <= 0)
+            {
+                // Busy: re-arm and hand the loop back so accept/connect (port) completions get serviced.
+                Win32.RIONotify(_cq);
+                return;
+            }
         }
     }
 
