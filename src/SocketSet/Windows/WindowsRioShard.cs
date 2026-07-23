@@ -265,14 +265,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         // AsSpan over the backing array: skips the List indexer's bounds/version checks on this hot
         // path. Safe — nothing structurally modifies _toCommit mid-loop (RIOSend can't re-enter
         // QueueCommit; the Clear is after).
-        if (_toCommit.Count > 0) Diag($"FlushCommits n={_toCommit.Count}");
         foreach (var conn in CollectionsMarshal.AsSpan(_toCommit))
         {
             conn.CommitPending = false;
             if (conn.Socket != 0 && conn.Rq != 0)
             {
                 int cr = Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
-                if (cr == 0) Diag($"COMMIT_ONLY FAILED s={conn.Slot} err={Win32.WSAGetLastError()}");
+                Diag($"Commit s={conn.Slot} recvArmed={conn.RecvArmed} sendBusy={conn.SendBusy} ret={cr} err={(cr == 0 ? Win32.WSAGetLastError() : 0)}");
             }
         }
         _toCommit.Clear();
@@ -674,7 +673,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.Length = (uint)_recvBufSize;
         conn.RecvArmed = true;
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
-        if (Win32.RIOReceive(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqRecv) == 0)
+        int rr = Win32.RIOReceive(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqRecv);
+        Diag($"ArmReceive s={conn.Slot} ret={rr} err={(rr == 0 ? Win32.WSAGetLastError() : 0)}");
+        if (rr == 0)
         {
             conn.RecvArmed = false;
             CloseClient(conn.Slot);
