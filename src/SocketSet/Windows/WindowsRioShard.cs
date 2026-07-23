@@ -33,11 +33,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private static readonly nuint WakeKey = unchecked((nuint)(-1)); // PQCS wake
     private static readonly nuint RioKey = unchecked((nuint)(-2));  // RIONotify → "drain the CQ"
 
-    // TEMPORARY OOB-verify hunt trace (stderr, globally capped). Remove once the RIO --verify stall is fixed.
-    private static int _diagN;
-    private static void Diag(string s) { if (Interlocked.Increment(ref _diagN) <= 220) Console.Error.WriteLine("[rio] " + s); }
-    private void NotifyDiag(string where) { int r = Win32.RIONotify(_cq); if (r != 0) Diag($"RIONotify {where} FAILED ret={r}"); }
-
     private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
     private const uint ReqSend = 2; // NULL context being treated as "no completion")
 
@@ -184,7 +179,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         PinLoopThread();
 
         // Arm the first RIO notification (must precede any RIO op so the CQ can wake us).
-        NotifyDiag("initial");
+        Win32.RIONotify(_cq);
 
         while (IsActive)
         {
@@ -235,7 +230,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             if (n == 0)
             {
                 // CQ empty: re-arm race-free (arm, then one more drain to catch the gap).
-                NotifyDiag("drain-empty");
+                Win32.RIONotify(_cq);
                 if (DrainRioOnce() == 0) return; // nothing slipped into the gap → done
                 FlushCommits();                   // flush anything the gap-drain deferred
                 continue;                         // something arrived; keep going (subject to budget)
@@ -244,7 +239,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             if (budget <= 0)
             {
                 // Busy: re-arm and hand the loop back so accept/connect (port) completions get serviced.
-                NotifyDiag("drain-budget");
+                Win32.RIONotify(_cq);
                 return;
             }
         }
@@ -273,9 +268,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             conn.CommitRecv = conn.CommitSend = false;
             if (conn.Socket != 0 && conn.Rq != 0)
             {
-                // COMMIT_ONLY flushes only the direction it's issued on, so kick each deferred direction.
+                // RIO_MSG_COMMIT_ONLY kicks the direction it's issued on, but a send-side commit also
+                // flushes a co-pending deferred receive on the same RQ (the receive piggybacks — this is
+                // why ECHO works). So one call suffices: commit the send if there is one (it carries any
+                // deferred receive); only a receive with NO send to ride on needs its own receive-side
+                // commit. Keeps DEFER's syscall-per-batch win — never two commits for one RQ.
                 if (send) Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
-                if (recv) Win32.RIOReceive(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
+                else if (recv) Win32.RIOReceive(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
             }
         }
         _toCommit.Clear();
@@ -394,7 +393,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         if (slot == 0) return;
         var conn = _conns[slot - 1];
         if (conn.Socket == 0 || conn.Closing) return;
-        Diag($"CloseClient s={slot}");
         conn.Closing = true;
 
         if (conn.Opened)
@@ -678,9 +676,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.Length = (uint)_recvBufSize;
         conn.RecvArmed = true;
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
-        int rr = Win32.RIOReceive(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqRecv);
-        Diag($"ArmReceive s={conn.Slot} ret={rr} err={(rr == 0 ? Win32.WSAGetLastError() : 0)}");
-        if (rr == 0)
+        if (Win32.RIOReceive(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqRecv) == 0)
         {
             conn.RecvArmed = false;
             CloseClient(conn.Slot);
@@ -699,9 +695,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.Offset = (uint)(wi * _writeBufSize + off);
         buf.Length = (uint)len;
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
-        int isr = Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend);
-        Diag($"IssueSend s={slot} off={off} len={len} ret={isr} err={(isr == 0 ? Win32.WSAGetLastError() : 0)}");
-        if (isr == 0) { FailSend(conn, slot); return; }
+        if (Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend) == 0) { FailSend(conn, slot); return; }
         conn.CommitSend = true;
         QueueCommit(conn);
     }
@@ -725,7 +719,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private void HandleRecv(uint slot, uint bytes, bool failed)
     {
         var conn = _conns[slot - 1];
-        Diag($"HandleRecv s={slot} bytes={bytes} failed={failed} closing={conn.Closing}");
 
         if (conn.Closing) { conn.RecvArmed = false; TryFinalize(conn, slot); return; }
         if (failed || bytes == 0) { conn.RecvArmed = false; CloseClient(slot); return; }
@@ -775,7 +768,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     {
         var conn = _conns[slot - 1];
         int wi = conn.SendBuf;
-        Diag($"HandleSend s={slot} bytes={bytes} failed={failed} sent={conn.SendSent} tot={conn.SendTotal} pend={conn.Pending?.Count ?? 0} closing={conn.Closing}");
 
         if (conn.Closing)
         {
@@ -819,7 +811,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             }
         }
 
-        Diag($"CompleteWrite s={slot} next={next} pendAfter={conn.Pending?.Count ?? 0}");
         if (next > 0)
         {
             conn.SendSent = 0;
@@ -843,8 +834,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         var conn = _conns[slot - 1];
         if (conn.Generation != generation || conn.Socket == 0 || conn.Closing
             || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
-        { Diag($"PumpFlush DROP s={slot} gen={generation}/{conn.Generation} sock={conn.Socket} closing={conn.Closing}"); return; }
-        Diag($"PumpFlush s={slot} len={len} sendBusy={conn.SendBusy} pend={conn.Pending?.Count ?? 0}");
+            return;
 
         var pending = conn.Pending ??= new();
         for (int off = 0; off < len;)
