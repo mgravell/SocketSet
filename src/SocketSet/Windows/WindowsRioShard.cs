@@ -101,6 +101,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private readonly ConcurrentQueue<(nint Socket, object? Token)> _incoming = [];
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
 
+    // TEMP: stderr diagnostics for the conns<64 drop investigation. The real drop paths use
+    // Debug.WriteLine, which is compiled OUT in Release — so drops were invisible. Remove once resolved.
+    private static int _diagN;
+    private static void Diag(string m) { if (Interlocked.Increment(ref _diagN) <= 200) Console.Error.WriteLine("[rio] " + m); }
+
     public WindowsRioShard(SocketSetOptions options)
     {
         _socketsPerShard = options.SocketsPerShard;
@@ -330,7 +335,16 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
         // closesocket aborts the outstanding RIO recv/send (they complete on the CQ with an error) and
         // destroys the request queue. Socket stays non-zero as the claimed marker until TryFinalize.
-        Win32.shutdown(conn.Socket, Win32.SD_BOTH);
+        if (Parent.Options.ResetOnClose)
+        {
+            // Abortive: SO_LINGER{1,0} → closesocket sends RST, no FIN, no TIME_WAIT on the active closer.
+            var lg = new Win32.LINGER { l_onoff = 1, l_linger = 0 };
+            Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_LINGER, &lg, sizeof(Win32.LINGER));
+        }
+        else
+        {
+            Win32.shutdown(conn.Socket, Win32.SD_BOTH);
+        }
         Win32.closesocket(conn.Socket);
         TryFinalize(conn, slot);
     }
@@ -551,10 +565,15 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private void HandleConnect(uint slot, bool failed)
     {
         var conn = _conns[slot - 1];
-        if (failed || conn.Socket == 0) { CloseClient(slot); return; }
+        if (failed || conn.Socket == 0)
+        {
+            Diag($"drop: ConnectEx failed slot={slot} status=0x{(ulong)_ops[slot - 1].Overlapped.Internal:x} socket={conn.Socket}");
+            CloseClient(slot);
+            return;
+        }
 
         Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_UPDATE_CONNECT_CONTEXT, null, 0);
-        if (!SetupConnection(conn)) { CloseClient(slot); return; }
+        if (!SetupConnection(conn)) { Diag($"drop: connect SetupConnection failed slot={slot}"); CloseClient(slot); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
@@ -575,11 +594,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         nint rq = Win32.RIOCreateRequestQueue(conn.Socket, 1, 1, 1, 1, _cq, _cq, (void*)(nuint)conn.Slot);
         if (rq == Win32.RIO_INVALID_RQ)
         {
-            System.Diagnostics.Debug.WriteLine($"RIOCreateRequestQueue failed: {Win32.WSAGetLastError()}");
+            Diag($"drop: RIOCreateRequestQueue failed slot={conn.Slot} err={Win32.WSAGetLastError()}");
             return false;
         }
         conn.Rq = rq;
-        if (!_recvBuffer.TryLease(out int ri, out _)) return false;
+        if (!_recvBuffer.TryLease(out int ri, out _)) { Diag($"drop: recv-buffer lease failed slot={conn.Slot}"); return false; }
         conn.RecvBuf = ri;
         return true;
     }

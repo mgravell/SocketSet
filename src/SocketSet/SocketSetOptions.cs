@@ -20,6 +20,11 @@ public class SocketSetOptions
     /// ignores this; the managed fallback accepts one at a time.</summary>
     public int AcceptConcurrency { get; set; } = 32;
 
+    /// <summary>Close connections abortively (SO_LINGER{on,0} → RST) instead of a graceful FIN. Skips
+    /// TIME_WAIT on the active closer — mainly a churn/benchmark aid so rapid connect/close doesn't
+    /// exhaust the client ephemeral-port pool. Not for production (a RST can drop in-flight data).</summary>
+    public bool ResetOnClose { get; set; }
+
     /// <summary>Pre-allocated, pre-pinned outbound buffers per shard. Each in-flight
     /// send holds one; sized to bound concurrent responses.</summary>
     public int WriteBuffersPerShard { get; set; } = 1024;

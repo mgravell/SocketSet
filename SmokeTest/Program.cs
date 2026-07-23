@@ -113,6 +113,9 @@ for (int i = 0; i < args.Length; i++)
         case "--accept":    // one round-trip per socket then drop + reconnect — accept/connect/teardown churn
             closeAfter = 1; churn = 10;
             break;
+        case "--reset-close": // abortive close (RST, no TIME_WAIT) — makes TCP churn measure the backend, not the port recycler
+            options.ResetOnClose = true;
+            break;
     }
 }
 
@@ -266,6 +269,17 @@ else if (server)
 {
     set.Listen(listenEp, EchoServer.ServerToken);
     Console.WriteLine($"listening on {listenEp}");
+}
+
+// TIME_WAIT warning: rapid connect/close over TCP with a graceful (client-active) close piles the
+// client's ephemeral ports into TIME_WAIT (~4 min on Windows, no tcp_tw_reuse), so back-to-back churn
+// runs share a draining pool and report artificially low rates. UDS has no TIME_WAIT; --reset-close
+// (RST) sidesteps it. Warn so the numbers aren't misread.
+if ((churn > 0 || closeAfter > 0) && clientCount > 0 && uds is null && !options.ResetOnClose)
+{
+    Console.WriteLine("warning: TCP socket churn accumulates TIME_WAIT on the client ephemeral pool — " +
+        "back-to-back runs will under-report. Use --reset-close (RST), test over UDS (-u), or let " +
+        "TIME_WAIT drain between runs (netstat) for meaningful accept rates.");
 }
 
 // Graceful-drain lifecycle test / socket-churn soak: each loop opens the clients, each client sends

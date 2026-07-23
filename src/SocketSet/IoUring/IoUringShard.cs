@@ -167,7 +167,7 @@ internal sealed class IoUringShard : SocketSetShard
     /// does NOT close the fd or free the slot yet — it forces the in-flight ops to drain (shutdown +
     /// ASYNC_CANCEL) and the slot is finalized only once they have (see <see cref="TryFinalize"/>), so
     /// no stale completion can ever land on a re-tenanted slot.</summary>
-    private void CloseClient(uint slot)
+    private unsafe void CloseClient(uint slot)
     {
         if (slot == 0) return;
         var conn = _conns[slot - 1];
@@ -185,7 +185,17 @@ internal sealed class IoUringShard : SocketSetShard
         // Force the drain: shutdown(RDWR) sends the FIN and EOFs the armed recv; ASYNC_CANCEL(FD|ALL)
         // cancels the recv + any in-flight send so nothing lingers. The fd stays open (cancel matches
         // by fd) and the slot stays claimed until every op is reaped.
-        LibC.shutdown(conn.Fd, LibC.SHUT_RDWR);
+        if (Parent.Options.ResetOnClose)
+        {
+            // Abortive close: SO_LINGER{1,0} makes the eventual close() send RST (no FIN, no TIME_WAIT).
+            // The ASYNC_CANCEL below still drains the in-flight recv/send so defer-recycle holds.
+            var lg = new LibC.Linger { l_onoff = 1, l_linger = 0 };
+            LibC.setsockopt(conn.Fd, LibC.SOL_SOCKET, LibC.SO_LINGER, &lg, (uint)sizeof(LibC.Linger));
+        }
+        else
+        {
+            LibC.shutdown(conn.Fd, LibC.SHUT_RDWR);
+        }
         if (conn.RecvArmed || conn.SendBusy)
         {
             conn.CancelPending = true;

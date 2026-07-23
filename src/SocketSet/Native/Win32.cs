@@ -36,6 +36,7 @@ internal static unsafe partial class Win32
     // --- setsockopt levels/options ---
     internal const int SOL_SOCKET = 0xFFFF;
     internal const int SO_REUSEADDR = 0x0004;
+    internal const int SO_LINGER = 0x0080;
     internal const int SO_UPDATE_ACCEPT_CONTEXT = 0x700B;
     internal const int SO_UPDATE_CONNECT_CONTEXT = 0x7010;
     internal const int TCP_NODELAY = 0x0001;
@@ -94,6 +95,10 @@ internal static unsafe partial class Win32
         public uint len;   // ULONG
         public byte* buf;  // CHAR*
     }
+
+    /// <summary>struct linger { u_short l_onoff; u_short l_linger; } — SO_LINGER{1,0} → closesocket sends RST (no TIME_WAIT).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct LINGER { public ushort l_onoff; public ushort l_linger; }
 
     /// <summary>sockaddr_in (IPv4, 16 bytes) — same wire layout as elsewhere.</summary>
     [StructLayout(LayoutKind.Sequential, Size = 16)]

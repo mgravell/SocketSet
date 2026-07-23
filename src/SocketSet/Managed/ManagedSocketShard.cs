@@ -371,7 +371,15 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
         }
 
-        try { conn.Socket.Shutdown(SocketShutdown.Both); } catch { /* best effort */ }
+        if (Parent.Options.ResetOnClose)
+        {
+            // Abortive: linger{true,0} → Dispose sends RST (no FIN, no TIME_WAIT on the active closer).
+            try { conn.Socket.LingerState = new LingerOption(true, 0); } catch { /* best effort */ }
+        }
+        else
+        {
+            try { conn.Socket.Shutdown(SocketShutdown.Both); } catch { /* best effort */ }
+        }
         SafeDispose(conn.Socket);
         // Deliberately do NOT dispose RecvArgs/SendArgs here: a receive or send may still be
         // in flight, and disposing a SocketAsyncEventArgs with a pending operation makes that

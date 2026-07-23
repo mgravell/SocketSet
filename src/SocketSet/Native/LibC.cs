@@ -15,7 +15,12 @@ internal static unsafe partial class LibC
     internal const int SOL_SOCKET = 1;
     internal const int SO_REUSEADDR = 2;
     internal const int SO_REUSEPORT = 15;
+    internal const int SO_LINGER = 13;
     internal const int TCP_NODELAY = 1;
+
+    /// <summary>struct linger { int l_onoff; int l_linger; } — SO_LINGER{1,0} makes close() send RST (no TIME_WAIT).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct Linger { public int l_onoff; public int l_linger; }
     
     public const int EAGAIN = 11, EINTR = 4, EBUSY = 16, ENOBUFS = 105;
 

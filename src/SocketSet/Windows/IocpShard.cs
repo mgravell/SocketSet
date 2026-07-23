@@ -387,7 +387,16 @@ internal sealed unsafe class IocpShard : SocketSetShard
         // shutdown sends the FIN; closesocket aborts the pending recv/send (they complete with an error,
         // which clears RecvArmed/SendBusy). Socket stays non-zero (the now-closed handle) as the claimed
         // marker until TryFinalize publishes the slot free.
-        Win32.shutdown(conn.Socket, Win32.SD_BOTH);
+        if (Parent.Options.ResetOnClose)
+        {
+            // Abortive: SO_LINGER{1,0} → closesocket sends RST, no FIN, no TIME_WAIT on the active closer.
+            var lg = new Win32.LINGER { l_onoff = 1, l_linger = 0 };
+            Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_LINGER, &lg, sizeof(Win32.LINGER));
+        }
+        else
+        {
+            Win32.shutdown(conn.Socket, Win32.SD_BOTH);
+        }
         Win32.closesocket(conn.Socket);
         TryFinalize(conn, slot); // nothing in flight → finalize immediately
     }
