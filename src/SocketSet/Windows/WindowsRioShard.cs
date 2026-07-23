@@ -269,10 +269,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         foreach (var conn in CollectionsMarshal.AsSpan(_toCommit))
         {
             conn.CommitPending = false;
+            bool recv = conn.CommitRecv, send = conn.CommitSend;
+            conn.CommitRecv = conn.CommitSend = false;
             if (conn.Socket != 0 && conn.Rq != 0)
             {
-                int cr = Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
-                Diag($"Commit s={conn.Slot} recvArmed={conn.RecvArmed} sendBusy={conn.SendBusy} ret={cr} err={(cr == 0 ? Win32.WSAGetLastError() : 0)}");
+                // COMMIT_ONLY flushes only the direction it's issued on, so kick each deferred direction.
+                if (send) Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
+                if (recv) Win32.RIOReceive(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
             }
         }
         _toCommit.Clear();
@@ -374,6 +377,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
                 conn.RecvArmed = false;
                 conn.SendBusy = false;
                 conn.CommitPending = false;
+                conn.CommitRecv = conn.CommitSend = false;
                 conn.Rq = 0;
                 conn.RecvBuf = -1;
                 conn.SendBuf = -1;
@@ -682,6 +686,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             CloseClient(conn.Slot);
             return;
         }
+        conn.CommitRecv = true;
         QueueCommit(conn);
         // else: the completion arrives on the CQ (after the batched commit kicks the RQ).
     }
@@ -697,6 +702,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         int isr = Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend);
         Diag($"IssueSend s={slot} off={off} len={len} ret={isr} err={(isr == 0 ? Win32.WSAGetLastError() : 0)}");
         if (isr == 0) { FailSend(conn, slot); return; }
+        conn.CommitSend = true;
         QueueCommit(conn);
     }
 
