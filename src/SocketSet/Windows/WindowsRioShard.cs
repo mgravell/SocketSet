@@ -268,13 +268,14 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             conn.CommitRecv = conn.CommitSend = false;
             if (conn.Socket != 0 && conn.Rq != 0)
             {
-                // RIO_MSG_COMMIT_ONLY kicks the direction it's issued on, but a send-side commit also
-                // flushes a co-pending deferred receive on the same RQ (the receive piggybacks — this is
-                // why ECHO works). So one call suffices: commit the send if there is one (it carries any
-                // deferred receive); only a receive with NO send to ride on needs its own receive-side
-                // commit. Keeps DEFER's syscall-per-batch win — never two commits for one RQ.
+                // RIO_MSG_COMMIT_ONLY kicks ONLY the direction it's issued on, so commit each deferred
+                // direction explicitly. A send commit APPEARS to also flush a co-pending recv (the
+                // "piggyback"), and simple echo tolerates relying on that — but --verify-echo proved it
+                // strands the recv under a deep pipeline (dropped message → hang). So never rely on it:
+                // `if`/`if`, not `else if`. Cost is at most two commit calls per RQ per flush, still
+                // amortized over a whole drain chunk (DEFER's batching win is intact).
                 if (send) Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
-                else if (recv) Win32.RIOReceive(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
+                if (recv) Win32.RIOReceive(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
             }
         }
         _toCommit.Clear();
