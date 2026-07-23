@@ -104,6 +104,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     // TEMP: stderr diagnostics for the conns<64 drop investigation. The real drop paths use
     // Debug.WriteLine, which is compiled OUT in Release — so drops were invisible. Remove once resolved.
     private static int _diagN;
+    private static int _connIssued;    // ConnectEx posted (Connect returned without throwing)
+    private static int _connCompleted; // HandleConnect fired (completion delivered)
     private static void Diag(string m) { if (Interlocked.Increment(ref _diagN) <= 200) Console.Error.WriteLine("[rio] " + m); }
 
     public WindowsRioShard(SocketSetOptions options)
@@ -236,6 +238,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     protected override void OnShutdown()
     {
         _portReady = false;
+        if (Shard == 0) Diag($"connect tally: issued={_connIssued} completed={_connCompleted} (lost={_connIssued - _connCompleted})");
 
         lock (_acceptGate)
         {
@@ -413,11 +416,12 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         Win32.bind(s, &any, 16); // ConnectEx requires a bound socket
 
         var conn = InitClient(s, userToken, SocketSet.SocketFlags.None);
-        if (conn is null) { Win32.closesocket(s); throw new InvalidOperationException("Shard socket table is full."); }
+        if (conn is null) { Diag("connect SYNC-FAIL: table full"); Win32.closesocket(s); throw new InvalidOperationException("Shard socket table is full."); }
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(s, _port, slot, 0) == 0)
         {
+            Diag($"connect SYNC-FAIL: CreateIoCompletionPort err={Marshal.GetLastPInvokeError()}");
             Win32.closesocket(s);
             Volatile.Write(ref conn.Socket, 0);
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(connect) failed");
@@ -439,10 +443,12 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         int okc = Win32.ConnectEx(s, addrPtr, 16, null, 0, &sent, &op->Overlapped);
         if (okc == 0 && Win32.WSAGetLastError() != Win32.WSA_IO_PENDING)
         {
+            Diag($"connect SYNC-FAIL: ConnectEx err={Win32.WSAGetLastError()} slot={slot}");
             Win32.closesocket(s);
             Volatile.Write(ref conn.Socket, 0);
             throw new Win32Exception(Win32.WSAGetLastError(), "ConnectEx failed");
         }
+        Interlocked.Increment(ref _connIssued); // posted OK (async completion pending)
     }
 
     private (nint socket, int af, int proto) CreateListener(IPEndPoint ip)
@@ -565,6 +571,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private void HandleConnect(uint slot, bool failed)
     {
         var conn = _conns[slot - 1];
+        Interlocked.Increment(ref _connCompleted);
         if (failed || conn.Socket == 0)
         {
             Diag($"drop: ConnectEx failed slot={slot} status=0x{(ulong)_ops[slot - 1].Overlapped.Internal:x} socket={conn.Socket}");
