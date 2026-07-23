@@ -35,7 +35,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     // TEMPORARY OOB-verify hunt trace (stderr, globally capped). Remove once the RIO --verify stall is fixed.
     private static int _diagN;
-    private static void Diag(string s) { if (Interlocked.Increment(ref _diagN) <= 160) Console.Error.WriteLine("[rio] " + s); }
+    private static void Diag(string s) { if (Interlocked.Increment(ref _diagN) <= 220) Console.Error.WriteLine("[rio] " + s); }
+    private void NotifyDiag(string where) { int r = Win32.RIONotify(_cq); if (r != 0) Diag($"RIONotify {where} FAILED ret={r}"); }
 
     private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
     private const uint ReqSend = 2; // NULL context being treated as "no completion")
@@ -183,7 +184,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         PinLoopThread();
 
         // Arm the first RIO notification (must precede any RIO op so the CQ can wake us).
-        Win32.RIONotify(_cq);
+        NotifyDiag("initial");
 
         while (IsActive)
         {
@@ -234,7 +235,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             if (n == 0)
             {
                 // CQ empty: re-arm race-free (arm, then one more drain to catch the gap).
-                Win32.RIONotify(_cq);
+                NotifyDiag("drain-empty");
                 if (DrainRioOnce() == 0) return; // nothing slipped into the gap → done
                 FlushCommits();                   // flush anything the gap-drain deferred
                 continue;                         // something arrived; keep going (subject to budget)
@@ -243,7 +244,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             if (budget <= 0)
             {
                 // Busy: re-arm and hand the loop back so accept/connect (port) completions get serviced.
-                Win32.RIONotify(_cq);
+                NotifyDiag("drain-budget");
                 return;
             }
         }
