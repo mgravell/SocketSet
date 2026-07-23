@@ -50,6 +50,12 @@ internal sealed class RioConnection : WindowsOutboundConnection
     /// the shard's per-pass commit list so it's committed (kicked) exactly once at the pass boundary.</summary>
     public bool CommitPending;
 
+    /// <summary>Which deferred directions are pending a commit. RIO_MSG_COMMIT_ONLY only flushes the
+    /// direction it's issued on — <c>RIOSend(COMMIT_ONLY)</c> commits deferred sends, <c>RIOReceive(
+    /// COMMIT_ONLY)</c> commits deferred receives — so a pure-receiver (no sends) needs the receive commit
+    /// or its re-armed recv never activates. Set at defer, consumed in FlushCommits.</summary>
+    public bool CommitRecv, CommitSend;
+
     public RioConnection(WindowsRioShard shard, uint slot)
     {
         Shard = shard;
