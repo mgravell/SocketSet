@@ -33,6 +33,10 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private static readonly nuint WakeKey = unchecked((nuint)(-1)); // PQCS wake
     private static readonly nuint RioKey = unchecked((nuint)(-2));  // RIONotify → "drain the CQ"
 
+    // TEMPORARY OOB-verify hunt trace (stderr, globally capped). Remove once the RIO --verify stall is fixed.
+    private static int _diagN;
+    private static void Diag(string s) { if (Interlocked.Increment(ref _diagN) <= 160) Console.Error.WriteLine("[rio] " + s); }
+
     private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
     private const uint ReqSend = 2; // NULL context being treated as "no completion")
 
@@ -261,11 +265,15 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         // AsSpan over the backing array: skips the List indexer's bounds/version checks on this hot
         // path. Safe — nothing structurally modifies _toCommit mid-loop (RIOSend can't re-enter
         // QueueCommit; the Clear is after).
+        if (_toCommit.Count > 0) Diag($"FlushCommits n={_toCommit.Count}");
         foreach (var conn in CollectionsMarshal.AsSpan(_toCommit))
         {
             conn.CommitPending = false;
             if (conn.Socket != 0 && conn.Rq != 0)
-                Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
+            {
+                int cr = Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
+                if (cr == 0) Diag($"COMMIT_ONLY FAILED s={conn.Slot} err={Win32.WSAGetLastError()}");
+            }
         }
         _toCommit.Clear();
     }
@@ -382,6 +390,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         if (slot == 0) return;
         var conn = _conns[slot - 1];
         if (conn.Socket == 0 || conn.Closing) return;
+        Diag($"CloseClient s={slot}");
         conn.Closing = true;
 
         if (conn.Opened)
@@ -683,7 +692,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         buf.Offset = (uint)(wi * _writeBufSize + off);
         buf.Length = (uint)len;
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
-        if (Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend) == 0) { FailSend(conn, slot); return; }
+        int isr = Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend);
+        Diag($"IssueSend s={slot} off={off} len={len} ret={isr} err={(isr == 0 ? Win32.WSAGetLastError() : 0)}");
+        if (isr == 0) { FailSend(conn, slot); return; }
         QueueCommit(conn);
     }
 
@@ -706,6 +717,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private void HandleRecv(uint slot, uint bytes, bool failed)
     {
         var conn = _conns[slot - 1];
+        Diag($"HandleRecv s={slot} bytes={bytes} failed={failed} closing={conn.Closing}");
 
         if (conn.Closing) { conn.RecvArmed = false; TryFinalize(conn, slot); return; }
         if (failed || bytes == 0) { conn.RecvArmed = false; CloseClient(slot); return; }
@@ -755,6 +767,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     {
         var conn = _conns[slot - 1];
         int wi = conn.SendBuf;
+        Diag($"HandleSend s={slot} bytes={bytes} failed={failed} sent={conn.SendSent} tot={conn.SendTotal} pend={conn.Pending?.Count ?? 0} closing={conn.Closing}");
 
         if (conn.Closing)
         {
@@ -798,6 +811,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             }
         }
 
+        Diag($"CompleteWrite s={slot} next={next} pendAfter={conn.Pending?.Count ?? 0}");
         if (next > 0)
         {
             conn.SendSent = 0;
@@ -821,7 +835,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         var conn = _conns[slot - 1];
         if (conn.Generation != generation || conn.Socket == 0 || conn.Closing
             || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
-            return;
+        { Diag($"PumpFlush DROP s={slot} gen={generation}/{conn.Generation} sock={conn.Socket} closing={conn.Closing}"); return; }
+        Diag($"PumpFlush s={slot} len={len} sendBusy={conn.SendBusy} pend={conn.Pending?.Count ?? 0}");
 
         var pending = conn.Pending ??= new();
         for (int off = 0; off < len;)
