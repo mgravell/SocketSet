@@ -16,6 +16,7 @@ int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.
 bool poke = false; // server echoes out-of-band via Connection.Send from a background thread
 bool adopt = false; // bind+listen a socket ourselves, then hand its handle to ListenHandle (socket-activation style)
 int verify = 0;    // >0: run the out-of-band Send content-verification harness with this payload size
+long verifyEcho = 0; // >0: run the bidirectional echo content-verification harness, round-tripping this many bytes
 int closeAfter = 0; // >0: each client sends this many messages then closes (graceful-drain test)
 int loops = 1;      // drain test: repeat this many connect→drain cycles (0 = forever, until Ctrl+C)
 int churn = 0;      // >0: overlapping-churn soak for this many seconds (reconnect while teardowns fly)
@@ -79,6 +80,9 @@ for (int i = 0; i < args.Length; i++)
         case "--verify" when i + 1 < args.Length && int.TryParse(args[i + 1], out var vp):
             verify = Math.Max(1, vp);
             break;
+        case "--verify-echo" when i + 1 < args.Length && long.TryParse(args[i + 1], out var ve):
+            verifyEcho = Math.Max(1, ve);
+            break;
         case "--close-after" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ca):
             closeAfter = Math.Max(1, ca);
             break;
@@ -125,6 +129,12 @@ if (verify > 0)
     return;
 }
 
+if (verifyEcho > 0)
+{
+    RunEchoVerify(options, verifyEcho, size, window, port);
+    return;
+}
+
 static void RunVerify(SocketSetOptions opts, int payloadLen, int port)
 {
     const int seg = 7000; // multi-segment chunk size for the sequence send (straddles page boundaries)
@@ -144,6 +154,22 @@ static void RunVerify(SocketSetOptions opts, int payloadLen, int port)
 
     bool ok = set.Received == set.Expected && set.Mismatches == 0;
     Console.WriteLine($"verify: received={set.Received}/{set.Expected} mismatches={set.Mismatches} => {(ok ? "PASS" : "FAIL")}");
+}
+
+static void RunEchoVerify(SocketSetOptions opts, long totalBytes, int chunk, int window, int port)
+{
+    using var set = new EchoVerify(opts, totalBytes, chunk, window);
+    var ep = new IPEndPoint(IPAddress.Loopback, port);
+    set.Listen(ep);
+    set.Connect(ep);
+    Console.WriteLine($"verify-echo: backend={opts.Factory.GetType().Name} total={totalBytes} chunk={chunk} window={window}");
+
+    var sw = Stopwatch.StartNew();
+    while (set.RoundTripped < set.Expected && sw.Elapsed < TimeSpan.FromSeconds(30)) Thread.Sleep(10);
+
+    bool ok = set.RoundTripped == set.Expected && set.ClientMismatches == 0 && set.ServerMismatches == 0;
+    Console.WriteLine($"verify-echo: roundtripped={set.RoundTripped}/{set.Expected} " +
+        $"clientMismatch={set.ClientMismatches} serverMismatch={set.ServerMismatches} => {(ok ? "PASS" : "FAIL")}");
 }
 
 if (!server && clientCount == 0)
@@ -166,6 +192,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --poke            server echoes out-of-band via Connection.Send from a background thread");
     Console.WriteLine("  --adopt           bind the listener here and hand its handle to ListenHandle (socket-activation style)");
     Console.WriteLine("  --verify N        run the out-of-band Send correctness harness with an N-byte payload");
+    Console.WriteLine("  --verify-echo N   round-trip N bytes of a known pattern through the echo path and");
+    Console.WriteLine("                    byte-verify both legs (-z sets chunk size, --window the pipe depth)");
     Console.WriteLine("  --close-after N   each client sends N messages then closes (graceful-drain lifecycle test)");
     Console.WriteLine("  --loops N         repeat the drain cycle N times (0 = forever); a socket-churn soak");
     Console.WriteLine("  --churn S         overlapping-churn soak for S seconds: keep the population topped up so");

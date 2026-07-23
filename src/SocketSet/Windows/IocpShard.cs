@@ -83,7 +83,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
     private readonly int _socketsPerShard;
     private readonly int _writeCount;
     private readonly int _writeBufSize;
-    private readonly int _obWriteCount;
     private readonly int _recvCount;
     private readonly int _recvBufSize;
     private readonly int _opCount;
@@ -92,10 +91,8 @@ internal sealed unsafe class IocpShard : SocketSetShard
 
     // --- created on the loop thread in OnInitialize() ---
     private nint _port;
-    private PinnedWriteBufferPool _writeBuffer;      // IO-thread send pool
-    private PinnedWriteBufferPool _obWriteBuffer;    // out-of-band send pool (unused until the OOB slice; kept for parity)
+    private PinnedWriteBufferPool _writeBuffer;      // IO-thread send pool (out-of-band writes ride this too, via Pending)
     private PinnedWriteBufferPool _recvBuffer;       // one buffer per live connection
-    private readonly object _obGate = new();
     private Win32.OVERLAPPED_ENTRY* _entries;        // GQCSEx batch buffer
     private IocpOp* _ops;                            // op-context slab: recv=[2i], send=[2i+1] per slot i
     private byte* _connectAddrs;                     // per-slot stable sockaddr storage for ConnectEx
@@ -130,7 +127,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
         _socketsPerShard = options.SocketsPerShard;
         _writeCount = options.WriteBuffersPerShard;
         _writeBufSize = options.BufferPageSize;
-        _obWriteCount = options.OutOfBandWriteBuffersPerShard;
         _recvBufSize = options.BufferPageSize;
         _recvCount = _socketsPerShard;         // one recv buffer per connection (recv is always armed)
         _opCount = _socketsPerShard * 2;       // recv + send per connection
@@ -184,7 +180,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort failed");
 
         _writeBuffer = new PinnedWriteBufferPool(_writeCount, _writeBufSize);
-        _obWriteBuffer = new PinnedWriteBufferPool(_obWriteCount, _writeBufSize);
         _recvBuffer = new PinnedWriteBufferPool(_recvCount, _recvBufSize);
         _entries = (Win32.OVERLAPPED_ENTRY*)NativeMemory.AllocZeroed(EntryBatch * (nuint)sizeof(Win32.OVERLAPPED_ENTRY));
         // Op-context OVERLAPPEDs are zeroed once here and never re-zeroed per op: we never set hEvent (it
@@ -309,7 +304,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
         if (_entries != null) { NativeMemory.Free(_entries); _entries = null; }
         if (_connectAddrs != null) { NativeMemory.Free(_connectAddrs); _connectAddrs = null; }
         _writeBuffer.Dispose();
-        lock (_obGate) _obWriteBuffer.Dispose();
         _recvBuffer.Dispose();
         if (_port != 0) { Win32.CloseHandle(_port); _port = 0; }
     }
