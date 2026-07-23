@@ -15,17 +15,22 @@ public abstract class SocketSetFactory
 
 #if NET
     /// <summary>io_uring backend (Linux only).</summary>
-    public static SocketSetFactory IoUring { get; } = IoUringFactory.Instance;
+    public static SocketSetFactory IoUring => IoUringFactory.Instance;
 
     /// <summary>Windows IOCP backend (raw Winsock, bypassing managed sockets).</summary>
-    public static SocketSetFactory WindowsIocp { get; } = WindowsIocpFactory.Instance;
+    public static SocketSetFactory WindowsIocp => WindowsIocpFactory.Instance;
 
-    /// <summary>Windows RIO backend (Registered I/O; TCP-only, opt-in — not selected by <see cref="Default"/>).</summary>
-    public static SocketSetFactory WindowsRio { get; } = WindowsRioFactory.Instance;
+    /// <summary>Windows RIO backend (Registered I/O; TCP-only, opt-in; not selected by <see cref="Default"/>).
+    /// Targets low latency: it drains completions in user mode and services each inbound the instant it
+    /// arrives. That eagerness is a deliberate trade - under deep-pipelined small-message load it reads
+    /// ~one message per <c>recv</c> where a batching backend (e.g. <see cref="Managed"/>) coalesces several, so it
+    /// wins latency but trails on bulk throughput. Best for latency-sensitive request/response traffic, or where
+    /// the source does not suffer excessive packet fragmentation.</summary>
+    public static SocketSetFactory WindowsRio => WindowsRioFactory.Instance;
 #endif
 
     /// <summary>Portable .NET managed-socket (SAEA) fallback.</summary>
-    public static SocketSetFactory Managed { get; } = ManagedSocketFactory.Instance;
+    public static SocketSetFactory Managed => ManagedSocketFactory.Instance;
 
     private static SocketSetFactory? _default;
 

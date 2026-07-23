@@ -101,6 +101,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     private readonly ConcurrentQueue<(nint Socket, object? Token)> _incoming = [];
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
+    // Out-of-band flushed writes (Connection.Flush, any thread): sent on the loop via the Pending path.
+    private readonly ConcurrentQueue<(uint Slot, uint Generation, byte[] Data, int Len)> _flush = [];
 
     // Connections with RIO_MSG_DEFER'd submissions awaiting a commit. Loop-thread-only. Flushed at each
     // drain-pass / loop-iteration boundary — so a connection's recv-rearm + echo-send (and any pipelined
@@ -331,6 +333,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     internal void EnqueueInbound(nint socket, object? token) { _incoming.Enqueue((socket, token)); Poke(); }
     internal void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
+    internal void SubmitFlush(uint slot, uint generation, byte[] data, int length) { _flush.Enqueue((slot, generation, data, length)); Poke(); }
 
     private void DrainCrossThread()
     {
@@ -340,6 +343,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             var conn = _conns[c.Slot - 1];
             if (conn.Generation == c.Generation && conn.Socket != 0) CloseClient(c.Slot);
         }
+        while (_flush.TryDequeue(out var f)) PumpFlush(f.Slot, f.Generation, f.Data, f.Len);
     }
 
     // =====================================================================
@@ -806,6 +810,54 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             conn.SendBuf = -1;
             conn.SendBusy = false;
         }
+    }
+
+    // Deliver a flushed out-of-band write (loop thread): chunk the bytes into write-page-sized Pending
+    // segments — the same shape the echo path drains — then kick a send if idle. They queue behind any
+    // in-flight/queued echo, preserving stream order. Dropped if the slot was re-tenanted or its send
+    // half is closed.
+    private void PumpFlush(uint slot, uint generation, byte[] data, int len)
+    {
+        var conn = _conns[slot - 1];
+        if (conn.Generation != generation || conn.Socket == 0 || conn.Closing
+            || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
+            return;
+
+        var pending = conn.Pending ??= new();
+        for (int off = 0; off < len;)
+        {
+            int n = Math.Min(_writeBufSize, len - off);
+            var buf = ArrayPool<byte>.Shared.Rent(n);      // pooled staging (uniform with echo; returned on drain)
+            Array.Copy(data, off, buf, 0, n);
+            pending.Enqueue(new ArraySegment<byte>(buf, 0, n));
+            off += n;
+        }
+        if (!conn.SendBusy) StartPendingSend(conn, slot);
+    }
+
+    // Start draining Pending into a freshly-leased write page (precondition: !SendBusy). Coalesces as in
+    // CompleteWrite; used to kick an out-of-band flush when the connection is otherwise idle.
+    private void StartPendingSend(RioConnection conn, uint slot)
+    {
+        if (conn.Pending is not { Count: > 0 } pending) return;
+        if (!_writeBuffer.TryLease(out int wi, out byte* wp))
+        {
+            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
+            CloseClient(slot);
+            return;
+        }
+        int next = 0;
+        while (pending.Count > 0)
+        {
+            var seg = pending.Peek();
+            if (next + seg.Count > _writeBufSize) break;
+            pending.Dequeue();
+            Marshal.Copy(seg.Array!, seg.Offset, (nint)(wp + next), seg.Count);
+            next += seg.Count;
+            ArrayPool<byte>.Shared.Return(seg.Array!);
+        }
+        if (next > 0) SubmitSendBuffer(conn, slot, wi, next);
+        else _writeBuffer.Release(wi);
     }
 
     private void PinLoopThread()

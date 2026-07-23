@@ -8,10 +8,10 @@ namespace SocketSets.Windows;
 /// and the lock-free allocation CAS target; <see cref="Generation"/> guards a stale Close against slot
 /// reuse (ABA).
 ///
-/// The out-of-band <see cref="System.Buffers.IBufferWriter{T}"/> path is not implemented in this slice
-/// (same as the IOCP backend): the echo data path is context-driven, so GetSpan/Advance/Flush throw.
+/// The out-of-band <see cref="System.Buffers.IBufferWriter{T}"/> path is inherited from
+/// <see cref="WindowsOutboundConnection"/> (marshaled to the loop, sent via the normal Pending path).
 /// </summary>
-internal sealed class RioConnection : Connection
+internal sealed class RioConnection : WindowsOutboundConnection
 {
     public readonly WindowsRioShard Shard;
 
@@ -61,13 +61,15 @@ internal sealed class RioConnection : Connection
         if (Volatile.Read(ref Socket) != 0) Shard.SubmitClose(Slot, Volatile.Read(ref Generation));
     }
 
-    private static NotSupportedException NoWriter() => new(
-        "RioConnection: the out-of-band IBufferWriter path is not yet implemented for the Windows RIO " +
-        "backend. The echo data path is context-driven (ctx.SendBytes / ctx.ResponseBytes).");
+    // --- out-of-band IBufferWriter path (accumulator in WindowsOutboundConnection) ---
 
-    public override Span<byte> GetSpan(int sizeHint = 0) => throw NoWriter();
-    public override Memory<byte> GetMemory(int sizeHint = 0) => throw NoWriter();
-    public override void Advance(int count) => throw NoWriter();
-    public override bool Flush() => throw NoWriter();
+    protected override bool IsClosed => Volatile.Read(ref Socket) == 0;
+
+    protected override bool SubmitOutbound(byte[] data, int length)
+    {
+        if (Volatile.Read(ref Socket) == 0) return false;
+        Shard.SubmitFlush(Slot, Volatile.Read(ref Generation), data, length);
+        return true;
+    }
 }
 #endif

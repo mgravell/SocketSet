@@ -13,11 +13,11 @@ namespace SocketSets.Windows;
 /// shard's native op-context slab, indexed by <see cref="Slot"/>. This object only carries loop-thread
 /// bookkeeping (recv/send buffers, send serialization, teardown state).
 ///
-/// The <see cref="IBufferWriter{T}"/> out-of-band write path is not implemented in this slice: the
-/// echo data path is entirely context-driven (ctx.SendBytes / ctx.ResponseBytes), so GetSpan/Advance/
-/// Flush are not exercised by basic accept/connect/send/receive. They throw until the RIO/OOB slice.
+/// The out-of-band <see cref="System.Buffers.IBufferWriter{T}"/> write path is inherited from
+/// <see cref="WindowsOutboundConnection"/>: staged bytes are marshaled to the loop via
+/// <see cref="SubmitOutbound"/> and sent through the normal Pending → send path.
 /// </summary>
-internal sealed class IocpConnection : Connection
+internal sealed class IocpConnection : WindowsOutboundConnection
 {
     public readonly IocpShard Shard;
 
@@ -72,16 +72,17 @@ internal sealed class IocpConnection : Connection
         if (Volatile.Read(ref Socket) != 0) Shard.SubmitClose(Slot, Volatile.Read(ref Generation));
     }
 
-    // --- IBufferWriter<byte>: out-of-band write path (not in this slice) ---
+    // --- out-of-band IBufferWriter path (accumulator in WindowsOutboundConnection) ---
 
-    private static NotSupportedException NoWriter() => new(
-        "IocpConnection: the out-of-band IBufferWriter path (GetSpan/Advance/Flush/Send) is not yet " +
-        "implemented for the Windows IOCP backend. The echo data path is context-driven (ctx.SendBytes " +
-        "/ ctx.ResponseBytes); out-of-band writes land with the RIO/OOB slice.");
+    protected override bool IsClosed => Volatile.Read(ref Socket) == 0;
 
-    public override Span<byte> GetSpan(int sizeHint = 0) => throw NoWriter();
-    public override Memory<byte> GetMemory(int sizeHint = 0) => throw NoWriter();
-    public override void Advance(int count) => throw NoWriter();
-    public override bool Flush() => throw NoWriter();
+    protected override bool SubmitOutbound(byte[] data, int length)
+    {
+        // Generation-captured marshal onto the loop (same guard as Close): a flush for a since-closed
+        // and re-tenanted slot is dropped on the loop thread rather than misdelivered.
+        if (Volatile.Read(ref Socket) == 0) return false;
+        Shard.SubmitFlush(Slot, Volatile.Read(ref Generation), data, length);
+        return true;
+    }
 }
 #endif

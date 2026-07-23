@@ -112,6 +112,9 @@ internal sealed unsafe class IocpShard : SocketSetShard
     // Close requests marshaled from arbitrary threads. Generation-guarded so a request can't retract a
     // slot that has since been closed and re-tenanted.
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
+    // Out-of-band flushed writes (Connection.Flush from any thread): a private byte[] + length + the
+    // capturing generation, sent on the loop through the normal Pending path. Generation-guarded.
+    private readonly ConcurrentQueue<(uint Slot, uint Generation, byte[] Data, int Len)> _flush = [];
 
     // Synchronous (FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) recv/send completions that posted no port
     // packet. Loop-thread-only. Deferred here and drained ITERATIVELY (not by calling the handler
@@ -251,6 +254,9 @@ internal sealed unsafe class IocpShard : SocketSetShard
             var conn = _conns[c.Slot - 1];
             if (conn.Generation == c.Generation && conn.Socket != 0) CloseClient(c.Slot);
         }
+
+        while (_flush.TryDequeue(out var f))
+            PumpFlush(f.Slot, f.Generation, f.Data, f.Len);
     }
 
     // Defer a synchronously-completed recv/send (no port packet was posted for it). Loop-thread-only.
@@ -328,6 +334,13 @@ internal sealed unsafe class IocpShard : SocketSetShard
     internal void SubmitClose(uint slot, uint generation)
     {
         _closes.Enqueue((slot, generation));
+        Poke();
+    }
+
+    /// <summary>Marshal an out-of-band flushed write onto the loop thread (from <see cref="WindowsOutboundConnection.Flush"/>).</summary>
+    internal void SubmitFlush(uint slot, uint generation, byte[] data, int length)
+    {
+        _flush.Enqueue((slot, generation, data, length));
         Poke();
     }
 
@@ -903,6 +916,54 @@ internal sealed unsafe class IocpShard : SocketSetShard
             conn.SendBuf = -1;
             conn.SendBusy = false;
         }
+    }
+
+    // Deliver a flushed out-of-band write (loop thread): chunk the bytes into write-page-sized Pending
+    // segments — exactly the shape the echo path already drains — then kick a send if idle. They queue
+    // behind any in-flight/queued echo, preserving stream order. Dropped if the slot was re-tenanted or
+    // its send half is closed.
+    private void PumpFlush(uint slot, uint generation, byte[] data, int len)
+    {
+        var conn = _conns[slot - 1];
+        if (conn.Generation != generation || conn.Socket == 0 || conn.Closing
+            || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
+            return;
+
+        var pending = conn.Pending ??= new();
+        for (int off = 0; off < len;)
+        {
+            int n = Math.Min(_writeBufSize, len - off);
+            var buf = ArrayPool<byte>.Shared.Rent(n);      // pooled staging (uniform with echo; returned on drain)
+            Array.Copy(data, off, buf, 0, n);
+            pending.Enqueue(new ArraySegment<byte>(buf, 0, n));
+            off += n;
+        }
+        if (!conn.SendBusy) StartPendingSend(conn, slot);
+    }
+
+    // Start draining Pending into a freshly-leased write page (precondition: !SendBusy). Coalesces as in
+    // CompleteWrite; used to kick an out-of-band flush when the connection is otherwise idle.
+    private void StartPendingSend(IocpConnection conn, uint slot)
+    {
+        if (conn.Pending is not { Count: > 0 } pending) return;
+        if (!_writeBuffer.TryLease(out int wi, out byte* wp))
+        {
+            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
+            CloseClient(slot);
+            return;
+        }
+        int next = 0;
+        while (pending.Count > 0)
+        {
+            var seg = pending.Peek();
+            if (next + seg.Count > _writeBufSize) break;
+            pending.Dequeue();
+            Marshal.Copy(seg.Array!, seg.Offset, (nint)(wp + next), seg.Count);
+            next += seg.Count;
+            ArrayPool<byte>.Shared.Return(seg.Array!);
+        }
+        if (next > 0) SubmitSendBuffer(conn, slot, wi, next);
+        else _writeBuffer.Release(wi);
     }
 
     private void ArmRecv(IocpConnection conn)
