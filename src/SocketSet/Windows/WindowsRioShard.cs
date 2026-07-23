@@ -104,11 +104,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     // TEMP: stderr diagnostics for the conns<64 drop investigation. The real drop paths use
     // Debug.WriteLine, which is compiled OUT in Release — so drops were invisible. Remove once resolved.
-    private static int _diagN;
-    private static int _connIssued;    // ConnectEx posted (Connect returned without throwing)
-    private static int _connCompleted; // HandleConnect fired (completion delivered)
-    private static void Diag(string m) { if (Interlocked.Increment(ref _diagN) <= 200) Console.Error.WriteLine("[rio] " + m); }
-
     public WindowsRioShard(SocketSetOptions options)
     {
         _socketsPerShard = options.SocketsPerShard;
@@ -200,7 +195,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
                 {
                     case OpKind.Accept: HandleAccept((AcceptOp*)e.lpOverlapped, failed); break;
                     case OpKind.Connect: HandleConnect(op->Slot, failed); break;
-                    default: Diag($"UNEXPECTED port completion kind={(int)op->Kind} key={(long)e.lpCompletionKey}"); break;
+                    default: System.Diagnostics.Debug.WriteLine($"unexpected port completion kind={(int)op->Kind}"); break;
                 }
             }
         }
@@ -258,7 +253,6 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     protected override void OnShutdown()
     {
         _portReady = false;
-        if (Shard == 0) Diag($"connect tally: issued={_connIssued} completed={_connCompleted} (lost={_connIssued - _connCompleted})");
 
         lock (_acceptGate)
         {
@@ -436,12 +430,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         Win32.bind(s, &any, 16); // ConnectEx requires a bound socket
 
         var conn = InitClient(s, userToken, SocketSet.SocketFlags.None);
-        if (conn is null) { Diag("connect SYNC-FAIL: table full"); Win32.closesocket(s); throw new InvalidOperationException("Shard socket table is full."); }
+        if (conn is null) { Win32.closesocket(s); throw new InvalidOperationException("Shard socket table is full."); }
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(s, _port, slot, 0) == 0)
         {
-            Diag($"connect SYNC-FAIL: CreateIoCompletionPort err={Marshal.GetLastPInvokeError()}");
             Win32.closesocket(s);
             Volatile.Write(ref conn.Socket, 0);
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(connect) failed");
@@ -463,12 +456,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         int okc = Win32.ConnectEx(s, addrPtr, 16, null, 0, &sent, &op->Overlapped);
         if (okc == 0 && Win32.WSAGetLastError() != Win32.WSA_IO_PENDING)
         {
-            Diag($"connect SYNC-FAIL: ConnectEx err={Win32.WSAGetLastError()} slot={slot}");
             Win32.closesocket(s);
             Volatile.Write(ref conn.Socket, 0);
             throw new Win32Exception(Win32.WSAGetLastError(), "ConnectEx failed");
         }
-        Diag($"connect issued #{Interlocked.Increment(ref _connIssued)} shard={Shard} slot={slot} okc={okc}"); // okc!=0 = ConnectEx completed synchronously
+        // okc != 0 (immediate) or WSA_IO_PENDING → completion arrives on the port → HandleConnect.
     }
 
     private (nint socket, int af, int proto) CreateListener(IPEndPoint ip)
@@ -591,16 +583,10 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private void HandleConnect(uint slot, bool failed)
     {
         var conn = _conns[slot - 1];
-        Diag($"connect completed #{Interlocked.Increment(ref _connCompleted)} shard={Shard} slot={slot} failed={failed}");
-        if (failed || conn.Socket == 0)
-        {
-            Diag($"drop: ConnectEx failed slot={slot} status=0x{(ulong)_ops[slot - 1].Overlapped.Internal:x} socket={conn.Socket}");
-            CloseClient(slot);
-            return;
-        }
+        if (failed || conn.Socket == 0) { CloseClient(slot); return; }
 
         Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_UPDATE_CONNECT_CONTEXT, null, 0);
-        if (!SetupConnection(conn)) { Diag($"drop: connect SetupConnection failed slot={slot}"); CloseClient(slot); return; }
+        if (!SetupConnection(conn)) { CloseClient(slot); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
@@ -621,11 +607,11 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         nint rq = Win32.RIOCreateRequestQueue(conn.Socket, 1, 1, 1, 1, _cq, _cq, (void*)(nuint)conn.Slot);
         if (rq == Win32.RIO_INVALID_RQ)
         {
-            Diag($"drop: RIOCreateRequestQueue failed slot={conn.Slot} err={Win32.WSAGetLastError()}");
+            System.Diagnostics.Debug.WriteLine($"RIOCreateRequestQueue failed: {Win32.WSAGetLastError()}");
             return false;
         }
         conn.Rq = rq;
-        if (!_recvBuffer.TryLease(out int ri, out _)) { Diag($"drop: recv-buffer lease failed slot={conn.Slot}"); return false; }
+        if (!_recvBuffer.TryLease(out int ri, out _)) { System.Diagnostics.Debug.WriteLine("recv-buffer pool exhausted"); return false; }
         conn.RecvBuf = ri;
         return true;
     }
