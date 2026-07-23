@@ -448,7 +448,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             Volatile.Write(ref conn.Socket, 0);
             throw new Win32Exception(Win32.WSAGetLastError(), "ConnectEx failed");
         }
-        Diag($"connect issued #{Interlocked.Increment(ref _connIssued)} slot={slot}"); // posted OK (async pending)
+        Diag($"connect issued #{Interlocked.Increment(ref _connIssued)} slot={slot} okc={okc} sync={okc != 0}"); // okc!=0 = ConnectEx completed synchronously
     }
 
     private (nint socket, int af, int proto) CreateListener(IPEndPoint ip)
