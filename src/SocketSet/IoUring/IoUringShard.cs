@@ -44,7 +44,11 @@ internal sealed class IoUringShard : SocketSetShard
     // --- slot table (1-based ids; id 0 == "none"). Connections are pooled: one instance per
     // slot, reused across connection lifetimes so accept/connect never allocates. ---
     private readonly IoUringConnection[] _conns;
-    private uint _clientStart;
+    private SlotAllocator _slots; // loop-local free-slot allocator (claim/free, single-writer). NOT readonly:
+                                  // it's a mutable struct, so a readonly field would mutate a throwaway copy.
+    // Connect requests marshaled from the caller thread to the loop, which claims the slot + issues the
+    // CONNECT SQE — so the slot table stays single-writer (only the loop claims). fd is created caller-side.
+    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token)> _pendingConnects = [];
 
     // --- options snapshot ---
     private readonly int _socketsPerShard;
@@ -112,6 +116,7 @@ internal sealed class IoUringShard : SocketSetShard
         _conns = new IoUringConnection[_socketsPerShard];
         for (int i = 0; i < _conns.Length; i++)
             _conns[i] = new IoUringConnection(this, (uint)i + 1);
+        _slots = new SlotAllocator(_conns.Length);
         SetShardCapacity(_conns.Length); // reservation ceiling == slot-table size
 
         // Stable native storage the kernel dereferences after we return.
@@ -131,44 +136,31 @@ internal sealed class IoUringShard : SocketSetShard
     // Slot table
     // =====================================================================
 
-    /// <summary>Claim a free slot for <paramref name="fd"/>. Lock-free (CAS on the pooled
-    /// connection's Fd), so callable from the loop thread (accept) or an arbitrary thread
-    /// (connect). Returns null if the table is full.</summary>
+    /// <summary>Claim a free slot for <paramref name="fd"/> from the loop-local allocator. Loop-thread
+    /// only (accept adoption, or a connect marshaled via <see cref="StartConnect"/>) — the single-writer
+    /// model, so the claim is a plain free-list pop + plain store, no CAS. Returns null only if the table
+    /// is full, which a prior reservation should have made impossible (backstop against counter drift).</summary>
     private IoUringConnection? InitClient(int fd, object? userToken, SocketSet.SocketFlags flags)
     {
         if (fd <= 0) Throw();
-        var conns = _conns;
-        // Callers reserve a slot (TryReserve) before claiming, so a free row is guaranteed to exist —
-        // but a single pass can lose the row it spotted to a concurrent claimer, so retry from a fresh
-        // round-robin offset. Bounded as a backstop against an unreserved caller / counter drift: on
-        // exhaustion return null and let the caller release the reservation and drop.
-        for (int pass = 0; pass < 32; pass++)
-        {
-            var offset = (uint)Interlocked.Increment(ref _clientStart);
-            for (int i = 0; i < conns.Length; i++)
-            {
-                var conn = conns[(i + offset) % (uint)conns.Length];
-                if (Interlocked.CompareExchange(ref conn.Fd, fd, 0) is 0)
-                {
-                    conn.UserToken = userToken;
-                    conn.Flags = flags;
-                    conn.SendBusy = false;
-                    conn.Pending?.Clear();
-                    // Publish a fresh generation last: any out-of-band send captured against the
-                    // previous tenant now mismatches and is dropped rather than misdelivered.
-                    Volatile.Write(ref conn.Generation, conn.Generation + 1);
-                    return conn;
-                }
-            }
-            Thread.Yield(); // every row was contended this pass; let claimers settle
-        }
-
-        return null; // no free slot despite a reservation → counter drift / unreserved caller (a bug)
+        // Loop-thread only (accept adoption, or a marshaled connect) → single writer of the slot table,
+        // so the claim is a plain free-list pop + plain store, no CAS. The caller reserved first, so a
+        // slot is guaranteed; Claim only fails on counter drift (backstop → caller releases + drops).
+        int idx = _slots.Claim();
+        if (idx < 0) return null;
+        var conn = _conns[idx];
+        conn.UserToken = userToken;
+        conn.Flags = flags;
+        conn.SendBusy = false;
+        conn.Pending?.Clear();
+        // Bump the generation before publishing Fd: any out-of-band send/close captured against the
+        // previous tenant now mismatches and is dropped rather than misdelivered.
+        Volatile.Write(ref conn.Generation, conn.Generation + 1);
+        Volatile.Write(ref conn.Fd, fd); // publish live last (foreign readers gate on Fd != 0)
+        return conn;
 
         static void Throw() => throw new ArgumentOutOfRangeException(nameof(fd), "Invalid socket handle");
     }
-
-    private int GetFd(uint slot) => slot == 0 ? 0 : Volatile.Read(ref _conns[slot - 1].Fd);
 
     private SocketSet.SocketFlags GetFlags(uint slot) => _conns[slot - 1].Flags;
 
@@ -236,7 +228,8 @@ internal sealed class IoUringShard : SocketSetShard
         conn.RecvArmed = false;
         conn.Closing = false;
         if (fd > 0) LibC.close(fd);
-        Volatile.Write(ref conn.Fd, 0); // publish free last
+        Volatile.Write(ref conn.Fd, 0); // publish free (foreign readers see the slot as dead)
+        _slots.Free((int)(slot - 1));   // return to the loop-local allocator (loop thread only)
         ReleaseReservation();           // paired with the TryReserve that placed this connection
     }
 
@@ -262,74 +255,73 @@ internal sealed class IoUringShard : SocketSetShard
         EnqueueAccept(fd, local: false);
     }
 
-    public override unsafe void Connect(EndPoint endpoint, object? userToken)
+    public override void Connect(EndPoint endpoint, object? userToken)
     {
-        int fd = endpoint switch
+        // This shard holds a reservation (TryPlace took it before dispatching here); release it on any
+        // failure before the connect is handed to the loop, so a rejected connect doesn't leak capacity.
+        if (endpoint is not (IPEndPoint or UnixDomainSocketEndPoint))
         {
-            IPEndPoint => LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP),
-            UnixDomainSocketEndPoint => LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0),
-            _ => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported."),
-        };
-        // This shard holds a reservation (TryPlace reserved it before dispatching here); release it on any
-        // failure before the slot is claimed, so a rejected connect doesn't permanently consume capacity.
+            ReleaseReservation();
+            throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported.");
+        }
+
+        // Create the fd here (thread-agnostic syscall, so failures stay synchronous to the caller) but
+        // hand the claim + sockaddr-build + CONNECT SQE to the loop, keeping the slot table single-writer.
+        int fd = endpoint is IPEndPoint
+            ? LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP)
+            : LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0);
         if (fd < 0)
         {
             ReleaseReservation();
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
         }
 
-        var conn = InitClient(fd, userToken, SocketSet.SocketFlags.None);
-        if (conn is null)
-        {
-            LibC.close(fd);
-            ReleaseReservation();
-            throw new InvalidOperationException("Shard socket table is full.");
-        }
+        _pendingConnects.Enqueue((fd, endpoint, userToken));
+        Poke();
+    }
 
+    // Loop thread: claim the reserved slot for a marshaled connect, build the target sockaddr into its
+    // stable native storage, and issue the CONNECT SQE. The reservation is consumed by the claim, or
+    // released here on the (should-not-happen) claim-failure backstop.
+    private unsafe void StartConnect(int fd, EndPoint endpoint, object? userToken)
+    {
+        var conn = InitClient(fd, userToken, SocketSet.SocketFlags.None);
+        if (conn is null) { LibC.close(fd); ReleaseReservation(); return; }
         uint slot = conn.Slot;
 
-        // Build the target sockaddr into this slot's stable native storage; the
-        // kernel dereferences it asynchronously once the CONNECT SQE is submitted.
         byte* addrPtr = _connectAddrs + (nint)(slot - 1) * AddrStride;
         uint addrLen;
-        switch (endpoint)
+        if (endpoint is IPEndPoint ip)
         {
-            case IPEndPoint ip:
-            {
-                int one = 1;
-                LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
-                var sa = (LibC.SockAddrIn*)addrPtr;
-                *sa = default; // clear any stale bytes from a prior tenant of this slot
-                sa->sin_family = LibC.AF_INET;
-                sa->sin_port = LibC.Htons((ushort)ip.Port);
-                var bytes = ip.Address.GetAddressBytes(); // 4 bytes, already network order
-                byte* dst = (byte*)&sa->sin_addr;
-                dst[0] = bytes[0];
-                dst[1] = bytes[1];
-                dst[2] = bytes[2];
-                dst[3] = bytes[3];
-                addrLen = 16; // sizeof(sockaddr_in)
-                break;
-            }
-            case UnixDomainSocketEndPoint uds:
-                // SockAddrUn.Init zeroes the struct and maps a leading '@' to the
-                // abstract namespace ('\0'); addrLen bounds the abstract name.
-                addrLen = LibC.SockAddrUn.Init((LibC.SockAddrUn*)addrPtr, uds.ToString());
-                break;
-            default:
-                LibC.close(fd);
-                throw new NotSupportedException(endpoint.GetType().Name);
+            int one = 1;
+            LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
+            var sa = (LibC.SockAddrIn*)addrPtr;
+            *sa = default; // clear any stale bytes from a prior tenant of this slot
+            sa->sin_family = LibC.AF_INET;
+            sa->sin_port = LibC.Htons((ushort)ip.Port);
+            var bytes = ip.Address.GetAddressBytes(); // 4 bytes, already network order
+            byte* dst = (byte*)&sa->sin_addr;
+            dst[0] = bytes[0];
+            dst[1] = bytes[1];
+            dst[2] = bytes[2];
+            dst[3] = bytes[3];
+            addrLen = 16; // sizeof(sockaddr_in)
+        }
+        else // UnixDomainSocketEndPoint (caller validated the type before marshaling)
+        {
+            var uds = (UnixDomainSocketEndPoint)endpoint;
+            // SockAddrUn.Init zeroes the struct and maps a leading '@' to the abstract namespace ('\0').
+            addrLen = LibC.SockAddrUn.Init((LibC.SockAddrUn*)addrPtr, uds.ToString());
         }
 
-        var sqe = new LibC.io_uring_sqe
+        Submit(new LibC.io_uring_sqe
         {
             opcode = LibC.IORING_OP_CONNECT,
             fd = fd,
             addr = (ulong)addrPtr,
             off = addrLen,
             user_data = Pack(Op.Connect, slot),
-        };
-        Enqueue(sqe);
+        });
     }
 
     private void EnqueueAccept(int listenerFd, bool local)
@@ -724,6 +716,10 @@ internal sealed class IoUringShard : SocketSetShard
             // Adopt any connections handed off from another shard's listener.
             while (_incoming.TryDequeue(out var inbound))
                 AdoptAccepted(inbound.Fd, inbound.Token);
+
+            // Start any connects marshaled in from caller threads (claim + CONNECT SQE on the loop).
+            while (_pendingConnects.TryDequeue(out var pc))
+                StartConnect(pc.Fd, pc.Endpoint, pc.Token);
 
             // Issue any out-of-band writes flushed in from other threads.
             while (_flush.TryDequeue(out var f))
