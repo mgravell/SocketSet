@@ -71,7 +71,12 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     // --- slot table ---
     private readonly RioConnection[] _conns;
-    private uint _clientStart;
+    private SlotAllocator _slots; // loop-local free-slot allocator (claim/free, single-writer). NOT readonly:
+                                  // it's a mutable struct, so a readonly field would mutate a throwaway copy.
+    // Connect requests marshaled from the caller thread to the loop, which claims the slot + posts
+    // ConnectEx — so the slot table stays single-writer. The socket is created caller-side (thread-agnostic
+    // syscalls, sync failures stay synchronous); the port-assoc + ConnectEx run on the loop (async failures).
+    private readonly ConcurrentQueue<(nint Socket, EndPoint Endpoint, object? Token)> _pendingConnects = [];
 
     // --- options snapshot ---
     private readonly int _socketsPerShard;
@@ -123,6 +128,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         _conns = new RioConnection[_socketsPerShard];
         for (int i = 0; i < _conns.Length; i++)
             _conns[i] = new RioConnection(this, (uint)i + 1);
+        _slots = new SlotAllocator(_conns.Length);
         SetShardCapacity(_conns.Length); // reservation ceiling == slot-table size
     }
 
@@ -350,6 +356,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private void DrainCrossThread()
     {
         while (_incoming.TryDequeue(out var inbound)) AdoptAccepted(inbound.Socket, inbound.Token);
+        while (_pendingConnects.TryDequeue(out var pc)) StartConnect(pc.Socket, pc.Endpoint, pc.Token);
         while (_closes.TryDequeue(out var c))
         {
             var conn = _conns[c.Slot - 1];
@@ -362,39 +369,42 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     // Slot table
     // =====================================================================
 
+    // Loop-thread only (accept adoption, or a connect marshaled via StartConnect) — the single-writer
+    // model, so the claim is a plain free-list pop + plain stores, no CAS. The caller reserved first, so a
+    // slot is guaranteed; Claim only fails on counter drift / an unreserved caller (backstop → caller
+    // releases + drops). Returns null if the table is full.
     private RioConnection? InitClient(nint socket, object? userToken, SocketSet.SocketFlags flags)
     {
-        var conns = _conns;
-        // Callers reserve (TryReserve) before claiming, so a free row is guaranteed; retry past a
-        // concurrent claimer that grabbed the spotted row. Bounded backstop (returns null → caller
-        // releases + drops) against an unreserved caller / counter drift.
-        for (int pass = 0; pass < 32; pass++)
-        {
-            var offset = (uint)Interlocked.Increment(ref _clientStart);
-            for (int i = 0; i < conns.Length; i++)
-            {
-                var conn = conns[(i + offset) % (uint)conns.Length];
-                if (Interlocked.CompareExchange(ref conn.Socket, socket, 0) == 0)
-                {
-                    conn.UserToken = userToken;
-                    conn.Flags = flags;
-                    conn.Opened = false;
-                    conn.Closing = false;
-                    conn.RecvArmed = false;
-                    conn.SendBusy = false;
-                    conn.CommitPending = false;
-                    conn.CommitRecv = conn.CommitSend = false;
-                    conn.Rq = 0;
-                    conn.RecvBuf = -1;
-                    conn.SendBuf = -1;
-                    conn.Pending?.Clear();
-                    Volatile.Write(ref conn.Generation, conn.Generation + 1);
-                    return conn;
-                }
-            }
-            Thread.Yield(); // every row contended this pass; let claimers settle
-        }
-        return null; // no free slot despite a reservation → counter drift / unreserved caller (a bug)
+        int idx = _slots.Claim();
+        if (idx < 0) return null;
+        var conn = _conns[idx];
+        conn.UserToken = userToken;
+        conn.Flags = flags;
+        conn.Opened = false;
+        conn.Closing = false;
+        conn.RecvArmed = false;
+        conn.SendBusy = false;
+        conn.CommitPending = false;
+        conn.CommitRecv = conn.CommitSend = false;
+        conn.Rq = 0;
+        conn.RecvBuf = -1;
+        conn.SendBuf = -1;
+        conn.Pending?.Clear();
+        // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
+        // previous tenant now mismatches and is dropped rather than misapplied.
+        Volatile.Write(ref conn.Generation, conn.Generation + 1);
+        Volatile.Write(ref conn.Socket, socket); // publish live last (foreign readers gate on Socket != 0)
+        return conn;
+    }
+
+    // Roll back a loop-side claim whose connect/adoption couldn't be armed: publish the slot free, return
+    // it to the allocator, and release the reservation — the post-claim analogue of TryFinalize's tail
+    // (minus buffer cleanup, since nothing was armed). Loop thread only.
+    private void FreeSlot(RioConnection conn)
+    {
+        Volatile.Write(ref conn.Socket, 0);
+        _slots.Free((int)(conn.Slot - 1));
+        ReleaseReservation();
     }
 
     private void CloseClient(uint slot)
@@ -440,7 +450,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         conn.Flags = 0;
         conn.Closing = false;
         Volatile.Write(ref conn.Socket, 0);
-        ReleaseReservation(); // paired with the TryReserve that placed this connection
+        _slots.Free((int)(slot - 1)); // return to the loop-local allocator (loop thread only)
+        ReleaseReservation();         // paired with the TryReserve that placed this connection
     }
 
     // =====================================================================
@@ -477,11 +488,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     public override void Connect(EndPoint endpoint, object? userToken)
     {
         Win32.EnsureWinsock();
-        if (endpoint is not IPEndPoint ip)
+        if (endpoint is not IPEndPoint)
             throw new NotSupportedException("The RIO backend is TCP-only; use the IOCP backend for AF_UNIX.");
 
-        // This shard holds a reservation (TryPlace took it before dispatching here); release it on any
-        // failure before the slot is claimed, so a rejected connect doesn't permanently consume capacity.
+        // This shard holds a reservation (TryPlace took it). Create + bind the socket HERE (thread-agnostic
+        // syscalls, so their failures stay synchronous to the caller), then hand the claim + port-assoc +
+        // ConnectEx to the loop, keeping the slot table single-writer. Release the reservation on any
+        // synchronous failure so a rejected connect doesn't permanently consume capacity.
         nint s = Win32.WSASocketW(Win32.AF_INET, Win32.SOCK_STREAM, Win32.IPPROTO_TCP, null, 0,
             Win32.WSA_FLAG_OVERLAPPED | Win32.WSA_FLAG_REGISTERED_IO);
         if (s == Win32.INVALID_SOCKET) { ReleaseReservation(); throw new Win32Exception(Marshal.GetLastPInvokeError(), "WSASocketW failed"); }
@@ -493,16 +506,25 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         any.sin_family = (ushort)Win32.AF_INET;
         Win32.bind(s, &any, 16); // ConnectEx requires a bound socket
 
+        _pendingConnects.Enqueue((s, endpoint, userToken));
+        Poke();
+    }
+
+    // Loop thread: claim the reserved slot for a marshaled connect, associate the socket with the port,
+    // build the target sockaddr into the slot's stable native storage, and post ConnectEx. The reservation
+    // is consumed by the claim, or released here on any post-claim failure (now async, like accept).
+    private void StartConnect(nint s, EndPoint endpoint, object? userToken)
+    {
+        var ip = (IPEndPoint)endpoint; // caller validated the type before marshaling
         var conn = InitClient(s, userToken, SocketSet.SocketFlags.None);
-        if (conn is null) { Win32.closesocket(s); ReleaseReservation(); throw new InvalidOperationException("Shard socket table is full."); }
+        if (conn is null) { Win32.closesocket(s); ReleaseReservation(); return; }
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(s, _port, slot, 0) == 0)
         {
             Win32.closesocket(s);
-            Volatile.Write(ref conn.Socket, 0);
-            ReleaseReservation();
-            throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(connect) failed");
+            FreeSlot(conn);
+            return;
         }
 
         byte* addrPtr = _connectAddrs + (nint)(slot - 1) * AddrStride;
@@ -522,9 +544,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         if (okc == 0 && Win32.WSAGetLastError() != Win32.WSA_IO_PENDING)
         {
             Win32.closesocket(s);
-            Volatile.Write(ref conn.Socket, 0);
-            ReleaseReservation();
-            throw new Win32Exception(Win32.WSAGetLastError(), "ConnectEx failed");
+            FreeSlot(conn);
+            return;
         }
         // okc != 0 (immediate) or WSA_IO_PENDING → completion arrives on the port → HandleConnect.
     }
@@ -635,7 +656,7 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         if (conn is null) { Win32.closesocket(socket); ReleaseReservation(); return; }
         uint slot = conn.Slot;
 
-        if (!SetupConnection(conn)) { Win32.closesocket(socket); Volatile.Write(ref conn.Socket, 0); ReleaseReservation(); return; }
+        if (!SetupConnection(conn)) { Win32.closesocket(socket); FreeSlot(conn); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
