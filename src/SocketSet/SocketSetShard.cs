@@ -12,6 +12,32 @@ public abstract class SocketSetShard
     private SocketSet _parent = null!; // set via init
     private int _shard;
 
+    // Free-slot reservation counter (capacity-aware placement). A placing thread reserves a slot with a
+    // single Interlocked.Decrement before routing a connection here; the owning loop releases it when the
+    // slot is published free. `>= 0 after decrement` == a free slot is guaranteed to exist, so the walk
+    // across shards fails a full shard in O(1) instead of scanning it. Default int.MaxValue == unbounded;
+    // fixed-table backends call SetShardCapacity to cap it at their slot count. (Not cache-line padded yet
+    // — a later micro-opt; today it neighbours rarely-written init fields, not another hot counter.)
+    private int _available = int.MaxValue;
+
+    /// <summary>Fixed-table backends set their reservation ceiling to the slot-table size (once, at init).</summary>
+    protected void SetShardCapacity(int slots) => _available = slots;
+
+    /// <summary>Reserve one slot on this shard. True == a slot is guaranteed available (go claim it);
+    /// false == full (the decrement is undone). O(1). Callable from any thread. Overridden by unbounded
+    /// backends (managed) to always succeed without touching the counter.</summary>
+    internal virtual bool TryReserve()
+    {
+        if (Interlocked.Decrement(ref _available) >= 0) return true;
+        Interlocked.Increment(ref _available); // undo the over-decrement; shard is full
+        return false;
+    }
+
+    /// <summary>Release a reservation: paired 1:1 with <see cref="TryReserve"/>, called wherever a slot is
+    /// published free (normal teardown, or a claim/connect rollback). Over/under-calling drifts the
+    /// counter into phantom-full drops, so keep it colocated with the free-publish.</summary>
+    internal void ReleaseReservation() => Interlocked.Increment(ref _available);
+
     protected SocketSet Parent => _parent;
 
     /// <summary>This shard's index within the set.</summary>

@@ -147,6 +147,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
         _conns = new IocpConnection[_socketsPerShard];
         for (int i = 0; i < _conns.Length; i++)
             _conns[i] = new IocpConnection(this, (uint)i + 1);
+        SetShardCapacity(_conns.Length); // reservation ceiling == slot-table size
     }
 
     // WSAStartup once per process; WSACleanup is left to process exit.
@@ -347,30 +348,37 @@ internal sealed unsafe class IocpShard : SocketSetShard
     private IocpConnection? InitClient(nint socket, object? userToken, SocketSet.SocketFlags flags)
     {
         var conns = _conns;
-        var offset = (uint)Interlocked.Increment(ref _clientStart);
-        for (int i = 0; i < conns.Length; i++)
+        // Callers reserve (TryReserve) before claiming, so a free row is guaranteed; retry past a
+        // concurrent claimer that grabbed the spotted row. Bounded backstop (returns null → caller
+        // releases + drops) against an unreserved caller / counter drift.
+        for (int pass = 0; pass < 32; pass++)
         {
-            var conn = conns[(i + offset) % (uint)conns.Length];
-            if (Interlocked.CompareExchange(ref conn.Socket, socket, 0) == 0)
+            var offset = (uint)Interlocked.Increment(ref _clientStart);
+            for (int i = 0; i < conns.Length; i++)
             {
-                conn.UserToken = userToken;
-                conn.Flags = flags;
-                conn.Opened = false;
-                conn.Closing = false;
-                conn.RecvArmed = false;
-                conn.SendBusy = false;
-                conn.SkipOnSuccess = false;
-                conn.RecvBuf = -1;
-                conn.SendBuf = -1;
-                conn.Pending?.Clear();
-                // Publish a fresh generation last: any out-of-band Close captured against the previous
-                // tenant now mismatches and is dropped rather than misapplied.
-                Volatile.Write(ref conn.Generation, conn.Generation + 1);
-                return conn;
+                var conn = conns[(i + offset) % (uint)conns.Length];
+                if (Interlocked.CompareExchange(ref conn.Socket, socket, 0) == 0)
+                {
+                    conn.UserToken = userToken;
+                    conn.Flags = flags;
+                    conn.Opened = false;
+                    conn.Closing = false;
+                    conn.RecvArmed = false;
+                    conn.SendBusy = false;
+                    conn.SkipOnSuccess = false;
+                    conn.RecvBuf = -1;
+                    conn.SendBuf = -1;
+                    conn.Pending?.Clear();
+                    // Publish a fresh generation last: any out-of-band Close captured against the previous
+                    // tenant now mismatches and is dropped rather than misapplied.
+                    Volatile.Write(ref conn.Generation, conn.Generation + 1);
+                    return conn;
+                }
             }
+            Thread.Yield(); // every row contended this pass; let claimers settle
         }
 
-        return null; // table full
+        return null; // no free slot despite a reservation → counter drift / unreserved caller (a bug)
     }
 
     /// <summary>Begin tearing a connection down (loop thread). Idempotent. Fires OnClosed now, but does
@@ -423,6 +431,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
         conn.Flags = 0;
         conn.Closing = false;
         Volatile.Write(ref conn.Socket, 0); // publish free last (socket already closed in CloseClient)
+        ReleaseReservation();               // paired with the TryReserve that placed this connection
     }
 
     private IocpOp* RecvOp(uint slot) => &_ops[(slot - 1) * 2];
@@ -473,8 +482,10 @@ internal sealed unsafe class IocpShard : SocketSetShard
             _ => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported."),
         };
 
+        // This shard holds a reservation (TryPlace took it before dispatching here); release it on any
+        // failure before the slot is claimed, so a rejected connect doesn't permanently consume capacity.
         nint s = Win32.WSASocketW(af, Win32.SOCK_STREAM, proto, null, 0, Win32.WSA_FLAG_OVERLAPPED);
-        if (s == Win32.INVALID_SOCKET) throw new Win32Exception(Marshal.GetLastPInvokeError(), "WSASocketW failed");
+        if (s == Win32.INVALID_SOCKET) { ReleaseReservation(); throw new Win32Exception(Marshal.GetLastPInvokeError(), "WSASocketW failed"); }
         Win32.LoadExtensions(s);
 
         int one = 1;
@@ -488,13 +499,14 @@ internal sealed unsafe class IocpShard : SocketSetShard
         }
 
         var conn = InitClient(s, userToken, SocketSet.SocketFlags.None);
-        if (conn is null) { Win32.closesocket(s); throw new InvalidOperationException("Shard socket table is full."); }
+        if (conn is null) { Win32.closesocket(s); ReleaseReservation(); throw new InvalidOperationException("Shard socket table is full."); }
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(s, _port, slot, 0) == 0)
         {
             Win32.closesocket(s);
             Volatile.Write(ref conn.Socket, 0);
+            ReleaseReservation();
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(connect) failed");
         }
 
@@ -522,6 +534,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
             default:
                 Win32.closesocket(s);
                 Volatile.Write(ref conn.Socket, 0);
+                ReleaseReservation();
                 throw new NotSupportedException(endpoint.GetType().Name);
         }
 
@@ -537,6 +550,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
         {
             Win32.closesocket(s);
             Volatile.Write(ref conn.Socket, 0);
+            ReleaseReservation();
             throw new Win32Exception(Win32.WSAGetLastError(), "ConnectEx failed");
         }
         // ok != 0 (immediate) or WSA_IO_PENDING → a completion is queued to the port.
@@ -654,9 +668,11 @@ internal sealed unsafe class IocpShard : SocketSetShard
         nint listener = st.Listener;
         Win32.setsockopt(acc, Win32.SOL_SOCKET, Win32.SO_UPDATE_ACCEPT_CONTEXT, &listener, sizeof(nint));
 
-        // Single acceptor → bounce round-robin to spread connections across shards.
-        var target = (IocpShard)Parent.RoundRobin();
-        target.EnqueueInbound(acc, st.Token);
+        // Single acceptor → place on the first shard with a free slot (capacity-aware; drops only if
+        // every shard is full).
+        var target = (IocpShard?)Parent.TryPlace();
+        if (target is not null) target.EnqueueInbound(acc, st.Token);
+        else Win32.closesocket(acc); // every shard full → drop (runtime shard growth would expand here)
 
         PostAccept(st); // keep the listener saturated
     }
@@ -668,13 +684,14 @@ internal sealed unsafe class IocpShard : SocketSetShard
         Win32.setsockopt(socket, Win32.IPPROTO_TCP, Win32.TCP_NODELAY, &one, sizeof(int)); // harmless on AF_UNIX
 
         var conn = InitClient(socket, token, SocketSet.SocketFlags.None);
-        if (conn is null) { Win32.closesocket(socket); return; }
+        if (conn is null) { Win32.closesocket(socket); ReleaseReservation(); return; }
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(socket, _port, slot, 0) == 0)
         {
             Win32.closesocket(socket);
             Volatile.Write(ref conn.Socket, 0);
+            ReleaseReservation();
             return;
         }
 
@@ -688,6 +705,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
             // Recv pool exhausted (should not happen: sized to the connection table). Drop the connection.
             Win32.closesocket(socket);
             Volatile.Write(ref conn.Socket, 0);
+            ReleaseReservation();
             return;
         }
         conn.RecvBuf = ri;

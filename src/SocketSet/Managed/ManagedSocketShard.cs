@@ -27,6 +27,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
     protected override void OnInitialize() => _bufferSize = Parent.Options.BufferPageSize;
 
+    // Managed has no fixed slot table (connections are heap objects in a ConcurrentDictionary), so it is
+    // never "full" — placement always succeeds here without touching the reservation counter.
+    internal override bool TryReserve() => true;
+
     // Never called: the managed backend reports UsesWorkerThreads = false, so the base
     // does not run a pump loop for it.
     protected override void OnRun()

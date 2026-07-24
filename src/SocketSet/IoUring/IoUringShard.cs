@@ -112,6 +112,7 @@ internal sealed class IoUringShard : SocketSetShard
         _conns = new IoUringConnection[_socketsPerShard];
         for (int i = 0; i < _conns.Length; i++)
             _conns[i] = new IoUringConnection(this, (uint)i + 1);
+        SetShardCapacity(_conns.Length); // reservation ceiling == slot-table size
 
         // Stable native storage the kernel dereferences after we return.
         _connectAddrs = (byte*)NativeMemory.AllocZeroed((nuint)_socketsPerShard * AddrStride);
@@ -137,24 +138,32 @@ internal sealed class IoUringShard : SocketSetShard
     {
         if (fd <= 0) Throw();
         var conns = _conns;
-        var offset = (uint)Interlocked.Increment(ref _clientStart);
-        for (int i = 0; i < conns.Length; i++)
+        // Callers reserve a slot (TryReserve) before claiming, so a free row is guaranteed to exist —
+        // but a single pass can lose the row it spotted to a concurrent claimer, so retry from a fresh
+        // round-robin offset. Bounded as a backstop against an unreserved caller / counter drift: on
+        // exhaustion return null and let the caller release the reservation and drop.
+        for (int pass = 0; pass < 32; pass++)
         {
-            var conn = conns[(i + offset) % (uint)conns.Length];
-            if (Interlocked.CompareExchange(ref conn.Fd, fd, 0) is 0)
+            var offset = (uint)Interlocked.Increment(ref _clientStart);
+            for (int i = 0; i < conns.Length; i++)
             {
-                conn.UserToken = userToken;
-                conn.Flags = flags;
-                conn.SendBusy = false;
-                conn.Pending?.Clear();
-                // Publish a fresh generation last: any out-of-band send captured against the
-                // previous tenant now mismatches and is dropped rather than misdelivered.
-                Volatile.Write(ref conn.Generation, conn.Generation + 1);
-                return conn;
+                var conn = conns[(i + offset) % (uint)conns.Length];
+                if (Interlocked.CompareExchange(ref conn.Fd, fd, 0) is 0)
+                {
+                    conn.UserToken = userToken;
+                    conn.Flags = flags;
+                    conn.SendBusy = false;
+                    conn.Pending?.Clear();
+                    // Publish a fresh generation last: any out-of-band send captured against the
+                    // previous tenant now mismatches and is dropped rather than misdelivered.
+                    Volatile.Write(ref conn.Generation, conn.Generation + 1);
+                    return conn;
+                }
             }
+            Thread.Yield(); // every row was contended this pass; let claimers settle
         }
 
-        return null; // table full
+        return null; // no free slot despite a reservation → counter drift / unreserved caller (a bug)
 
         static void Throw() => throw new ArgumentOutOfRangeException(nameof(fd), "Invalid socket handle");
     }
@@ -228,6 +237,7 @@ internal sealed class IoUringShard : SocketSetShard
         conn.Closing = false;
         if (fd > 0) LibC.close(fd);
         Volatile.Write(ref conn.Fd, 0); // publish free last
+        ReleaseReservation();           // paired with the TryReserve that placed this connection
     }
 
     // =====================================================================
@@ -260,12 +270,19 @@ internal sealed class IoUringShard : SocketSetShard
             UnixDomainSocketEndPoint => LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0),
             _ => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported."),
         };
-        if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
+        // This shard holds a reservation (TryPlace reserved it before dispatching here); release it on any
+        // failure before the slot is claimed, so a rejected connect doesn't permanently consume capacity.
+        if (fd < 0)
+        {
+            ReleaseReservation();
+            throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
+        }
 
         var conn = InitClient(fd, userToken, SocketSet.SocketFlags.None);
         if (conn is null)
         {
             LibC.close(fd);
+            ReleaseReservation();
             throw new InvalidOperationException("Shard socket table is full.");
         }
 
@@ -817,15 +834,18 @@ internal sealed class IoUringShard : SocketSetShard
             object? defaultToken = _listeners.TryGetValue(listenerFd, out var t) ? t : null;
             if (local)
             {
-                // reuse-port: each shard has its own listener, so it is already balanced.
-                AdoptAccepted(newFd, defaultToken);
+                // reuse-port: each shard has its own listener, so it is already balanced — adopt here.
+                // Reserve our own slot first; if we're full, drop rather than scan-fail deep in adoption.
+                if (TryReserve()) AdoptAccepted(newFd, defaultToken);
+                else LibC.close(newFd);
             }
             else
             {
-                // Single listener (e.g. UDS): all accepts land on this one shard, so
-                // bounce each connection onto a round-robin shard to spread the load.
-                var target = (IoUringShard)Parent.RoundRobin();
-                target.EnqueueInbound(newFd, defaultToken);
+                // Single listener (e.g. UDS): all accepts land on this one shard, so place each connection
+                // on the first shard with a free slot (capacity-aware; drops only if every shard is full).
+                var target = (IoUringShard?)Parent.TryPlace();
+                if (target is not null) target.EnqueueInbound(newFd, defaultToken);
+                else LibC.close(newFd); // every shard full → drop (runtime shard growth would expand here)
             }
         }
 
@@ -849,7 +869,9 @@ internal sealed class IoUringShard : SocketSetShard
         var conn = InitClient(newFd, userToken, SocketSet.SocketFlags.None);
         if (conn is null)
         {
+            // Reserved (in HandleAccept) but couldn't claim — counter drift; release and drop.
             LibC.close(newFd);
+            ReleaseReservation();
             return;
         }
 

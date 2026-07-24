@@ -118,6 +118,24 @@ public abstract partial class SocketSet : IDisposable
         return arr[next % (uint)arr.Length];
     }
 
+    /// <summary>Capacity-aware placement: walk the shards from the round-robin cursor and reserve a slot
+    /// on the first one with room. Returns that shard (the caller then routes the connection to it and
+    /// claims the reserved slot), or <c>null</c> if every shard is full — the caller drops the connection.
+    /// The reservation must be released (<see cref="SocketSetShard.ReleaseReservation"/>) if the claim
+    /// never happens. Unlike <see cref="RoundRobin"/>, this never lands a connection on a full shard while
+    /// a sibling has space, which is the spurious-drop the fixed round-robin could cause.</summary>
+    internal SocketSetShard? TryPlace()
+    {
+        var arr = _shards;
+        uint start = (uint)Interlocked.Increment(ref _next);
+        for (uint k = 0; k < (uint)arr.Length; k++)
+        {
+            var shard = arr[(start + k) % (uint)arr.Length];
+            if (shard.TryReserve()) return shard;
+        }
+        return null; // every shard full (we may grow here later; for now the caller drops/throws)
+    }
+
     public void Listen(EndPoint endpoint, object? userToken = null)
     {
         if (Options.Factory.CanMultiBind(endpoint))
@@ -138,7 +156,14 @@ public abstract partial class SocketSet : IDisposable
     }
 
     public void Connect(EndPoint endpoint, object? userToken = null)
-        => RoundRobin().Connect(endpoint, userToken);
+    {
+        // Walk for a shard with a free slot rather than committing to one round-robin pick that might be
+        // full while siblings have room. The chosen shard holds a reservation; its Connect consumes it by
+        // claiming the slot, or releases it on a pre-claim failure.
+        var shard = TryPlace()
+            ?? throw new InvalidOperationException("All shards are at capacity; cannot place the connection.");
+        shard.Connect(endpoint, userToken);
+    }
 
     /// <summary>
     /// Start accepting on an already-bound-and-listening socket handle (an fd on Linux/io_uring, a
