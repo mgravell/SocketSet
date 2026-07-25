@@ -36,14 +36,18 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
 
     public void Bind()
     {
+        // Tunable for benchmarking: SS_SHARDS (io_uring worker threads), SS_PIN (pin them to cores).
+        int shards = int.TryParse(Environment.GetEnvironmentVariable("SS_SHARDS"), out var s) ? s : 2;
+        bool pin = Environment.GetEnvironmentVariable("SS_PIN") == "1";
         var options = new SocketSetOptions
         {
             Factory = SocketSetFactory.IoUring,
-            Shards = 2,
-            PinWorkerThreads = false,
+            Shards = shards,
+            PinWorkerThreads = pin,
         };
         _set = new TransportSet(options, this);
         _set.Listen(EndPoint);
+        Console.WriteLine($"[socketset transport] shards={shards} pin={pin}");
     }
 
     // --- SocketSet callbacks (loop thread) → Kestrel bridge ---

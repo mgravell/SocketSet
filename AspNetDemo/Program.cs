@@ -17,6 +17,7 @@ var app = builder.Build();
 
 app.MapGet("/", () => "Hello from SocketSet — ASP.NET Core running its HTTP stack over an io_uring transport!\n");
 app.MapGet("/ping", () => Results.Json(new { ok = true, transport = "socketset-io_uring" }));
+app.MapGet("/plaintext", () => Results.Text("OK")); // minimal — isolates transport cost from app work
 
 // Exercise the inbound path with a real request body.
 app.MapPost("/echo", async (HttpRequest req) =>
