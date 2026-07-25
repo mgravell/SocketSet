@@ -4,6 +4,11 @@
         <OutputType>Exe</OutputType>
     </PropertyGroup>
 
+    <!-- Only NetFxShims.cs needs it, to reach the pointer-based BCL overloads .NET Framework does have. -->
+    <PropertyGroup Condition="'$(TargetFramework)' == 'net472'">
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
     <ItemGroup>
       <ProjectReference Include="..\src\SocketSet\SocketSet.csproj" />
     </ItemGroup>

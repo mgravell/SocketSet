@@ -32,6 +32,9 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
     /// cert); if null, the client uses the system CA store.</param>
     /// <param name="verifyServer">Whether the client verifies the server certificate + hostname. Leaving
     /// this true is the safe default; false is the man-in-the-middle footgun and exists only for bring-up.</param>
+    /// <param name="kernelOffload">Enable kTLS (SSL_OP_ENABLE_KTLS) on the contexts, so connections driven
+    /// via the fd-bound path hand their keys to the kernel at handshake completion; see
+    /// <see cref="SupportsKernelOffload"/>.</param>
     public OpenSslTlsProvider(string? serverCertPem = null, string? serverKeyPem = null,
         string? trustCertPem = null, bool verifyServer = true, bool kernelOffload = false)
     {
