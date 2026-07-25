@@ -2,14 +2,14 @@
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
-        <TargetFrameworks>net10.0;net472</TargetFrameworks>
-        <LangVersion>14.0</LangVersion>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
     </PropertyGroup>
 
     <ItemGroup>
       <ProjectReference Include="..\src\SocketSet\SocketSet.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Remove="foo.sock" />
     </ItemGroup>
 
 </Project>

@@ -1,14 +1,21 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFrameworks>net10.0;net472</TargetFrameworks>
-        <LangVersion>14.0</LangVersion>
-        <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <ServerGarbageCollection>true</ServerGarbageCollection>
         <InvariantGlobalization>true</InvariantGlobalization>
         <RootNamespace>SocketSets</RootNamespace>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <IsPackable>true</IsPackable>
+        <PackageId>SocketSet</PackageId>
+        <Title>SocketSet</Title>
+        <Description>High-performance, low-allocation sharded socket hosting for .NET, over io_uring (Linux), IOCP or RIO (Windows), with a portable managed fallback.</Description>
+        <PackageTags>socket;sockets;tcp;network;io_uring;iocp;rio;winsock;performance;server</PackageTags>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <!-- The API is documented where it is non-obvious; don't fail the build over the rest. -->
+        <NoWarn>$(NoWarn);CS1591</NoWarn>
     </PropertyGroup>
 
     <!-- .NET Framework lacks Span<T>/BinaryPrimitives in the box; pull them in via NuGet. -->

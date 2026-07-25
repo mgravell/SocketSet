@@ -1,0 +1,61 @@
+<Project>
+
+    <!-- Language / compilation defaults for every project in the repo. -->
+    <PropertyGroup>
+        <LangVersion>14.0</LangVersion>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <TargetFrameworks>net10.0;net472</TargetFrameworks>
+    </PropertyGroup>
+
+    <!-- Package/assembly identity. Only the library opts in to packing (see its .csproj). -->
+    <PropertyGroup>
+        <Authors>Marc Gravell</Authors>
+        <Company>Marc Gravell</Company>
+        <Product>SocketSet</Product>
+        <Copyright>Copyright (c) 2026 Marc Gravell</Copyright>
+        <RepositoryUrl>https://github.com/mgravell/SocketSet</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageProjectUrl>$(RepositoryUrl)</PackageProjectUrl>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+        <IsPackable>false</IsPackable>
+    </PropertyGroup>
+
+    <!--
+      Versioning comes from version.json + git height (Nerdbank.GitVersioning): the series is pinned
+      to 0.1 there, the patch is the number of commits since that pin, and builds off main carry a
+      -g<commit> suffix so only main produces release versions. AssemblyVersion is pinned outright to
+      0.1.0.0 — with a strong name in play, moving it every commit would break binding for every
+      consumer; FileVersion and the package version still move with git height.
+    -->
+    <ItemGroup>
+        <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.91" PrivateAssets="all" />
+    </ItemGroup>
+
+    <!--
+      Strong-name everything from one repo key. Retro-fitting a strong name is a breaking change for
+      every consumer, and .NET Framework consumers (GAC, binding redirects, strong-name-signed callers)
+      can't reference an unsigned assembly at all — so it has to be on from the first build. The key is
+      committed on purpose: a strong name is an identity, not a secret, and full signing means no
+      consumer needs a key of their own.
+    -->
+    <PropertyGroup>
+        <SignAssembly>true</SignAssembly>
+        <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)SocketSet.snk</AssemblyOriginatorKeyFile>
+        <DelaySign>false</DelaySign>
+        <PublicSign>false</PublicSign>
+    </PropertyGroup>
+
+    <!-- Symbols + deterministic, source-linked builds. SourceLink for GitHub ships in the SDK. -->
+    <PropertyGroup>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+        <PublishRepositoryUrl>true</PublishRepositoryUrl>
+        <EmbedUntrackedSources>true</EmbedUntrackedSources>
+        <Deterministic>true</Deterministic>
+        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    </PropertyGroup>
+
+</Project>

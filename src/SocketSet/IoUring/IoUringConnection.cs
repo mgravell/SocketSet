@@ -87,7 +87,7 @@ internal unsafe struct WriteVState
 /// is bumped on each (re)allocation so a stale reference held past close is detected and its writes
 /// dropped rather than delivered to whichever connection later reused the slot.
 ///
-/// Writer state (the <c>_cur*</c> fields and <see cref="_segs"/>) is single-writer: the thread
+/// Writer state (the <c>_cur*</c> and <c>_segs</c> fields) is single-writer: the thread
 /// currently writing to this connection owns it until <see cref="Flush"/>. Flush detaches the chain
 /// and marshals it onto the loop thread, which owns it from then on.
 /// </summary>

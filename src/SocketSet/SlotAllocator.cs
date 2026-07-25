@@ -10,7 +10,7 @@ namespace SocketSets;
 /// Hands out never-used indices from a high-water counter first (ascending 0,1,2,… on a cold set, no
 /// init fill), and recycles freed indices from a LIFO hole-stack — most-recently-freed first, so the
 /// reused <c>Connection</c> object is still cache-warm from its own teardown. Capacity is the table size;
-/// a caller reserves before claiming, so <see cref="TryClaim"/> only returns false on a bug (counter
+/// a caller reserves before claiming, so <see cref="Claim"/> only returns -1 on a bug (counter
 /// drift / an unreserved caller).
 /// </summary>
 /// Mutable struct on purpose: it is pure per-shard state held in one non-readonly field and only ever

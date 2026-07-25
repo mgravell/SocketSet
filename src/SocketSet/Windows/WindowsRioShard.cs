@@ -15,7 +15,7 @@ namespace SocketSets.Windows;
 /// completion port); the recv/send hot path rides RIO: pre-registered buffers, a per-connection request
 /// queue, and a shard completion queue drained in USER MODE with <see cref="Win32.RIODequeueCompletion"/>
 /// (no per-op syscall — the op-count win). RIONotify posts a packet to the IOCP port when the CQ needs
-/// draining, so the whole thing runs off the one <see cref="Win32.GetQueuedCompletionStatusEx"/> loop.
+/// draining, so the whole thing runs off the one <see cref="Win32.GetQueuedCompletionStatusExBlocking"/> loop.
 ///
 /// TCP/UDP only — RIO can't do AF_UNIX (that stays on the IOCP backend). Parallel to <c>IocpShard</c>
 /// rather than sharing a base: the control plane is similar but the data path + completion model differ

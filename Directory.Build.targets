@@ -1,0 +1,13 @@
+<Project>
+
+    <!--
+      Ship the repo-root README (NuGet requires the readme to be *inside* the package) and the
+      license text alongside it. Evaluated after each .csproj, so $(IsPackable) reflects the
+      project's own opt-in rather than the default from Directory.Build.props.
+    -->
+    <ItemGroup Condition="'$(IsPackable)' == 'true'">
+        <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" />
+        <None Include="$(MSBuildThisFileDirectory)LICENSE" Pack="true" PackagePath="\" Visible="false" />
+    </ItemGroup>
+
+</Project>

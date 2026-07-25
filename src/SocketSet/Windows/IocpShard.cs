@@ -14,7 +14,7 @@ namespace SocketSets.Windows;
 /// thread owns the completion port (created with concurrency 1); cross-thread work (accept hand-off,
 /// Close) is marshaled in and the loop woken with <see cref="Win32.PostQueuedCompletionStatus"/> (the
 /// eventfd analogue), and completions are drained in batches with
-/// <see cref="Win32.GetQueuedCompletionStatusEx"/>. <see cref="Listen"/>/<see cref="Connect"/> submit
+/// <see cref="Win32.GetQueuedCompletionStatusExBlocking"/>. <see cref="Listen"/>/<see cref="Connect"/> submit
 /// their overlapped ops directly (Winsock allows this from any thread); only per-connection state
 /// mutation and completion processing are loop-thread-exclusive.
 ///

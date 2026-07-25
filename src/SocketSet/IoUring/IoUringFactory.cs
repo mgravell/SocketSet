@@ -76,12 +76,10 @@ internal sealed class IoUringFactory : SocketSetFactory
         };
 
     /// <summary>
-    /// Create, bind and listen. When <paramref name="udsName"/> is non-null the
-    /// listener is an abstract-namespace AF_UNIX socket (loopback proxy front
-    /// end: no port churn, no TIME_WAIT, no socket file); otherwise it is a TCP
-    /// socket on <paramref name="port"/> with Nagle disabled. TCP_NODELAY is set
-    /// on the listener because Linux propagates it to accepted sockets, which
-    /// keeps it off the accept hot path; UDS has no Nagle so the option is N/A.
+    /// Create, bind and listen on <paramref name="ip"/> — a TCP socket with Nagle
+    /// disabled. TCP_NODELAY is set on the listener because Linux propagates it to
+    /// accepted sockets, which keeps it off the accept hot path. (The AF_UNIX
+    /// overload has no Nagle, so the option is N/A there.)
     /// </summary>
     private static unsafe int Bind(IPEndPoint ip, int backlog)
     {

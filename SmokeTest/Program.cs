@@ -10,7 +10,7 @@ AppDomain.CurrentDomain.UnhandledException += (_, e) =>
 bool server = false;
 int clientCount = 0;
 int seconds = 0; // 0 == run until Ctrl+C
-string? uds = null; // UDS name (e.g. "@fastnet-smoke" for the abstract namespace)
+string? uds = null; // UDS name (e.g. "@socketset-smoke" for the abstract namespace)
 int size = 512; // message size
 int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.MaxValue = unbounded
 bool poke = false; // server echoes out-of-band via Connection.Send from a background thread

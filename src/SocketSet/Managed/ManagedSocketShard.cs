@@ -429,7 +429,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     }
 
     /// <summary>Map our "@name" abstract-socket convention onto the leading-NUL form
-    /// that .NET's <see cref="UnixDomainSocketEndPoint"/> uses for the abstract namespace.</summary>
+    /// that .NET's <c>UnixDomainSocketEndPoint</c> uses for the abstract namespace.</summary>
     private static EndPoint Normalize(EndPoint endpoint)
     {
 #if NET
