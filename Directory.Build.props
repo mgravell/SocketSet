@@ -55,7 +55,34 @@
         <PublishRepositoryUrl>true</PublishRepositoryUrl>
         <EmbedUntrackedSources>true</EmbedUntrackedSources>
         <Deterministic>true</Deterministic>
-        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+        <!--
+          Release implies CI-build semantics so that *anyone* can reproduce a shipped package with a
+          plain `dotnet build -c Release` — reproducibility is a property of the artifact, not of the
+          environment it happened to be built in. The cost is that source paths in a locally-built
+          Release binary are normalized, so stepping into one goes via SourceLink rather than the
+          working copy; Debug, where that actually matters, is unaffected.
+        -->
+        <ContinuousIntegrationBuild Condition="'$(CI)' == 'true' or '$(Configuration)' == 'Release'">true</ContinuousIntegrationBuild>
     </PropertyGroup>
+
+    <!--
+      Repeatable restore: packages.lock.json pins the *transitive* graph, not just the versions written
+      in the project files, so a restore months from now resolves exactly what it resolves today. The
+      lock files are committed; CI restores in locked mode, where any drift from them is an error rather
+      than a silent update. Locally the lock file is allowed to update itself, so adding a
+      PackageReference just works — commit the resulting lock file change with it.
+    -->
+    <PropertyGroup>
+        <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+        <RestoreLockedMode Condition="'$(CI)' == 'true'">true</RestoreLockedMode>
+    </PropertyGroup>
+
+    <!--
+      Build net472 from the NuGet reference assemblies rather than whatever targeting packs happen to be
+      installed on the machine — same inputs on a dev box, a CI agent, or a non-Windows host.
+    -->
+    <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == '.NETFramework'">
+        <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    </ItemGroup>
 
 </Project>
