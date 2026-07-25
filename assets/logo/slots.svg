@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="SocketSet mark">
+  <circle cx="128.00" cy="44.00" r="19" fill="#00ABC5" />
+  <circle cx="177.37" cy="60.04" r="19" fill="#ED0F69" />
+  <circle cx="207.89" cy="102.04" r="19" fill="#F58220" />
+  <circle cx="207.89" cy="153.96" r="19" fill="#B2D135" />
+  <circle cx="177.37" cy="195.96" r="8" class="ink" opacity="0.28" />
+  <circle cx="128.00" cy="212.00" r="8" class="ink" opacity="0.28" />
+  <circle cx="78.63" cy="195.96" r="8" class="ink" opacity="0.28" />
+  <circle cx="48.11" cy="153.96" r="8" class="ink" opacity="0.28" />
+  <circle cx="48.11" cy="102.04" r="8" class="ink" opacity="0.28" />
+  <circle cx="78.63" cy="60.04" r="8" class="ink" opacity="0.28" />
+</svg>

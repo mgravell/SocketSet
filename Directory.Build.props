@@ -19,6 +19,8 @@
         <PackageProjectUrl>$(RepositoryUrl)</PackageProjectUrl>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
         <PackageReadmeFile>README.md</PackageReadmeFile>
+        <!-- assets/logo/ring.svg is the source; assets/icon.png is it rasterized to the 128px NuGet wants. -->
+        <PackageIcon>icon.png</PackageIcon>
         <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
         <IsPackable>false</IsPackable>
     </PropertyGroup>

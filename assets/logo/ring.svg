@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="SocketSet mark">
+  <path d="M 141.77 41.08 A 88 88 0 0 1 214.92 114.23" fill="none" stroke="#00ABC5" stroke-width="32" />
+  <path d="M 214.92 141.77 A 88 88 0 0 1 141.77 214.92" fill="none" stroke="#ED0F69" stroke-width="32" />
+  <path d="M 114.23 214.92 A 88 88 0 0 1 41.08 141.77" fill="none" stroke="#F58220" stroke-width="32" />
+  <path d="M 41.08 114.23 A 88 88 0 0 1 114.23 41.08" fill="none" stroke="#B2D135" stroke-width="32" />
+</svg>
