@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using SocketSets.Tls;
 
 namespace SocketSets.Managed;
 
@@ -99,6 +100,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             MaybeNoDelay(sock);
             var conn = Register(sock, args.DefaultToken);
 
+            if (Parent.Options.Tls is not null)
+            {
+                // TLS: defer OnAccept until the handshake completes (see BeginTls / FireTlsOpen).
+                BeginTls(conn, isClient: false);
+                return true;
+            }
+
             int sendBytes;
             fixed (byte* buf = conn.SendBuffer)
             {
@@ -148,6 +156,14 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         MaybeNoDelay(socket);
         var token = args.Token;
         var conn = Register(socket, token);
+        args.Dispose(); // connect SAEA no longer needed
+
+        if (Parent.Options.Tls is not null)
+        {
+            // TLS: defer OnConnect until the handshake completes; the client speaks first (ClientHello).
+            BeginTls(conn, isClient: true);
+            return;
+        }
 
         int sendBytes;
         fixed (byte* buf = conn.SendBuffer)
@@ -157,8 +173,6 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             Parent.OnConnect(ref ctx);
             sendBytes = ctx.SendBytes;
         }
-
-        args.Dispose(); // connect SAEA no longer needed
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) PumpReceive(conn);
         if (sendBytes > 0) BeginSend(conn, conn.SendBuffer, sendBytes);
@@ -196,6 +210,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             Close(conn);
             return false;
         }
+
+        if (conn.Tls is { } tls)
+            return ProcessReceiveTls(conn, tls, n);
 
         int response;
         fixed (byte* buf = conn.RecvBuffer)
@@ -309,12 +326,36 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             conn.CurrentPooled = false;
         }
 
-        int next;
-        fixed (byte* buf = conn.SendBuffer)
+        // OnWrite reports an APPLICATION write completing — never fire it for a TLS handshake-record send
+        // (which rides this same machinery before the app has been told the connection is open). Gate on
+        // Opened: false during the handshake, true once FireTlsOpen / the plaintext open path has run.
+        int next = 0;
+        if (conn.Opened)
         {
-            var ctx = new SocketSet.WriteContext(conn, buf, conn.SendBuffer.Length);
-            Parent.OnWrite(ref ctx);
-            next = ctx.SendBytes;
+            fixed (byte* buf = conn.SendBuffer)
+            {
+                var ctx = new SocketSet.WriteContext(conn, buf, conn.SendBuffer.Length);
+                Parent.OnWrite(ref ctx);
+                next = ctx.SendBytes;
+            }
+        }
+
+        // TLS: the OnWrite payload is plaintext in the scratch buffer — encrypt it into a pooled ciphertext
+        // buffer, which then travels the same send machinery as an out-of-band (pooled) buffer. The scratch
+        // reuse fast-path is bypassed for TLS (ciphertext ≠ plaintext and may not fit the scratch).
+        byte[]? tlsCipher = null;
+        int tlsLen = 0;
+        if (next > 0 && conn.Tls is { OutboundCrypto: TlsCryptoMode.Transform })
+        {
+            lock (conn.TlsGate)
+            {
+                conn.Cipher!.Reset();
+                conn.Tls!.ProcessOutbound(conn.SendBuffer.AsSpan(0, next), conn.Cipher);
+                var span = conn.Cipher.WrittenSpan;
+                tlsLen = span.Length;
+                tlsCipher = ArrayPool<byte>.Shared.Rent(Math.Max(1, tlsLen));
+                span.CopyTo(tlsCipher);
+            }
         }
 
         lock (conn.SendGate)
@@ -324,9 +365,16 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
                 // Earlier-queued responses go first; a pipelined write joins the tail (pooled).
                 if (next > 0)
                 {
-                    var copy = ArrayPool<byte>.Shared.Rent(next);
-                    Buffer.BlockCopy(conn.SendBuffer, 0, copy, 0, next);
-                    conn.Overflow.Enqueue((copy, next, true));
+                    if (tlsCipher is not null)
+                    {
+                        conn.Overflow.Enqueue((tlsCipher, tlsLen, true));
+                    }
+                    else
+                    {
+                        var copy = ArrayPool<byte>.Shared.Rent(next);
+                        Buffer.BlockCopy(conn.SendBuffer, 0, copy, 0, next);
+                        conn.Overflow.Enqueue((copy, next, true));
+                    }
                 }
                 var (b, l, pooled) = conn.Overflow.Dequeue();
                 conn.CurrentBuffer = b;
@@ -338,9 +386,18 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
             if (next > 0)
             {
-                conn.CurrentBuffer = conn.SendBuffer; // reuse the scratch — no allocation
-                conn.CurrentLength = next;
-                conn.CurrentPooled = false;
+                if (tlsCipher is not null)
+                {
+                    conn.CurrentBuffer = tlsCipher; // pooled ciphertext — returned once fully sent
+                    conn.CurrentLength = tlsLen;
+                    conn.CurrentPooled = true;
+                }
+                else
+                {
+                    conn.CurrentBuffer = conn.SendBuffer; // reuse the scratch — no allocation
+                    conn.CurrentLength = next;
+                    conn.CurrentPooled = false;
+                }
                 conn.SendOffset = 0;
                 return true;
             }
@@ -349,6 +406,152 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             conn.CurrentBuffer = null;
             return false;
         }
+    }
+
+    // =====================================================================
+    // TLS interception (see TlsFilter)
+    // -------------------------------------------------------------------------------------
+    // NOTE: the managed backend has NO single loop thread — recv/send completions run on arbitrary
+    // thread-pool threads — so filter access is serialized with a coarse per-connection gate
+    // (conn.TlsGate), held across encrypt→enqueue so a stateful engine's record order matches the wire.
+    // The loop-thread backends (io_uring/IOCP/RIO) own one thread per shard and need no such lock; this
+    // gate is a managed-fallback concession, kept correct but not fast. TlsGate is always taken OUTSIDE
+    // SendGate (never the reverse) to keep the lock order consistent.
+    // =====================================================================
+
+    // Attach a fresh TLS engine to a just-registered connection and kick the handshake. OnConnect/OnAccept
+    // are NOT fired here — they fire from FireTlsOpen once the handshake completes.
+    private void BeginTls(ManagedConnection conn, bool isClient)
+    {
+        var opts = Parent.Options;
+        conn.IsClient = isClient;
+        conn.Tls = isClient ? opts.Tls!.CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.Plain = new PooledBufferWriter(_bufferSize);  // decrypt target (data phase)
+        conn.Cipher = new PooledBufferWriter(_bufferSize); // encrypt scratch
+        conn.Ctrl = new PooledBufferWriter(64);            // handshake / control-record output
+
+        // Client emits its ClientHello now; server produces nothing until it sees one. Either way arm the
+        // receive so the handshake advances as bytes arrive.
+        DriveHandshakeStep(conn, ReadOnlySpan<byte>.Empty);
+        if (!conn.Closed && (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) PumpReceive(conn);
+    }
+
+    // Feed one chunk of received bytes to the handshake, send any handshake output RAW (it is already TLS
+    // records, not application data), and fire the deferred open on completion. Gated (managed only).
+    private void DriveHandshakeStep(ManagedConnection conn, ReadOnlySpan<byte> input)
+    {
+        TlsHandshakeStatus status;
+        lock (conn.TlsGate)
+        {
+            conn.Ctrl!.Reset();
+            status = conn.Tls!.DriveHandshake(input, conn.Socket.Handle, conn.Ctrl);
+            SendRawLocked(conn, conn.Ctrl.WrittenSpan);
+        }
+        if (status == TlsHandshakeStatus.Faulted) { Close(conn); return; }
+        if (status == TlsHandshakeStatus.Completed) FireTlsOpen(conn);
+    }
+
+    // The handshake finished: fire the deferred OnConnect/OnAccept and send any greeting (encrypted).
+    private void FireTlsOpen(ManagedConnection conn)
+    {
+        int sendBytes;
+        fixed (byte* buf = conn.SendBuffer)
+        {
+            conn.Opened = true; // app now sees it open → pairs with OnClosed
+            if (conn.IsClient)
+            {
+                var ctx = new SocketSet.ConnectContext(conn, buf, _bufferSize);
+                Parent.OnConnect(ref ctx);
+                sendBytes = ctx.SendBytes;
+            }
+            else
+            {
+                var ctx = new SocketSet.AcceptContext(conn, buf, _bufferSize);
+                Parent.OnAccept(ref ctx);
+                sendBytes = ctx.SendBytes;
+            }
+        }
+        if (sendBytes > 0) SendEncrypted(conn, conn.SendBuffer.AsSpan(0, sendBytes));
+    }
+
+    // Data phase inbound: decrypt, deliver plaintext to OnReceive, encrypt any response.
+    private bool ProcessReceiveTls(ManagedConnection conn, TlsFilter tls, int n)
+    {
+        var cipherIn = new ReadOnlySpan<byte>(conn.RecvBuffer, 0, n);
+
+        if (!tls.HandshakeComplete)
+        {
+            DriveHandshakeStep(conn, cipherIn);
+            if (conn.Closed) return false;
+            if (!tls.HandshakeComplete)
+                return (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0; // still handshaking
+
+            // Just completed. Application data coalesced into the same TCP segment as the peer's final
+            // handshake flight is already buffered inside the engine (it was fed to the read BIO during the
+            // step above but not consumed by SSL_do_handshake). Fall through with EMPTY input to surface it
+            // now — otherwise it strands until a next recv that may never come (a classic post-handshake
+            // wedge). See the note in TlsFilter.DriveHandshake.
+            cipherIn = default;
+        }
+
+        int plainLen;
+        byte[] plainBuf;
+        TlsInboundStatus status;
+        lock (conn.TlsGate)
+        {
+            conn.Plain!.Reset();
+            conn.Ctrl!.Reset();
+            status = tls.ProcessInbound(cipherIn, TlsContentType.Ciphertext, conn.Plain, conn.Ctrl);
+            SendRawLocked(conn, conn.Ctrl.WrittenSpan); // any protocol reply (e.g. a KeyUpdate ack)
+            plainLen = conn.Plain.WrittenCount;
+            plainBuf = conn.Plain.Array;
+        }
+
+        if (status == TlsInboundStatus.Faulted) { Close(conn); return false; }
+
+        if (plainLen > 0)
+        {
+            int response;
+            fixed (byte* pp = plainBuf)
+            {
+                var ctx = new SocketSet.ReceiveContext(conn, pp, plainBuf.Length, plainLen);
+                Parent.OnReceive(ref ctx);
+                response = ctx.ResponseBytes;
+            }
+            if (response > 0) SendEncrypted(conn, new ReadOnlySpan<byte>(plainBuf, 0, response));
+        }
+
+        if (status == TlsInboundStatus.PeerClosed) { Close(conn); return false; }
+        return (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0;
+    }
+
+    // Copy ciphertext into a pooled buffer and hand it to the serialized send path. Caller holds TlsGate.
+    private void SendRawLocked(ManagedConnection conn, ReadOnlySpan<byte> cipher)
+    {
+        if (cipher.IsEmpty) return;
+        var buf = ArrayPool<byte>.Shared.Rent(cipher.Length);
+        cipher.CopyTo(buf);
+        BeginSendOwned(conn, buf, cipher.Length);
+    }
+
+    // Encrypt application plaintext and send it (gated: encrypt→enqueue stays ordered for a stateful engine).
+    private void SendEncrypted(ManagedConnection conn, ReadOnlySpan<byte> plaintext)
+    {
+        if (plaintext.IsEmpty) return;
+        lock (conn.TlsGate)
+        {
+            conn.Cipher!.Reset();
+            conn.Tls!.ProcessOutbound(plaintext, conn.Cipher);
+            SendRawLocked(conn, conn.Cipher.WrittenSpan);
+        }
+    }
+
+    // Out-of-band flushed plaintext (Connection.Flush) for a TLS connection: encrypt + send, then return
+    // the (pooled) plaintext buffer the writer handed over.
+    private void SendEncryptedOob(ManagedConnection conn, byte[] plaintext, int length)
+    {
+        SendEncrypted(conn, new ReadOnlySpan<byte>(plaintext, 0, length));
+        ArrayPool<byte>.Shared.Return(plaintext);
     }
 
     // =====================================================================
@@ -515,6 +718,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         public readonly ConnArgs RecvArgs;
         public readonly ConnArgs SendArgs;
 
+        // --- TLS state (all null/unused unless Options.Tls is set; Tls itself lives on the base). ---
+        public bool IsClient;
+        public readonly object TlsGate = new();     // serializes filter access (managed has no loop thread)
+        public PooledBufferWriter? Plain;           // decrypt target (data phase)
+        public PooledBufferWriter? Cipher;          // encrypt scratch
+        public PooledBufferWriter? Ctrl;            // handshake / control-record output
+
         // Sends are serialized per connection: a SAEA can't be reused mid-flight, and
         // concurrent sends on one socket could reorder the byte stream. Only one SendAsync
         // is ever outstanding. The steady state reuses SendBuffer (CurrentBuffer points at
@@ -581,6 +791,12 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             if (buf is null || len == 0)
             {
                 if (buf is not null) ArrayPool<byte>.Shared.Return(buf);
+                return true;
+            }
+            if (Tls is not null)
+            {
+                // TLS: encrypt the accumulated plaintext, send the ciphertext, and return this buffer.
+                Shard.SendEncryptedOob(this, buf, len);
                 return true;
             }
             // BeginSendOwned takes ownership of buf and returns it to the pool once fully sent.

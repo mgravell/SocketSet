@@ -1,6 +1,19 @@
-﻿namespace SocketSets;
+﻿using SocketSets.Tls;
+
+namespace SocketSets;
 public class SocketSetOptions
 {
+    /// <summary>Optional TLS engine factory. When set, connections are wrapped in a per-connection
+    /// <see cref="TlsFilter"/> (client filters on <c>Connect</c>, server filters on accept) and the app's
+    /// OnConnect/OnAccept fire only after the handshake completes. Null (default) = plaintext, as today.</summary>
+    public TlsProvider? Tls { get; set; }
+
+    /// <summary>Client-handshake config used when <see cref="Tls"/> is set and this set dials out.</summary>
+    public TlsClientOptions TlsClient { get; set; } = new();
+
+    /// <summary>Server-handshake config used when <see cref="Tls"/> is set and this set accepts.</summary>
+    public TlsServerOptions TlsServer { get; set; } = new();
+
     public int Shards { get; set; } = 4;
     public int SocketsPerShard { get; set; } = 4096;
     public bool PinWorkerThreads { get; set; } = true;

@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SocketSets.Native;
+using SocketSets.Tls;
 
 namespace SocketSets.IoUring;
 
@@ -77,6 +78,8 @@ internal unsafe struct WriteVState
     public long Sent;
     public long Total;
     public OutChain Chain;    // segments backing the iovecs (to release on completion)
+    public bool AppData;      // TLS: this send carried encrypted APPLICATION data → fire OnWrite on completion
+                              // (handshake records / control replies / plaintext OOB flushes leave it false)
 }
 
 /// <summary>
@@ -118,6 +121,20 @@ internal sealed unsafe class IoUringConnection : Connection
     public bool SendBusy;
     public Queue<PendingJob>? Pending;
     public WriteVState WriteV; // the in-flight scatter-gather send, if any (Chain != null while active)
+
+    // --- TLS (loop-thread only; all null/false unless Options.Tls is set). The filter itself lives on
+    // the base Connection (Tls). TLS output rides the OOB chain send path (DispatchChain/WriteV), so no
+    // separate send machinery — these are just the loop-thread scratch writers for decrypt/encrypt. ---
+    public bool TlsClient;             // role: fire OnConnect (true) vs OnAccept (false) once the handshake completes
+    public PooledBufferWriter? TlsPlain; // decrypt target (and greeting scratch)
+    public PooledBufferWriter? TlsOut;   // ciphertext scratch (handshake / control replies / encrypt output)
+
+    // --- kTLS path (io_uring only; distinct from the userspace TlsFilter above). OpenSSL owns the fd
+    // (socket BIO) and pushed keys to the kernel at handshake completion, so the DATA path is plaintext:
+    // TX rides the normal SubmitSend machinery unchanged, RX is SSL_read driven by an io_uring POLL. ---
+    public nint KtlsSsl;    // OpenSSL SSL* bound to the fd; 0 == not a kTLS connection
+    public bool KtlsReady;  // handshake done + kTLS active → data phase (else still handshaking)
+    public byte[]? KtlsRecv; // plaintext SSL_read target (also the OnReceive/response buffer)
 
     // --- IBufferWriter accumulation (single-writer until Flush) ---
     // Committed segments of the message being built (first inline, rest in a list — a single-segment
@@ -312,5 +329,6 @@ internal struct PendingJob
 {
     public ArraySegment<byte> Seg;
     public OutChain Chain; // Count > 0 => this is a flushed chain; otherwise Seg is the echo response
+    public bool AppData;   // TLS: chain carries encrypted application data → fire OnWrite when it completes
 }
 #endif

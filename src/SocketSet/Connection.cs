@@ -1,4 +1,5 @@
 using System.Buffers;
+using SocketSets.Tls;
 
 namespace SocketSets;
 
@@ -28,6 +29,11 @@ public abstract class Connection : IBufferWriter<byte>
 
     /// <summary>Send/receive-closed state, mutated through the context Close* methods.</summary>
     internal SocketSet.SocketFlags Flags;
+
+    /// <summary>The per-connection TLS engine, or null for a plaintext connection. Owned and touched only
+    /// by the owning shard's IO loop (created at accept/connect; handshake driven, then encrypt/decrypt).
+    /// Backends store it here so the shared receive/send interception is uniform across transports.</summary>
+    internal TlsFilter? Tls;
 
     /// <summary>True once the app has seen this connection open (OnAccept/OnConnect fired); gates
     /// <see cref="SocketSet.OnClosed"/> so it pairs with an open and never fires for a connection the

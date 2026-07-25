@@ -7,6 +7,9 @@ using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SocketSets.Native;
+using SocketSets.Tls;
+using SocketSets.Tls.OpenSsl;
+using static SocketSets.Tls.OpenSsl.NativeOpenSsl;
 
 namespace SocketSets.IoUring;
 
@@ -31,6 +34,7 @@ internal sealed class IoUringShard : SocketSetShard
         SendBid = 5, // no-copy echo: send straight from a read (provided) buffer (aux = bid)
         WriteV = 6, // scatter-gather send of a large payload across N write-pool pages (aux = first page index)
         Cancel = 7, // IORING_OP_ASYNC_CANCEL(CANCEL_FD|ALL) issued during teardown to drain in-flight ops
+        Poll = 8,   // IORING_OP_POLL_ADD readiness wait (kTLS: handshake step / RX SSL_read trigger)
     }
 
     private struct WriteState
@@ -152,6 +156,8 @@ internal sealed class IoUringShard : SocketSetShard
         conn.UserToken = userToken;
         conn.Flags = flags;
         conn.SendBusy = false;
+        conn.TlsClient = false;  // Tls/KtlsSsl are nulled in TryFinalize; belt-and-suspenders for a fresh tenant
+        conn.KtlsReady = false;
         conn.Pending?.Clear();
         // Bump the generation before publishing Fd: any out-of-band send/close captured against the
         // previous tenant now mismatches and is dropped rather than misdelivered.
@@ -195,6 +201,12 @@ internal sealed class IoUringShard : SocketSetShard
         }
         else
         {
+            // kTLS: emit a proper TLS close_notify (not just a bare FIN) so a strict peer sees a clean
+            // shutdown rather than a truncation. Only when idle — the alert must not jump ahead of an
+            // in-flight/queued application send on the wire; if busy we fall back to the FIN (still a
+            // valid, if less polite, close). kTLS TX means the kernel encrypts the alert record.
+            if (conn.KtlsSsl != 0 && !conn.SendBusy && (conn.Pending is null || conn.Pending.Count == 0))
+                SSL_shutdown(conn.KtlsSsl);
             LibC.shutdown(conn.Fd, LibC.SHUT_RDWR);
         }
         if (conn.RecvArmed || conn.SendBusy)
@@ -222,6 +234,8 @@ internal sealed class IoUringShard : SocketSetShard
         }
 
         int fd = conn.Fd;
+        if (conn.Tls is { } tlsf) { try { tlsf.Dispose(); } catch { /* SSL_free best-effort */ } conn.Tls = null; }
+        if (conn.KtlsSsl != 0) { SSL_free(conn.KtlsSsl); conn.KtlsSsl = 0; conn.KtlsReady = false; }
         conn.UserToken = null;
         conn.Flags = 0;
         conn.SendBusy = false;
@@ -524,6 +538,14 @@ internal sealed class IoUringShard : SocketSetShard
             return;
         }
 
+        if (conn.Tls is not null)
+        {
+            // Out-of-band write on a TLS connection: the chain holds PLAINTEXT — encrypt it, send the
+            // ciphertext, and release the plaintext buffers. (Ordered behind any in-flight send by TlsSend.)
+            TlsPumpFlush(conn, chain);
+            return;
+        }
+
         int fd = conn.Fd;
 
         // One writev is capped at IovMax iovecs; split a larger chain into ordered sub-chains that
@@ -543,7 +565,7 @@ internal sealed class IoUringShard : SocketSetShard
         }
     }
 
-    private void DispatchChain(IoUringConnection conn, int fd, in OutChain chain)
+    private void DispatchChain(IoUringConnection conn, int fd, in OutChain chain, bool appData = false)
     {
         // Ordering across a connection's byte stream is enforced by a single in-flight send per
         // connection (SendBusy) — response-writes and flushed writes share the gate, and the next is submitted
@@ -552,18 +574,18 @@ internal sealed class IoUringShard : SocketSetShard
         // IO_LINK may earn its keep in massive-throughput scenarios later, but for now: KISS.
         if (conn.SendBusy)
         {
-            (conn.Pending ??= new()).Enqueue(new PendingJob { Chain = chain });
+            (conn.Pending ??= new()).Enqueue(new PendingJob { Chain = chain, AppData = appData });
             return;
         }
 
         conn.SendBusy = true;
-        SubmitChain(conn, fd, chain);
+        SubmitChain(conn, fd, chain, appData);
     }
 
     /// <summary>Send a flushed chain as one IORING_OP_WRITEV: pool-page segments contribute their
     /// native address; POH overflow segments their (stable, pinned) array address. State lives on the
     /// connection (one send in flight at a time). Assumes SendBusy is already claimed.</summary>
-    private unsafe void SubmitChain(IoUringConnection conn, int fd, in OutChain chain)
+    private unsafe void SubmitChain(IoUringConnection conn, int fd, in OutChain chain, bool appData = false)
     {
         int n = chain.Count;
         var iov = (LibC.iovec*)NativeMemory.Alloc((nuint)n * (nuint)sizeof(LibC.iovec));
@@ -578,7 +600,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         conn.WriteV = new WriteVState
         {
-            Iov = iov, TotalIov = n, Cursor = 0, Sent = 0, Total = total, Chain = chain,
+            Iov = iov, TotalIov = n, Cursor = 0, Sent = 0, Total = total, Chain = chain, AppData = appData,
         };
         SubmitWriteV(conn.Slot, fd, iov, n);
     }
@@ -625,7 +647,7 @@ internal sealed class IoUringShard : SocketSetShard
     {
         if (job.Chain.Count > 0)
         {
-            SubmitChain(conn, fd, job.Chain);
+            SubmitChain(conn, fd, job.Chain, job.AppData);
             return;
         }
 
@@ -647,6 +669,309 @@ internal sealed class IoUringShard : SocketSetShard
     {
         if (conn.Pending is { Count: > 0 } pending) SubmitPendingJob(conn, slot, fd, pending.Dequeue());
         else conn.SendBusy = false;
+    }
+
+    // =====================================================================
+    // TLS (loop thread; see TlsFilter). No lock: the loop is the single owner, and OOB flushes are
+    // already marshaled here — so the filter's not-thread-safe contract holds natively (unlike managed).
+    // All TLS output rides the OOB chain path (TlsSend -> DispatchChain -> WriteV), reusing the validated
+    // scatter-gather send + teardown machinery, so arbitrary-size ciphertext records just work.
+    // =====================================================================
+
+    // Stand up the per-connection engine at open, arm recv, and take the first handshake step (a client
+    // emits its ClientHello; a server produces nothing until it sees one). OnConnect/OnAccept are deferred
+    // to TlsFireOpen at handshake completion.
+    private unsafe void StartTls(IoUringConnection conn, uint slot, int fd, bool client)
+    {
+        var opts = Parent.Options;
+        conn.TlsClient = client;
+        conn.Tls = client ? opts.Tls!.CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.TlsPlain ??= new PooledBufferWriter(_readPageSize);
+        conn.TlsOut ??= new PooledBufferWriter(_readPageSize);
+
+        ArmRecv(slot, fd);                          // multishot recv: handshake records then app data land here
+        TlsDriveHandshake(conn, slot, fd, default); // client: sends ClientHello; server: no-op (awaits peer)
+    }
+
+    // Ciphertext arrived in a read (provided) buffer. Feed the engine; the bytes are copied into the
+    // engine's read BIO synchronously, so the caller may release the buffer as soon as this returns.
+    private unsafe void DeliverReceiveTls(IoUringConnection conn, uint slot, int fd, byte* rp, int res)
+    {
+        var cipher = new ReadOnlySpan<byte>(rp, res);
+        if (!conn.Tls!.HandshakeComplete) TlsDriveHandshake(conn, slot, fd, cipher);
+        else TlsData(conn, slot, fd, cipher);
+    }
+
+    // One handshake step: feed input, send any handshake records produced (RAW — they are already TLS
+    // records, not app data), and on completion fire the deferred open + drain any coalesced app data.
+    private unsafe void TlsDriveHandshake(IoUringConnection conn, uint slot, int fd, ReadOnlySpan<byte> input)
+    {
+        conn.TlsOut!.Reset();
+        var status = conn.Tls!.DriveHandshake(input, fd, conn.TlsOut);
+        if (conn.TlsOut.WrittenCount > 0) TlsSend(conn, fd, conn.TlsOut.WrittenSpan);
+
+        if (status == TlsHandshakeStatus.Faulted) { CloseClient(slot); return; }
+        if (status != TlsHandshakeStatus.Completed) return; // NeedMoreData: await the next recv
+
+        TlsFireOpen(conn, slot, fd);
+        // Application data coalesced into the same segment as the peer's final handshake flight is already
+        // buffered in the engine — surface it now with an empty inbound step (see TlsFilter.DriveHandshake).
+        if (conn.Fd != 0 && !conn.Closing) TlsData(conn, slot, fd, default);
+    }
+
+    // Handshake done: fire the deferred OnConnect/OnAccept and send any greeting (encrypted).
+    private unsafe void TlsFireOpen(IoUringConnection conn, uint slot, int fd)
+    {
+        byte[] gbuf = conn.TlsPlain!.Array; // scratch for greeting plaintext (>= a page)
+        int sb;
+        fixed (byte* gp = gbuf)
+        {
+            conn.Opened = true; // app now sees it open → pairs with OnClosed
+            if (conn.TlsClient)
+            {
+                var ctx = new SocketSet.ConnectContext(conn, gp, gbuf.Length);
+                Parent.OnConnect(ref ctx);
+                sb = ctx.SendBytes;
+            }
+            else
+            {
+                var ctx = new SocketSet.AcceptContext(conn, gp, gbuf.Length);
+                Parent.OnAccept(ref ctx);
+                sb = ctx.SendBytes;
+            }
+        }
+        if (sb > 0) TlsEncryptSend(conn, fd, new ReadOnlySpan<byte>(gbuf, 0, sb));
+    }
+
+    // Data phase inbound: decrypt, deliver plaintext to OnReceive, encrypt any response.
+    private unsafe void TlsData(IoUringConnection conn, uint slot, int fd, ReadOnlySpan<byte> cipher)
+    {
+        conn.TlsPlain!.Reset();
+        conn.TlsOut!.Reset();
+        var status = conn.Tls!.ProcessInbound(cipher, TlsContentType.Ciphertext, conn.TlsPlain, conn.TlsOut);
+        if (conn.TlsOut.WrittenCount > 0) TlsSend(conn, fd, conn.TlsOut.WrittenSpan); // control replies (raw)
+
+        if (status == TlsInboundStatus.Faulted) { CloseClient(slot); return; }
+
+        int plen = conn.TlsPlain.WrittenCount;
+        if (plen > 0)
+        {
+            byte[] pbuf = conn.TlsPlain.Array;
+            int response;
+            fixed (byte* pp = pbuf)
+            {
+                var ctx = new SocketSet.ReceiveContext(conn, pp, pbuf.Length, plen);
+                Parent.OnReceive(ref ctx);
+                response = ctx.ResponseBytes;
+            }
+            if (response > 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
+                TlsEncryptSend(conn, fd, new ReadOnlySpan<byte>(pbuf, 0, response));
+        }
+
+        if (status == TlsInboundStatus.PeerClosed) CloseClient(slot);
+    }
+
+    // Out-of-band flushed plaintext (Connection.Flush) on a TLS connection: encrypt the whole chain, send
+    // the ciphertext, release the plaintext buffers.
+    private unsafe void TlsPumpFlush(IoUringConnection conn, in OutChain chain)
+    {
+        conn.TlsOut!.Reset();
+        for (int i = 0; i < chain.Count; i++)
+        {
+            var seg = chain[i];
+            byte* p = seg.Page >= 0 ? OutOfBandAddress(seg.Page) : PinnedAddress(seg.Managed!);
+            conn.Tls!.ProcessOutbound(new ReadOnlySpan<byte>(p, seg.Length), conn.TlsOut);
+        }
+        if (conn.TlsOut.WrittenCount > 0) TlsSend(conn, conn.Fd, conn.TlsOut.WrittenSpan);
+        ReleaseChainBuffers(chain);
+    }
+
+    // A prior encrypted-application send completed: offer OnWrite a plaintext scratch so the app can
+    // pipeline the next message (drives the echo/verify window state machine), and send it if it does.
+    private unsafe void TlsOnWrite(IoUringConnection conn, uint slot, int fd)
+    {
+        byte[] wbuf = conn.TlsPlain!.Array; // plaintext scratch for the next write
+        int sb;
+        fixed (byte* wp = wbuf)
+        {
+            var ctx = new SocketSet.WriteContext(conn, wp, wbuf.Length);
+            Parent.OnWrite(ref ctx);
+            sb = ctx.SendBytes;
+        }
+        if (sb > 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
+            TlsEncryptSend(conn, fd, new ReadOnlySpan<byte>(wbuf, 0, sb));
+    }
+
+    // Encrypt application plaintext and send the resulting ciphertext (appData → fires OnWrite on completion).
+    private unsafe void TlsEncryptSend(IoUringConnection conn, int fd, ReadOnlySpan<byte> plaintext)
+    {
+        conn.TlsOut!.Reset();
+        conn.Tls!.ProcessOutbound(plaintext, conn.TlsOut);
+        TlsSend(conn, fd, conn.TlsOut.WrittenSpan, appData: true);
+    }
+
+    // Send raw ciphertext: chunk it into OOB pool pages (POH overflow if the pool is dry) and dispatch as
+    // a scatter-gather chain — reusing the connection's single-in-flight-send + Pending serialization, so
+    // handshake records, control replies and encrypted responses all stay in wire order. appData marks an
+    // encrypted-application send (→ OnWrite on completion); handshake/control sends leave it false.
+    private unsafe void TlsSend(IoUringConnection conn, int fd, ReadOnlySpan<byte> cipher, bool appData = false)
+    {
+        if (cipher.IsEmpty) return;
+        var chain = new OutChain();
+        int off = 0, page = WritePageSize;
+        while (off < cipher.Length)
+        {
+            int take = Math.Min(page, cipher.Length - off);
+            if (LeaseOutOfBand(out int idx, out byte* p))
+            {
+                cipher.Slice(off, take).CopyTo(new Span<byte>(p, take));
+                chain.Add(new OutSeg { Page = idx, Managed = null, Length = take });
+            }
+            else
+            {
+                var arr = GC.AllocateUninitializedArray<byte>(take, pinned: true);
+                cipher.Slice(off, take).CopyTo(arr);
+                chain.Add(new OutSeg { Page = -1, Managed = arr, Length = take });
+            }
+            off += take;
+        }
+        DispatchChain(conn, fd, chain, appData);
+    }
+
+    // =====================================================================
+    // kTLS (io_uring only). OpenSSL owns the fd (socket BIO, SSL_OP_ENABLE_KTLS) and pushes the keys into
+    // the kernel at handshake completion — so the DATA path is plaintext: TX = the NORMAL SubmitSend
+    // machinery (kernel encrypts), RX = SSL_read (kernel decrypts, OpenSSL services control records)
+    // driven by an io_uring POLL. The handshake runs non-blocking, stepped by POLL readiness. Distinct
+    // from the userspace TlsFilter path (no memory BIOs, no per-record userspace crypto).
+    // =====================================================================
+
+    // Stand up the kTLS engine at open: fd non-blocking (so OpenSSL doesn't block the loop), SSL bound to
+    // the fd, then drive the handshake (client sends ClientHello; server awaits). OnConnect/OnAccept fire
+    // from KtlsComplete once keys are in the kernel.
+    private unsafe void StartKtls(IoUringConnection conn, uint slot, int fd, bool client, OpenSslTlsProvider prov)
+    {
+        LibC.SetNonBlocking(fd);
+        conn.TlsClient = client;
+        conn.KtlsRecv ??= new byte[_readPageSize];
+        conn.KtlsSsl = prov.CreateKernelSsl(fd, client, client ? Parent.Options.TlsClient.TargetHost : null);
+        KtlsPump(conn, slot, fd);
+    }
+
+    // One handshake step: SSL_do_handshake, then either complete or arm a POLL for the readiness OpenSSL
+    // is waiting on. Runs on the loop thread; the fd is non-blocking so this never blocks.
+    private unsafe void KtlsPump(IoUringConnection conn, uint slot, int fd)
+    {
+        int ret = SSL_do_handshake(conn.KtlsSsl);
+        if (ret == 1) { KtlsComplete(conn, slot, fd); return; }
+        int err = SSL_get_error(conn.KtlsSsl, ret);
+        if (err == SSL_ERROR_WANT_READ) SubmitPoll(conn, slot, fd, LibC.POLLIN);
+        else if (err == SSL_ERROR_WANT_WRITE) SubmitPoll(conn, slot, fd, LibC.POLLOUT);
+        else CloseClient(slot); // handshake failed (bad cert, verify failure, protocol error, …)
+    }
+
+    // Arm a one-shot readiness wait. RecvArmed doubles as "a poll is in flight" so teardown (which cancels
+    // by fd) waits for it to drain, exactly as it does for a multishot recv.
+    private void SubmitPoll(IoUringConnection conn, uint slot, int fd, uint events)
+    {
+        conn.RecvArmed = true;
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_POLL_ADD,
+            fd = fd,
+            user_data = Pack(Op.Poll, slot),
+        };
+        sqe.rw_flags.rw_flags = events; // poll32_events aliases the rw_flags union
+        Submit(sqe);
+    }
+
+    private unsafe void HandlePoll(int res, uint slot)
+    {
+        var conn = _conns[slot - 1];
+        conn.RecvArmed = false; // the poll op has completed (incl. -ECANCELED during teardown)
+        if (conn.Closing) { TryFinalize(conn, slot); return; }
+        if (res < 0) { CloseClient(slot); return; }
+        int fd = conn.Fd;
+        if (!conn.KtlsReady) KtlsPump(conn, slot, fd); // still handshaking
+        else KtlsRead(conn, slot, fd);                 // data phase: socket readable → SSL_read
+    }
+
+    // Handshake done + keys in the kernel: fire the deferred open (greeting rides the NORMAL plaintext send
+    // path — kernel encrypts), then arm RX readiness (also surfaces any app data coalesced after the
+    // handshake, since POLL fires immediately if the socket already has bytes).
+    private unsafe void KtlsComplete(IoUringConnection conn, uint slot, int fd)
+    {
+        // (Diagnostics could assert BIO_get_ktls_send/recv here; TX-native assumes kTLS TX is active.)
+        conn.KtlsReady = true;
+
+        bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
+        conn.Opened = true; // app now sees it open → pairs with OnClosed
+        int sb;
+        if (conn.TlsClient)
+        {
+            var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
+            Parent.OnConnect(ref ctx);
+            sb = ctx.SendBytes;
+        }
+        else
+        {
+            var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
+            Parent.OnAccept(ref ctx);
+            sb = ctx.SendBytes;
+        }
+        if (leased && sb > 0) { conn.SendBusy = true; SubmitSend(slot, fd, wi, wp, sb); }
+        else if (leased) _writeBuffer.Release(wi);
+
+        SubmitPoll(conn, slot, fd, LibC.POLLIN);
+    }
+
+    // Socket readable: drain every whole record SSL_read can decrypt, delivering each to OnReceive and
+    // sending any response via the normal (plaintext) send path. Re-arm POLL when the kernel has no more.
+    private unsafe void KtlsRead(IoUringConnection conn, uint slot, int fd)
+    {
+        while (true)
+        {
+            int n;
+            fixed (byte* p = conn.KtlsRecv) n = SSL_read(conn.KtlsSsl, p, conn.KtlsRecv!.Length);
+            if (n > 0)
+            {
+                int response;
+                fixed (byte* p = conn.KtlsRecv)
+                {
+                    var ctx = new SocketSet.ReceiveContext(conn, p, conn.KtlsRecv.Length, n);
+                    Parent.OnReceive(ref ctx);
+                    response = ctx.ResponseBytes;
+                }
+                if (response > 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
+                    KtlsRespond(conn, slot, fd, response);
+                if (conn.Closing || conn.Fd == 0) return; // OnReceive/response tore it down
+                continue; // more records may be buffered
+            }
+
+            int err = SSL_get_error(conn.KtlsSsl, n);
+            if (err == SSL_ERROR_WANT_READ) { SubmitPoll(conn, slot, fd, LibC.POLLIN); return; }
+            if (err == SSL_ERROR_ZERO_RETURN) { CloseClient(slot); return; } // peer close_notify
+            CloseClient(slot); // fatal alert / decrypt error / syscall error
+            return;
+        }
+    }
+
+    // Send a plaintext response (kernel encrypts). Mirrors the non-TLS echo serialization: if a send is in
+    // flight, stage the bytes (pooled) behind it; otherwise claim the send and copy into a write page.
+    private unsafe void KtlsRespond(IoUringConnection conn, uint slot, int fd, int len)
+    {
+        fixed (byte* rp = conn.KtlsRecv)
+        {
+            if (conn.SendBusy)
+            {
+                var copy = ArrayPool<byte>.Shared.Rent(len);
+                Marshal.Copy((IntPtr)rp, copy, 0, len);
+                (conn.Pending ??= new()).Enqueue(new PendingJob { Seg = new ArraySegment<byte>(copy, 0, len) });
+                return;
+            }
+            conn.SendBusy = true;
+            SendResponse(slot, fd, rp, len);
+        }
     }
 
     // =====================================================================
@@ -815,6 +1140,10 @@ internal sealed class IoUringShard : SocketSetShard
                 case Op.Cancel:
                     HandleCancel(slot: id);
                     break;
+
+                case Op.Poll:
+                    HandlePoll(res, slot: id);
+                    break;
             }
         }
 
@@ -873,6 +1202,20 @@ internal sealed class IoUringShard : SocketSetShard
 
         uint slot = conn.Slot;
 
+        if (Parent.Options.Tls is { SupportsKernelOffload: true } and OpenSslTlsProvider kop
+            && Parent.Options.TlsServer.AllowKernelOffload)
+        {
+            StartKtls(conn, slot, newFd, client: false, kop); // kernel TLS
+            return;
+        }
+        if (Parent.Options.Tls is not null)
+        {
+            // TLS: don't fire OnAccept yet — stand up the server engine and arm recv to await the
+            // ClientHello. OnAccept fires from TlsFireOpen once the handshake completes.
+            StartTls(conn, slot, newFd, client: false);
+            return;
+        }
+
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
         conn.Opened = true; // app now sees it open → pairs with OnClosed
@@ -896,6 +1239,20 @@ internal sealed class IoUringShard : SocketSetShard
         int fd = conn.Fd;
         if (res == 0 && fd != 0)
         {
+            if (Parent.Options.Tls is { SupportsKernelOffload: true } kp and OpenSslTlsProvider kop
+                && Parent.Options.TlsClient.AllowKernelOffload)
+            {
+                StartKtls(conn, slot, fd, client: true, kop); // kernel TLS: OpenSSL owns the fd, POLL-driven
+                return;
+            }
+            if (Parent.Options.Tls is not null)
+            {
+                // TLS: don't fire OnConnect yet — stand up the client engine, arm recv, send ClientHello.
+                // OnConnect fires from TlsFireOpen once the handshake completes.
+                StartTls(conn, slot, fd, client: true);
+                return;
+            }
+
             // UserToken was seeded by Connect()'s InitClient; the handler may replace it in-place.
             bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
             var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
@@ -968,6 +1325,14 @@ internal sealed class IoUringShard : SocketSetShard
     private unsafe bool DeliverReceive(uint slot, int fd, ushort bid, int res)
     {
         var conn = _conns[slot - 1];
+        if (conn.Tls is not null)
+        {
+            // Ciphertext in the read buffer: decrypt/handshake, then the caller releases the bid (we never
+            // borrow it — TLS breaks the no-copy echo path). The engine copies the bytes it needs first.
+            DeliverReceiveTls(conn, slot, fd, _readBuffer.GetBufferAddress(bid), res);
+            return false;
+        }
+
         byte* rp = _readBuffer.GetBufferAddress(bid);
         var ctx = new SocketSet.ReceiveContext(conn, rp, _readBuffer.BufferSize, res);
         Parent.OnReceive(ref ctx);
@@ -1075,7 +1440,7 @@ internal sealed class IoUringShard : SocketSetShard
             {
                 // A flushed out-of-band chain is next: it has its own buffers, so free this page.
                 _writeBuffer.Release(writeIndex);
-                SubmitChain(conn, fd, job.Chain); // SendBusy stays set
+                SubmitChain(conn, fd, job.Chain, job.AppData); // SendBusy stays set
                 return;
             }
 
@@ -1246,7 +1611,12 @@ internal sealed class IoUringShard : SocketSetShard
         }
 
         // Full payload sent.
+        bool appData = conn.WriteV.AppData;
         ReleaseWriteV(conn);
+        // TLS: an encrypted application send just completed → fire OnWrite so the app can pipeline the
+        // next message (handshake records / control replies / plaintext OOB flushes leave AppData false).
+        if (appData && conn.Tls is not null && !conn.Closing && conn.Fd != 0)
+            TlsOnWrite(conn, slot, fd);
         DrainNext(conn, slot, fd);
     }
 

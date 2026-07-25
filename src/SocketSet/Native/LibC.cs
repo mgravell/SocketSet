@@ -61,6 +61,24 @@ internal static unsafe partial class LibC
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int shutdown(int fd, int how);
 
+    // fcntl(fd, cmd, arg) — used to flip a socket to non-blocking for the kTLS handshake, so OpenSSL's
+    // SSL_do_handshake/SSL_read return WANT_READ/WANT_WRITE (driven by io_uring POLL) instead of blocking
+    // the shared loop thread.
+    internal const int F_GETFL = 3;
+    internal const int F_SETFL = 4;
+    internal const int O_NONBLOCK = 0x800; // Linux x86_64
+
+    [SuppressGCTransition]
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int fcntl(int fd, int cmd, int arg);
+
+    /// <summary>Set a socket non-blocking (best-effort; kTLS handshake needs it).</summary>
+    internal static void SetNonBlocking(int fd)
+    {
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
     [SuppressGCTransition]
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int sched_setaffinity(int pid, nuint cpusetsize, void* mask);
@@ -232,9 +250,18 @@ internal static unsafe partial class LibC
     public const byte IORING_OP_ASYNC_CANCEL = 14;
     public const byte IORING_OP_CONNECT = 16;
     public const byte IORING_OP_CLOSE = 19;
+    public const byte IORING_OP_POLL_ADD = 6;
     public const byte IORING_OP_READ = 22;
     public const byte IORING_OP_SEND = 26;
     public const byte IORING_OP_RECV = 27;
+
+    // poll() event bits (for IORING_OP_POLL_ADD's poll32_events, which aliases the rw_flags union). The
+    // completion's res carries the revents that fired (or a negative errno). One-shot by default: it fires
+    // once, then must be re-armed — which is what the kTLS readiness loop wants.
+    public const uint POLLIN = 0x0001;
+    public const uint POLLOUT = 0x0004;
+    public const uint POLLERR = 0x0008;
+    public const uint POLLHUP = 0x0010;
 
     // IORING_OP_ASYNC_CANCEL cancel_flags (go in the sqe's op-flags union). CANCEL_FD matches by fd
     // (not user_data); CANCEL_ALL cancels every matching op, not just the first.

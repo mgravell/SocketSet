@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using SmokeTest;
 using SocketSets;
+using SocketSets.Tls;
 
 AppDomain.CurrentDomain.UnhandledException += (_, e) =>
     Console.Error.WriteLine("### UNHANDLED ###\n" + e.ExceptionObject);
@@ -23,6 +24,10 @@ int churn = 0;      // >0: overlapping-churn soak for this many seconds (reconne
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 string host = "127.0.0.1"; // client connect target (server always binds Any)
 int port = 10000;
+bool resp = false;          // >0: run the dumb RESP PING client against --host/--port
+string? tlsTrust = null;    // path to a PEM cert the TLS client should trust (external-server test)
+string tlsHost = "localhost"; // TargetHost for SNI + hostname verification
+bool ktls = false;          // use kernel-TLS (kTLS) offload (io_uring only)
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
 {
@@ -64,6 +69,33 @@ for (int i = 0; i < args.Length; i++)
         case "--iocp":
             options.Factory = SocketSetFactory.WindowsIocp;
             break;
+        case "--tls":
+            // Wrap connections in the no-crypto identity TLS filter — a wiring/plumbing test (a real
+            // 1-RTT handshake gate + decrypt-in/encrypt-out, but the "crypto" is a passthrough copy).
+            options.Tls = new IdentityTlsProvider();
+            break;
+
+#if NET
+        case "--tls-ssl":
+            // Real OpenSSL TLS: a throwaway self-signed cert for "localhost", server configured with it,
+            // client trusts exactly it with full verification (SNI + hostname). Loopback self-test only.
+            options.Tls = SocketSets.Tls.OpenSsl.OpenSslTlsProvider.CreateSelfSignedLoopback("localhost");
+            options.TlsClient.TargetHost = "localhost";
+            break;
+
+        case "--ktls":
+            // Same as --tls-ssl but with kernel-TLS offload (io_uring only; needs `sudo modprobe tls`).
+            options.Tls = SocketSets.Tls.OpenSsl.OpenSslTlsProvider.CreateSelfSignedLoopback("localhost", kernelOffload: true);
+            options.TlsClient.TargetHost = "localhost";
+            ktls = true;
+            break;
+
+        case "--ktls-trust" when i + 1 < args.Length: // kTLS client trusting this cert (external server)
+            tlsTrust = args[++i];
+            ktls = true;
+            break;
+#endif
+
         case "--rio":
             options.Factory = SocketSetFactory.WindowsRio;
             break;
@@ -120,8 +152,46 @@ for (int i = 0; i < args.Length; i++)
         case "--reset-close": // abortive close (RST, no TIME_WAIT) — makes TCP churn measure the backend, not the port recycler
             options.ResetOnClose = true;
             break;
+
+        case "--resp": // dumb RESP client: connect, PING, expect +PONG (against Garnet/Redis)
+            resp = true;
+            break;
+        case "--tls-trust" when i + 1 < args.Length: // PEM cert the TLS client trusts (external server)
+            tlsTrust = args[++i];
+            break;
+        case "--tls-host" when i + 1 < args.Length: // SNI + hostname-verify name (default localhost)
+            tlsHost = args[++i];
+            break;
     }
 }
+
+if (resp)
+{
+    RunRespPing(options, host, port, tlsTrust, tlsHost, ktls);
+    return;
+}
+
+if (args.Contains("--http"))
+{
+    // Bare SocketSet HTTP responder (no Kestrel/pipes) — RST-truncation isolation harness.
+    using var http = new HttpBench(options);
+    http.Listen(new IPEndPoint(IPAddress.Any, port));
+    Console.WriteLine($"http-bench: backend={options.Factory.GetType().Name} listening on {port} (Ctrl+C to stop)");
+    var httpStop = new ManualResetEventSlim();
+    Console.CancelKeyPress += (_, e) => { e.Cancel = true; httpStop.Set(); };
+    httpStop.Wait();
+    return;
+}
+
+#if NET
+if (args.Contains("--ktls-spike"))
+{
+    var (ok, report) = SocketSets.Tls.OpenSsl.KtlsProbe.Run();
+    Console.WriteLine(report);
+    Console.WriteLine($"ktls-spike => {(ok ? "PASS" : "FAIL")}");
+    return;
+}
+#endif
 
 if (verify > 0)
 {
@@ -133,6 +203,27 @@ if (verifyEcho > 0)
 {
     RunEchoVerify(options, verifyEcho, size, window, port);
     return;
+}
+
+static void RunRespPing(SocketSetOptions opts, string host, int port, string? tlsTrust, string tlsHost, bool ktls)
+{
+#if NET
+    if (tlsTrust is not null)
+    {
+        // Client-only TLS: trust exactly the given cert (the server's), verify chain + hostname.
+        opts.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(
+            trustCertPem: File.ReadAllText(tlsTrust), verifyServer: true, kernelOffload: ktls);
+        opts.TlsClient.TargetHost = tlsHost;
+    }
+#endif
+    using var set = new RespPing(opts);
+    var ep = new IPEndPoint(IPAddress.Parse(host), port);
+    Console.WriteLine($"resp-ping: {host}:{port} tls={(tlsTrust is not null ? $"on (trust={Path.GetFileName(tlsTrust)}, host={tlsHost})" : "off")}");
+    set.Connect(ep);
+
+    bool completed = set.Wait(TimeSpan.FromSeconds(10));
+    string reply = set.Reply.Replace("\r", "\\r").Replace("\n", "\\n");
+    Console.WriteLine($"resp-ping: reply=\"{reply}\" => {(completed && set.Ok ? "PASS" : "FAIL")}");
 }
 
 static void RunVerify(SocketSetOptions opts, int payloadLen, int port)
