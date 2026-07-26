@@ -102,7 +102,33 @@ Goodput MiB/s, median of 3 scored passes, Docker/loopback (`bench/run-tls-sizes.
 Unlike the small-message numbers these repeat tightly (~1-10% between passes), so the large-payload
 shape is worth acting on.
 
-### 1. io_uring+TLS goes BACKWARDS from 16KB to 256KB — probably a defect
+### 1. io_uring+TLS large-payload behaviour — INVESTIGATED 2026-07-26, NOT CONFIRMED
+
+**Status: could not reproduce in a container. Do not treat the regression below as established.**
+
+What was checked, so it is not repeated:
+
+- *Pool-exhaustion hypothesis: REFUTED.* `TlsSend` copies ciphertext into `WritePageSize` (4KB) chunks
+  leased from the out-of-band pool, falling back to a PINNED GC allocation per chunk when dry. One 256KB
+  response needs 64 chunks against a 256-chunk-per-shard pool, so exhaustion looked likely. Measured with
+  `SS_URING_STATS=1` across 512B-256KB x 8-64 connections: **0.0% miss in every combination.** Pages are
+  released as sends complete; the pool is never the constraint. A tidy story, and wrong.
+- *Throughput: did not reproduce.* A pure-transport comparison (SmokeTest, no Kestrel bridge) gave
+  contradictory results run to run at 8 connections, and at 64 connections every backend converged on
+  ~6.5 GB/s - a shared ceiling, so the test was bounded by the host rather than the transport. The
+  original 16KB->256KB decline came from the ASP.NET sweep, where the bridge is also in the path (item 3).
+
+**What remains, and is real regardless of timing:** io_uring copies EVERY ciphertext byte into 4KB chunks
+and dispatches a writev of N segments (~1.6M chunk-copies/sec at load), where epoll sends directly from
+the TLS output buffer with zero copies. That is a genuine structural difference in the send path. Whether
+it costs measurable throughput needs a host that is not saturating elsewhere - i.e. real hardware.
+
+Worth knowing before optimising it: the copy exists for a reason. `conn.TlsOut` is a reusable
+`PooledBufferWriter`, so its buffer cannot be handed to an in-flight io_uring send. `PooledBufferWriter`
+already has `TakeArray()` for exactly this hand-off pattern; the obstacle is that io_uring needs a stable
+(pinned) address for the duration, and ArrayPool arrays are not pinned.
+
+### ~~1b. Original observation (superseded by the above)~~
 
 1,395 -> 1,183 MiB/s while every other leg rises. Goodput falling as payload grows is a defect signature,
 not a tuning problem. Prime suspect is the outbound path: `OutChain`/writev plus write-page chunking

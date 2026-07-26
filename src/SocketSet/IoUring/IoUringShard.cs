@@ -112,6 +112,15 @@ internal sealed class IoUringShard : SocketSetShard
     private static readonly bool TraceCompletions =
         Environment.GetEnvironmentVariable("SS_URING_TRACE") == "1";
 
+    // TLS ciphertext is copied into WritePageSize (BufferPageSize, 4KB) chunks leased from the
+    // out-of-band pool; when that pool is dry each chunk becomes a PINNED GC allocation instead. One
+    // 256KB TLS response needs 64 chunks against a 256-chunk-per-shard pool, so the miss rate is a
+    // function of payload size x concurrency. SS_URING_STATS=1 reports it at shutdown - a behavioural
+    // fact, measurable even on a host too noisy to time.
+    private static long s_oobHit, s_oobMiss;
+    private static readonly bool ReportStats =
+        Environment.GetEnvironmentVariable("SS_URING_STATS") == "1";
+
     public unsafe IoUringShard(SocketSetOptions options)
     {
         _socketsPerShard = options.SocketsPerShard;
@@ -834,11 +843,16 @@ internal sealed class IoUringShard : SocketSetShard
             int take = Math.Min(page, cipher.Length - off);
             if (LeaseOutOfBand(out int idx, out byte* p))
             {
+                if (ReportStats) Interlocked.Increment(ref s_oobHit);
                 cipher.Slice(off, take).CopyTo(new Span<byte>(p, take));
                 chain.Add(new OutSeg { Page = idx, Managed = null, Length = take });
             }
             else
             {
+                // Pool dry: fall back to a PINNED per-segment allocation. Counted because the rate of this
+                // is a property of the workload, not of timing, and so can be measured even where
+                // throughput cannot (see SS_URING_STATS).
+                if (ReportStats) Interlocked.Increment(ref s_oobMiss);
                 var arr = GC.AllocateUninitializedArray<byte>(take, pinned: true);
                 cipher.Slice(off, take).CopyTo(arr);
                 chain.Add(new OutSeg { Page = -1, Managed = arr, Length = take });
@@ -1104,7 +1118,17 @@ internal sealed class IoUringShard : SocketSetShard
         }
     }
 
-    protected override void OnShutdown() => Cleanup();
+    protected override void OnShutdown()
+    {
+        if (ReportStats)
+        {
+            long hit = Interlocked.Read(ref s_oobHit), miss = Interlocked.Read(ref s_oobMiss);
+            if (hit + miss > 0)
+                Console.Error.WriteLine($"[uring-stats] tls out-of-band chunks: pooled={hit:n0} " +
+                    $"pinned-alloc={miss:n0} ({100.0 * miss / (hit + miss):n1}% miss)");
+        }
+        Cleanup();
+    }
 
     // =====================================================================
     // Completion processing
