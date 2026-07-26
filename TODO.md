@@ -82,10 +82,70 @@ a few percent, the performance case is dead and the decision is purely architect
 under Docker with `--security-opt seccomp=unconfined` (see below), though a loopback container shares all
 the caveats in `AspNetDemo/RESULTS.md`.
 
-**Status: the epoll backend is implemented** (`src/SocketSet/Epoll`) and passes the smoke matrix - echo,
-byte-exact verify, out-of-band send, poke, churn, AF_UNIX. TLS interception is not wired into it yet.
+**Status: DONE (2026-07-26).** `src/SocketSet/Epoll`, with TLS. Passes the smoke matrix - echo, byte-exact
+verify, out-of-band send, poke, churn, AF_UNIX, ALPN. Measured at parity with io_uring and stock Kestrel
+on small-message plaintext (102.5k vs 105.2k vs 102.8k rps, ~3% spread). What remains is the measurement
+below, on real hardware.
 
 ---
+
+## Performance follow-ups (from the 2026-07-26 Linux size sweep)
+
+Goodput MiB/s, median of 3 scored passes, Docker/loopback (`bench/run-tls-sizes.sh`):
+
+| payload | iouring | epoll+tls | iouring+tls | iouring+ktls | kestrel+tls |
+|---|---:|---:|---:|---:|---:|
+| 512 B | 94.9 | 70.3 | 69.4 | 74.8 | 65.2 |
+| 16 KB | 2,401 | 1,602 | 1,395 | 1,350 | 1,673 |
+| 256 KB | 4,379 | 2,814 | **1,183** | 1,951 | **8,383** |
+
+Unlike the small-message numbers these repeat tightly (~1-10% between passes), so the large-payload
+shape is worth acting on.
+
+### 1. io_uring+TLS goes BACKWARDS from 16KB to 256KB — probably a defect
+
+1,395 -> 1,183 MiB/s while every other leg rises. Goodput falling as payload grows is a defect signature,
+not a tuning problem. Prime suspect is the outbound path: `OutChain`/writev plus write-page chunking
+interacting badly with 16KB TLS records. Note io_uring+TLS is also the *slowest* leg at 256KB, below both
+epoll+TLS (2.4x) and kTLS (1.6x) - it should not be.
+
+Method that worked for the last io_uring bug: `SS_URING_TRACE=1` to see completions (failures are a
+negative `cqe.res`, never a syscall error), and bisect against a minimal raw probe before blaming the
+kernel or the environment.
+
+**Highest expected value of anything on this list.**
+
+### 2. Re-run the size sweep now the plaintext controls are in
+
+The first sweep had one plaintext control and it was the wrong one, so nothing at >=16KB is fully
+interpretable yet. Plaintext `kestrel` and `epoll` legs added 2026-07-26; just needs a run.
+
+### 3. The AspNetDemo bridge is the bottleneck at large payloads
+
+kestrel+tls hit 8,383 MiB/s against plaintext io_uring's 4,379 - a TLS leg beating a plaintext leg 2:1,
+which is only possible because they are limited by different things. The SocketSet legs go through the
+demo's Kestrel bridge (two `Pipe`s plus a copy per write in `SocketSetConnection`), and at large payloads
+that bridge, not the transport or the cipher, is what is being measured.
+
+If plaintext kestrel also lands near 8 GB/s, the bridge is costing 2-4x on big responses - which matters
+more to the "ASP.NET Core over SocketSet" story than any transport difference measured so far.
+
+### 4. kTLS: implement the RECVMSG + cmsg receive arm
+
+Only worth doing if kTLS matters. The current kTLS path drives receive as io_uring `POLL` + `SSL_read`,
+one syscall per message, forfeiting multishot receive and provided buffers - the design seam described in
+`TlsFilter`'s notes (`RECVMSG` + `TLS_GET_RECORD_TYPE` cmsg) is what would let it keep them. kTLS does
+already pull ahead of userspace io_uring TLS at 256KB (+65%), so the crossover is real; this is what
+would make it competitive rather than merely present.
+
+Note loopback has no NIC, so kTLS's largest win - inline NIC offload - cannot appear in any of the
+numbers above. Real hardware required before drawing conclusions about kTLS itself.
+
+### 5. Real-hardware Linux run
+
+The rigs are in-repo and runnable: `bench/run-matrix.sh` (transport matrix) and `bench/run-tls-sizes.sh`
+(payload sweep). Everything above was measured in a container on a WSL2 kernel over loopback, which is
+adequate for correctness and weak for performance.
 
 ## Smaller / previously flagged
 
