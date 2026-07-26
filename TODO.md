@@ -181,6 +181,46 @@ This also reframes the shard-count result: throughput scaled near-linearly with 
 flat at 32 = the pinned core count) precisely BECAUSE each connection's sends are serialised. Parallelism
 across connections was the only lever available.
 
+### 2b. BYO-buffer: caller-supplied (pinned) pipes, and killing the copies below them
+
+Proposal: let a connection optionally accept a caller-supplied `IDuplexPipe` plus a "this memory is
+pinned" flag, and drive I/O straight off it - so a caller who hands us a pipe backed by a pinned-heap
+pool (as Kestrel's own `PinnedBlockMemoryPool` does) pays no pinning and no copy.
+
+Right target. Today the out-of-band path copies **three times** for one response:
+
+1. `OutboundConnection.Flush` -> `w.WrittenSpan.ToArray()` - an UNPOOLED full-size allocation
+2. `PumpFlush` -> `StageOutbound` copies that array again into pooled `Pending` segments
+3. the drain copies those segments into write pages
+
+Split it into two tiers, because only one of them is cheap.
+
+**Tier 1 - no API change, do this first.** Rent in `Flush` instead of `ToArray`, and transfer ownership of
+that array straight into `Pending` rather than copying it again. Removes one allocation and one full copy
+per response. The only care needed is that `Pending` segments currently must not exceed a write page (the
+packing invariant in `DrainPendingIntoPages`), so an over-page segment has to be split or handled. This is
+the piece worth doing on its own merits - the bridge is now ~47% of the remaining gap to Kestrel.
+
+**Tier 2 - the actual BYO-pipe. Not a no-brainer; two things bite.**
+
+*Ownership, not pinning, is the blocker.* `Flush` snapshots via `ToArray` precisely so the writer may reuse
+its buffer immediately. Sending directly from pipe memory means the pump must not `AdvanceTo` until the
+send completes, so `Connection.Send`/`Flush` need a completion signal (`ValueTask` / `IValueTaskSource`)
+rather than today's fire-and-forget bool. That is the real design change, and it ripples into every
+backend's send-completion path.
+
+*"Pinned" is not a sufficient capability, because RIO does not take addresses.* RIO wants
+`RIO_BUF { BufferId, Offset, Length }` where `BufferId` comes from `RIORegisterBuffer` - so caller memory
+is unusable to it unless that slab is registered up front. Meanwhile io_uring only needs a stable address
+(pinned suffices) and epoll needs nothing at all, since `send()` is synchronous and copies before
+returning. So the contract is not one `IsPinned` bool; it is a per-backend capability, something closer to
+"can you accept foreign memory, and on what terms" - with RIO able to answer "only if I registered it".
+
+A workable shape: the caller supplies the pool, the SET registers/pins it once at construction (RIO
+registers the slab; io_uring/IOCP just require pinning; epoll ignores it), and connections then hand out
+memory from it. That inverts the direction - we accept a POOL, not a pipe - and sidesteps the per-buffer
+capability question entirely. Probably the better design.
+
 ### 3. The AspNetDemo bridge - real, but much smaller than first claimed
 
 **Correction.** This was described as "the bottleneck at large payloads" on the strength of the Linux
