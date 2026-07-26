@@ -70,6 +70,18 @@ for (int i = 0; i < args.Length; i++)
         case "--iocp":
             options.Factory = SocketSetFactory.WindowsIocp;
             break;
+        case "--page" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pg):
+            // Buffer page size. Every send is chunked into pages and only ONE send is in flight per
+            // connection, so a response larger than a page costs ceil(size/page) sequential round trips
+            // through the completion port. Scale the pool counts down so a big page does not multiply
+            // into gigabytes of pinned memory per shard.
+            options.BufferPageSize = pg;
+            options.WriteBuffersPerShard = Math.Max(16, 4 * 1024 * 1024 / pg);
+            options.OutOfBandWriteBuffersPerShard = Math.Max(16, 4 * 1024 * 1024 / pg);
+            options.BufferPagesPerShard = Math.Max(16, 4 * 1024 * 1024 / pg);
+            i++;
+            break;
+
         case "--epoll":
             // Linux readiness-based backend; the fallback when io_uring is unavailable (old kernel,
             // the disable sysctl, or a container seccomp profile — Docker blocks io_uring by default).
@@ -205,7 +217,9 @@ if (resp)
 if (args.Contains("--http"))
 {
     // Bare SocketSet HTTP responder (no Kestrel/pipes) — RST-truncation isolation harness.
-    using var http = new HttpBench(options);
+    // -z sets the response body size, so the bare responder can be compared with AspNetDemo's /payload
+    // at matching sizes under the same load generator.
+    using var http = new HttpBench(options, size);
     http.Listen(new IPEndPoint(IPAddress.Any, port));
     Console.WriteLine($"http-bench: backend={options.Factory.GetType().Name} listening on {port} (Ctrl+C to stop)");
     var httpStop = new ManualResetEventSlim();

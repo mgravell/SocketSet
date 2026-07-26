@@ -11,10 +11,22 @@ namespace SmokeTest;
 /// the AspNet transport's pump). If this reproduces the ~7% curl-52 failures, the bug is in SocketSet
 /// itself; if it's clean, the bug is in the Kestrel bridge.
 /// </summary>
-public sealed class HttpBench(SocketSetOptions options) : SocketSet(options)
+public sealed class HttpBench(SocketSetOptions options, int bodySize = 2) : SocketSet(options)
 {
-    private static readonly byte[] Response =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\nhi\n"u8.ToArray();
+    // Pre-rendered once. This exists so the bare responder can be compared against AspNetDemo at the SAME
+    // payload under the SAME client: the difference between them is then the Kestrel bridge (two Pipes,
+    // an ArrayBufferWriter, a per-flush ToArray, and a thread hop) and nothing else.
+    private readonly byte[] Response = BuildResponse(bodySize);
+
+    private static byte[] BuildResponse(int bodySize)
+    {
+        var head = Encoding.ASCII.GetBytes(
+            $"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {bodySize}\r\nConnection: keep-alive\r\n\r\n");
+        var buf = new byte[head.Length + bodySize];
+        head.CopyTo(buf, 0);
+        buf.AsSpan(head.Length).Fill((byte)'x');
+        return buf;
+    }
 
     private readonly BlockingCollection<Connection> _work = new();
     private int _started;

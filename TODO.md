@@ -146,7 +146,59 @@ kernel or the environment.
 The first sweep had one plaintext control and it was the wrong one, so nothing at >=16KB is fully
 interpretable yet. Plaintext `kestrel` and `epoll` legs added 2026-07-26; just needs a run.
 
-### 3. The AspNetDemo bridge is the bottleneck at large payloads
+### 0. IOCP/RIO sends are page-quantised - 4x on the table at large payloads (Windows, 2026-07-26)
+
+**The single most actionable finding so far.** `BufferPageSize` defaults to 4096 and the Windows send path
+puts at most ONE page in flight per connection, so a 256KB response goes out as **64 sequential 4KB
+WSASends**, each with its own completion-port round trip. Kestrel's transport issues one `SendAsync` over
+the whole buffer.
+
+Measured on the BARE SocketSet HTTP responder (no Kestrel, no bridge), 256KB payload, `-c 64`, 16 shards,
+median of 2 scored passes:
+
+| page size | goodput | vs 4KB |
+|---|---:|---:|
+| 4KB (default) | 885 MiB/s | - |
+| 16KB | 2,503 MiB/s | 2.8x |
+| 64KB | 3,556 MiB/s | **4.0x** |
+
+Passes were tight (878/885, 2474/2503, 3257/3556), so this is not noise.
+
+**Do not just raise the default.** Page size is a trade-off, not a dial: at a 16KB payload the best page is
+16KB (2,103 MiB/s) and a 64KB page is WORSE (1,273 MiB/s) because most of the page is wasted. A fixed page
+is wrong at both ends.
+
+The real fix is to stop quantising sends by page at all:
+
+- `IocpShard.IssueSend` posts a single WSABUF (`WSASend(sock, &b, 1, ...)`), and `CompleteWrite` coalesces
+  the pending queue into one write page. Build a WSABUF **array** from the pending chain and issue one
+  WSASend with count > 1 - scatter/gather is exactly what the API is for.
+- RIO has the same shape and `RIOSend` likewise takes a buffer array.
+- **io_uring already does this**: `TlsSend` builds an `OutChain` of segments and dispatches one writev.
+  So this is an IOCP/RIO gap, not a design gap - the shape to copy already exists in-tree.
+
+This also reframes the shard-count result: throughput scaled near-linearly with shards (2->4->8->16, then
+flat at 32 = the pinned core count) precisely BECAUSE each connection's sends are serialised. Parallelism
+across connections was the only lever available.
+
+### 3. The AspNetDemo bridge - real, but much smaller than first claimed
+
+**Correction.** This was described as "the bottleneck at large payloads" on the strength of the Linux
+sweep. A controlled Windows comparison - same client, same pinning, same payload, bare SocketSet HTTP
+responder vs the same transport behind the Kestrel bridge - puts the bridge at **12% at 16KB and 23% at
+256KB**, not the ~4x it was blamed for:
+
+| | 16KB | 256KB |
+|---|---:|---:|
+| bare SocketSet responder | 1,655 | 2,454 |
+| AspNetDemo iocp/s16 (bridged) | 1,455 | 1,899 |
+| AspNetDemo kestrel (own transport) | ~3,740 | ~9,417 |
+
+The bridge is worth fixing (the per-flush `ToArray()` in `OutboundConnection.Flush` allocates a full-size
+array per response, unpooled, on the ThreadPool thread that also runs Kestrel), but item 0 above is the
+larger prize and it is in the transport itself.
+
+### 3b. Original bridge write-up (superseded by the measurement above)
 
 kestrel+tls hit 8,383 MiB/s against plaintext io_uring's 4,379 - a TLS leg beating a plaintext leg 2:1,
 which is only possible because they are limited by different things. The SocketSet legs go through the
