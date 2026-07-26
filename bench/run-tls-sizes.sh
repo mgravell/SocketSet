@@ -65,7 +65,16 @@ export DOTNET_PROCESSOR_COUNT=$HALF
 export GOMAXPROCS=$HALF
 
 # name|demo args|expected transport|expected tls
+#
+# Both PLAINTEXT controls matter, and it is a mistake to include only one. Measured 2026-07-26, at a
+# 256KB payload kestrel+tls reached 8383 MiB/s against plaintext io_uring's 4379 - a TLS leg beating a
+# plaintext leg by ~2x, which is impossible unless the two are limited by different things. They are: the
+# SocketSet legs go through the demo's Kestrel bridge (two Pipes plus a copy per write), and at large
+# payloads that bridge, not the transport or the cipher, is what is being measured. Without a plaintext
+# kestrel leg there is nothing to separate "TLS is cheap" from "our bridge is expensive".
 LEGS=(
+  "kestrel|--kestrel|kestrel-sockets|off"
+  "epoll|--epoll|socketset/epoll|off"
   "iouring|--io-uring|socketset/io_uring|off"
   "iouring+tls|--io-uring --tls|socketset/io_uring|openssl"
   "iouring+ktls|--ktls|socketset/auto(iouring)|ktls (openssl + kernel offload)"
