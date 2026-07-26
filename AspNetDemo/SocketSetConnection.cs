@@ -1,10 +1,21 @@
 using System.Buffers;
 using System.IO.Pipelines;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using Microsoft.AspNetCore.Connections;
+using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Http.Features;
 using SocketSets;
 
 namespace SocketSets.AspNet;
+
+/// <summary>Reports the ALPN id agreed by a TLS session this transport terminated. ASP.NET Core has no
+/// public feature for this (ITlsHandshakeFeature carries the cipher suite, not the protocol), so the demo
+/// defines its own to make the negotiated value observable from a request handler.</summary>
+internal interface ITransportTlsFeature
+{
+    string? NegotiatedProtocol { get; }
+}
 
 /// <summary>
 /// One Kestrel connection backed by a SocketSet <see cref="Connection"/>. Bridges SocketSet's PUSH model
@@ -25,7 +36,7 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     private readonly CancellationTokenSource _closedCts = new();
     private Task? _pump;
 
-    public SocketSetConnection(Connection conn)
+    public SocketSetConnection(Connection conn, bool tls)
     {
         _conn = conn;
         var sched = PipeScheduler.ThreadPool;
@@ -38,6 +49,30 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         ConnectionId = Guid.NewGuid().ToString("n");
         Features = new FeatureCollection();
         Items = new Dictionary<object, object?>();
+
+        if (tls)
+        {
+            // The transport already terminated TLS, so Kestrel sees plaintext and would otherwise report
+            // the request as http://. Publishing ITlsConnectionFeature is what makes Request.IsHttps true
+            // and the scheme https. Kestrel exposes connection-level features through HttpContext.Features,
+            // so the ALPN one below is readable from a request handler too.
+            var feature = new TransportTlsFeature(conn);
+            Features.Set<ITlsConnectionFeature>(feature);
+            Features.Set<ITransportTlsFeature>(feature);
+        }
+    }
+
+    /// <summary>Minimal TLS features for a session terminated in the transport rather than by SslStream.
+    /// Client certificates are not requested (the providers are configured server-auth only), so the
+    /// certificate half is deliberately inert.</summary>
+    private sealed class TransportTlsFeature(Connection conn) : ITlsConnectionFeature, ITransportTlsFeature
+    {
+        public X509Certificate2? ClientCertificate { get => null; set { } }
+
+        public Task<X509Certificate2?> GetClientCertificateAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<X509Certificate2?>(null);
+
+        public string? NegotiatedProtocol => conn.NegotiatedProtocol;
     }
 
     /// <summary>Start the outbound pump (called once, right after accept).</summary>

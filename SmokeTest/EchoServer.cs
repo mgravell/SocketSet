@@ -71,11 +71,19 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
     /// <summary>Average bytes per receive completion — how much the stack coalesced per read.</summary>
     public double AvgRecvSize => RecvOps == 0 ? 0 : (double)RecvBytes / RecvOps;
 
+    private string? _alpnClient, _alpnServer;
+    /// <summary>ALPN protocol the last client connection agreed on (null = none negotiated).</summary>
+    public string? AlpnClient => Volatile.Read(ref _alpnClient);
+    /// <summary>ALPN protocol the last accepted connection agreed on. Both sides are recorded because a
+    /// mismatch between them is exactly the bug an ALPN test is looking for.</summary>
+    public string? AlpnServer => Volatile.Read(ref _alpnServer);
+
     protected override void OnAccept(ref AcceptContext ctx)
     {
         // Server-accepted connection; UserToken stays the default ServerToken from Listen().
         Interlocked.Increment(ref _live);
         Interlocked.Increment(ref _liveServer);
+        Volatile.Write(ref _alpnServer, ctx.Connection.NegotiatedProtocol);
     }
 
     protected override void OnClosed(Connection connection)
@@ -91,6 +99,7 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
         Interlocked.Increment(ref _connected);
         Interlocked.Increment(ref _live);
         Interlocked.Increment(ref _liveClient);
+        Volatile.Write(ref _alpnClient, ctx.Connection.NegotiatedProtocol);
         var client = new Client(Window, GreetingSize, CloseAfterMessages);
         ctx.Connection.UserToken = client;
 

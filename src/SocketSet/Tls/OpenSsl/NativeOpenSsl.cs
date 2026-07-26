@@ -10,7 +10,7 @@ namespace SocketSets.Tls.OpenSsl;
 /// Library resolution: the imports name "ssl"/"crypto"; a resolver maps those to the versioned sonames
 /// (libssl.so.3 first — OpenSSL 3, current everywhere modern .NET runs — then unversioned / 1.1 fallbacks).
 /// Runs only on platforms that actually have OpenSSL (Linux); the file compiles everywhere but is never
-/// invoked on Windows (which uses SChannel/SslStream).
+/// invoked on Windows (which uses SSPI/SChannel — see <see cref="SChannel.SChannelTlsProvider"/>).
 /// </summary>
 internal static unsafe partial class NativeOpenSsl
 {
@@ -32,6 +32,11 @@ internal static unsafe partial class NativeOpenSsl
     public const int TLSEXT_NAMETYPE_host_name = 0;
     public const int BIO_CTRL_PENDING = 10;
     public const long X509_V_OK = 0;
+
+    // --- ALPN select-callback return codes ---
+    public const int SSL_TLSEXT_ERR_OK = 0;
+    public const int SSL_TLSEXT_ERR_ALERT_FATAL = 2; // RFC 7301 no_application_protocol
+    public const int SSL_TLSEXT_ERR_NOACK = 3;       // decline quietly: no ALPN in the ServerHello
 
     // --- kTLS ---
     public const ulong SSL_OP_ENABLE_KTLS = 1UL << 3; // SSL_OP_BIT(3): let OpenSSL push keys to the kernel
@@ -79,6 +84,13 @@ internal static unsafe partial class NativeOpenSsl
     [LibraryImport(Ssl)] public static partial long SSL_ctrl(IntPtr ssl, int cmd, long larg, IntPtr parg);
     [LibraryImport(Ssl)] public static partial long SSL_get_verify_result(IntPtr ssl);
     [LibraryImport(Ssl, StringMarshalling = StringMarshalling.Utf8)] public static partial int SSL_set1_host(IntPtr ssl, string hostname);
+
+    // ALPN. Note the asymmetry: a CLIENT just hands over its preference list, but a SERVER has to supply a
+    // selection CALLBACK — and that callback is per-SSL_CTX, with no per-SSL equivalent, which is why one
+    // OpenSslTlsProvider can serve exactly one server-side protocol list.
+    [LibraryImport(Ssl)] public static partial int SSL_set_alpn_protos(IntPtr ssl, byte* protos, uint protosLen);
+    [LibraryImport(Ssl)] public static partial void SSL_CTX_set_alpn_select_cb(IntPtr ctx, IntPtr cb, IntPtr arg);
+    [LibraryImport(Ssl)] public static partial void SSL_get0_alpn_selected(IntPtr ssl, byte** data, uint* len);
 
     // kTLS path: bind the SSL directly to a socket fd (socket BIO), toggle options, inspect the BIOs.
     [LibraryImport(Ssl)] public static partial int SSL_set_fd(IntPtr ssl, int fd);

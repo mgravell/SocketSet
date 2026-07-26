@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using SocketSets.Native;
+using SocketSets.Tls;
 
 namespace SocketSets.Windows;
 
@@ -101,6 +102,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     private Win32.RIORESULT* _rioResults;          // RIODequeueCompletion output
     private volatile bool _portReady;
 
+    // TLS scratch, shared by every connection on this shard (null unless Options.Tls is set). Safe to share
+    // because a shard has ONE loop thread and a filter is only ever touched from it — the managed backend
+    // needs a per-connection gate precisely because it has no such thread.
+    private PooledBufferWriter? _tlsPlain;   // decrypt target
+    private PooledBufferWriter? _tlsCipher;  // encrypt scratch
+    private PooledBufferWriter? _tlsCtrl;    // handshake / control-record output
+
     private readonly List<AcceptState> _acceptStates = [];
     private readonly object _acceptGate = new();
 
@@ -177,6 +185,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         _cq = Win32.RIOCreateCompletionQueue((uint)(_socketsPerShard * 2), &notify);
         if (_cq == Win32.RIO_INVALID_CQ)
             throw new Win32Exception(Win32.WSAGetLastError(), "RIOCreateCompletionQueue failed");
+
+        if (Parent.Options.Tls is not null)
+        {
+            _tlsPlain = new PooledBufferWriter(_recvBufSize);
+            _tlsCipher = new PooledBufferWriter(_writeBufSize);
+            _tlsCtrl = new PooledBufferWriter(1024);
+        }
 
         _portReady = true;
     }
@@ -327,7 +342,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         {
             nint s = Interlocked.Exchange(ref _conns[i].Socket, 0);
             if (s != 0) Win32.closesocket(s); // also tears down the RIO request queue
+            var tls = _conns[i].Tls;
+            if (tls is not null) { _conns[i].Tls = null; tls.Dispose(); }
         }
+
+        _tlsPlain?.Dispose(); _tlsPlain = null;
+        _tlsCipher?.Dispose(); _tlsCipher = null;
+        _tlsCtrl?.Dispose(); _tlsCtrl = null;
 
         if (_cq != Win32.RIO_INVALID_CQ && Win32.RIOCloseCompletionQueue != null) { Win32.RIOCloseCompletionQueue(_cq); _cq = 0; }
         if (_recvBufferId != Win32.RIO_INVALID_BUFFERID) { Win32.RIODeregisterBuffer(_recvBufferId); _recvBufferId = Win32.RIO_INVALID_BUFFERID; }
@@ -390,6 +411,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         conn.RecvBuf = -1;
         conn.SendBuf = -1;
         conn.Pending?.Clear();
+        conn.Tls = null;      // disposed by TryFinalize; cleared here so a rolled-back claim starts clean
+        conn.IsClient = false;
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
         Volatile.Write(ref conn.Generation, conn.Generation + 1);
@@ -445,6 +468,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         if (conn.SendBuf >= 0) { _writeBuffer.Release(conn.SendBuf); conn.SendBuf = -1; }
         if (conn.Pending is { } pending)
             while (pending.Count > 0) ArrayPool<byte>.Shared.Return(pending.Dequeue().Array!);
+        // Release the TLS engine (SSPI context / SSL*) with the rest of the per-connection state.
+        if (conn.Tls is { } tls) { conn.Tls = null; tls.Dispose(); }
         conn.Rq = 0; // torn down with the socket
         conn.UserToken = null;
         conn.Flags = 0;
@@ -658,6 +683,10 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
         if (!SetupConnection(conn)) { Win32.closesocket(socket); FreeSlot(conn); return; }
 
+        // TLS: the app must not see this connection until the handshake completes, so OnAccept is deferred
+        // to FireTlsOpen and everything below is skipped.
+        if (Parent.Options.Tls is not null) { BeginTls(conn, slot, isClient: false); return; }
+
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
         conn.Opened = true;
@@ -677,6 +706,9 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
         Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_UPDATE_CONNECT_CONTEXT, null, 0);
         if (!SetupConnection(conn)) { CloseClient(slot); return; }
+
+        // TLS: OnConnect is deferred to FireTlsOpen (the client speaks first — see BeginTls).
+        if (Parent.Options.Tls is not null) { BeginTls(conn, slot, isClient: true); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
@@ -771,6 +803,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
 
     private bool DeliverReceive(RioConnection conn, uint slot, int bytes)
     {
+        if (conn.Tls is not null) return DeliverReceiveTls(conn, slot, bytes);
+
         byte* rp = _recvBuffer.Address(conn.RecvBuf);
         var ctx = new SocketSet.ReceiveContext(conn, rp, _recvBufSize, bytes);
         Parent.OnReceive(ref ctx);
@@ -831,10 +865,30 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     {
         int wi = conn.SendBuf;
         byte* wp = _writeBuffer.Address(wi);
-        var ctx = new SocketSet.WriteContext(conn, wp, _writeBufSize);
-        Parent.OnWrite(ref ctx);
 
-        int next = ctx.SendBytes;
+        // On a TLS connection OnWrite is suppressed until the deferred open has fired: until then the app
+        // has never seen this connection and must not be asked to fill a buffer for it.
+        int next = 0;
+        var tls = conn.Tls;
+        if (tls is null || conn.Opened)
+        {
+            var ctx = new SocketSet.WriteContext(conn, wp, _writeBufSize);
+            Parent.OnWrite(ref ctx);
+            next = ctx.SendBytes;
+        }
+
+        if (tls is not null && next > 0)
+        {
+            // OnWrite produced PLAINTEXT in the write page. Encrypt it onto the TAIL of Pending rather than
+            // sending the page as-is, so it stays ordered behind ciphertext already queued; the drain below
+            // then refills this same page from the head. (Records are sequence-numbered — order is not
+            // cosmetic here.)
+            _tlsCipher!.Reset();
+            tls.ProcessOutbound(new ReadOnlySpan<byte>(wp, next), _tlsCipher);
+            StageOutbound(conn, _tlsCipher.WrittenSpan);
+            next = 0;
+        }
+
         if (next == 0 && conn.Pending is { Count: > 0 } pending)
         {
             // Coalesce as many queued responses as fit into the write page into one RIOSend.
@@ -874,16 +928,40 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
             return;
 
-        var pending = conn.Pending ??= new();
-        for (int off = 0; off < len;)
+        if (conn.Tls is { } tls)
         {
-            int n = Math.Min(_writeBufSize, len - off);
-            var buf = ArrayPool<byte>.Shared.Rent(n);      // pooled staging (uniform with echo; returned on drain)
-            Array.Copy(data, off, buf, 0, n);
+            // Out-of-band writes are application plaintext; encrypt before staging. A flush cannot legally
+            // arrive before the handshake completes (the app has no Connection reference until the deferred
+            // open), so dropping one is strictly safer than letting plaintext reach the wire.
+            if (!tls.HandshakeComplete)
+            {
+                System.Diagnostics.Debug.WriteLine("TLS flush before handshake completion; dropped.");
+                return;
+            }
+            _tlsCipher!.Reset();
+            tls.ProcessOutbound(new ReadOnlySpan<byte>(data, 0, len), _tlsCipher);
+            StageOutbound(conn, _tlsCipher.WrittenSpan);
+        }
+        else
+        {
+            StageOutbound(conn, new ReadOnlySpan<byte>(data, 0, len));
+        }
+        if (!conn.SendBusy) StartPendingSend(conn, slot);
+    }
+
+    // Chunk bytes into write-page-sized pooled segments on Pending (the shape the echo path already
+    // drains). Page-sized chunks preserve the drain loops' "the first item always fits" invariant.
+    private void StageOutbound(RioConnection conn, ReadOnlySpan<byte> data)
+    {
+        var pending = conn.Pending ??= new();
+        for (int off = 0; off < data.Length;)
+        {
+            int n = Math.Min(_writeBufSize, data.Length - off);
+            var buf = ArrayPool<byte>.Shared.Rent(n); // pooled staging (uniform with echo; returned on drain)
+            data.Slice(off, n).CopyTo(buf);
             pending.Enqueue(new ArraySegment<byte>(buf, 0, n));
             off += n;
         }
-        if (!conn.SendBusy) StartPendingSend(conn, slot);
     }
 
     // Start draining Pending into a freshly-leased write page (precondition: !SendBusy). Coalesces as in
@@ -909,6 +987,133 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
         }
         if (next > 0) SubmitSendBuffer(conn, slot, wi, next);
         else _writeBuffer.Release(wi);
+    }
+
+    // =====================================================================
+    // TLS interception (see TlsFilter)
+    // -------------------------------------------------------------------------------------
+    // Mirrors the IOCP shard exactly; see the notes there. The short version: one loop thread per shard
+    // means no locking and shard-wide scratch, and ALL ciphertext is staged on the existing Pending queue
+    // so records reach the socket in the order the engine produced them (the direct SendResponse path
+    // would jump the queue and is never used on a TLS connection).
+    // =====================================================================
+
+    // Attach a fresh engine to a just-adopted connection and start the handshake. OnAccept/OnConnect are
+    // NOT fired here — they fire from FireTlsOpen once the handshake completes.
+    private void BeginTls(RioConnection conn, uint slot, bool isClient)
+    {
+        var opts = Parent.Options;
+        conn.IsClient = isClient;
+        conn.Tls = isClient ? opts.Tls!.CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+
+        // A client speaks first (ClientHello); a server emits nothing until it has seen one. Either way the
+        // receive must be armed so the handshake can advance as bytes arrive.
+        if (!DriveTlsHandshake(conn, slot, default)) return;
+        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmReceive(conn);
+    }
+
+    // Feed one chunk to the handshake and queue whatever it emits (already TLS records — staged raw, not
+    // re-encrypted). Returns false if the connection was torn down.
+    private bool DriveTlsHandshake(RioConnection conn, uint slot, ReadOnlySpan<byte> input)
+    {
+        _tlsCtrl!.Reset();
+        var status = conn.Tls!.DriveHandshake(input, conn.Socket, _tlsCtrl);
+        QueueCipher(conn, slot, _tlsCtrl.WrittenSpan); // may carry a fatal alert on failure — send it first
+
+        if (status == TlsHandshakeStatus.Faulted) { CloseClient(slot); return false; }
+        if (conn.Closing || conn.Socket == 0) return false; // QueueCipher tore it down (pool exhausted)
+        if (status == TlsHandshakeStatus.Completed) FireTlsOpen(conn, slot);
+        return !conn.Closing && conn.Socket != 0;
+    }
+
+    // Handshake complete: fire the deferred open and encrypt any greeting it produced.
+    private void FireTlsOpen(RioConnection conn, uint slot)
+    {
+        // The write page here is only scratch for the greeting — the ciphertext goes out via Pending, so
+        // the page is released again rather than sent.
+        bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
+        conn.Opened = true; // app now sees it open → pairs with OnClosed
+        int sb;
+        if (conn.IsClient)
+        {
+            var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
+            Parent.OnConnect(ref ctx);
+            sb = ctx.SendBytes;
+        }
+        else
+        {
+            var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
+            Parent.OnAccept(ref ctx);
+            sb = ctx.SendBytes;
+        }
+
+        if (!leased) return;
+        if (sb > 0 && !conn.Closing && conn.Socket != 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
+            SendEncrypted(conn, slot, wp, sb);
+        _writeBuffer.Release(wi);
+    }
+
+    // Data phase inbound: decrypt, hand the plaintext to OnReceive, encrypt any response.
+    private bool DeliverReceiveTls(RioConnection conn, uint slot, int bytes)
+    {
+        var tls = conn.Tls!;
+        byte* rp = _recvBuffer.Address(conn.RecvBuf);
+        var cipherIn = new ReadOnlySpan<byte>(rp, bytes);
+
+        if (!tls.HandshakeComplete)
+        {
+            if (!DriveTlsHandshake(conn, slot, cipherIn)) return false;
+            if (!tls.HandshakeComplete) return true; // still handshaking; keep receiving
+
+            // Just completed. Application data coalesced into the same segment as the peer's final
+            // handshake flight is already buffered INSIDE the engine — surface it now with an empty input,
+            // or it strands until a next recv that may never come. See TlsFilter.DriveHandshake.
+            cipherIn = default;
+        }
+
+        _tlsPlain!.Reset();
+        _tlsCtrl!.Reset();
+        var status = tls.ProcessInbound(cipherIn, TlsContentType.Ciphertext, _tlsPlain, _tlsCtrl);
+        QueueCipher(conn, slot, _tlsCtrl.WrittenSpan); // protocol replies (e.g. a TLS 1.3 KeyUpdate ack)
+
+        if (status == TlsInboundStatus.Faulted) { CloseClient(slot); return false; }
+        if (conn.Closing || conn.Socket == 0) return false;
+
+        int plainLen = _tlsPlain.WrittenCount;
+        if (plainLen > 0)
+        {
+            byte[] plain = _tlsPlain.Array;
+            fixed (byte* pp = plain)
+            {
+                var ctx = new SocketSet.ReceiveContext(conn, pp, plain.Length, plainLen);
+                Parent.OnReceive(ref ctx);
+                int rb = ctx.ResponseBytes;
+                if (rb > 0 && !conn.Closing && conn.Socket != 0
+                    && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
+                {
+                    SendEncrypted(conn, slot, pp, rb);
+                }
+            }
+        }
+
+        if (status == TlsInboundStatus.PeerClosed) { CloseClient(slot); return false; }
+        return !conn.Closing;
+    }
+
+    // Encrypt application plaintext into the outbound stream.
+    private void SendEncrypted(RioConnection conn, uint slot, byte* plaintext, int len)
+    {
+        _tlsCipher!.Reset();
+        conn.Tls!.ProcessOutbound(new ReadOnlySpan<byte>(plaintext, len), _tlsCipher);
+        QueueCipher(conn, slot, _tlsCipher.WrittenSpan);
+    }
+
+    // Stage ciphertext on Pending and kick a send if the connection is idle.
+    private void QueueCipher(RioConnection conn, uint slot, ReadOnlySpan<byte> cipher)
+    {
+        if (cipher.IsEmpty) return;
+        StageOutbound(conn, cipher);
+        if (!conn.SendBusy && !conn.Closing && conn.Socket != 0) StartPendingSend(conn, slot);
     }
 
     private void PinLoopThread()

@@ -32,6 +32,7 @@ internal sealed unsafe class OpenSslTlsFilter(nint ssl, nint rbio, nint wbio) : 
         if (ret == 1)
         {
             HandshakeComplete = true;
+            NegotiatedProtocol = GetAlpnSelected(ssl);
             return TlsHandshakeStatus.Completed;
         }
 
@@ -99,6 +100,16 @@ internal sealed unsafe class OpenSslTlsFilter(nint ssl, nint rbio, nint wbio) : 
         if (_freed) return;
         _freed = true;
         SSL_free(ssl); // also frees rbio + wbio (ownership transferred by SSL_set_bio)
+    }
+
+    /// <summary>The ALPN id the handshake settled on, or null if ALPN was not in play. Shared with the kTLS
+    /// path, which drives its own <c>SSL*</c> and so cannot ask a filter.</summary>
+    internal static string? GetAlpnSelected(nint ssl)
+    {
+        byte* data = null;
+        uint len = 0;
+        SSL_get0_alpn_selected(ssl, &data, &len);
+        return data == null || len == 0 ? null : AlpnProtocolList.DecodeId(new ReadOnlySpan<byte>(data, (int)len));
     }
 
     // Feed received ciphertext into the SSL's read side. A memory BIO grows to accept it, but loop to be safe.

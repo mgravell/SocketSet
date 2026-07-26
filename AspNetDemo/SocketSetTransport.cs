@@ -5,14 +5,15 @@ using SocketSets;
 
 namespace SocketSets.AspNet;
 
-/// <summary>Kestrel transport factory: hands back a listener backed by a SocketSet io_uring
+/// <summary>Kestrel transport factory: hands back a listener backed by a SocketSet
 /// <see cref="SocketSet"/>. Registered as the <see cref="IConnectionListenerFactory"/> so ASP.NET Core's
-/// entire HTTP stack runs its request pipeline over io_uring.</summary>
-internal sealed class SocketSetTransportFactory : IConnectionListenerFactory
+/// entire HTTP stack runs its request pipeline over io_uring / IOCP / RIO / managed sockets — and, when
+/// configured, over a TLS session this transport terminates itself.</summary>
+internal sealed class SocketSetTransportFactory(DemoConfig config, TransportTlsProvider tls) : IConnectionListenerFactory
 {
     public ValueTask<IConnectionListener> BindAsync(EndPoint endpoint, CancellationToken cancellationToken = default)
     {
-        var listener = new SocketSetConnectionListener(endpoint);
+        var listener = new SocketSetConnectionListener(endpoint, config, tls.Provider);
         listener.Bind();
         return ValueTask.FromResult<IConnectionListener>(listener);
     }
@@ -28,26 +29,31 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
 {
     private readonly Channel<ConnectionContext> _accepted =
         Channel.CreateUnbounded<ConnectionContext>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly DemoConfig _config;
+    private readonly SocketSets.Tls.TlsProvider? _tls;
     private TransportSet _set = null!;
 
-    public SocketSetConnectionListener(EndPoint endpoint) => EndPoint = endpoint;
+    public SocketSetConnectionListener(EndPoint endpoint, DemoConfig config, SocketSets.Tls.TlsProvider? tls)
+    {
+        EndPoint = endpoint;
+        _config = config;
+        _tls = tls;
+    }
 
     public EndPoint EndPoint { get; }
 
     public void Bind()
     {
-        // Tunable for benchmarking: SS_SHARDS (io_uring worker threads), SS_PIN (pin them to cores).
-        int shards = int.TryParse(Environment.GetEnvironmentVariable("SS_SHARDS"), out var s) ? s : 2;
-        bool pin = Environment.GetEnvironmentVariable("SS_PIN") == "1";
         var options = new SocketSetOptions
         {
-            Factory = SocketSetFactory.IoUring,
-            Shards = shards,
-            PinWorkerThreads = pin,
+            Factory = _config.Factory,
+            Shards = _config.Shards,
+            PinWorkerThreads = _config.Pin,
+            Tls = _tls, // null = plaintext; otherwise TLS terminates here, below Kestrel
         };
         _set = new TransportSet(options, this);
         _set.Listen(EndPoint);
-        Console.WriteLine($"[socketset transport] shards={shards} pin={pin}");
+        Console.WriteLine($"[socketset transport] {_config.Describe()}");
     }
 
     // --- SocketSet callbacks (loop thread) → Kestrel bridge ---
@@ -56,8 +62,10 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
 
     private void OnAccept(Connection conn)
     {
+        // With TLS this fires only after the handshake has completed, so conn.NegotiatedProtocol is
+        // already settled by the time the features are built.
         Interlocked.Increment(ref Accepts);
-        var c = new SocketSetConnection(conn);
+        var c = new SocketSetConnection(conn, _tls is not null);
         conn.UserToken = c;
         c.Start();
         if (!_accepted.Writer.TryWrite(c)) Interlocked.Increment(ref WriteFail);
@@ -95,6 +103,7 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
     {
         _accepted.Writer.TryComplete();
         _set?.Dispose();
+        (_tls as IDisposable)?.Dispose(); // credential handles / SSL_CTXs
         return ValueTask.CompletedTask;
     }
 

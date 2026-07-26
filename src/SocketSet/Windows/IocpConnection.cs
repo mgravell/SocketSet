@@ -38,6 +38,10 @@ internal sealed class IocpConnection : WindowsOutboundConnection
     /// model (every op posts). Set at accept/connect adoption.</summary>
     public bool SkipOnSuccess;
 
+    /// <summary>Which side of the TLS handshake this connection is, so the shard knows whether the
+    /// deferred open fires OnConnect or OnAccept. Only meaningful when <c>Tls</c> is set.</summary>
+    public bool IsClient;
+
     // --- teardown state (loop-thread only) ---
     // The slot is NOT recycled (Socket stays non-zero) until every in-flight op has been reaped, so a
     // completion can never land on a re-tenanted slot. closesocket() aborts the pending recv/send; the

@@ -854,7 +854,10 @@ internal sealed class IoUringShard : SocketSetShard
         LibC.SetNonBlocking(fd);
         conn.TlsClient = client;
         conn.KtlsRecv ??= new byte[_readPageSize];
-        conn.KtlsSsl = prov.CreateKernelSsl(fd, client, client ? Parent.Options.TlsClient.TargetHost : null);
+        conn.KtlsSsl = prov.CreateKernelSsl(
+            fd, client,
+            client ? Parent.Options.TlsClient.TargetHost : null,
+            client ? Parent.Options.TlsClient.AlpnProtocols : Parent.Options.TlsServer.AlpnProtocols);
         KtlsPump(conn, slot, fd);
     }
 
@@ -903,6 +906,9 @@ internal sealed class IoUringShard : SocketSetShard
     {
         // (Diagnostics could assert BIO_get_ktls_send/recv here; TX-native assumes kTLS TX is active.)
         conn.KtlsReady = true;
+        // No TlsFilter on this path, so publish the ALPN result straight from the SSL before the app sees
+        // the connection open — Connection.NegotiatedProtocol falls back to this.
+        conn.KernelAlpn = OpenSslTlsFilter.GetAlpnSelected(conn.KtlsSsl);
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         conn.Opened = true; // app now sees it open → pairs with OnClosed

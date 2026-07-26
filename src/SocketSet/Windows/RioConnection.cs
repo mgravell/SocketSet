@@ -25,6 +25,10 @@ internal sealed class RioConnection : WindowsOutboundConnection
     /// <summary>Bumped on each allocation; guards Close against slot reuse.</summary>
     public uint Generation;
 
+    /// <summary>Which side of the TLS handshake this connection is, so the shard knows whether the
+    /// deferred open fires OnConnect or OnAccept. Only meaningful when <c>Tls</c> is set.</summary>
+    public bool IsClient;
+
     /// <summary>RIO request queue for this connection (bound to the socket + the shard CQ); 0 when none.
     /// Destroyed implicitly when the socket closes.</summary>
     public nint Rq;

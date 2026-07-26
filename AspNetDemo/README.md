@@ -1,7 +1,10 @@
-# AspNetDemo — ASP.NET Core (Kestrel) over a SocketSet io_uring transport
+# AspNetDemo — ASP.NET Core (Kestrel) over a SocketSet transport
 
-A working demo that replaces Kestrel's default socket transport with a SocketSet io_uring backend,
-so ASP.NET Core runs its entire HTTP stack over io_uring.
+Replaces Kestrel's default socket transport with a SocketSet backend, so ASP.NET Core runs its entire
+HTTP stack over io_uring / IOCP / RIO / managed sockets — optionally with TLS terminated *in the
+transport* rather than by Kestrel's `SslStream`.
+
+Every axis is a command-line flag so configurations can be A/B'd without a rebuild; see `--help`.
 
 ## How it works
 
@@ -20,16 +23,57 @@ so ASP.NET Core runs its entire HTTP stack over io_uring.
 ## Run
 
 ```
-dotnet run -c Release --project AspNetDemo      # listens on http://127.0.0.1:5080
-curl http://127.0.0.1:5080/          # Hello ...
-curl http://127.0.0.1:5080/ping      # {"ok":true,"transport":"socketset-io_uring"}
+dotnet run -c Release --project AspNetDemo -- --help
+curl  http://127.0.0.1:5080/config           # what is actually running — check this first
+curl -k https://127.0.0.1:5080/plaintext     # -k: the certificate is self-signed
 curl -X POST --data-binary @somefile http://127.0.0.1:5080/echo
 curl "http://127.0.0.1:5080/big?n=100000" | wc -c
-curl http://127.0.0.1:5080/stats     # transport counters (diagnostics)
+curl  http://127.0.0.1:5080/stats            # transport counters (diagnostics)
 ```
 
-Validated: single requests, HTTP/1.1 keep-alive (connection reused), POST request bodies, and large
-(100 KB, multi-segment) responses all work.
+## The A/B matrix
+
+The comparisons this exists to answer — "how does vanilla Kestrel with TLS compare to X":
+
+| Question | Command |
+|---|---|
+| control: Kestrel sockets + SslStream | `--kestrel --tls` |
+| IOCP + SChannel/SSPI | `--iocp --tls` |
+| RIO + SChannel/SSPI | `--rio --tls` |
+| io_uring + OpenSSL (userspace) | `--io-uring --tls` |
+| io_uring + kernel TLS offload | `--ktls` |
+| any of the above, plaintext | drop the TLS flag |
+
+`--managed` selects the portable managed-socket backend; with no backend flag the transport
+auto-detects (IOCP on Windows, io_uring on Linux) and `/config` reports what it actually resolved to.
+
+**Fairness.** All TLS legs — including Kestrel's own — present the *same* certificate: one RSA-2048 /
+SHA-256 self-signed key generated once per process (`DemoCertificate`). Certificate choice moves TLS
+numbers a lot, so this is deliberately not a per-leg variable. Every leg is also pinned to HTTP/1.1,
+so a TLS leg cannot quietly negotiate HTTP/2 via ALPN while a plaintext leg stays on 1.1.
+
+`/config` reports the resolved backend, the certificate, `Request.IsHttps` and the negotiated ALPN id —
+worth checking before trusting any number.
+
+Measured results, and the confounders that invalidated several attempts at measuring them, are in
+[`RESULTS.md`](RESULTS.md). Read it before running your own — a single-box loopback benchmark has more
+ways to lie than to tell the truth.
+
+Validated: single requests, HTTP/1.1 keep-alive, POST bodies, and large (250 KB, multi-segment)
+responses, over every Windows leg and over Kestrel/managed/kTLS on Linux.
+
+> **Measuring io_uring needs a real Linux host.** Under Docker Desktop the io_uring *data* path does not
+> work: the default seccomp profile blocks the syscalls outright (the backend silently falls back to
+> managed sockets — check `/config`), and with `--privileged` io_uring is selected but multishot receive
+> yields no completions on the WSL2 kernel. The kTLS leg happens to survive because it drives the socket
+> through `POLL` + `SSL_read`/`SSL_write` rather than io_uring's receive path.
+
+> **Note (2026-07-26):** everything below was investigated while this demo was inadvertently capped at
+> ~2,000 rps by per-request `Information` logging (no `appsettings.json`, so
+> `Hosting.Diagnostics` logged every request behind a console lock). That is fixed in `Program.cs`; the
+> app now reaches ~250k rps. The findings below are about *correctness* and still stand, but the
+> concurrency they were reproduced at was far lower than the same `xargs -P 8` command produces today —
+> worth re-running if you want confidence at current rates. See [`RESULTS.md`](RESULTS.md).
 
 ## RESOLVED — the ~4–8% RST truncation under concurrency (2026-07-25)
 

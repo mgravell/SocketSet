@@ -27,7 +27,8 @@ namespace SocketSets.Tls;
 public enum TlsCryptoMode
 {
     /// <summary>Userspace: this filter encrypts/decrypts each record itself (OpenSSL memory-BIO, or
-    /// SChannel/SslStream on Windows). The baseline, and the only mode Windows ever uses.</summary>
+    /// SSPI/SChannel on Windows). The baseline, and the only mode Windows ever uses — Windows has no kTLS
+    /// equivalent to offload to.</summary>
     Transform,
 
     /// <summary>kTLS: the kernel (or a capable NIC) does the bulk symmetric crypto after we hand it the
@@ -100,6 +101,12 @@ public abstract class TlsFilter : IDisposable
     /// <summary>True once <see cref="DriveHandshake"/> has returned <see cref="TlsHandshakeStatus.Completed"/>.
     /// Before this, only <see cref="DriveHandshake"/> is valid; after, only the data-phase methods.</summary>
     public bool HandshakeComplete { get; protected set; }
+
+    /// <summary>The ALPN protocol agreed during the handshake ("h2", "http/1.1", …), or null when ALPN was
+    /// not configured, the peer did not speak it, or nothing was selected. Set by the time
+    /// <see cref="DriveHandshake"/> reports <see cref="TlsHandshakeStatus.Completed"/> — which is before
+    /// the app's OnAccept/OnConnect fires, so a dispatcher can branch on it immediately.</summary>
+    public string? NegotiatedProtocol { get; protected set; }
 
     /// <summary>Who decrypts inbound records. <see cref="TlsCryptoMode.Transform"/> until (and unless) the
     /// filter enables kTLS RX during the handshake transition. Baseline + Windows: always Transform.</summary>

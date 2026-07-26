@@ -35,6 +35,18 @@ public abstract class Connection : IBufferWriter<byte>
     /// Backends store it here so the shared receive/send interception is uniform across transports.</summary>
     internal TlsFilter? Tls;
 
+    /// <summary>The negotiated ALPN protocol for the kTLS bypass path, where there is no
+    /// <see cref="Tls"/> filter to ask (the handshake ran on a raw <c>SSL*</c> bound to the fd). Set by the
+    /// shard at handshake completion.</summary>
+    internal string? KernelAlpn { get; set; }
+
+    /// <summary>
+    /// The ALPN protocol agreed during the TLS handshake ("h2", "http/1.1", …), or null for a plaintext
+    /// connection, or when ALPN was not configured / not negotiated. Valid from OnAccept/OnConnect onwards
+    /// — those fire only after the handshake completes — so protocol dispatch can happen right there.
+    /// </summary>
+    public string? NegotiatedProtocol => Tls?.NegotiatedProtocol ?? KernelAlpn;
+
     /// <summary>True once the app has seen this connection open (OnAccept/OnConnect fired); gates
     /// <see cref="SocketSet.OnClosed"/> so it pairs with an open and never fires for a connection the
     /// app never saw (e.g. a failed connect). Backend-managed on the owning IO thread.</summary>

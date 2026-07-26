@@ -1,5 +1,6 @@
 #if NET
 using System.Net;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -20,6 +21,12 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
     private readonly bool _verifyServer;
     private readonly bool _kernelOffload;
     private bool _disposed;
+
+    // Server-side ALPN. The selection callback is per-SSL_CTX, so the list has to live as long as the
+    // context and is handed to the callback as its `arg`: [int length][RFC 7301 list bytes].
+    private readonly object _alpnLock = new();
+    private nint _serverAlpn;
+    private IReadOnlyList<string>? _serverAlpnSource;
 
     /// <summary>True if built with kernel-offload (kTLS): the CTXs carry SSL_OP_ENABLE_KTLS, so a
     /// connection driven via the fd-bound path (see <see cref="CreateKernelSsl"/>) will hand keys to the
@@ -93,25 +100,113 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
             if (_verifyServer && SSL_set1_host(ssl, host) != 1)
                 throw Err("SSL_set1_host");
         }
+        ApplyClientAlpn(ssl, options.AlpnProtocols);
         return new OpenSslTlsFilter(ssl, rbio, wbio);
     }
 
     public override TlsFilter CreateServerFilter(TlsServerOptions options)
     {
         if (_serverCtx == 0) throw new InvalidOperationException("This provider has no server certificate; it is client-only.");
+        ConfigureServerAlpn(options.AlpnProtocols);
         var (ssl, rbio, wbio) = NewSsl(_serverCtx);
         SSL_set_accept_state(ssl);
         return new OpenSslTlsFilter(ssl, rbio, wbio);
+    }
+
+    /// <summary>Offer an ALPN list on a client SSL. OpenSSL copies the bytes, so nothing needs to outlive
+    /// the call. Note the inverted convention: SSL_set_alpn_protos returns 0 for SUCCESS.</summary>
+    private static void ApplyClientAlpn(nint ssl, IReadOnlyList<string>? protocols)
+    {
+        byte[]? list = AlpnProtocolList.Encode(protocols);
+        if (list is null) return;
+        fixed (byte* p = list)
+        {
+            if (SSL_set_alpn_protos(ssl, p, (uint)list.Length) != 0) throw Err("SSL_set_alpn_protos");
+        }
+    }
+
+    /// <summary>
+    /// Install the server-side ALPN selection callback on the shared SSL_CTX, with this provider's protocol
+    /// list as its argument. OpenSSL has no per-SSL equivalent of <c>SSL_CTX_set_alpn_select_cb</c>, so a
+    /// provider serves exactly one server list — presenting a different one is an error rather than a
+    /// silent last-writer-wins that would reconfigure connections already in flight.
+    /// </summary>
+    private void ConfigureServerAlpn(IReadOnlyList<string>? protocols)
+    {
+        if (protocols is null || protocols.Count == 0) return;
+
+        lock (_alpnLock)
+        {
+            if (_serverAlpn != 0)
+            {
+                if (!ReferenceEquals(_serverAlpnSource, protocols))
+                    throw new InvalidOperationException(
+                        "OpenSSL's ALPN selection callback is per-SSL_CTX, so one OpenSslTlsProvider supports one " +
+                        "server-side protocol list; use a separate provider for a different list.");
+                return;
+            }
+
+            byte[] list = AlpnProtocolList.Encode(protocols)!;
+            nint arg = Marshal.AllocHGlobal(sizeof(int) + list.Length);
+            *(int*)arg = list.Length;
+            list.CopyTo(new Span<byte>((byte*)arg + sizeof(int), list.Length));
+
+            SSL_CTX_set_alpn_select_cb(
+                _serverCtx,
+                (nint)(delegate* unmanaged[Cdecl]<nint, byte**, byte*, byte*, uint, nint, int>)&SelectAlpn,
+                arg);
+
+            _serverAlpn = arg;
+            _serverAlpnSource = protocols;
+        }
+    }
+
+    /// <summary>
+    /// OpenSSL's ALPN selection callback (native calling convention, so it must not throw). Picks by SERVER
+    /// preference: the first id WE list that the client also offered. <paramref name="arg"/> is the native
+    /// buffer built in <see cref="ConfigureServerAlpn"/>, which outlives every handshake — important,
+    /// because the selected id is returned as a POINTER INTO it.
+    /// </summary>
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int SelectAlpn(nint ssl, byte** selected, byte* selectedLen, byte* client, uint clientLen, nint arg)
+    {
+        if (arg == 0) return SSL_TLSEXT_ERR_NOACK;
+        int serverLen = *(int*)arg;
+        byte* server = (byte*)arg + sizeof(int);
+
+        for (int s = 0; s + 1 <= serverLen; s += server[s] + 1)
+        {
+            int n = server[s];
+            if (n == 0 || s + 1 + n > serverLen) break; // malformed; cannot happen via AlpnProtocolList
+            for (uint c = 0; c + 1 <= clientLen; c += (uint)client[c] + 1)
+            {
+                int m = client[c];
+                if (m == 0 || c + 1 + m > clientLen) break;
+                if (m != n) continue;
+                if (new ReadOnlySpan<byte>(server + s + 1, n).SequenceEqual(new ReadOnlySpan<byte>(client + c + 1, m)))
+                {
+                    *selected = server + s + 1;
+                    *selectedLen = (byte)n;
+                    return SSL_TLSEXT_ERR_OK;
+                }
+            }
+        }
+
+        // The client offered ALPN and we share nothing: RFC 7301 says fail the handshake rather than serve
+        // a protocol neither side agreed to.
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
     /// <summary>kTLS path (io_uring only): create an <c>SSL*</c> bound DIRECTLY to the socket fd (a socket
     /// BIO, not memory BIOs) with SSL_OP_ENABLE_KTLS active, so OpenSSL pushes the keys into the kernel at
     /// handshake completion. The caller drives SSL_do_handshake / SSL_read and frees the SSL. Returns the
     /// raw handle (this path deliberately bypasses <see cref="TlsFilter"/> — kTLS is a different I/O model).</summary>
-    internal nint CreateKernelSsl(int fd, bool client, string? targetHost)
+    internal nint CreateKernelSsl(int fd, bool client, string? targetHost, IReadOnlyList<string>? alpn)
     {
         nint ctx = client ? _clientCtx : _serverCtx;
         if (ctx == 0) throw new InvalidOperationException("kTLS: this provider has no " + (client ? "client" : "server") + " context.");
+        // This path bypasses CreateServerFilter, so the server's ALPN callback has to be installed here too.
+        if (!client) ConfigureServerAlpn(alpn);
         nint ssl = SSL_new(ctx);
         if (ssl == 0) throw Err("SSL_new(ktls)");
         SSL_set_fd(ssl, fd); // socket BIO, BIO_NOCLOSE — the shard still owns/closes the fd
@@ -125,6 +220,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
                 finally { Marshal.FreeCoTaskMem(hp); }
                 if (_verifyServer) SSL_set1_host(ssl, host);
             }
+            ApplyClientAlpn(ssl, alpn);
         }
         else
         {
@@ -185,7 +281,8 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
         if (_disposed) return;
         _disposed = true;
         if (_clientCtx != 0) SSL_CTX_free(_clientCtx);
-        if (_serverCtx != 0) SSL_CTX_free(_serverCtx);
+        if (_serverCtx != 0) SSL_CTX_free(_serverCtx); // frees the ctx before its alpn `arg` goes away
+        if (_serverAlpn != 0) { Marshal.FreeHGlobal(_serverAlpn); _serverAlpn = 0; }
     }
 
     /// <summary>

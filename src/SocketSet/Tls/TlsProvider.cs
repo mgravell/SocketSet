@@ -3,8 +3,8 @@ namespace SocketSets.Tls;
 /// <summary>
 /// Creates <see cref="TlsFilter"/> instances — the seam where the platform/implementation choice lives,
 /// so nothing above it (the shard loop, the connection) knows or cares whether TLS is backed by OpenSSL
-/// memory-BIOs (Linux, the kTLS-capable path), SChannel/SslStream (the Windows fallback), or a test
-/// double. One provider is configured per <see cref="SocketSet"/> that wants TLS; the shard asks it for a
+/// memory-BIOs (Linux, the kTLS-capable path), SSPI/SChannel (Windows, in-box, no SslStream involved), or a
+/// test double. One provider is configured per <see cref="SocketSet"/> that wants TLS; the shard asks it for a
 /// client filter (on <c>Connect</c>) or a server filter (on accept), once per connection.
 ///
 /// A connection is either raw (no filter) or filtered; the provider is the thing that decides "filtered,
@@ -22,7 +22,7 @@ public abstract class TlsProvider
     public abstract TlsFilter CreateServerFilter(TlsServerOptions options);
 
     /// <summary>Whether this provider can hand keys to the kernel/NIC (kTLS) after the handshake. False
-    /// for the Windows/SslStream fallback (no kTLS on Windows) and for any pure-userspace provider; a
+    /// for the Windows SChannel provider (Windows has no kTLS) and for any pure-userspace provider; a
     /// filter it produces will then keep both directions in <see cref="TlsCryptoMode.Transform"/>. Even
     /// when true, whether a given connection actually offloads is a per-connection, per-direction
     /// decision the filter makes at handshake completion (cipher support, options, socket capability).</summary>

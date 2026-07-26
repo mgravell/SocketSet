@@ -28,6 +28,7 @@ bool resp = false;          // >0: run the dumb RESP PING client against --host/
 string? tlsTrust = null;    // path to a PEM cert the TLS client should trust (external-server test)
 string tlsHost = "localhost"; // TargetHost for SNI + hostname verification
 bool ktls = false;          // use kernel-TLS (kTLS) offload (io_uring only)
+string[]? alpn = null;      // ALPN ids offered by BOTH ends (self-test: the overlap is the whole list)
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
 {
@@ -93,6 +94,31 @@ for (int i = 0; i < args.Length; i++)
         case "--ktls-trust" when i + 1 < args.Length: // kTLS client trusting this cert (external server)
             tlsTrust = args[++i];
             ktls = true;
+            break;
+
+        case "--alpn" when i + 1 < args.Length:
+            // Same list on both ends, so a self-test always has an overlap and should settle on the FIRST
+            // id (selection is server-preference). Order matters — that is the point of the check.
+            alpn = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            options.TlsClient.AlpnProtocols = alpn;
+            options.TlsServer.AlpnProtocols ??= alpn;
+            break;
+
+        case "--alpn-server" when i + 1 < args.Length:
+            // Give the server a DIFFERENT list from the client, which is what makes the two interesting
+            // cases observable: whose preference order wins, and what happens when there is no overlap.
+            options.TlsServer.AlpnProtocols =
+                args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            break;
+
+        case "--tls-schannel":
+            // Real Windows TLS via SSPI/SChannel — same self-signed loopback shape as --tls-ssl (server
+            // presents the cert, client trusts exactly it with SNI + hostname verification), but through
+            // the in-box engine instead of OpenSSL, and with no SslStream anywhere.
+            if (!OperatingSystem.IsWindows())
+                throw new PlatformNotSupportedException("--tls-schannel is Windows-only; use --tls-ssl elsewhere.");
+            options.Tls = SocketSets.Tls.SChannel.SChannelTlsProvider.CreateSelfSignedLoopback("localhost");
+            options.TlsClient.TargetHost = "localhost";
             break;
 #endif
 
@@ -291,6 +317,13 @@ if (!server && clientCount == 0)
     Console.WriteLine("                    reconnects race in-flight teardowns (stresses slot reuse / ABA)");
     Console.WriteLine("  --sockets N       sockets per shard (small = tight table = immediate slot reuse under churn)");
     Console.WriteLine("  --iocp / --rio    force the Windows IOCP / RIO backend (RIO is TCP-only; default auto-detects)");
+    Console.WriteLine("  TLS (self-signed loopback: server presents the cert, client trusts exactly it):");
+    Console.WriteLine("  --tls             no-crypto identity filter — plumbing test only, no security");
+    Console.WriteLine("  --tls-ssl         real TLS via OpenSSL memory BIOs (userspace transform)");
+    Console.WriteLine("  --tls-schannel    real TLS via Windows SSPI/SChannel (userspace transform; Windows only)");
+    Console.WriteLine("  --ktls            as --tls-ssl but offloading bulk crypto to the kernel (io_uring/Linux only)");
+    Console.WriteLine("  --alpn a,b        offer these ALPN ids from both ends (e.g. h2,http/1.1) and report what won");
+    Console.WriteLine("  --alpn-server a,b give the server a different list (preference / no-overlap testing)");
     Console.WriteLine("  scenario aliases (set workload-shape defaults; any later flag overrides them):");
     Console.WriteLine("  --latency         no-pipeline ping/pong, small messages (window=1, size=64) — per-op latency");
     Console.WriteLine("  --bandwidth       deep pipe, fat messages (window=64, size=4096) — saturation throughput");
@@ -548,4 +581,12 @@ if (clientCount > 0)
 {
     Console.WriteLine($"done: {set.RoundTripBytes:n0} round-trip bytes over {sw.Elapsed.TotalSeconds:0.0}s across {set.Connected} connection(s)");
     Console.WriteLine($"recv: {set.RecvOps:n0} completions, {set.RecvBytes:n0} bytes, avg {set.AvgRecvSize:n0} bytes/recv");
+    if (alpn is not null)
+    {
+        // Both ends must land on the same id — a one-sided result means the extension went out but the
+        // answer never came back (or was never read).
+        bool agreed = set.AlpnClient is not null && set.AlpnClient == set.AlpnServer;
+        Console.WriteLine($"alpn: offered=[{string.Join(",", alpn)}] client={set.AlpnClient ?? "(none)"} " +
+            $"server={set.AlpnServer ?? "(none)"} => {(agreed ? "PASS" : "FAIL")}");
+    }
 }

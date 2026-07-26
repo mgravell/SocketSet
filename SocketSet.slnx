@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/bench/">
+    <Project Path="AspNetDemo/AspNetDemo.csproj" />
     <Project Path="SmokeTest/SmokeTest.csproj" />
   </Folder>
   <Folder Name="/src/">
