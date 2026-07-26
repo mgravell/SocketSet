@@ -34,7 +34,11 @@ param(
     [string]$Duration = "8s",
     [string]$WarmupDuration = "3s",
     [int]$Connections = 64,
-    [int]$Shards = 16,
+    # Sweepable. Kestrel legs ignore it (its transport has no shards); SocketSet legs are expanded one
+    # leg per shard count, named e.g. "iocp+tls/s8". Worth sweeping because more shards is not obviously
+    # better here: each shard is a dedicated loop thread competing with the ThreadPool that runs Kestrel
+    # and the bridge pump, on the same pinned cores - whereas Kestrel's own transport adds no threads.
+    [int[]]$Shards = @(16),
     # First pass is host warm-up and is discarded, so this is scored passes + 1. Do not drop below 3.
     [int]$Repetitions = 4,
     [int]$WarmupPasses = 1,
@@ -100,13 +104,24 @@ function Set-Affinity([System.Diagnostics.Process]$Process, [int64]$Mask, [strin
 }
 
 # name | demo args | expected transport | expected tls
-$legs = @(
-    @{ Name = "kestrel";     Args = @("--kestrel");          T = "kestrel-sockets";   Tls = "off" }
-    @{ Name = "kestrel+tls"; Args = @("--kestrel", "--tls"); T = "kestrel-sockets";   Tls = "kestrel/sslstream" }
-    @{ Name = "iocp";        Args = @("--iocp");             T = "socketset/iocp";    Tls = "off" }
-    @{ Name = "iocp+tls";    Args = @("--iocp", "--tls");    T = "socketset/iocp";    Tls = "schannel (sspi)" }
-    @{ Name = "rio+tls";     Args = @("--rio", "--tls");     T = "socketset/rio";     Tls = "schannel (sspi)" }
-) | Where-Object { $_.Name -like $Filter }
+$base = @(
+    @{ Name = "kestrel";     Args = @("--kestrel");          T = "kestrel-sockets"; Tls = "off" }
+    @{ Name = "kestrel+tls"; Args = @("--kestrel", "--tls"); T = "kestrel-sockets"; Tls = "kestrel/sslstream" }
+    @{ Name = "iocp";        Args = @("--iocp");             T = "socketset/iocp";  Tls = "off" }
+    @{ Name = "iocp+tls";    Args = @("--iocp", "--tls");    T = "socketset/iocp";  Tls = "schannel (sspi)" }
+    @{ Name = "rio+tls";     Args = @("--rio", "--tls");     T = "socketset/rio";   Tls = "schannel (sspi)" }
+)
+
+# Expand SocketSet legs across the shard sweep; Kestrel legs appear once (no shards to vary).
+# Clone rather than "+": hashtable addition throws on a duplicate key, and Name is being replaced.
+$legs = @(foreach ($b in $base) {
+    if ($b.T -eq "kestrel-sockets") {
+        $c = $b.Clone(); $c.ShardCount = 0; $c
+    }
+    else {
+        foreach ($s in $Shards) { $c = $b.Clone(); $c.Name = "$($b.Name)/s$s"; $c.ShardCount = $s; $c }
+    }
+}) | Where-Object { $_.Name -like $Filter }
 
 if (-not $legs) { throw "no legs matched filter '$Filter'" }
 
@@ -115,10 +130,12 @@ function Invoke-Leg($Leg, [int]$Size, [int]$Rep) {
     $url = "${scheme}://127.0.0.1:$Port/payload?n=$Size"
     $argList = @($Leg.Args)
     # Shard count is meaningless for kestrel (its own transport) and is rejected as an unknown flag.
-    if ($Leg.T -ne "kestrel-sockets") { $argList += @("--shards", "$Shards") }
+    if ($Leg.ShardCount -gt 0) { $argList += @("--shards", "$($Leg.ShardCount)") }
     $argList += @("--port", "$Port")
 
-    $log = Join-Path $logDir "$($Leg.Name).$Size.r$Rep"
+    # Leg names carry a shard suffix like "iocp+tls/s16"; the slash would become a path separator.
+    $safe = $Leg.Name -replace '[\\/:*?"<>|]', '-'
+    $log = Join-Path $logDir "$safe.$Size.r$Rep"
     $proc = Start-Process -FilePath $demoExe -ArgumentList $argList -PassThru -NoNewWindow `
         -RedirectStandardOutput "$log.server.log" -RedirectStandardError "$log.server.err"
     Set-Affinity $proc $serverMask "server"
@@ -158,7 +175,7 @@ function Invoke-Leg($Leg, [int]$Size, [int]$Rep) {
 Write-Host ""
 Write-Host "TLS payload sweep: $($legs.Count) legs x $($Sizes.Count) sizes x $Repetitions passes (first $WarmupPasses discarded)" -ForegroundColor Cyan
 Write-Host "  host   : $cpuCount logical processors; server=0x$($serverMask.ToString('x')) client=0x$($clientMask.ToString('x'))"
-Write-Host "  load   : -c $Connections -d $Duration, keep-alive, GET /payload?n=<size>, shards=$Shards"
+Write-Host "  load   : -c $Connections -d $Duration, keep-alive, GET /payload?n=<size>, shards=$($Shards -join ',')"
 Write-Host "  csv    : $csvPath"
 Write-Host ""
 
