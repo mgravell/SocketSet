@@ -14,10 +14,10 @@ namespace SocketSets.Windows;
 /// bookkeeping (recv/send buffers, send serialization, teardown state).
 ///
 /// The out-of-band <see cref="System.Buffers.IBufferWriter{T}"/> write path is inherited from
-/// <see cref="WindowsOutboundConnection"/>: staged bytes are marshaled to the loop via
+/// <see cref="OutboundConnection"/>: staged bytes are marshaled to the loop via
 /// <see cref="SubmitOutbound"/> and sent through the normal Pending → send path.
 /// </summary>
-internal sealed class IocpConnection : WindowsOutboundConnection
+internal sealed class IocpConnection : OutboundConnection
 {
     public readonly IocpShard Shard;
 
@@ -76,7 +76,7 @@ internal sealed class IocpConnection : WindowsOutboundConnection
         if (Volatile.Read(ref Socket) != 0) Shard.SubmitClose(Slot, Volatile.Read(ref Generation));
     }
 
-    // --- out-of-band IBufferWriter path (accumulator in WindowsOutboundConnection) ---
+    // --- out-of-band IBufferWriter path (accumulator in OutboundConnection) ---
 
     protected override bool IsClosed => Volatile.Read(ref Socket) == 0;
 

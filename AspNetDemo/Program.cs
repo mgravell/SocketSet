@@ -73,6 +73,21 @@ app.MapPost("/echo", async (HttpRequest req) =>
 // Exercise multi-segment outbound (a response bigger than one buffer/chunk).
 app.MapGet("/big", (int n = 100_000) => Results.Text(new string('x', n)));
 
+// Benchmark endpoint: same as /big but served from a PRE-RENDERED byte[] per size. /big allocates a
+// fresh n-char string and UTF8-encodes it on every request, which at the sizes and rates used for a
+// message-size sweep measures the allocator and the GC rather than the transport.
+var payloads = new System.Collections.Concurrent.ConcurrentDictionary<int, byte[]>();
+app.MapGet("/payload", (int n = 1024) =>
+{
+    byte[] body = payloads.GetOrAdd(Math.Clamp(n, 1, 8 * 1024 * 1024), static size =>
+    {
+        var b = new byte[size];
+        b.AsSpan().Fill((byte)'x');
+        return b;
+    });
+    return Results.Bytes(body, "text/plain");
+});
+
 // What is actually running — hit this first to confirm the leg under test is the leg you meant.
 app.MapGet("/config", (HttpContext http) => Results.Json(new
 {

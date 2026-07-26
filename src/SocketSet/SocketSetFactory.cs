@@ -1,5 +1,6 @@
 using System.Net;
 #if NET
+using SocketSets.Epoll;
 using SocketSets.IoUring;
 using SocketSets.Windows;
 #endif
@@ -29,6 +30,14 @@ public abstract class SocketSetFactory
     public static SocketSetFactory WindowsRio => WindowsRioFactory.Instance;
 #endif
 
+#if NET
+    /// <summary>Linux epoll backend - the fallback for hosts where io_uring is unavailable (old kernel,
+    /// the io_uring_disabled sysctl, or a container seccomp profile that blocks it, which is Docker's
+    /// default). Readiness-based rather than completion-based, but keeps the single-owner loop-thread
+    /// shard model the other native backends use.</summary>
+    public static SocketSetFactory Epoll => EpollFactory.Instance;
+#endif
+
     /// <summary>Portable .NET managed-socket (SAEA) fallback.</summary>
     public static SocketSetFactory Managed => ManagedSocketFactory.Instance;
 
@@ -40,8 +49,12 @@ public abstract class SocketSetFactory
 
     private static SocketSetFactory Detect()
 #if NET
+        // epoll sits between io_uring and managed: on Linux without io_uring (old kernel, the disable
+        // sysctl, or a container seccomp profile) it keeps the native loop-thread shard model rather
+        // than dropping all the way to the callback-driven managed backend.
         => WindowsIocp.IsSupported ? WindowsIocp
          : IoUring.IsSupported ? IoUring
+         : Epoll.IsSupported ? Epoll
          : Managed;
 #else
         => Managed;

@@ -151,6 +151,88 @@ internal static unsafe partial class LibC
         return PinCurrentThreadToCpu(chosen);
     }
 
+    // =========================================================================
+    // epoll + readiness-mode socket calls (the epoll backend)
+    // -------------------------------------------------------------------------
+    // io_uring is a COMPLETION model: you submit a read and are told how many bytes arrived. epoll is a
+    // READINESS model: you are told the fd is readable and must then call recv() yourself, and handle the
+    // fact that it may still return EAGAIN (a spurious wake) or short reads.
+    // =========================================================================
+
+    internal const int EPOLL_CLOEXEC = 0x80000;
+    internal const int EPOLL_CTL_ADD = 1;
+    internal const int EPOLL_CTL_DEL = 2;
+    internal const int EPOLL_CTL_MOD = 3;
+
+    internal const uint EPOLLIN = 0x001;
+    internal const uint EPOLLOUT = 0x004;
+    internal const uint EPOLLERR = 0x008;
+    internal const uint EPOLLHUP = 0x010;
+    internal const uint EPOLLRDHUP = 0x2000; // peer closed its write half — a clean half-close, not an error
+    internal const uint EPOLLET = 0x80000000;
+
+    internal const int SOCK_NONBLOCK = 0x800;    // 04000 octal in the kernel headers
+    internal const int SOCK_CLOEXEC = 0x80000;   // 02000000 octal
+    internal const int SO_ERROR = 4;
+    internal const int EINPROGRESS = 115;
+    internal const int ECONNRESET = 104;
+    internal const int EPIPE = 32;
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int epoll_create1(int flags);
+
+    /// <summary>Register/modify/remove interest. <paramref name="ev"/> points at a struct epoll_event —
+    /// build it with <see cref="WriteEpollEvent"/>, never by blitting a managed struct (see the note there).</summary>
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int epoll_ctl(int epfd, int op, int fd, void* ev);
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int epoll_wait(int epfd, void* events, int maxevents, int timeout);
+
+    /// <summary>
+    /// SIZE OF struct epoll_event IS ARCHITECTURE-DEPENDENT. On x86-64 the kernel declares it
+    /// <c>__attribute__((packed))</c> so it is 12 bytes (uint32 events + uint64 data, no padding); every
+    /// other Linux architecture leaves it naturally aligned at 16 bytes. Blitting one managed struct on
+    /// both would silently corrupt the data word on one of them, so the layout is computed here and the
+    /// fields are read/written by offset.
+    /// </summary>
+    internal static readonly int EpollEventSize =
+        RuntimeInformation.ProcessArchitecture == Architecture.X64 ? 12 : 16;
+
+    private static readonly int EpollDataOffset = EpollEventSize == 12 ? 4 : 8;
+
+    internal static void WriteEpollEvent(void* p, uint events, ulong data)
+    {
+        *(uint*)p = events;
+        *(ulong*)((byte*)p + EpollDataOffset) = data;
+    }
+
+    internal static uint ReadEpollEvents(void* p, int index)
+        => *(uint*)((byte*)p + (index * EpollEventSize));
+
+    internal static ulong ReadEpollData(void* p, int index)
+        => *(ulong*)((byte*)p + (index * EpollEventSize) + EpollDataOffset);
+
+    /// <summary>accept4 rather than accept: SOCK_NONBLOCK|SOCK_CLOEXEC atomically, so there is no window
+    /// where an accepted fd is blocking or leaks across an exec.</summary>
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int accept4(int fd, void* addr, uint* addrlen, int flags);
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int connect(int fd, SockAddrIn* addr, uint addrlen);
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int connect(int fd, SockAddrUn* addr, uint addrlen);
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int getsockopt(int fd, int level, int optname, void* optval, uint* optlen);
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial nint recv(int fd, void* buf, nuint len, int flags);
+
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial nint send(int fd, void* buf, nuint len, int flags);
+
     /// <summary>Kernel sockaddr_in (16 bytes), IPv4.</summary>
     [StructLayout(LayoutKind.Sequential, Size = 16)]
     internal struct SockAddrIn

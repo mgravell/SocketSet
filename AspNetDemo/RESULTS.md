@@ -88,6 +88,64 @@ unmeasured**, and the handshake is exactly where SChannel, SslStream and OpenSSL
 exercises only the record layer. Measuring handshakes properly wants a bounded connection count with
 explicit port accounting, or a second machine.
 
+## Linux: epoll vs io_uring vs kTLS (2026-07-26)
+
+Run with `bench/run-matrix.sh` inside a Docker container (`--security-opt seccomp=unconfined`, without
+which Docker's seccomp blocks io_uring and the backend silently falls back to managed sockets). Same
+method as above: `-c 128 -d 10s`, reshuffled passes, first discarded as host warm-up, median of the rest.
+This is a **container on a WSL2 kernel over loopback** - weaker ground than the Windows numbers, and the
+spreads show it.
+
+### Plaintext - clean, and the answer is "no meaningful difference"
+
+| leg | med rps | spread | med p99 |
+|---|---:|---:|---:|
+| io_uring | 105,187 | 3.3% | 3,049µs |
+| kestrel | 102,788 | 1.6% | 3,379µs |
+| epoll | 102,453 | 3.5% | 3,186µs |
+
+Three passes each, all legs within ~3% of one another with ~3% run-to-run spread. **The epoll backend is
+at parity with both the completion backend and stock Kestrel.** io_uring leads by 2.6%, right at the edge
+of the noise. For a fallback, parity is the result you want.
+
+### TLS - four variants, and none of them are separable
+
+Six scored passes (seven run, first discarded), because four passes were not enough to tell.
+
+| leg | med rps | spread | min-max | med p99 |
+|---|---:|---:|---|---:|
+| kestrel+tls (SslStream) | 81,644 | 18.1% | 78.9k-93.7k | 4,413µs |
+| iouring+tls (OpenSSL userspace) | 80,830 | 37.4% | 63.3k-93.6k | 3,131µs |
+| epoll+tls (OpenSSL userspace) | 76,384 | 24.3% | 69.2k-87.8k | 4,214µs |
+| iouring+ktls (kernel offload) | 75,834 | 21.7% | 65.5k-82.0k | 3,893µs |
+
+Between-leg range **7.7%**; worst within-leg spread **37.4%**. Every leg's range overlaps every other's.
+
+**No ordering among these four is supported by this data** - including the one the medians suggest. Do
+not quote the ranking.
+
+The only thing that looks like it might be real is p99: `iouring+tls` sits ~1.3ms below the others across
+passes. Suggestive, not established.
+
+### A retraction
+
+An earlier four-pass run put `iouring+ktls` at 58,475 rps - far below the userspace TLS legs - and it was
+tempting to explain: the kTLS path deliberately bypasses io_uring's data ops, driving the socket through
+`POLL` + `SSL_read`/`SSL_write`, so it loses the batching that makes io_uring fast for 512-byte messages,
+and kernel crypto has to beat that syscall overhead.
+
+That explanation is plausible, fits the code, and **is not supported by the data.** With six scored
+passes kTLS lands at 75,834, within noise of everything else. The 58k figure was one arm of a bimodal
+distribution being read as a result. The mechanism may still be real; this measurement says nothing about
+it either way.
+
+### What would move this forward
+
+Not more passes in a container. A real Linux host, ideally two machines, and a message size large enough
+that per-record crypto dominates per-syscall overhead - at 512 bytes the transport and the TLS record
+layer are both drowned by fixed costs. Connection churn would also need to come back, since handshake
+cost is where these TLS stacks genuinely differ and it is entirely out of scope here.
+
 ## Confounders found
 
 Each produced *believable* numbers, which is the dangerous kind of wrong.

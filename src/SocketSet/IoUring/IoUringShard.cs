@@ -107,6 +107,11 @@ internal sealed class IoUringShard : SocketSetShard
     // request can't retract a slot that has since been closed and re-tenanted.
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
 
+    /// <summary>SS_URING_TRACE=1 dumps every completion to stderr. Read once, so the hot loop pays only a
+    /// never-taken branch. See the use site for why this is worth having.</summary>
+    private static readonly bool TraceCompletions =
+        Environment.GetEnvironmentVariable("SS_URING_TRACE") == "1";
+
     public unsafe IoUringShard(SocketSetOptions options)
     {
         _socketsPerShard = options.SocketsPerShard;
@@ -448,7 +453,12 @@ internal sealed class IoUringShard : SocketSetShard
             opcode = LibC.IORING_OP_RECV,
             fd = fd,
             ioprio = LibC.IORING_RECV_MULTISHOT,
-            len = (uint)_readBuffer.BufferSize,
+            // len MUST be 0 for a MULTISHOT recv: the size comes from the provided-buffer ring, and the
+            // kernel rejects a non-zero len outright (io_recv_prep: "opcode == IORING_OP_RECV && sr->len"
+            // -> -EINVAL). Passing the buffer size here - which reads naturally, and which a SINGLE-shot
+            // buffer-select recv would want as its maximum - made every recv fail with -22 and the
+            // connection close with no data ever delivered.
+            len = 0,
             flags = LibC.IOSQE_BUFFER_SELECT,
             buf_index = _readBuffer.GroupId, // buf_index aliases buf_group
             user_data = Pack(Op.Recv, slot),
@@ -1112,6 +1122,14 @@ internal sealed class IoUringShard : SocketSetShard
             int res = cqe->res;
             uint flags = cqe->flags;
             head++; // advance our local view before dispatching (handlers may submit)
+
+            // Opt-in CQE trace (SS_URING_TRACE=1). io_uring reports operation failures as a NEGATIVE
+            // cqe.res, not as a syscall error, so a mis-built SQE looks like a healthy submit followed by
+            // silence - every handler below just closes the connection. Without this the only symptom is
+            // "no data ever arrives", which is exactly how the -EINVAL on multishot recv above hid.
+            // Read once into a static: a predictable never-taken branch, not an env lookup per completion.
+            if (TraceCompletions)
+                Console.Error.WriteLine($"[cqe] shard={Shard} op={op} id={id} aux={aux} res={res} flags=0x{flags:x}");
 
             switch (op)
             {

@@ -62,11 +62,16 @@ ways to lie than to tell the truth.
 Validated: single requests, HTTP/1.1 keep-alive, POST bodies, and large (250 KB, multi-segment)
 responses, over every Windows leg and over Kestrel/managed/kTLS on Linux.
 
-> **Measuring io_uring needs a real Linux host.** Under Docker Desktop the io_uring *data* path does not
-> work: the default seccomp profile blocks the syscalls outright (the backend silently falls back to
-> managed sockets — check `/config`), and with `--privileged` io_uring is selected but multishot receive
-> yields no completions on the WSL2 kernel. The kTLS leg happens to survive because it drives the socket
-> through `POLL` + `SSL_read`/`SSL_write` rather than io_uring's receive path.
+> **io_uring in Docker needs `--security-opt seccomp=unconfined`.** Docker's default seccomp profile
+> blocks the io_uring syscalls, so the backend silently falls back to managed sockets — always check
+> `/config` to see what was actually selected rather than assuming. With seccomp relaxed it works normally
+> under Docker Desktop's WSL2 kernel.
+>
+> An earlier version of this note claimed the io_uring data path was broken there. That was wrong: the
+> symptom (zero completions) was a SocketSet bug — multishot recv was submitted with a non-zero `len`,
+> which the kernel rejects with `-EINVAL` — since fixed. `SS_URING_TRACE=1` dumps every completion, which
+> is how it was found; io_uring reports operation failures as a negative `cqe.res`, not a syscall error,
+> so a mis-built SQE looks exactly like silence.
 
 > **Note (2026-07-26):** everything below was investigated while this demo was inadvertently capped at
 > ~2,000 rps by per-request `Information` logging (no `appsettings.json`, so

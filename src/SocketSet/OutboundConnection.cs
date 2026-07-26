@@ -1,10 +1,10 @@
 #if NET // Windows IOCP/RIO backends; compiled out of the netfx fallback build.
 using System.Buffers;
 
-namespace SocketSets.Windows;
+namespace SocketSets;
 
 /// <summary>
-/// Shared out-of-band write accumulator for the Windows connection types (IOCP + RIO). Implements the
+/// Shared out-of-band write accumulator for the loop-thread backends (IOCP, RIO, epoll). Implements the
 /// <see cref="System.Buffers.IBufferWriter{T}"/> surface (GetSpan/GetMemory/Advance/Flush) over a
 /// managed <see cref="ArrayBufferWriter{T}"/>: the writing thread stages bytes, then <see cref="Flush"/>
 /// snapshots them and hands them to the owning IO loop (<see cref="SubmitOutbound"/>), which feeds them
@@ -19,7 +19,7 @@ namespace SocketSets.Windows;
 /// Single-writer until Flush (the IBufferWriter contract): the thread currently writing owns the
 /// accumulator; Flush detaches a private snapshot and marshals it, after which the loop owns it.
 /// </summary>
-internal abstract class WindowsOutboundConnection : Connection
+internal abstract class OutboundConnection : Connection
 {
     private ArrayBufferWriter<byte>? _ob;
 

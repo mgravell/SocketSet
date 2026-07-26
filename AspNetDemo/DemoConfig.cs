@@ -25,7 +25,7 @@ internal sealed class DemoConfig
     /// <see cref="SocketSetFactory"/> is an abstract class of static instances, not an enum — so it
     /// cannot be switched on, and "which one did the user pick" has to be tracked separately from
     /// "which instance did that resolve to".</summary>
-    public enum Backend { Auto, Managed, Iocp, Rio, IoUring }
+    public enum Backend { Auto, Managed, Iocp, Rio, IoUring, Epoll }
 
     public Backend Which { get; private set; } = Backend.Auto;
 
@@ -37,6 +37,7 @@ internal sealed class DemoConfig
         Backend.Iocp => SocketSetFactory.WindowsIocp,
         Backend.Rio => SocketSetFactory.WindowsRio,
         Backend.IoUring => SocketSetFactory.IoUring,
+        Backend.Epoll => SocketSetFactory.Epoll,
         _ => SocketSetFactory.Default,
     };
 
@@ -74,6 +75,7 @@ internal sealed class DemoConfig
                 case "--iocp": cfg.Which = Backend.Iocp; break;
                 case "--rio": cfg.Which = Backend.Rio; break;
                 case "--io-uring": cfg.Which = Backend.IoUring; break;
+                case "--epoll": cfg.Which = Backend.Epoll; break;
 
                 // --- TLS ---
                 case "--tls": cfg.Tls = true; break;
@@ -110,8 +112,8 @@ internal sealed class DemoConfig
             throw new ArgumentException("--ktls applies to the SocketSet transport; it cannot combine with --kestrel.");
         if (Which is Backend.Iocp or Backend.Rio && !OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("--iocp / --rio need Windows.");
-        if (Which == Backend.IoUring && !OperatingSystem.IsLinux())
-            throw new PlatformNotSupportedException("--io-uring needs Linux.");
+        if (Which is Backend.IoUring or Backend.Epoll && !OperatingSystem.IsLinux())
+            throw new PlatformNotSupportedException("--io-uring / --epoll need Linux.");
     }
 
     /// <summary>
@@ -144,6 +146,7 @@ internal sealed class DemoConfig
                 Backend.Iocp => "socketset/iocp",
                 Backend.Rio => "socketset/rio",
                 Backend.IoUring => "socketset/io_uring",
+                Backend.Epoll => "socketset/epoll",
                 // Name what Default actually resolved to, so a run is self-describing in the log.
                 _ => $"socketset/auto({Factory.GetType().Name.Replace("Factory", "").ToLowerInvariant()})",
             };
@@ -169,7 +172,8 @@ internal sealed class DemoConfig
         Console.WriteLine("    --kestrel        vanilla Kestrel sockets — the control leg (alias: --default-transport)");
         Console.WriteLine("    --managed        SocketSet's portable managed-socket backend");
         Console.WriteLine("    --iocp / --rio   force a Windows backend");
-        Console.WriteLine("    --io-uring       force the Linux backend");
+        Console.WriteLine("    --io-uring       force the Linux io_uring backend");
+        Console.WriteLine("    --epoll          force the Linux epoll backend (io_uring's fallback)");
         Console.WriteLine();
         Console.WriteLine("  tls (default: off)");
         Console.WriteLine("    --tls            terminate TLS in the transport (SChannel on Windows, OpenSSL on Linux),");

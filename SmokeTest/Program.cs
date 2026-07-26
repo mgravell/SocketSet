@@ -70,6 +70,11 @@ for (int i = 0; i < args.Length; i++)
         case "--iocp":
             options.Factory = SocketSetFactory.WindowsIocp;
             break;
+        case "--epoll":
+            // Linux readiness-based backend; the fallback when io_uring is unavailable (old kernel,
+            // the disable sysctl, or a container seccomp profile — Docker blocks io_uring by default).
+            options.Factory = SocketSetFactory.Epoll;
+            break;
         case "--tls":
             // Wrap connections in the no-crypto identity TLS filter — a wiring/plumbing test (a real
             // 1-RTT handshake gate + decrypt-in/encrypt-out, but the "crypto" is a passthrough copy).
@@ -317,6 +322,7 @@ if (!server && clientCount == 0)
     Console.WriteLine("                    reconnects race in-flight teardowns (stresses slot reuse / ABA)");
     Console.WriteLine("  --sockets N       sockets per shard (small = tight table = immediate slot reuse under churn)");
     Console.WriteLine("  --iocp / --rio    force the Windows IOCP / RIO backend (RIO is TCP-only; default auto-detects)");
+    Console.WriteLine("  --epoll           force the Linux epoll backend (io_uring's fallback)");
     Console.WriteLine("  TLS (self-signed loopback: server presents the cert, client trusts exactly it):");
     Console.WriteLine("  --tls             no-crypto identity filter — plumbing test only, no security");
     Console.WriteLine("  --tls-ssl         real TLS via OpenSSL memory BIOs (userspace transform)");

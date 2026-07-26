@@ -77,9 +77,13 @@ completion the shard API expects; on `EPOLLOUT`, drain the write queue), with `E
 handling moving into the loop and per-connection writable-interest registration (arm/disarm `EPOLLOUT`)
 that no other backend needs. That last part is the usually-underestimated bit.
 
-**Do first:** measure io_uring vs managed on a **real Linux host** with `--latency` and `--bandwidth`.
-If managed is within a few percent, the performance case is dead and the decision is purely
-architectural. This cannot be measured under Docker Desktop (see below).
+**Do first:** measure io_uring vs epoll vs managed with `--latency` and `--bandwidth`. If they land within
+a few percent, the performance case is dead and the decision is purely architectural. This IS measurable
+under Docker with `--security-opt seccomp=unconfined` (see below), though a loopback container shares all
+the caveats in `AspNetDemo/RESULTS.md`.
+
+**Status: the epoll backend is implemented** (`src/SocketSet/Epoll`) and passes the smoke matrix - echo,
+byte-exact verify, out-of-band send, poke, churn, AF_UNIX. TLS interception is not wired into it yet.
 
 ---
 
@@ -98,8 +102,21 @@ architectural. This cannot be measured under Docker Desktop (see below).
 - **`Connection.Close()` is abortive** and truncates a queued send. Harmless on the client-close and
   abort paths, but a server-side graceful close with a pending write (or a Redis client closing with an
   unsent command) wants a flush-then-close primitive. Pre-existing; see `AspNetDemo/README.md`.
-- **io_uring is unmeasurable under Docker Desktop.** Without `--privileged`, seccomp blocks it and the
-  backend silently falls back to managed sockets; with `--privileged` io_uring is selected but multishot
-  receive yields no completions on the WSL2 kernel. Needs a real Linux host or a proper WSL distro. Two
-  commit messages (`925db23`, `1b48f8a`) claim "verified io_uring in a Linux container" — that was
-  actually the managed backend, and the claim should be corrected.
+- **RESOLVED (2026-07-26): io_uring in Docker.** Two things were tangled together here, and the earlier
+  entry got the conclusion wrong.
+  1. Docker's default seccomp profile blocks the io_uring syscalls, so the backend silently falls back to
+     managed sockets. Fix: `--security-opt seccomp=unconfined` (`--privileged` also works but changes far
+     more than seccomp, which is what made this look kernel-related). Always check which backend was
+     actually selected rather than assuming.
+  2. With io_uring genuinely selected, every recv failed. That was *ours*, not the kernel's: multishot
+     recv was submitted with a non-zero `len`, which the kernel rejects with `-EINVAL`. Fixed. io_uring
+     now passes the full smoke matrix in a container, TLS included.
+
+  Worth carrying forward: **io_uring reports operation failures as a negative `cqe.res`, not as a syscall
+  error**, so a mis-built SQE presents as a healthy submit followed by silence - `strace` shows nothing
+  wrong. `SS_URING_TRACE=1` now dumps every completion, which is what found it. Bisecting against a
+  60-line raw-io_uring C probe (does NOP complete? does single-shot recv? multishot? with a buffer ring?)
+  is what separated "kernel cannot" from "we asked wrongly".
+
+  The claim in commits `925db23` / `1b48f8a` that io_uring was verified in a container was still wrong at
+  the time - those runs were the managed backend, because seccomp had hidden io_uring from the probe.

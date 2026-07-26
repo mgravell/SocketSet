@@ -362,7 +362,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
         Poke();
     }
 
-    /// <summary>Marshal an out-of-band flushed write onto the loop thread (from <see cref="WindowsOutboundConnection.Flush"/>).</summary>
+    /// <summary>Marshal an out-of-band flushed write onto the loop thread (from <see cref="OutboundConnection.Flush"/>).</summary>
     internal void SubmitFlush(uint slot, uint generation, byte[] data, int length)
     {
         _flush.Enqueue((slot, generation, data, length));

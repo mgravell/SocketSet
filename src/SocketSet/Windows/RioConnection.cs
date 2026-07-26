@@ -9,9 +9,9 @@ namespace SocketSets.Windows;
 /// reuse (ABA).
 ///
 /// The out-of-band <see cref="System.Buffers.IBufferWriter{T}"/> path is inherited from
-/// <see cref="WindowsOutboundConnection"/> (marshaled to the loop, sent via the normal Pending path).
+/// <see cref="OutboundConnection"/> (marshaled to the loop, sent via the normal Pending path).
 /// </summary>
-internal sealed class RioConnection : WindowsOutboundConnection
+internal sealed class RioConnection : OutboundConnection
 {
     public readonly WindowsRioShard Shard;
 
@@ -71,7 +71,7 @@ internal sealed class RioConnection : WindowsOutboundConnection
         if (Volatile.Read(ref Socket) != 0) Shard.SubmitClose(Slot, Volatile.Read(ref Generation));
     }
 
-    // --- out-of-band IBufferWriter path (accumulator in WindowsOutboundConnection) ---
+    // --- out-of-band IBufferWriter path (accumulator in OutboundConnection) ---
 
     protected override bool IsClosed => Volatile.Read(ref Socket) == 0;
 
