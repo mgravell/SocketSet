@@ -116,6 +116,48 @@ IOCP/RIO factoring below means writing it N times too.
 
 ## Factor the shared IOCP/RIO data path
 
+**Status: PARTLY DONE (2026-07-27), and the remaining scope is much smaller than this entry assumed.**
+
+Done:
+
+- `WindowsConnection` + `IWindowsShard` - identity, teardown state, send serialization and the
+  Close/IsClosed/SubmitOutbound trio, written once. (This entry claimed `WindowsOutboundConnection`
+  already existed as a shared base; it did not.)
+- `WindowsShardBase<TConn>` - the whole TLS block, outbound staging, the out-of-band flush pump, slot
+  release, and the options/slot-table/pool/TLS-scratch fields both shards declared identically.
+
+Net so far: the two shards went from 1331 + 1134 lines to 1154 + 957, against 269 lines of shared base -
+roughly 350 lines of duplication removed, plus ~150 from the connection types.
+
+**The generic-struct ops parameter is not needed.** The base asks for only `CloseClient` and
+`StartPendingSend`, both per-EVENT; the per-operation primitives (issue-a-send, arm-a-receive,
+drain-completions) never route through the base, so there is no virtual call on the hot path to
+devirtualise. `TConn` is generic purely so the slot table stays typed.
+
+**What must NOT be unified: the send state machine.** `CompleteWrite` and `StartPendingSend` differ by 39
+and 25 lines because IOCP has a send page array and RIO cannot have one - Windows caps
+`maxSendDataBuffers` at 1. This entry was written when the two were near-identical; they diverged when
+IOCP got scatter-gather. Forcing them back together would mean giving RIO a shape the OS refuses.
+
+**What is left**, all in the control plane, and all *near*-identical rather than identical - so each wants
+reading before moving, not a mechanical lift:
+
+| method | lines differing |
+|---|---|
+| `BeginTls`, `FailSend`, `SendResponse` | 2-3 |
+| `SubmitSendBuffer`, `HandleSend` | 5-8 |
+| `CloseClient`, `DrainCrossThread`, `TryFinalize` | 9-10 |
+| `Poke` | 12 |
+| listen/accept/connect (`Listen`, `ListenHandle`, `StartAccept`, `PostAccept`, `HandleAccept`, `StartConnect`, `HandleConnect`, `AdoptAccepted`) | not yet diffed |
+
+The differences are mostly RIO's extra teardown bookkeeping (`Rq`, `Commit*`) and IOCP's inline-completion
+path (`SkipOnSuccess`, `QueueInline`). Worth doing, but the easy 500 lines are already gone and what
+remains needs judgement per method.
+
+---
+
+*Original analysis follows.*
+
 **Status:** proposed, not started.
 
 `IocpShard` and `WindowsRioShard` have evolved in parallel and are now largely the same code. Measured
