@@ -28,24 +28,22 @@ the kernel rejects with `-EINVAL`, so *every* recv failed silently); scatter-gat
 response left as 64 sequential `WSASend`s. Issuing one call with up to 64 `WSABUF`s gave **+133% at 16KB
 and +162% at 256KB**, validated with `bench/Compare-Commits.ps1`. See `AspNetDemo/RESULTS.md`.
 
-**RIO's large-payload gap is real but has no cheap fix.** RIO *leads* IOCP at 512B (142.7 vs 138.0 MiB/s)
-and trails it **2.5x at 16KB** (1,521 vs 3,741) and **2.2x at 256KB** (2,052 vs 4,483), because its send
-is still quantised to one write page. The obvious fix - port IOCP's scatter-gather - was attempted on
-2026-07-27 and **is impossible**: Windows caps `RIOCreateRequestQueue`'s `maxSendDataBuffers` at 1 and
-returns WSAEINVAL for anything higher. The viable alternative is multiple *outstanding* single-buffer
-sends, which is a different and larger change. See item 0 before picking this up.
+**The biggest win now on the table: give RIO a bigger write page.** RIO trails IOCP 2.2-2.5x at >=16KB
+because its send is quantised to one write page, and unlike IOCP it cannot scatter-gather (Windows caps
+`maxSendDataBuffers` at 1 - attempted and refuted 2026-07-27). But page size alone recovers all of it and
+more: at a 64KB page RIO goes **2,404 -> 10,969 MiB/s at 256KB (4.68x)** and **1,643 -> 4,449 at 16KB
+(2.7x)**, with no penalty at 512B, and ends up faster than IOCP at *every* payload. Not yet a default
+change - the blocker is pool sizing and the fact that pool exhaustion currently drops connections. See
+items 0 and 0b.
 
-**In flight and UNMEASURED:** `fa97dd4` makes the out-of-band flush snapshot rent from `ArrayPool`
-instead of allocating. Its A/B was contaminated by a power loss mid-run and is void. Re-run:
+**`fa97dd4` is now MEASURED and is the second-largest win in the project: +27.0% at 256KB**, +5.9% at
+16KB, nothing at 512B (disjoint ranges; `Compare-Commits.ps1`, 2026-07-27). Pooling the out-of-band flush
+snapshot matters because the old `ToArray()` allocated the whole response per flush, and past 85KB that
+is a **Large Object Heap allocation on every response**.
 
-```
-.\bench\Compare-Commits.ps1 -Before HEAD~1 -After HEAD     # (while fa97dd4 is HEAD)
-```
-
-**Run it at a LARGE payload.** Its own commit message pre-registers the interpretation - "if it moves
-throughput, allocation was the cost; if it does not, copies dominate" - but that question only has
-meaning where the copies are large. At 512B neither allocation nor copies matter, and a sweep dominated by
-small payloads would answer nothing. 256KB is the size that discriminates.
+Its pre-registered reading was "if it moves throughput, allocation was the cost; if it does not, copies
+dominate". It moved throughput, so **allocation was the cost and copies are not the constraint** - which
+is the finding that de-prioritises BYO-buffer. See item 2b.
 
 **Before trusting any measurement, read `bench/README.md`.** It documents the eight confounders that each
 produced clean-looking wrong numbers, and the noise floor (~6% between identical builds on this host).
@@ -314,11 +312,57 @@ from the IOCP one, not a port of it:
 - Teardown must reclaim every page still outstanding, not just page 0.
 - `RIO_MSG_DEFER` already batches the kernel kick, so K submissions still cost one commit.
 
-**Unknown until measured:** whether K deep single-buffer sends recover the 2.2-2.5x, or whether RIO's
-per-send cost means the win is smaller than IOCP's scatter-gather win. Worth a spike before a full
-implementation - and note the cheaper partial mitigation available today is simply a larger
-`BufferPageSize` for RIO, since one send is one page and page size is then the only lever (the
-2026-07-26 sweep put a 64KB page at 4.0x a 4KB page at 256KB, at the cost of waste at small payloads).
+#### MEASURED 2026-07-27: page size fixes it, and the deep-queue spike is not needed
+
+Page size is RIO's only lever, so it was swept against payload on the bare responder. Goodput MiB/s:
+
+| payload | rio p4k | rio p16k | rio p64k | iocp p4k | iocp p64k |
+|---|---:|---:|---:|---:|---:|
+| 512 B | 154.1 | 153.9 | **154.5** | 152.4 | 149.0 |
+| 16 KB | 1,642.9 | 2,967.6 | **4,448.9** | 4,357.0 | 4,255.6 |
+| 256 KB | 2,404.1 | 6,948.8 | **10,968.8** | 5,495.5 | 5,873.4 |
+
+**A 64KB page wins for RIO at every payload, monotonically, with no penalty at 512B** - 4.68x at 256KB
+and 2.7x at 16KB. IOCP is page-insensitive (+-2%), which is exactly what scatter-gather buys it. And with
+a large page RIO beats IOCP everywhere, inverting the standing: RIO was starved, not slow.
+
+So the deep-send-queue rewrite described above is **not needed** to close this gap. Do not build it.
+
+**But this is not yet a default change, and the blocker is not throughput.** Page size trades against
+pool depth. Shipped defaults are `SocketsPerShard` 4096 against `WriteBuffersPerShard` 1024 (4:1
+oversubscribed already); holding pinned memory constant at a 64KB page means ~64 buffers per shard, i.e.
+**64:1**. The sweep ran `-c 64` over 12 shards - about 5 connections per shard - so it never went near
+pool pressure.
+
+That is dangerous rather than merely slow, because **write-pool exhaustion closes the connection**
+(`CloseClient` in `SendResponse` and `StartPendingSend`) instead of queueing. See item 0b.
+
+**To land this:**
+
+1. Measure high connections-per-shard at a 64KB page and find where the pool goes dry.
+2. Decide the memory budget explicitly - 64KB x 1024 buffers is 64MB per shard, x12 shards is 768MB, so
+   constant-memory means fewer buffers and constant-buffers means much more memory. One of them has to give.
+3. Make `BufferPageSize` effectively **per-backend** (RIO large, IOCP small) rather than one global
+   constant, since the matrix shows they want opposite things.
+4. Sweep past 64KB - RIO is still improving monotonically at the top of the range, so the peak is unknown.
+5. `AspNetDemo` has no `--page` option, so none of this reaches the bridged numbers until it does.
+
+### 0b. Write-pool exhaustion closes the connection instead of applying backpressure
+
+**Status: proposed, not started. Surfaced by item 0 on 2026-07-27.**
+
+`WindowsRioShard.SendResponse` and `StartPendingSend` both do
+`if (!_writeBuffer.TryLease(...)) { CloseClient(slot); return; }`, and `IocpShard` has the same shape. So
+running out of write buffers is a **dropped connection**, not a slow one.
+
+That is tolerable while pools are generously sized relative to sockets, and it becomes a live hazard the
+moment page size goes up and buffer counts come down (item 0). It also makes pool sizing a
+correctness-adjacent decision rather than a tuning knob, which is the wrong shape for something an
+operator is expected to set.
+
+Wanted: queue the send (the `Pending` machinery already exists for exactly this) or refuse the write and
+let the caller retry, rather than tearing down a healthy connection because a buffer was briefly
+unavailable. Note the drop is currently invisible in Release - `Debug.WriteLine` is compiled out.
 
 ---
 
@@ -357,7 +401,26 @@ across connections was the only lever available.
 
 ### 2b. BYO-buffer: caller-supplied (pinned) pipes, and killing the copies below them
 
-**Measure three things before designing anything (added 2026-07-27).** The 2026-07-27 sweep puts IOCP at
+> **DE-PRIORITISED 2026-07-27. The three measurements below were run, and they refute the premise.**
+>
+> The hypothesis was that the three copies dominate the large-payload gap. Two independent results say
+> otherwise:
+>
+> - **Removing one ALLOCATION and zero copies** (`fa97dd4`) moved 256KB by **+27%**.
+> - **Changing page size** moved RIO by **4.68x** at 256KB - and page size changes the number of segments,
+>   not the bytes copied. 256KB is 256KB either way.
+> - At a 64KB page RIO reaches 11,180 MiB/s against IOCP's best 6,083 while running an identical copy
+>   path. If copies dominated, they would converge, not sit 84% apart.
+>
+> **Allocation and per-operation cost dominate; per-byte copying does not.** Tier 1's allocation half is
+> already delivered by `fa97dd4`. Tier 2 buys the copies at the price of threading a completion signal
+> through every backend's send path - aimed at a cost that is not binding.
+>
+> Not dead, but not next. Revisit if a real-NIC run (where memory bandwidth is contended, unlike loopback)
+> shows a different shape, or if allocation/GC pressure turns out to matter for its own sake rather than
+> for throughput. Also note the bridge measured at 14-19%, not the ~47% assumed below.
+
+**Original reasoning, kept for the record.** The 2026-07-27 sweep puts IOCP at
 4,483 MiB/s against Kestrel's 11,489 at 256KB - a 61% gap, and the largest open number in
 `AspNetDemo/RESULTS.md`. The working hypothesis is that the three copies below dominate it. That is
 plausible (the ratio, 2.56x, is about what 2-3 extra copies per byte would cost) but **not established**,

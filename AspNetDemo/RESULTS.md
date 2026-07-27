@@ -219,6 +219,109 @@ Read with care. Kestrel's -37.6% is a real record-layer cost at a rate where the
 RIO's positive figure is entirely that effect and is not evidence that TLS is free. A backend has to be
 fast enough for the cipher to show up.
 
+## What actually costs at 256 KB: allocation and op-count, not copying (2026-07-27)
+
+Three measurements, run to decide whether to start the BYO-buffer work. They decided against it.
+
+### 1. `fa97dd4` validated: pooling the flush snapshot is worth +27% at 256 KB
+
+`bench/Compare-Commits.ps1 -Before fa97dd4~1 -After fa97dd4 -Shards 12`, isolated worktrees, back to back,
+median of 3 scored passes. This A/B had been outstanding since a power loss voided it on the old host.
+
+| payload | before | after | change | before passes | after passes |
+|---|---:|---:|---:|---|---|
+| 512 B | 152.1 | 152.4 | +0.2% | 152.4, 152.0, 152.2 | 152.1, 152.8, 152.9 |
+| 16 KB | 4,088.9 | 4,331.0 | **+5.9%** | 4083.5, 4100.1, 4094.4 | 4334.9, 4341.5, 4327.1 |
+| 256 KB | 4,332.1 | 5,501.7 | **+27.0%** | 4389.4, 4302.1, 4362.0 | 5578.3, 5425.1, 5686.5 |
+
+Ranges are disjoint at 16 KB and 256 KB and overlapping at 512 B - the size-dependence a real effect
+predicts, and far outside the noise floor.
+
+The mechanism: the old `WrittenSpan.ToArray()` allocated an array the size of the whole response on every
+flush. At 256 KB that is past the 85 KB threshold, so **every response allocated on the Large Object
+Heap**. Nothing at 512 B, moderate at 16 KB, dramatic at 256 KB.
+
+That commit pre-registered its own interpretation - *"if it moves throughput, allocation was the cost; if
+it does not, copies dominate"*. It moved throughput. **Allocation was the cost.**
+
+### 2. The Kestrel bridge costs 14-19% at 256 KB, not ~47%
+
+Bare SocketSet HTTP responder (`SmokeTest --http`, no Kestrel, no pipes) against the same transport
+behind the bridge, same client, pinning, payload and shard count:
+
+| backend | bare | bridged | bridge cost |
+|---|---:|---:|---:|
+| iocp/s12 | 5,538.6 | 4,483.4 | **19.0%** |
+| rio/s12 | 2,387.2 | 2,051.6 | **14.1%** |
+
+Consistent with the 23% measured on the old host, and not the ~47% share it was last estimated at. Worth
+fixing; not the main event.
+
+Incidentally this retires a caveat: `--page 4096` and the default differ only in pool depth (1024 vs 256
+buffers per shard), and they measured 2,387.7 vs 2,387.2 MiB/s - 0.02% apart. The pool-depth co-variation
+that confounded the original page sweep has no effect at this payload.
+
+### 3. Per-byte copying is not the binding constraint
+
+The out-of-band path copies three times per response, and the BYO-buffer proposal exists to remove them.
+Two independent results say those copies are not what costs:
+
+- **Page size moves RIO 4.68x** (2,387 -> 11,180 MiB/s at 256 KB, below). Page size changes the NUMBER of
+  segments, not the BYTES copied - 256 KB is 256 KB either way.
+- **Removing one allocation moves 256 KB by 27%** (above) while removing zero copies.
+- At a 64 KB page RIO does 11,180 against IOCP's best 6,083 while executing an identical copy path. If
+  copies dominated, those would converge rather than sit 84% apart.
+
+**Allocation and per-operation cost dominate this path; per-byte copying does not.** BYO-buffer Tier 2
+targets the copies specifically, at the price of a completion signal threaded through every backend's
+send path - so it is aimed at a cost this data says is not binding. Tier 1's allocation half is already
+delivered by `fa97dd4`.
+
+Two limits on that conclusion: this is loopback at one payload size, where memory bandwidth is not
+contended as it would be behind a real NIC; and BYO-buffer also removes allocation and GC pressure, which
+is a separate benefit these measurements say nothing about.
+
+### 4. Page size x payload: RIO wants a big page at EVERY size; IOCP does not care
+
+Bare responder, `--page` swept against payload, median of 3 scored passes. Goodput MiB/s:
+
+**RIO**
+
+| payload | 4 KB page | 16 KB page | 64 KB page |
+|---|---:|---:|---:|
+| 512 B | 154.1 | 153.9 | **154.5** |
+| 16 KB | 1,642.9 | 2,967.6 | **4,448.9** |
+| 256 KB | 2,404.1 | 6,948.8 | **10,968.8** |
+
+**IOCP**
+
+| payload | 4 KB page | 16 KB page | 64 KB page |
+|---|---:|---:|---:|
+| 512 B | **152.4** | 151.3 | 149.0 |
+| 16 KB | **4,357.0** | 4,276.5 | 4,255.6 |
+| 256 KB | 5,495.5 | **5,971.7** | 5,873.4 |
+
+**There is no trade-off for RIO.** 64 KB wins at every payload, monotonically, with no penalty at 512 B -
+the opposite of the pre-scatter-gather IOCP result that a big page loses on small responses. IOCP is now
+page-INSENSITIVE (+-2% at 512 B and 16 KB, 8.7% at 256 KB), which is what scatter-gather buys: the
+coalescing moved into the `WSABUF` array, so the page stopped being the unit of transfer. RIO has no
+such mechanism, so for RIO the page IS the unit of transfer and its size is everything.
+
+With a 64 KB page RIO beats IOCP at every payload (4,449 vs 4,357 at 16 KB; 10,969 vs 5,972 at 256 KB),
+inverting the current standing. RIO is not a weak backend; it has been starved.
+
+**This does NOT translate into a default change yet, for a reason the benchmark could not see.** Page
+size and pool depth trade against each other, and the harness holds total pinned memory constant by
+scaling buffer counts down as the page grows (`WriteBuffersPerShard = 4MB/page`). At the shipped defaults
+`SocketsPerShard` is 4096 against `WriteBuffersPerShard` 1024 - already 4:1 oversubscribed - and a 64 KB
+page at constant memory would make that **64:1**. This run used `-c 64` over 12 shards, about **5
+connections per shard**, so it never approached pool pressure.
+
+That matters more than a throughput regression would, because **write-pool exhaustion currently CLOSES
+the connection** (`CloseClient` in both `SendResponse` and `StartPendingSend`) rather than queueing or
+applying backpressure. Getting the sizing wrong drops connections rather than slowing them down. The
+missing measurement is high connections-per-shard at a large page.
+
 ## Not measured: connection establishment
 
 The churn shape (`-IncludeChurn`, `Connection: close`) is off by default. Windows has ~16k ephemeral ports
