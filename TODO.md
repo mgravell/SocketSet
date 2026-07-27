@@ -4,6 +4,45 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## START HERE (state as of 2026-07-27)
+
+Orientation for picking this up cold.
+
+**Backends.** io_uring + epoll (Linux), IOCP + RIO (Windows), managed (portable fallback). All except
+managed own one loop thread per shard; managed is callback-driven, which is why it alone needs a
+per-connection TLS gate. TLS is wired into every backend: SChannel via raw SSPI on Windows, OpenSSL
+(optionally kTLS) on Linux. ALPN works on both providers.
+
+**Recently landed, in order:** SChannel TLS without SslStream; ALPN; TLS on IOCP/RIO; the epoll backend
+(+ TLS); a fix that made io_uring work at all (multishot recv was submitted with a non-zero `len`, which
+the kernel rejects with `-EINVAL`, so *every* recv failed silently); scatter-gather sends on IOCP.
+
+**The one measured performance win:** IOCP sends were quantised to a single 4KB write page, so a 256KB
+response left as 64 sequential `WSASend`s. Issuing one call with up to 64 `WSABUF`s gave **+133% at 16KB
+and +162% at 256KB**, validated with `bench/Compare-Commits.ps1`. See `AspNetDemo/RESULTS.md`.
+
+**In flight and UNMEASURED:** `fa97dd4` makes the out-of-band flush snapshot rent from `ArrayPool`
+instead of allocating. Its A/B was contaminated by a power loss mid-run and is void. Re-run:
+
+```
+.\bench\Compare-Commits.ps1 -Before HEAD~1 -After HEAD     # (while fa97dd4 is HEAD)
+```
+
+Uncontaminated passes leaned flat-to-slightly-positive, which if confirmed is the *informative* answer:
+removing the allocation alone changes little, so **copies dominate** — go to item 2b below.
+
+**Before trusting any measurement, read `bench/README.md`.** It documents the eight confounders that each
+produced clean-looking wrong numbers, and the noise floor (~6% between identical builds on this host).
+
+**Direction of travel:** BYO-buffer, in measured steps — see 2b. The end goal is that a caller supplies
+the memory (ideally pinned/registered) and we stop copying into it. Accepting single-shot reads, or
+bypassing provided buffers, is an acceptable price for minimal copy. A robust fallback is required for
+backends that cannot take foreign memory at all — RIO takes only registered `BufferId`s, never addresses.
+
+---
+
+---
+
 ## Factor the shared IOCP/RIO data path
 
 **Status:** proposed, not started.
