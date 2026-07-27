@@ -28,6 +28,12 @@ the kernel rejects with `-EINVAL`, so *every* recv failed silently); scatter-gat
 response left as 64 sequential `WSASend`s. Issuing one call with up to 64 `WSABUF`s gave **+133% at 16KB
 and +162% at 256KB**, validated with `bench/Compare-Commits.ps1`. See `AspNetDemo/RESULTS.md`.
 
+**Confirmed end to end (2026-07-27):** through the Kestrel bridge, `--page 65536 --recv-buffer 4096` takes
+RIO from 2,023 to **6,348 MiB/s at 256KB (3.14x)** and 1,484 to **3,735 at 16KB (2.52x)**, closing the gap
+to stock Kestrel from 82% to 43.6% and to within 5.8% at 16KB — and tuned RIO then beats tuned IOCP at both
+sizes. No data-path code changed. It is still not the default: see items 0 and 0b for the pool-sizing and
+connection-dropping caveats that have to be settled first.
+
 **The biggest win now on the table: give RIO a bigger write page.** RIO trails IOCP 2.2-2.5x at >=16KB
 because its send is quantised to one write page, and unlike IOCP it cannot scatter-gather (Windows caps
 `maxSendDataBuffers` at 1 - attempted and refuted 2026-07-27). But page size alone recovers all of it and
@@ -580,8 +586,13 @@ mode already costs.
 
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 
-**Status: designed, not started. This is where the bridge cost is actually recovered** - phase 1 measured
-at parity (above), so everything below is the part that pays.
+**Status: designed, not started. Now the highest-value item on this list, with a measured target.**
+
+Phase 1 measured at parity (above), so everything below is the part that pays — and the end-to-end run on
+2026-07-27 says how much. Bare tuned RIO does 11,030 MiB/s at 256KB; through the Kestrel bridge it does
+6,348. **The bridge costs ~42% on the best configuration**, up from the 14-19% measured the same day on the
+untuned one. The bridge did not get worse; the transport got fast enough to expose it. That 42% is what
+zero-copy is aiming at, and it is measured rather than assumed.
 
 IOCP is the right first driver because the shape already fits: its send
 path takes a `WSABUF` ARRAY, and a `ReadOnlySequence<byte>` is exactly an array of segments. Outbound

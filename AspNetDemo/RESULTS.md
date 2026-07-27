@@ -365,6 +365,39 @@ than close) rather than being papered over by a page-size change. The knobs are 
 `SmokeTest` and `AspNetDemo` both take `--page` / `--recv-buffer` / `--write-buffers`, and `/config`
 reports them so a harness can verify the setting actually took.
 
+## End to end: the tuning survives the bridge, and moves the bottleneck (2026-07-27)
+
+Everything above measures the bare responder or an isolated A/B. This is the full path — Kestrel over the
+SocketSet transport, `/payload`, 12 shards, `-c 64`, median of 3 scored passes, each leg verified through
+`/config`. "tuned" is a 64 KB send page with a 4 KB receive buffer; nothing else differs.
+
+| payload | kestrel | iocp/default | iocp/tuned | rio/default | **rio/tuned** |
+|---|---:|---:|---:|---:|---:|
+| 512 B | 146.5 | 135.2 | 133.8 | 141.1 | 141.8 |
+| 16 KB | 3,963.0 | 3,403.5 | 3,529.2 | 1,484.4 | **3,734.7** |
+| 256 KB | 11,259.4 | 4,472.1 | 4,766.8 | 2,023.1 | **6,348.5** |
+
+**The tuning is not lost to the bridge.** RIO at 256 KB goes 2,023 -> 6,348 MiB/s (**3.14x**) and at 16 KB
+1,484 -> 3,735 (**2.52x**). Tuned RIO beats tuned IOCP at both sizes, having been the worst leg in the file
+that morning. IOCP gains only ~6%, which is the expected result — scatter-gather already made it
+page-insensitive.
+
+Against stock Kestrel, RIO closes from **82% behind to 43.6% behind** at 256 KB, and to within **5.8%** at
+16 KB. No data-path code changed; this is `--page 65536 --recv-buffer 4096`.
+
+The 512 B row is saturation-bound (~300k rps ceiling, see above) and ranks nothing.
+
+### The bottleneck moved to the bridge
+
+Bare tuned RIO measured **11,030** MiB/s at 256 KB (page x payload matrix above); bridged it is **6,348**.
+So the Kestrel bridge now costs about **42%** on the fastest configuration, against the 14-19% measured the
+same day on the untuned one. Nothing about the bridge changed — the transport got fast enough that the
+bridge became the binding constraint.
+
+This is the second time in this file that fixing a transport bottleneck promoted the bridge to the top of
+the list, and it is the number that should drive what happens next: the caller-supplied-pipe work
+(`TODO.md` item 2b) now has a measured 42% target on the best configuration rather than a speculative one.
+
 ## Not measured: connection establishment
 
 The churn shape (`-IncludeChurn`, `Connection: close`) is off by default. Windows has ~16k ephemeral ports
