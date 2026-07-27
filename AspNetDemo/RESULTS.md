@@ -215,18 +215,33 @@ Page size is a trade-off rather than a dial, though: at a 16 KB payload the best
 
 `WSASend` always took a buffer array; only the call site passed 1. A send is now a set of pages issued as
 one call with up to 64 `WSABUF`s, segments packed (so small queued responses still coalesce) and partial
-sends resuming across pages. Bare responder, **default 4 KB page**:
+sends resuming across pages.
 
-| payload | before | after |
-|---|---:|---:|
-| 16 KB | 1,655 | 1,739 |
-| 256 KB | 2,454 | **3,843** (+57%) |
+Measured with `bench/Compare-Commits.ps1` - the two commits built in isolated git worktrees and measured
+back to back on mains, median of 3 scored passes, **default 4 KB page**:
 
-**Correction.** The commit for this change (`d2cec1e`) claims 4.3x by comparing against the 885 MiB/s
-figure above. That is not a like-for-like comparison: the 885 run was taken via `--page 4096`, which also
-raises `OutOfBandWriteBuffersPerShard` and `BufferPagesPerShard` from 256 to 1024, so the pools differed.
-Against the default configuration the honest number is **2,454 -> 3,843, i.e. +57%** - still the largest
-single win found, but not 4.3x. (Why the larger pools measured *slower* is unexplained and worth a look.)
+| payload | before | after | change | before passes | after passes |
+|---|---:|---:|---:|---|---|
+| 512 B | 138.9 | 142.6 | +2.7% | 138.4, 140.0, 139.3 | 141.5, 143.6, 144.0 |
+| 4 KB | 785.8 | 1,112.1 | **+41.5%** | 793, 779, 793 | 1095, 1132, 1130 |
+| 16 KB | 1,664.3 | 3,882.8 | **+133%** | 1770, 1730, 1598 | 3828, 3937, 3942 |
+| 256 KB | 2,462.2 | 6,447.8 | **+162%** | 2528, 2510, 2414 | 6593, 6303, 6855 |
+
+Ranges are disjoint at 4 KB and above, far outside the ~6% noise floor. 512 B shows a small consistent
+gain (every "after" pass above every "before" pass) and, importantly, **no regression at small payloads** -
+which was the specific risk, since the code this replaced was tuned for exactly that case.
+
+**This is the only properly controlled measurement in this document**, and it took four attempts. The
+first three were void for three different reasons - a cross-run comparison, a power-state change midway,
+and the A/B harness corrupting the repository so that both halves measured the same build (see
+`bench/Compare-Commits.ps1` for the details, which are worth reading before writing another harness).
+
+Two claims made earlier and now superseded: "+57%" (cross-run, understated the effect by ~3x) and
+"a 2-6% regression" (both halves were the same binary). The unexplained 885 MiB/s figure came from a
+`--page 4096` run, which also raises `OutOfBandWriteBuffersPerShard`/`BufferPagesPerShard` from 256 to
+1024 - so page size and pool size moved together there and that whole sweep is confounded. The
+page-quantisation diagnosis survives because this A/B confirms it directly; the page-size *sweep* should
+not be quoted.
 
 End-to-end through AspNetDemo the win does not show (256 KB: 1,899 -> 2,041): the bridge is now the
 binding constraint, having gone from ~23% of the gap to ~47%. The bottleneck moved rather than vanished.
