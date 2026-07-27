@@ -30,7 +30,7 @@ namespace SocketSets.Windows;
 ///  - close: <c>closesocket</c> aborts the pending recv/send; the slot is held (defer-recycle) until
 ///    those completions drain, so no stale completion lands on a re-tenanted slot.
 /// </summary>
-internal sealed unsafe class IocpShard : SocketSetShard
+internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
 {
     private const int EntryBatch = 128;              // completions dequeued per GetQueuedCompletionStatusEx
     private const int AddrStride = 128;              // per-address storage for AcceptEx (covers sockaddr_in and _un)
@@ -362,15 +362,15 @@ internal sealed unsafe class IocpShard : SocketSetShard
         Poke();
     }
 
-    /// <summary>Marshal a close request onto the loop thread (from <see cref="IocpConnection.Close"/>).</summary>
-    internal void SubmitClose(uint slot, uint generation)
+    /// <summary>Marshal a close request onto the loop thread (from <see cref="WindowsConnection.Close"/>).</summary>
+    public void SubmitClose(uint slot, uint generation)
     {
         _closes.Enqueue((slot, generation));
         Poke();
     }
 
     /// <summary>Marshal an out-of-band flushed write onto the loop thread (from <see cref="OutboundConnection.Flush"/>).</summary>
-    internal void SubmitFlush(uint slot, uint generation, byte[] data, int length)
+    public void SubmitFlush(uint slot, uint generation, byte[] data, int length)
     {
         _flush.Enqueue((slot, generation, data, length));
         Poke();

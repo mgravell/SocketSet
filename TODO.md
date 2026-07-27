@@ -616,11 +616,26 @@ adequate for correctness and weak for performance.
 
 ## Check UDS on Windows
 
-**Status: unverified, suspected broken. Raised 2026-07-27.**
+**Status: RAISED as suspected-broken, then TESTED and it WORKS (2026-07-27).**
 
-AF_UNIX is solid on Linux (io_uring and epoll both exercise it in the smoke matrix). On Windows it has
-never been observed working, and it may never have been exercised - the claim has not been tested either
-way, which is the point of this item.
+Evidence, IOCP backend, filesystem path under `%TEMP%`:
+
+- `SmokeTest --iocp -s -c 4 -t 6 -u <path>` reports `transport=uds`, listens on the path, creates the
+  socket file, opens 4 client connections and exits 0.
+- `SmokeTest --iocp --verify-echo 1048576 -u <path>` round-trips 1,048,576/1,048,576 bytes with zero
+  mismatches on either leg.
+
+Checked deliberately, because "the test passed" is not evidence when the flag might have been ignored and
+the run silently fallen back to TCP - the banner and the socket file are what confirm it did not.
+
+**Still untested on Windows**, so the item stays open with a narrower scope:
+
+- TLS over UDS (SChannel), and the out-of-band `--verify` path over UDS.
+- Churn/teardown over UDS: stale socket files at bind, and whether the shared cleanup helper is on the
+  Windows path at all.
+- That `@abstract` names are rejected with a clear error rather than silently creating a file called
+  `@name` - the abstract namespace is Linux-only.
+- Path-length limits (`sockaddr_un` is ~108 bytes; a long `%TEMP%` could overflow it).
 
 Scope, so the test is not run against the wrong thing:
 

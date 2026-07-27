@@ -24,7 +24,7 @@ namespace SocketSets.Windows;
 ///
 /// BLIND: written on Linux, validated on Windows. Compiles everywhere; only ever runs on Windows.
 /// </summary>
-internal sealed unsafe class WindowsRioShard : SocketSetShard
+internal sealed unsafe class WindowsRioShard : SocketSetShard, IWindowsShard
 {
     private const int EntryBatch = 128;               // IOCP completions per GQCSEx (accept/connect + RIO notify)
     private const int RioBatch = 256;                 // RIO completions per RIODequeueCompletion pass
@@ -373,8 +373,8 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
     }
 
     internal void EnqueueInbound(nint socket, object? token) { _incoming.Enqueue((socket, token)); Poke(); }
-    internal void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
-    internal void SubmitFlush(uint slot, uint generation, byte[] data, int length) { _flush.Enqueue((slot, generation, data, length)); Poke(); }
+    public void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
+    public void SubmitFlush(uint slot, uint generation, byte[] data, int length) { _flush.Enqueue((slot, generation, data, length)); Poke(); }
 
     private void DrainCrossThread()
     {
