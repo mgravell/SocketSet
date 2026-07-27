@@ -30,7 +30,7 @@ namespace SocketSets.Windows;
 ///  - close: <c>closesocket</c> aborts the pending recv/send; the slot is held (defer-recycle) until
 ///    those completions drain, so no stale completion lands on a re-tenanted slot.
 /// </summary>
-internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
+internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 {
     private const int EntryBatch = 128;              // completions dequeued per GetQueuedCompletionStatusEx
     private const int AddrStride = 128;              // per-address storage for AcceptEx (covers sockaddr_in and _un)
@@ -77,8 +77,6 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
     }
 
     // --- slot table (1-based ids; id 0 == "none"). Connections are pooled and reused. ---
-    private readonly IocpConnection[] _conns;
-    private SlotAllocator _slots; // loop-local free-slot allocator (claim/free, single-writer). NOT readonly:
                                   // it's a mutable struct, so a readonly field would mutate a throwaway copy.
     // Connect requests marshaled from the caller thread to the loop, which claims the slot + posts
     // ConnectEx — so the slot table stays single-writer. The socket is created caller-side (thread-agnostic
@@ -87,19 +85,9 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
     private readonly ConcurrentQueue<(nint Socket, EndPoint Endpoint, object? Token)> _pendingConnects = [];
 
     // --- options snapshot ---
-    private readonly int _socketsPerShard;
-    private readonly int _writeCount;
-    private readonly int _writeBufSize;
-    private readonly int _recvCount;
-    private readonly int _recvBufSize;
     private readonly int _opCount;
-    private readonly int _listenBacklog;
-    private readonly int _acceptConcurrency;
 
     // --- created on the loop thread in OnInitialize() ---
-    private nint _port;
-    private PinnedWriteBufferPool _writeBuffer;      // IO-thread send pool (out-of-band writes ride this too, via Pending)
-    private PinnedWriteBufferPool _recvBuffer;       // one buffer per live connection
     private Win32.OVERLAPPED_ENTRY* _entries;        // GQCSEx batch buffer
     private IocpOp* _ops;                            // op-context slab: recv=[2i], send=[2i+1] per slot i
     private byte* _connectAddrs;                     // per-slot stable sockaddr storage for ConnectEx
@@ -108,9 +96,6 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
     // TLS scratch, shared by every connection on this shard (null unless Options.Tls is set). Safe to share
     // because a shard has ONE loop thread and a filter is only ever touched from it — the managed backend
     // needs a per-connection gate precisely because it has no such thread.
-    private PooledBufferWriter? _tlsPlain;   // decrypt target
-    private PooledBufferWriter? _tlsCipher;  // encrypt scratch
-    private PooledBufferWriter? _tlsCtrl;    // handshake / control-record output
 
     // Accept states (one per listener). Only mutated under _acceptGate; iterated at shutdown (loop stopped).
     private readonly List<AcceptState> _acceptStates = [];
@@ -136,18 +121,9 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
     private const int InlineBurst = 512;
     private readonly Queue<InlineOp> _inline = new();
 
-    public IocpShard(SocketSetOptions options)
+    public IocpShard(SocketSetOptions options) : base(options)
     {
-        _socketsPerShard = options.SocketsPerShard;
-        _writeCount = options.WriteBuffersPerShard;
-        _writeBufSize = options.BufferPageSize;
-        // Receive buffers are per-socket and held for the connection lifetime, so their size multiplies by
-        // SocketsPerShard; the send page does not. See SocketSetOptions.ReceiveBufferSize.
-        _recvBufSize = options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize;
-        _recvCount = _socketsPerShard;         // one recv buffer per connection (recv is always armed)
         _opCount = _socketsPerShard * 2;       // recv + send per connection
-        _listenBacklog = options.ListenBacklog;
-        _acceptConcurrency = Math.Max(1, Math.Min(options.AcceptConcurrency, _socketsPerShard));
         // Everything native is deferred to OnInitialize (loop thread); the ctor stays inert so the
         // factory can be constructed on any OS.
 
@@ -363,14 +339,14 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
     }
 
     /// <summary>Marshal a close request onto the loop thread (from <see cref="WindowsConnection.Close"/>).</summary>
-    public void SubmitClose(uint slot, uint generation)
+    public override void SubmitClose(uint slot, uint generation)
     {
         _closes.Enqueue((slot, generation));
         Poke();
     }
 
     /// <summary>Marshal an out-of-band flushed write onto the loop thread (from <see cref="OutboundConnection.Flush"/>).</summary>
-    public void SubmitFlush(uint slot, uint generation, byte[] data, int length)
+    public override void SubmitFlush(uint slot, uint generation, byte[] data, int length)
     {
         _flush.Enqueue((slot, generation, data, length));
         Poke();
@@ -409,21 +385,12 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
         return conn;
     }
 
-    // Roll back a loop-side claim whose connect/adoption couldn't be armed: publish the slot free, return
-    // it to the allocator, and release the reservation — the post-claim analogue of TryFinalize's tail
-    // (minus buffer cleanup, since nothing was armed). Loop thread only.
-    private void FreeSlot(IocpConnection conn)
-    {
-        Volatile.Write(ref conn.Socket, 0);
-        _slots.Free((int)(conn.Slot - 1));
-        ReleaseReservation();
-    }
 
     /// <summary>Begin tearing a connection down (loop thread). Idempotent. Fires OnClosed now, but does
     /// NOT free the slot yet — closesocket aborts the in-flight recv/send, and the slot is finalized
     /// only once those completions have drained (see <see cref="TryFinalize"/>), so no stale completion
     /// lands on a re-tenanted slot.</summary>
-    private void CloseClient(uint slot)
+    protected override void CloseClient(uint slot)
     {
         if (slot == 0) return;
         var conn = _conns[slot - 1];
@@ -1062,57 +1029,12 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
         }
     }
 
-    // Deliver a flushed out-of-band write (loop thread): chunk the bytes into write-page-sized Pending
-    // segments — exactly the shape the echo path already drains — then kick a send if idle. They queue
-    // behind any in-flight/queued echo, preserving stream order. Dropped if the slot was re-tenanted or
-    // its send half is closed.
-    private void PumpFlush(uint slot, uint generation, byte[] data, int len)
-    {
-        var conn = _conns[slot - 1];
-        if (conn.Generation != generation || conn.Socket == 0 || conn.Closing
-            || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
-            return;
 
-        if (conn.Tls is { } tls)
-        {
-            // Out-of-band writes are application plaintext; encrypt before staging. A flush cannot legally
-            // arrive before the handshake completes (the app has no Connection reference until the deferred
-            // open), so dropping one is strictly safer than letting plaintext reach the wire.
-            if (!tls.HandshakeComplete)
-            {
-                System.Diagnostics.Debug.WriteLine("TLS flush before handshake completion; dropped.");
-                return;
-            }
-            _tlsCipher!.Reset();
-            tls.ProcessOutbound(new ReadOnlySpan<byte>(data, 0, len), _tlsCipher);
-            StageOutbound(conn, _tlsCipher.WrittenSpan);
-        }
-        else
-        {
-            StageOutbound(conn, new ReadOnlySpan<byte>(data, 0, len));
-        }
-        if (!conn.SendBusy) StartPendingSend(conn, slot);
-    }
-
-    // Chunk bytes into write-page-sized pooled segments on Pending (the shape the echo path already
-    // drains). Page-sized chunks preserve the drain loops' "the first item always fits" invariant.
-    private void StageOutbound(IocpConnection conn, ReadOnlySpan<byte> data)
-    {
-        var pending = conn.Pending ??= new();
-        for (int off = 0; off < data.Length;)
-        {
-            int n = Math.Min(_writeBufSize, data.Length - off);
-            var buf = ArrayPool<byte>.Shared.Rent(n); // pooled staging (uniform with echo; returned on drain)
-            data.Slice(off, n).CopyTo(buf);
-            pending.Enqueue(new ArraySegment<byte>(buf, 0, n));
-            off += n;
-        }
-    }
 
     // Start draining Pending into freshly-leased write pages (precondition: !SendBusy). Used to kick an
     // out-of-band flush when the connection is otherwise idle; spills across pages exactly as
     // CompleteWrite does, so a large flush is one multi-buffer WSASend.
-    private void StartPendingSend(IocpConnection conn, uint slot)
+    protected override void StartPendingSend(IocpConnection conn, uint slot)
     {
         if (conn.Pending is not { Count: > 0 }) return;
         conn.SendPageCount = 0;
@@ -1161,109 +1083,10 @@ internal sealed unsafe class IocpShard : SocketSetShard, IWindowsShard
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmRecv(conn);
     }
 
-    // Feed one chunk to the handshake and queue whatever it emits (already TLS records — staged raw, not
-    // re-encrypted). Returns false if the connection was torn down.
-    private bool DriveTlsHandshake(IocpConnection conn, uint slot, ReadOnlySpan<byte> input)
-    {
-        _tlsCtrl!.Reset();
-        var status = conn.Tls!.DriveHandshake(input, conn.Socket, _tlsCtrl);
-        QueueCipher(conn, slot, _tlsCtrl.WrittenSpan); // may carry a fatal alert on failure — send it first
 
-        if (status == TlsHandshakeStatus.Faulted) { CloseClient(slot); return false; }
-        if (conn.Closing || conn.Socket == 0) return false; // QueueCipher tore it down (pool exhausted)
-        if (status == TlsHandshakeStatus.Completed) FireTlsOpen(conn, slot);
-        return !conn.Closing && conn.Socket != 0;
-    }
 
-    // Handshake complete: fire the deferred open and encrypt any greeting it produced.
-    private void FireTlsOpen(IocpConnection conn, uint slot)
-    {
-        // The write page here is only scratch for the greeting — the ciphertext goes out via Pending, so
-        // the page is released again rather than sent.
-        bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
-        conn.Opened = true; // app now sees it open → pairs with OnClosed
-        int sb;
-        if (conn.IsClient)
-        {
-            var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
-            Parent.OnConnect(ref ctx);
-            sb = ctx.SendBytes;
-        }
-        else
-        {
-            var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
-            Parent.OnAccept(ref ctx);
-            sb = ctx.SendBytes;
-        }
 
-        if (!leased) return;
-        if (sb > 0 && !conn.Closing && conn.Socket != 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
-            SendEncrypted(conn, slot, wp, sb);
-        _writeBuffer.Release(wi);
-    }
 
-    // Data phase inbound: decrypt, hand the plaintext to OnReceive, encrypt any response.
-    private bool DeliverReceiveTls(IocpConnection conn, uint slot, int bytes)
-    {
-        var tls = conn.Tls!;
-        byte* rp = _recvBuffer.Address(conn.RecvBuf);
-        var cipherIn = new ReadOnlySpan<byte>(rp, bytes);
-
-        if (!tls.HandshakeComplete)
-        {
-            if (!DriveTlsHandshake(conn, slot, cipherIn)) return false;
-            if (!tls.HandshakeComplete) return true; // still handshaking; keep receiving
-
-            // Just completed. Application data coalesced into the same segment as the peer's final
-            // handshake flight is already buffered INSIDE the engine — surface it now with an empty input,
-            // or it strands until a next recv that may never come. See TlsFilter.DriveHandshake.
-            cipherIn = default;
-        }
-
-        _tlsPlain!.Reset();
-        _tlsCtrl!.Reset();
-        var status = tls.ProcessInbound(cipherIn, TlsContentType.Ciphertext, _tlsPlain, _tlsCtrl);
-        QueueCipher(conn, slot, _tlsCtrl.WrittenSpan); // protocol replies (e.g. a TLS 1.3 KeyUpdate ack)
-
-        if (status == TlsInboundStatus.Faulted) { CloseClient(slot); return false; }
-        if (conn.Closing || conn.Socket == 0) return false;
-
-        int plainLen = _tlsPlain.WrittenCount;
-        if (plainLen > 0)
-        {
-            byte[] plain = _tlsPlain.Array;
-            fixed (byte* pp = plain)
-            {
-                var ctx = new SocketSet.ReceiveContext(conn, pp, plain.Length, plainLen);
-                Parent.OnReceive(ref ctx);
-                int rb = ctx.ResponseBytes;
-                if (rb > 0 && !conn.Closing && conn.Socket != 0
-                    && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
-                {
-                    SendEncrypted(conn, slot, pp, rb);
-                }
-            }
-        }
-
-        if (status == TlsInboundStatus.PeerClosed) { CloseClient(slot); return false; }
-        return !conn.Closing;
-    }
-
-    // Encrypt application plaintext into the outbound stream.
-    private void SendEncrypted(IocpConnection conn, uint slot, byte* plaintext, int len)
-    {
-        _tlsCipher!.Reset();
-        conn.Tls!.ProcessOutbound(new ReadOnlySpan<byte>(plaintext, len), _tlsCipher);
-        QueueCipher(conn, slot, _tlsCipher.WrittenSpan);
-    }
-
-    // Stage ciphertext on Pending and kick a send if the connection is idle.
-    private void QueueCipher(IocpConnection conn, uint slot, ReadOnlySpan<byte> cipher)
-    {
-        if (cipher.IsEmpty) return;
-        StageOutbound(conn, cipher);
-        if (!conn.SendBusy && !conn.Closing && conn.Socket != 0) StartPendingSend(conn, slot);
-    }
 
     private void ArmRecv(IocpConnection conn)
     {
