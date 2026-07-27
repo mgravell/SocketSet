@@ -150,10 +150,10 @@ cost is where these TLS stacks genuinely differ and it is entirely out of scope 
 
 Real hardware this time - no container, no WSL2 - so this is the strongest data in this file.
 
-> **Power state.** The host is an ASUS GZ302 (Strix Halo), where battery vs mains is a large and
-> *variable* difference in sustained power limit, not a few percent - so it has to be stated. Every figure
-> in this section was taken **on mains**. A later spot-check of small payloads (2026-07-27) was taken on
-> battery and is deliberately NOT recorded here; it is not comparable to anything below.
+> **Power state.** The host is a laptop, where battery vs mains is a large and *variable* difference in
+> sustained power limit rather than a few percent - so it has to be stated. Every figure in this section
+> was taken **on mains**. A later spot-check of small payloads (2026-07-27) ran on battery and is
+> deliberately NOT recorded here; it is not comparable to anything below.
 `bench/Run-TlsSizes.ps1`, `-c 64`, 16 shards, server pinned to logical CPUs 0-15, generator to 16-31,
 first pass discarded, median of the rest.
 
