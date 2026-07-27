@@ -68,6 +68,11 @@ internal sealed class DemoConfig
     /// rather than queueing.</summary>
     public int WriteBuffers { get; private set; }
 
+    /// <summary>BYO-buffer bridge: hand Kestrel's own pipes to the transport via ctx.UsePipe instead of
+    /// copying inbound and running an outbound pump in SocketSetConnection. Parallel option so the two can
+    /// be measured against each other on the same harness.</summary>
+    public bool ByoPipe { get; private set; }
+
     public string Scheme => Tls ? "https" : "http";
 
     private DemoConfig() { }
@@ -106,6 +111,7 @@ internal sealed class DemoConfig
                 case "--page" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pg): cfg.PageSize = pg; i++; break;
                 case "--recv-buffer" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rb): cfg.RecvBufferSize = rb; i++; break;
                 case "--write-buffers" when i + 1 < args.Length && int.TryParse(args[i + 1], out var wb): cfg.WriteBuffers = wb; i++; break;
+                case "--byo": cfg.ByoPipe = true; break;
 
                 case "-h":
                 case "--help": cfg.Help = true; break;
@@ -134,6 +140,8 @@ internal sealed class DemoConfig
             throw new PlatformNotSupportedException("--iocp / --rio need Windows.");
         if (Which is Backend.IoUring or Backend.Epoll && !OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("--io-uring / --epoll need Linux.");
+        if (ByoPipe && VanillaKestrel)
+            throw new ArgumentException("--byo configures the SocketSet transport bridge; it cannot combine with --kestrel.");
         if ((PageSize > 0 || RecvBufferSize > 0 || WriteBuffers > 0) && VanillaKestrel)
             throw new ArgumentException("--page / --recv-buffer / --write-buffers configure the SocketSet transport; they cannot combine with --kestrel.");
     }
@@ -185,7 +193,8 @@ internal sealed class DemoConfig
         // (transport=, tls=, shards=) are unchanged for every existing leg.
         string bufs = (PageSize > 0 ? $" page={PageSize}" : "")
                     + (RecvBufferSize > 0 ? $" recvbuf={RecvBufferSize}" : "")
-                    + (WriteBuffers > 0 ? $" writebufs={WriteBuffers}" : "");
+                    + (WriteBuffers > 0 ? $" writebufs={WriteBuffers}" : "")
+                    + (ByoPipe ? " byo=pipe" : "");
 
         return VanillaKestrel
             ? $"transport={transport} tls={tls} port={Port}"
@@ -218,6 +227,8 @@ internal sealed class DemoConfig
         Console.WriteLine("                     there is one per socket, so it multiplies by sockets-per-shard");
         Console.WriteLine("    --write-buffers N  write buffers per shard (default 1024). Slab = this x --page, so");
         Console.WriteLine("                     a big page wants fewer; running dry currently CLOSES connections");
+        Console.WriteLine("    --byo            BYO-buffer bridge: hand Kestrel's own pipes to the transport");
+        Console.WriteLine("                     (ctx.UsePipe) instead of copying inbound + pumping outbound here");
         Console.WriteLine();
         Console.WriteLine("  The TLS certificate is a throwaway self-signed one for localhost, so clients must");
         Console.WriteLine("  skip verification: curl -k https://127.0.0.1:5080/plaintext");

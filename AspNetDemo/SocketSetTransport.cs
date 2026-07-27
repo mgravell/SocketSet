@@ -65,14 +65,26 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
 
     internal static int Accepts, Closes, ClosedEmpty, WriteFail, SendFalse;
 
-    private void OnAccept(Connection conn)
+    /// <summary>True when accepted connections should hand Kestrel's own pipes to the transport.</summary>
+    internal bool ByoPipe => _config.ByoPipe;
+
+    /// <summary>Build the Kestrel-side connection. Split from <see cref="PublishConnection"/> so the
+    /// caller can attach the pipe in between: <c>AcceptContext</c> is only visible to a SocketSet
+    /// subclass, so the UsePipe call has to happen in <c>TransportSet</c>, and it must happen BEFORE the
+    /// connection is published or Kestrel could start writing to a pipe nobody is reading yet.</summary>
+    private SocketSetConnection CreateConnection(Connection conn)
     {
         // With TLS this fires only after the handshake has completed, so conn.NegotiatedProtocol is
         // already settled by the time the features are built.
         Interlocked.Increment(ref Accepts);
-        var c = new SocketSetConnection(conn, _tls is not null);
+        var c = new SocketSetConnection(conn, _tls is not null, _config.ByoPipe);
         conn.UserToken = c;
-        c.Start();
+        return c;
+    }
+
+    private void PublishConnection(SocketSetConnection c)
+    {
+        c.Start(); // no-op in BYO mode: SocketSet reads the outbound pipe itself
         if (!_accepted.Writer.TryWrite(c)) Interlocked.Increment(ref WriteFail);
     }
 
@@ -117,7 +129,16 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
     /// pipes and return without blocking.</summary>
     private sealed class TransportSet(SocketSetOptions options, SocketSetConnectionListener listener) : SocketSet(options)
     {
-        protected override void OnAccept(ref AcceptContext ctx) => listener.OnAccept(ctx.Connection);
+        protected override void OnAccept(ref AcceptContext ctx)
+        {
+            var c = listener.CreateConnection(ctx.Connection);
+            // BYO: hand Kestrel's OWN pipes to the transport, so SocketSet drives them directly instead of
+            // SocketSetConnection copying inbound and pumping outbound. The same two pipes either way -
+            // this relocates the bridge rather than removing it, which is the point: it is the vehicle the
+            // per-backend zero-copy work needs, and a like-for-like baseline to measure that against.
+            if (listener.ByoPipe) ctx.UsePipe(c.TransportSide);
+            listener.PublishConnection(c);
+        }
         protected override void OnReceive(ref ReceiveContext ctx) => listener.OnReceive(ctx.Connection, ctx.Payload);
         protected override void OnClosed(Connection connection) => listener.OnClosed(connection);
     }

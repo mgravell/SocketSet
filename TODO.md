@@ -554,9 +554,36 @@ Known limitations, all for phase 2:
 - Applications must not mix pipe mode with direct `Connection.Send`/IBufferWriter on the same connection;
   the outbound pump owns ordering on that half.
 
+### 2a-bis. The AspNetDemo BYO bridge (`--byo`) - LANDED 2026-07-27, and it is at PARITY as predicted
+
+`AspNetDemo --byo` selects a parallel bridge: the same two pipes, but handed to the transport via
+`ctx.UsePipe` instead of `SocketSetConnection` copying inbound and running its own outbound pump.
+Reported in `/config` as `byo=pipe` so a harness refuses a leg where the flag was ignored.
+
+Measured on IOCP, 12 shards, `-c 64`, median of 3 scored passes (goodput MiB/s):
+
+| payload | classic | byo | delta | classic passes | byo passes |
+|---|---:|---:|---:|---|---|
+| 512 B | 134.0 | 135.8 | +1.3% | 134,134,134 | 136,132,137 |
+| 16 KB | 3,475.2 | 3,434.6 | -1.2% | 3475,3510,3421 | 3435,3372,3544 |
+| 256 KB | 4,410.7 | 4,430.1 | +0.4% | 4410,4428,4411 | 4267,4430,4621 |
+
+**Every per-pass range overlaps: this is parity, and parity was the prediction.** Phase 1 relocates the
+bridge into the library rather than removing it - `PipeIoBridge` performs the same inbound copy and the
+same `Connection.Send` that `SocketSetConnection` did. An earlier note in this file claimed switching the
+demo to `UsePipe` would recover the measured 14-19% bridge cost "with no zero-copy work at all"; that was
+wrong, and this measurement is what corrects it.
+
+The value of the leg is that it is the vehicle phase 2 needs, and a like-for-like baseline: the zero-copy
+work must be measured against THIS, not against the callback path, or it will be credited with what pipe
+mode already costs.
+
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 
-**Status: designed, not started.** IOCP is the right first driver because the shape already fits: its send
+**Status: designed, not started. This is where the bridge cost is actually recovered** - phase 1 measured
+at parity (above), so everything below is the part that pays.
+
+IOCP is the right first driver because the shape already fits: its send
 path takes a `WSABUF` ARRAY, and a `ReadOnlySequence<byte>` is exactly an array of segments. Outbound
 becomes "build WSABUFs over the sequence's segments and issue one WSASend", with no staging copy at all.
 

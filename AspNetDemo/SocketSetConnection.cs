@@ -36,9 +36,25 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     private readonly CancellationTokenSource _closedCts = new();
     private Task? _pump;
 
-    public SocketSetConnection(Connection conn, bool tls)
+    /// <summary>
+    /// BYO-buffer mode. Instead of this class copying inbound bytes into <c>_inbound</c> and running its
+    /// own outbound pump, the SAME two pipes are handed to the transport via <c>ctx.UsePipe</c> and
+    /// SocketSet drives them itself.
+    ///
+    /// Expect PARITY from this alone, not a win: the library's bridge does the same copy inbound and the
+    /// same <c>Connection.Send</c> outbound, so phase 1 relocates the bridge rather than removing it. It
+    /// exists as a parallel option so the same harness can measure the per-backend zero-copy work (where
+    /// the transport receives straight into pipe memory and sends straight from it) against a like-for-like
+    /// baseline rather than against the callback path.
+    /// </summary>
+    public IDuplexPipe TransportSide { get; }
+
+    private readonly bool _byo;
+
+    public SocketSetConnection(Connection conn, bool tls, bool byo = false)
     {
         _conn = conn;
+        _byo = byo;
         var sched = PipeScheduler.ThreadPool;
         _inbound = new Pipe(new PipeOptions(readerScheduler: sched, writerScheduler: sched,
             useSynchronizationContext: false, pauseWriterThreshold: 1 << 20, resumeWriterThreshold: 1 << 19));
@@ -46,6 +62,9 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
             useSynchronizationContext: false));
 
         Transport = this;
+        // The transport's view is the mirror of Kestrel's: it WRITES what it receives (into the inbound
+        // pipe Kestrel reads from) and READS what it should send (from the outbound pipe Kestrel writes to).
+        TransportSide = new TransportDuplexPipe(_outbound.Reader, _inbound.Writer);
         ConnectionId = Guid.NewGuid().ToString("n");
         Features = new FeatureCollection();
         Items = new Dictionary<object, object?>();
@@ -75,8 +94,18 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         public string? NegotiatedProtocol => conn.NegotiatedProtocol;
     }
 
-    /// <summary>Start the outbound pump (called once, right after accept).</summary>
-    public void Start() => _pump = Task.Run(PumpOutboundAsync);
+    /// <summary>Start the outbound pump (called once, right after accept). In BYO mode there is no pump
+    /// here — SocketSet reads the outbound pipe itself.</summary>
+    public void Start()
+    {
+        if (!_byo) _pump = Task.Run(PumpOutboundAsync);
+    }
+
+    private sealed class TransportDuplexPipe(PipeReader input, PipeWriter output) : IDuplexPipe
+    {
+        public PipeReader Input => input;
+        public PipeWriter Output => output;
+    }
 
     // --- IDuplexPipe: what Kestrel reads/writes ---
     public PipeReader Input => _inbound.Reader;
