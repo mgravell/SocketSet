@@ -9,72 +9,208 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > itself as an error. The confounders are documented at the bottom; they are the more transferable half of
 > this document.
 
-## Environment
+> **Two hosts appear in this file.** Everything dated 2026-07-27 is the current baseline, measured on a
+> desktop. Everything dated 2026-07-26 or earlier was measured on a *different, weaker laptop* and is kept
+> for the findings and the method, not as a baseline. **Never compare a number across the two.** Where an
+> older section's conclusion has been re-tested, that is stated inline.
+
+## Environment (current baseline, 2026-07-27)
 
 | | |
 |---|---|
-| Host | Windows 11, 16 cores / 32 logical processors |
-| Date | 2026-07-26 |
+| Host | Windows 11, AMD Ryzen 9 7900X, 12 cores / 24 logical processors, desktop on mains |
+| Date | 2026-07-27 |
+| Toolchain | .NET SDK 10.0.302, `net10.0`, Release |
 | Load generator | bombardier v1.2.6, fasthttp client, same box (loopback) |
 | Server | `AspNetDemo`, Release, HTTP/1.1 pinned on every leg |
 | TLS certificate | one shared RSA-2048/SHA-256 self-signed cert across **all** legs, Kestrel's included |
 | Route | `/plaintext` - minimal work, so the transport is as visible as it can be |
-| Pinning | server -> logical CPUs 0-15, generator -> 16-31; `DOTNET_PROCESSOR_COUNT`/`GOMAXPROCS` = 16 |
-| Method | `-c 128 -d 10s`, 4 passes in reshuffled order, pass 1 discarded as host warm-up, median of 3 |
+| Pinning | server -> logical CPUs 0-11, generator -> 12-23; `DOTNET_PROCESSOR_COUNT`/`GOMAXPROCS` = 12 |
+| Method | `-c 128 -d 15s`, 4 passes in reshuffled order, pass 1 discarded as host warm-up, median of 3 |
 
-## Keep-alive, steady state
+Shard counts are swept at **4/8/12**, not 4/8/16: the server half of this box is 12 logical CPUs, so s12
+is the leg that matches core count. The older `s16` legs are not the equivalent configuration.
+
+**This host is roughly an order of magnitude more repeatable than the previous one.** Per-leg spreads are
+0.2-2.4% where the laptop's were up to 6% and once 58%. A 2% effect is detectable here and was pure noise
+there - so the "anything under ~6% is unproven" rule in `bench/README.md` is specific to the old host, and
+over-conservative for this one.
+
+## Keep-alive, steady state (2026-07-27)
 
 All legs zero errors. `SpreadPct` is each leg's own run-to-run range - the honesty check.
 
-| leg | med rps | vs kestrel | spread | med p99 |
-|---|---:|---:|---:|---:|
-| managed | 128,148 | +1.5% | 1.8% | 2,382µs |
-| **kestrel** *(control)* | 126,199 | - | 1.1% | 2,716µs |
-| managed+tls | 121,665 | -3.6% | 0.7% | 2,527µs |
-| rio-s16 | 118,052 | -6.5% | 0.4% | 3,178µs |
-| kestrel+tls | 117,773 | -6.7% | 1.4% | 2,999µs |
-| iocp-s16 | 116,516 | -7.7% | 0.9% | 3,001µs |
-| rio-s16+tls | 112,374 | -10.9% | 0.8% | 3,519µs |
-| iocp-s16+tls | 111,127 | -11.9% | 0.9% | 3,001µs |
-| rio-s8 | 103,041 | -18.4% | 1.3% | 4,520µs |
-| iocp-s8 | 99,930 | -20.8% | 4.5% | 6,219µs |
-| iocp-s8+tls | 95,235 | -24.5% | 3.5% | 7,936µs |
-| rio-s8+tls | 94,746 | -24.9% | 5.0% | 6,857µs |
-| rio-s4 | 94,479 | -25.1% | 2.3% | 2,549µs |
-| iocp-s4 | 89,521 | -29.1% | 1.6% | 2,721µs |
-| rio-s4+tls | 88,581 | -29.8% | 0.7% | 2,521µs |
-| iocp-s4+tls | 83,629 | -33.7% | 1.3% | 2,615µs |
+| leg | med rps | vs kestrel | spread |
+|---|---:|---:|---:|
+| rio-s12 | 305,984 | +0.3% | 0.4% |
+| **kestrel** *(control)* | 304,989 | - | 0.5% |
+| iocp-s12 | 302,840 | -0.7% | 0.3% |
+| managed | 301,861 | -1.0% | 0.3% |
+| rio-s12+tls | 301,171 | -1.3% | 0.9% |
+| iocp-s12+tls | 293,799 | -3.7% | 0.2% |
+| kestrel+tls | 290,979 | -4.6% | 0.6% |
+| managed+tls | 289,817 | -5.0% | 1.0% |
+| rio-s8 | 274,122 | -10.1% | 1.3% |
+| iocp-s8 | 269,990 | -11.5% | 0.2% |
+| rio-s8+tls | 264,116 | -13.4% | 0.5% |
+| iocp-s8+tls | 259,484 | -14.9% | 0.5% |
+| rio-s4 | 181,583 | -40.5% | 1.3% |
+| rio-s4+tls | 174,673 | -42.7% | 0.8% |
+| iocp-s4 | 171,945 | -43.6% | 2.4% |
+| iocp-s4+tls | 162,801 | -46.6% | 1.6% |
 
-Between-leg range 53.2%, worst within-leg spread 5.0% - the differences are larger than the noise.
+p99 is deliberately omitted from this table. Every leg reported 1,503-1,504µs, which is a measurement
+artifact - see "p99 is quantised" below.
 
-### What it says
+### Read this before reading the table above
 
-**Shard count is the dominant variable.** IOCP: 89.5k -> 99.9k -> 116.5k across 4/8/16 shards; RIO:
-94.5k -> 103.0k -> 118.1k. Obvious in hindsight - the server is pinned to 16 logical CPUs, so 4 shards
-leaves most of them idle. Anyone benchmarking these backends should match shards to available cores
-before comparing anything else.
+**At `-c 128` this box is saturated, and the top eight legs are all sitting on the same ceiling.** The
+differences between them are not transport differences. See the next section - it is the most important
+result of this run, and it makes "SocketSet reaches parity with Kestrel on small messages" an
+*unsupported* reading of the top of that table.
 
-**The thread-pool backends win here.** `managed` (128.1k) and stock `kestrel` (126.2k) beat every sharded
-configuration, including 16 shards (116-118k). They use the .NET thread pool and therefore all 16 CPUs
-without the operator having to size anything. That the specialised backends do not beat stock Kestrel on
-this workload is worth sitting with rather than explaining away - though see the caveats: this is a
-minimal route on loopback, which is close to the best case for a general-purpose transport.
+What the table does support:
 
-**RIO edges IOCP at every shard count** on throughput: +5.6% at s4, +3.1% at s8, +1.3% at s16. Its p99 is
-better at s4 and s8 but slightly worse at s16.
+**Shard count is the dominant variable**, by a wide margin. IOCP 171.9k -> 270.0k -> 302.8k across 4/8/12
+shards; RIO 181.6k -> 274.1k -> 306.0k. Anyone benchmarking these backends should match shards to
+available cores before comparing anything else. Note the s4 and s8 legs are *below* the ceiling and so are
+the only ones in this table making a real transport comparison.
 
-**TLS cost, in-transport SChannel vs Kestrel's SslStream** - the question this exercise started from:
+**RIO edges IOCP at every shard count**, as it did on the old host: +5.6% at s4, +1.5% at s8, +1.0% at
+s12. This reproduces across two machines and is the one small-message ordering worth any confidence.
 
-| stack | plaintext -> TLS | cost |
+**Low shard counts are sensitive to background host load.** The s4 legs moved 3.6-5.2% depending on what
+else was running on the machine, while the s12 legs moved under 0.5%. At low shard counts each loop thread
+is itself the bottleneck, so stolen cycles come straight off throughput; at s12 the work is spread and
+absorbed. Quiesce the host before trusting any low-shard-count number.
+
+**TLS cost is NOT usefully measured here.** With the plaintext legs pinned against a ceiling, the apparent
+TLS costs (-1.6% for RIO, -3.0% for IOCP, -4.6% for Kestrel) are compressed by however much headroom the
+plaintext leg was denied. The honest small-message statement is that this run cannot measure TLS cost. The
+256 KB legs in the payload sweep below are not ceiling-bound and are where TLS cost is visible.
+
+## The ~300k ceiling is real, and it is the box (2026-07-27)
+
+This needs stating carefully, because **a ceiling was claimed once before in this document and retracted**
+- confounder 3 below, where a pending firewall dialog held everything to ~95k and was misread as a
+generator limit. That retraction is why the evidence here is of a different kind, and why it was gathered
+before any conclusion was drawn.
+
+**Throughput does not move with offered concurrency.** Each leg run alone, 3 scored passes:
+
+| leg | -c 64 | -c 128 | -c 256 |
+|---|---:|---:|---:|
+| kestrel | 289,822 *(p99 1,005µs)* | 303,978 *(1,503µs)* | 299,225 *(2,000µs)* |
+| iocp-s12 | 301,051 *(1,188µs)* | 302,862 *(1,503µs)* | 303,441 *(2,000µs)* |
+| rio-s12 | 304,122 *(1,503µs)* | 305,498 *(1,503µs)* | 304,971 *(2,001µs)* |
+
+A 4x change in offered concurrency moves throughput by less than the run-to-run spread, while p99 rises in
+proportion. That is the textbook signature of a saturated system: added concurrency becomes queueing, not
+work. **The knee is at or below `-c 64`, so the `-c 128` default used by every Windows figure in this file
+is past it.**
+
+**Both pinned halves saturate together.** Sampling per-core utilisation during a measured window, split
+into the server's cores (0-11) and the generator's (12-23):
+
+| leg | rps | server half | client half |
+|---|---:|---:|---:|
+| kestrel | 300,536 | 90.6% | 89.5% |
+| iocp-s12 | 297,922 | 98.1% | 97.7% |
+| rio-s12 | 303,804 | 98.4% | 97.9% |
+
+Neither side is *the* bottleneck; they run out together, which is what a loopback test converges to when
+both endpoints are CPU-bound on one machine. Unlike the retracted firewall case there is no external agent
+involved, the firewall binaries are explicitly allow-listed, and the effect survives a 4x concurrency
+sweep.
+
+**Consequence.** Small-message rps on this box, at this operating point, is a property of the host and not
+of the transport. Any transport able to reach ~300k reports ~300k. Separating them needs either a load
+point below the knee, a second machine, or a workload where the transport is not competing with its own
+load generator for the same silicon.
+
+### p99 is quantised at ~500µs on this platform
+
+Observed p99 values across every run land on 1,005 / 1,188 / 1,495 / 1,503 / 2,000 / 2,001µs - clustering
+on half-millisecond steps. That is timer granularity in the Go client on Windows, not transport behaviour,
+and it is why sixteen different legs all reported an identical 1,503µs. **Do not quote p99 from this
+harness below about 2ms.** The larger values in the payload sweep (6.6-14ms) are well above the quantum
+and are usable.
+
+### Backends do not idle hot
+
+Server started, listening, zero traffic, CPU sampled over the server's cores:
+
+| leg | idle CPU | idle cores |
+|---|---:|---:|
+| rio-s12+tls | 2.7% | 0.32 |
+| iocp-s12 | 3.5% | 0.42 |
+| kestrel | 3.8% | 0.46 |
+| kestrel+tls | 3.8% | 0.45 |
+| rio-s12 | 4.1% | 0.50 |
+| iocp-s12+tls | 6.4% | 0.76 |
+
+Worth recording because the opposite was hypothesised and is intuitive: twelve dedicated loop threads
+sounds like it should burn CPU while waiting. It does not - `iocp-s12` idles slightly *below* stock
+Kestrel. The shard threads block properly rather than spinning.
+
+## Payload sweep, and RIO's unfixed send path (2026-07-27)
+
+`bench/Run-TlsSizes.ps1 -Shards 12`, `-c 64 -d 8s`, 4 passes reshuffled, first discarded, median of 3.
+Goodput MiB/s:
+
+| payload | kestrel | kestrel+tls | iocp/s12 | iocp+tls/s12 | **rio/s12** | **rio+tls/s12** |
+|---|---:|---:|---:|---:|---:|---:|
+| 512 B | 146.3 | 135.5 | 138.0 | 135.3 | **142.7** | **139.4** |
+| 16 KB | 4,007.7 | 3,107.2 | 3,741.1 | 3,326.9 | **1,521.1** | **1,418.9** |
+| 256 KB | 11,488.9 | 7,165.1 | 4,483.4 | 4,040.6 | **2,051.6** | **2,123.3** |
+
+Per-leg spreads 0.3-3.3%, zero errors. The 512 B row is ceiling-bound (see above) and should not be read
+as a transport comparison; the 16 KB and 256 KB rows are not.
+
+### RIO is 2.2-2.5x behind IOCP at large payloads, and it is a known defect
+
+**RIO leads IOCP at 512 B (142.7 vs 138.0) and trails it 2.5x at 16 KB (1,521 vs 3,741) and 2.2x at
+256 KB (2,052 vs 4,483).** A deficit that appears only once the payload exceeds one write page, in exactly
+one backend, is not a tuning difference:
+
+- `IocpShard.IssueSendPages` builds a `WSABUF` array and issues one `WSASend` with up to 64 segments.
+- `WindowsRioShard.IssueSend` still posts `RIOSend(conn.Rq, &buf, 1, ...)` - buffer count **1** - and
+  `CompleteWrite` still coalesces only "as many queued responses as fit into the write page".
+
+So RIO retains the page-quantised send that was diagnosed and fixed for IOCP (see the 2026-07-26 section
+below). The fix was described at the time as applying to both; only IOCP received it.
+
+**The plaintext `rio` control is what makes this attributable**, and it was added to the harness for this
+run. `rio+tls` tracks plaintext `rio` almost exactly and at 256 KB is marginally *faster* (2,123 vs
+2,052). When the cipher is invisible, the constraint is upstream of it - the same reasoning that read the
+old 16 KB numbers correctly. Without a plaintext RIO leg this pattern is indistinguishable from "SChannel
+is slow on RIO".
+
+**Expected value of finishing it: 2.2-2.5x on RIO at >=16 KB.** `RIOSend` takes a buffer array exactly as
+`WSASend` does; the shape to copy is already in-tree in `IocpShard`.
+
+### What the scatter-gather fix bought, and what is left
+
+At 16 KB, IOCP now runs within **6.7%** of Kestrel (3,741 vs 4,008). The laptop-era figures had bridged
+IOCP at ~1,449 against ~3,740, a 61% deficit. Different machines, so this is directional rather than an
+A/B - the controlled measurement is the `Compare-Commits.ps1` run recorded below.
+
+At 256 KB IOCP is still **61% behind** Kestrel (4,483 vs 11,489). That is now the largest open gap in this
+file and it is the regime the BYO-buffer work targets.
+
+**TLS cost, measured where it is actually visible.** These legs are not ceiling-bound, unlike the
+small-message table:
+
+| stack | 256 KB plaintext -> TLS | cost |
 |---|---|---:|
-| Kestrel + SslStream | 126,199 -> 117,773 | **-6.7%** |
-| managed + SChannel | 128,148 -> 121,665 | **-5.1%** |
-| iocp-s16 + SChannel | 116,516 -> 111,127 | **-4.6%** |
-| rio-s16 + SChannel | 118,052 -> 112,374 | **-4.8%** |
+| Kestrel + SslStream | 11,488.9 -> 7,165.1 | **-37.6%** |
+| iocp-s12 + SChannel | 4,483.4 -> 4,040.6 | **-9.9%** |
+| rio-s12 + SChannel | 2,051.6 -> 2,123.3 | **+3.5%** |
 
-Terminating TLS in the transport with raw SSPI costs roughly **4.6-5.1%**, against **6.7%** for Kestrel's
-SslStream - about a third less relative overhead, consistently across three backends. This is
-steady-state record-layer cost only; handshake cost is out of scope (see below).
+Read with care. Kestrel's -37.6% is a real record-layer cost at a rate where the cipher matters. IOCP's
+-9.9% is *partly* real and partly the same "cipher is cheap relative to whatever else binds us" effect;
+RIO's positive figure is entirely that effect and is not evidence that TLS is free. A backend has to be
+fast enough for the cipher to show up.
 
 ## Not measured: connection establishment
 
@@ -146,14 +282,17 @@ that per-record crypto dominates per-syscall overhead - at 512 bytes the transpo
 layer are both drowned by fixed costs. Connection churn would also need to come back, since handshake
 cost is where these TLS stacks genuinely differ and it is entirely out of scope here.
 
-## Windows: payload sweep, and finding the real bottleneck (2026-07-26)
+## Windows: payload sweep, and finding the real bottleneck (2026-07-26, PREVIOUS HOST)
 
-Real hardware this time - no container, no WSL2 - so this is the strongest data in this file.
+> **Different machine.** Everything in this section was measured on the earlier laptop (16C/32T), not the
+> current desktop. The absolute numbers are superseded by the 2026-07-27 sweep above and must not be
+> compared with it. The section is kept because the *diagnosis* - page-quantised sends - and the
+> controlled A/B that confirmed it are still the reasoning behind current work, and because the RIO half
+> of that fix is still outstanding.
 
 > **Power state.** The host is a laptop, where battery vs mains is a large and *variable* difference in
 > sustained power limit rather than a few percent - so it has to be stated. Every figure in this section
-> was taken **on mains**. A later spot-check of small payloads (2026-07-27) ran on battery and is
-> deliberately NOT recorded here; it is not comparable to anything below.
+> was taken **on mains**.
 `bench/Run-TlsSizes.ps1`, `-c 64`, 16 shards, server pinned to logical CPUs 0-15, generator to 16-31,
 first pass discarded, median of the rest.
 
@@ -217,6 +356,10 @@ Page size is a trade-off rather than a dial, though: at a 16 KB payload the best
 one call with up to 64 `WSABUF`s, segments packed (so small queued responses still coalesce) and partial
 sends resuming across pages.
 
+> **IOCP only.** This was written up as applying to IOCP and RIO alike. It was never applied to RIO, which
+> still posts `RIOSend(conn.Rq, &buf, 1, ...)`. The 2026-07-27 sweep measures what that costs: **2.2-2.5x
+> at >=16 KB**. See the RIO section above.
+
 Measured with `bench/Compare-Commits.ps1` - the two commits built in isolated git worktrees and measured
 back to back on mains, median of 3 scored passes, **default 4 KB page**:
 
@@ -274,6 +417,31 @@ Each produced *believable* numbers, which is the dangerous kind of wrong.
    own spread is reported and compared against the between-leg range, with an explicit verdict when the
    noise rivals the signal.
 
+7. **Measuring at a saturated operating point - the whole top of a table becomes meaningless.** `-c 128`
+   is past the knee on the current host, so eight legs converged inside 1.3% and looked like parity. Found
+   by sweeping concurrency (`-c 64/128/256`) and seeing throughput refuse to move while p99 rose in
+   proportion. **Sweep concurrency before believing that two transports are equal.**
+8. **p99 quantised at ~500µs** by Go-client timer granularity on Windows, which made sixteen legs report
+   an identical 1,503µs. A latency figure that is *identical* across unrelated legs is an instrument
+   reading, not a result.
+9. **Attributing CPU cost per request - three failed attempts, and the reason is not the instrument.**
+   Comparing CPU per request under a rate-limited load produced per-leg spreads of 38-174% and TLS legs
+   *cheaper* than their own plaintext controls, every time. The first two attempts sampled
+   `\Processor(N)\% Processor Time` at 1Hz, which is obviously the wrong instrument. Replacing it with
+   `Process.TotalProcessorTime` deltas - kernel-accounted, exact, scoped to the server process - **did not
+   help**: the same leg swung 63.55 -> 38.24 core-µs/req between two passes.
+
+   The operating point is the confound. At a fixed sub-saturation rate the server has idle gaps between
+   arrivals, and threads that wake, find no work and spin briefly before sleeping charge that time to
+   whichever request follows. It also explains the persistent inversion: a slower per-request path (TLS)
+   leaves fewer idle gaps to spin in, so it can measure *cheaper* per request than its own plaintext
+   control while genuinely doing more work.
+
+   **Measure cost per request at saturation, not under a rate limit** - there are no idle gaps to
+   misattribute. All three attempts here are discarded; the question remains open. **A TLS leg beating its
+   own plaintext control is a reliable "this run is noise" signal** - build that gate into anything
+   comparing cost.
+
 Two further notes for anyone extending the harness: a BOM-less `.ps1` containing non-ASCII (an em-dash)
 is read as ANSI by Windows PowerShell 5.1, which turns it into a string delimiter and reports a syntax
 error hundreds of lines away - keep the script ASCII. And `[IntPtr]0xFFFF0000` silently becomes negative,
@@ -287,17 +455,33 @@ approaches the effect being claimed.
 
 - **Loopback.** Client and server share the host. Absolute numbers are not comparable to a two-machine
   test; treat these as relative between legs.
-- **Half the machine each.** Server and generator get 8 physical cores apiece. A 16-shard server on 8
-  physical cores is oversubscribed, which may flatter lower shard counts.
+- **Saturation.** On the current host `-c 128` is past the knee for small messages, so the small-message
+  table ranks nothing at the top end. Large payloads are bandwidth-bound rather than ceiling-bound and do
+  not share this problem.
+- **Half the machine each.** Server and generator get 6 physical cores apiece on the current host (8 on
+  the previous one). A 12-shard server on 6 physical cores is oversubscribed, which may flatter lower
+  shard counts.
 - **Minimal route.** `/plaintext` is close to the best case for exposing transport differences; a real
   application would dilute them further.
-- **RIO** trades bulk throughput for latency by design, so judge it on percentiles as much as on rps.
+- **RIO** trades bulk throughput for latency by design, so judge it on percentiles as much as on rps -
+  noting that p99 is unusable below ~2ms here.
 
 ## Open
 
+- **Finish RIO's scatter-gather send.** Quantified at 2.2-2.5x at >=16 KB. The largest measured,
+  attributable win currently on the table.
+- **The 256 KB gap to Kestrel (4,483 vs 11,489 MiB/s).** Hypothesis is that the three copies in the
+  out-of-band path dominate, which is what BYO-buffer targets. Not yet established: part of that gap is
+  the AspNetDemo bridge rather than the transport, and a purely per-byte cost should not *widen* as a
+  fraction of the total the way this one does between 16 KB and 256 KB. Three cheap measurements settle it
+  before any design change - see `TODO.md`.
+- **CPU cost per request.** Three attempts failed (confounder 9). Unmeasured, and it matters: equal
+  throughput at a shared ceiling says nothing about equal efficiency, and the small-message table is
+  entirely at that ceiling. Next attempt should measure at saturation with `Process.TotalProcessorTime`,
+  not under a rate limit.
 - How much of the remaining cost is Kestrel's pipeline rather than the transport? The bare SocketSet HTTP
-  responder (`SmokeTest --http`) is the comparison, but the only figures taken for it predate the firewall
-  fix and used different pinning, so they are not comparable. Re-measure both under identical conditions
-  before repeating any "the pipeline dominates" claim.
-- Shard counts above 16, and shards matched to *physical* rather than logical cores.
+  responder (`SmokeTest --http`) is the comparison, but the only figures taken for it are from the
+  previous host. Re-measure both under identical conditions before repeating any "the pipeline dominates"
+  claim.
+- Shard counts above 12 on this host, and shards matched to *physical* rather than logical cores.
 - Handshake cost, per the "not measured" section above.

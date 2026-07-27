@@ -109,6 +109,14 @@ $base = @(
     @{ Name = "kestrel+tls"; Args = @("--kestrel", "--tls"); T = "kestrel-sockets"; Tls = "kestrel/sslstream" }
     @{ Name = "iocp";        Args = @("--iocp");             T = "socketset/iocp";  Tls = "off" }
     @{ Name = "iocp+tls";    Args = @("--iocp", "--tls");    T = "socketset/iocp";  Tls = "schannel (sspi)" }
+    # Plaintext RIO control. Added 2026-07-27: without it, rio+tls has no same-transport baseline, and
+    # this file's own opening argument is that a TLS leg with no plaintext control cannot distinguish
+    # "TLS is expensive" from "our send path is expensive". That distinction is live for RIO
+    # specifically - IocpShard.IssueSendPages now issues one WSASend with up to 64 WSABUFs, but
+    # WindowsRioShard.IssueSend still posts RIOSend(..., &buf, 1, ...), i.e. one write page in flight
+    # per connection. RIO is expected to trail IOCP at 256KB for that reason, and this leg is what makes
+    # that attributable to the send path rather than to the cipher.
+    @{ Name = "rio";         Args = @("--rio");              T = "socketset/rio";   Tls = "off" }
     @{ Name = "rio+tls";     Args = @("--rio", "--tls");     T = "socketset/rio";   Tls = "schannel (sspi)" }
 )
 

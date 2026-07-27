@@ -8,6 +8,13 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 Orientation for picking this up cold.
 
+**The benchmark host changed on 2026-07-27** - from a laptop (16C/32T) to a desktop (Ryzen 9 7900X,
+12C/24T, mains). Every Windows number recorded before that date is from the old machine and **cannot be
+compared with anything measured since**. The current baseline is in `AspNetDemo/RESULTS.md` under the
+2026-07-27 headings. Two practical consequences: shard sweeps run at **4/8/12** here (12 = the server
+half's logical core count), not 4/8/16; and this host is roughly an order of magnitude more repeatable
+than the old one, with per-leg spreads of 0.2-2.4% rather than up to 6%.
+
 **Backends.** io_uring + epoll (Linux), IOCP + RIO (Windows), managed (portable fallback). All except
 managed own one loop thread per shard; managed is callback-driven, which is why it alone needs a
 per-connection TLS gate. TLS is wired into every backend: SChannel via raw SSPI on Windows, OpenSSL
@@ -21,6 +28,11 @@ the kernel rejects with `-EINVAL`, so *every* recv failed silently); scatter-gat
 response left as 64 sequential `WSASend`s. Issuing one call with up to 64 `WSABUF`s gave **+133% at 16KB
 and +162% at 256KB**, validated with `bench/Compare-Commits.ps1`. See `AspNetDemo/RESULTS.md`.
 
+**The biggest measured, attributable win still on the table: finish the same fix for RIO.** It was written
+up as covering IOCP and RIO; only IOCP got it. `WindowsRioShard.IssueSend` still posts
+`RIOSend(conn.Rq, &buf, 1, ...)`. Measured 2026-07-27: RIO *leads* IOCP at 512B (142.7 vs 138.0 MiB/s) and
+trails it **2.5x at 16KB** (1,521 vs 3,741) and **2.2x at 256KB** (2,052 vs 4,483). See item 0.
+
 **In flight and UNMEASURED:** `fa97dd4` makes the out-of-band flush snapshot rent from `ArrayPool`
 instead of allocating. Its A/B was contaminated by a power loss mid-run and is void. Re-run:
 
@@ -28,8 +40,10 @@ instead of allocating. Its A/B was contaminated by a power loss mid-run and is v
 .\bench\Compare-Commits.ps1 -Before HEAD~1 -After HEAD     # (while fa97dd4 is HEAD)
 ```
 
-Uncontaminated passes leaned flat-to-slightly-positive, which if confirmed is the *informative* answer:
-removing the allocation alone changes little, so **copies dominate** — go to item 2b below.
+**Run it at a LARGE payload.** Its own commit message pre-registers the interpretation - "if it moves
+throughput, allocation was the cost; if it does not, copies dominate" - but that question only has
+meaning where the copies are large. At 512B neither allocation nor copies matter, and a sweep dominated by
+small payloads would answer nothing. 256KB is the size that discriminates.
 
 **Before trusting any measurement, read `bench/README.md`.** It documents the eight confounders that each
 produced clean-looking wrong numbers, and the noise floor (~6% between identical builds on this host).
@@ -59,8 +73,10 @@ The genuine differences cluster in only two places:
   queue, completion queue, and deferred-commit batching;
 - teardown bookkeeping — RIO additionally carries `Rq`, `CommitPending`, `CommitRecv`, `CommitSend`.
 
-**Why it matters:** every feature is currently written twice. TLS interception was (2026-07-25), and an
-epoll backend (below) would make it a third copy of the send machinery. That is the argument — not
+**Why it matters:** every feature is currently written twice. TLS interception was (2026-07-25), and the
+epoll backend (below) landed 2026-07-26 as a third copy of the send machinery — the thing this entry
+predicted, now realised rather than hypothetical. `fa97dd4` then paid it again: one ownership rule,
+written out three times in `IocpShard`, `WindowsRioShard` and `EpollShard`. That is the argument — not
 tidiness.
 
 **Shape:** a shared `WindowsShardBase<TConn>` owning slot lifecycle (`InitClient`/`FreeSlot`/
@@ -89,8 +105,19 @@ down; `SkipOnSuccess` stays on IOCP, `Rq`/`Commit*` on RIO.
 
 ## epoll backend for Linux
 
-**Status:** proposed, not started. Sequence **after** the IOCP/RIO factoring, so it lands on a shared
-base rather than adding a fourth copy of the send machinery.
+**Status: DONE (2026-07-26)**, in `b1f4286`. `src/SocketSet/Epoll`, with TLS. Passes the smoke matrix —
+echo, byte-exact verify, out-of-band send, poke, churn, AF_UNIX, ALPN. Measured at parity with io_uring
+and stock Kestrel on small-message plaintext (102.5k vs 105.2k vs 102.8k rps, ~3% spread). What remains
+is the real-hardware measurement described below.
+
+**It landed BEFORE the IOCP/RIO factoring, against the sequencing plan in this entry.** The plan was to
+factor first so epoll would land on a shared base; instead it is a fourth independent copy of the send
+machinery, which is now an argument *for* that factoring rather than a cost avoided by it. `fa97dd4` is
+the evidence: a four-line ownership change had to be written out separately in `IocpShard`,
+`WindowsRioShard` and `EpollShard`.
+
+The rest of this entry is the original rationale, kept because the *why* still holds and the cost
+estimate is worth checking against what it actually took.
 
 **Not for throughput.** Linux already falls back to `SocketSetFactory.Managed`, and .NET's managed socket
 async path *is* epoll (`SocketAsyncEngine`). So this is not "add epoll", it is "replace .NET's epoll
@@ -119,12 +146,8 @@ that no other backend needs. That last part is the usually-underestimated bit.
 **Do first:** measure io_uring vs epoll vs managed with `--latency` and `--bandwidth`. If they land within
 a few percent, the performance case is dead and the decision is purely architectural. This IS measurable
 under Docker with `--security-opt seccomp=unconfined` (see below), though a loopback container shares all
-the caveats in `AspNetDemo/RESULTS.md`.
-
-**Status: DONE (2026-07-26).** `src/SocketSet/Epoll`, with TLS. Passes the smoke matrix - echo, byte-exact
-verify, out-of-band send, poke, churn, AF_UNIX, ALPN. Measured at parity with io_uring and stock Kestrel
-on small-message plaintext (102.5k vs 105.2k vs 102.8k rps, ~3% spread). What remains is the measurement
-below, on real hardware.
+the caveats in `AspNetDemo/RESULTS.md`. Partly done: the small-message parity numbers are in the status
+above; the `--latency`/`--bandwidth` comparison on real hardware is still outstanding (item 5).
 
 ---
 
@@ -185,9 +208,36 @@ kernel or the environment.
 The first sweep had one plaintext control and it was the wrong one, so nothing at >=16KB is fully
 interpretable yet. Plaintext `kestrel` and `epoll` legs added 2026-07-26; just needs a run.
 
-### 0. IOCP/RIO sends are page-quantised - 4x on the table at large payloads (Windows, 2026-07-26)
+### 0. Sends are page-quantised - **IOCP: FIXED. RIO: NOT FIXED, and now quantified.**
 
-**The single most actionable finding so far.** `BufferPageSize` defaults to 4096 and the Windows send path
+**Status (2026-07-27).**
+
+- **IOCP: done.** `IocpShard.IssueSendPages` builds a `WSABUF` array and issues one `WSASend` with up to
+  64 segments. Landed in `bb8007f`/`2be2663` (+133% at 16KB, +162% at 256KB, A/B controlled).
+- **RIO: not done.** `WindowsRioShard.IssueSend` still posts `RIOSend(conn.Rq, &buf, 1, ...)` - buffer
+  count 1 - and `CompleteWrite` still coalesces only "as many queued responses as fit into the write
+  page". This entry claimed both backends were covered; only one was, and nothing recorded the difference
+  until the 2026-07-27 sweep went looking for it.
+
+**What RIO's half is worth**, from `bench/Run-TlsSizes.ps1 -Shards 12` (goodput MiB/s, median of 3):
+
+| payload | rio/s12 | iocp/s12 | RIO vs IOCP |
+|---|---:|---:|---:|
+| 512 B | 142.7 | 138.0 | **+3.4%** |
+| 16 KB | 1,521.1 | 3,741.1 | **-59%** (2.5x) |
+| 256 KB | 2,051.6 | 4,483.4 | **-54%** (2.2x) |
+
+RIO is *ahead* below one write page and 2.2-2.5x behind above it - the signature of the defect, isolated
+to the one backend that still has it. Spreads 0.3-3.3%, so this is not close to noise. `rio+tls` tracks
+plaintext `rio` (and at 256KB is marginally faster), confirming the constraint is the send path and not
+the cipher.
+
+`RIOSend` takes a buffer array exactly as `WSASend` does. The shape to copy is `IocpShard.IssueSendPages`,
+in-tree. **This is the highest-value item on this list.**
+
+---
+
+*Original write-up follows, for the reasoning.* `BufferPageSize` defaults to 4096 and the Windows send path
 puts at most ONE page in flight per connection, so a 256KB response goes out as **64 sequential 4KB
 WSASends**, each with its own completion-port round trip. Kestrel's transport issues one `SendAsync` over
 the whole buffer.
@@ -221,6 +271,35 @@ flat at 32 = the pinned core count) precisely BECAUSE each connection's sends ar
 across connections was the only lever available.
 
 ### 2b. BYO-buffer: caller-supplied (pinned) pipes, and killing the copies below them
+
+**Measure three things before designing anything (added 2026-07-27).** The 2026-07-27 sweep puts IOCP at
+4,483 MiB/s against Kestrel's 11,489 at 256KB - a 61% gap, and the largest open number in
+`AspNetDemo/RESULTS.md`. The working hypothesis is that the three copies below dominate it. That is
+plausible (the ratio, 2.56x, is about what 2-3 extra copies per byte would cost) but **not established**,
+and two things argue for checking before committing to a design change that ripples into every backend's
+send-completion path:
+
+1. *Part of that 61% is the bridge, not the transport.* This sweep runs through AspNetDemo. The last
+   controlled bare-vs-bridged comparison put the bridge at 23% at 256KB, and that was **before** IOCP got
+   faster - the bridge's share was already noted as having grown from ~23% to ~47% of the remaining gap.
+   Re-measure `SmokeTest --http` against the bridged transport on this host, same pinning, same payload.
+   BYO-buffer cannot address the bridge's share.
+2. *A per-byte cost should not widen as a fraction of the total, and this one does.* IOCP goes
+   3,741 -> 4,483 MiB/s from 16KB to 256KB (+20%) while Kestrel goes 4,008 -> 11,489 (+187%). N fixed
+   copies per byte would give a roughly constant relative penalty once fixed costs amortise. Something
+   else also degrades with size - segment/page management, the `Pending` queue, or the bridge's per-write
+   behaviour. Only the copies are in BYO-buffer's scope.
+
+Cheapest discriminators, in order, all available today:
+
+1. **Bare responder control** - separates bridge from transport. Nothing to build.
+2. **The voided `fa97dd4` A/B, re-run at 256KB** - pre-registered: moves throughput => allocation was the
+   cost; does not => copies dominate. Never yet run validly.
+3. **Tier 1 below** - removes exactly one of the three copies, with no API change. If one copy of three
+   buys roughly a third of the gap, the hypothesis is confirmed and Tier 2 is justified. If it buys
+   nothing, BYO-buffer is aimed at the wrong target.
+
+Only then Tier 2.
 
 Proposal: let a connection optionally accept a caller-supplied `IDuplexPipe` plus a "this memory is
 pinned" flag, and drive I/O straight off it - so a caller who hands us a pipe backed by a pinned-heap

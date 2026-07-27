@@ -54,12 +54,46 @@ in the background; an unrelated `git add <one-file>; git commit` in the same che
 staged reverts, because `git commit` writes the whole index. It reverted the change under test, and the
 A/B measured the old code as its own "after". Use worktrees.
 
+**7. Sweep concurrency before believing two transports are equal.**
+A saturated operating point flattens everything that can reach the ceiling. On the current host (12C/24T
+desktop) `-c 128` is **past the knee** for small messages: throughput moves less than the run-to-run
+spread across `-c 64/128/256` while p99 rises in proportion, and eight legs converge inside 1.3% looking
+exactly like parity. Both pinned halves saturate together (90-98%), so it is the box, not one side. Run
+`Run-Matrix.ps1 -Filter <leg> -Connections 64,128,256` before trusting a tie. This one has bitten before
+from the other direction: a ~100k "generator ceiling" was once concluded from what turned out to be a
+firewall dialog, so establish a ceiling by sweeping concurrency, never by inference from a flat table.
+
+**8. Do not quote p99 below ~2ms on Windows.**
+It is quantised at roughly 500µs by Go-client timer granularity - observed values cluster on 1,005 /
+1,188 / 1,503 / 2,000µs. Sixteen unrelated legs all reporting an identical 1,503µs is the instrument, not
+the transports. Larger values (the multi-millisecond figures in the payload sweep) are above the quantum
+and usable.
+
+**9. Do not measure CPU cost per request under a rate limit.**
+Three attempts produced per-leg spreads of 38-174% and TLS legs *cheaper* than their own plaintext
+controls. The first two sampled `\Processor(N)\% Processor Time` at 1Hz - the wrong instrument. Switching
+to exact, kernel-accounted `Process.TotalProcessorTime` deltas **did not fix it**: one leg swung 63.55 ->
+38.24 core-µs/req between passes. The operating point is the real confound - at a fixed sub-saturation
+rate the server has idle gaps, and threads that wake, find nothing and spin before sleeping charge that
+time to the next request. A slower path (TLS) leaves fewer gaps to spin in and so measures *cheaper* while
+doing more work. **Measure cost per request at saturation**, where there are no idle gaps, and gate on
+"every TLS leg must cost more than its own plaintext control".
+
 ## Environment checklist — confirm before measuring
 
-- **Power state.** This is a laptop: battery vs mains is a large, *variable* difference in sustained
-  power limit, not a few percent. Never compare a battery run with a mains run.
-- **Firewall prompts.** A pending Windows Firewall dialog held every leg to ~95k rps (2.8x) with no
-  errors and no other symptom. Check for one before starting.
+- **Power state.** On a laptop, battery vs mains is a large and *variable* difference in sustained power
+  limit, not a few percent - never compare across the two. The current host is a desktop on mains, so this
+  no longer applies here, but the older figures in `AspNetDemo/RESULTS.md` were taken on a laptop.
+- **Firewall prompts.** A pending Windows Firewall dialog held every leg to ~95k rps (2.8x) with no errors
+  and no other symptom - and was then misread as a generator ceiling, so it cost a wrong conclusion as
+  well as a wrong number. Do not rely on spotting the dialog: allow-list the binaries **by path**, for all
+  profiles and protocols, once. Remember a `Block` rule beats an `Allow` rule, so remove any stale rules
+  for those paths first - dismissing a prompt can leave one behind.
+- **Background host load.** Whatever else runs on the machine hits low shard counts hardest: measured
+  2026-07-27, s4 legs moved 3.6-5.2% with background load while s12 legs moved under 0.5%. At low shard
+  counts each loop thread is itself the bottleneck, so stolen cycles come straight off throughput. Quiesce
+  the host, and never change what is running on it *during* a run - a mid-run change makes the passes
+  before and after incomparable, which is the whole run.
 - **io_uring under Docker.** The default seccomp profile blocks the io_uring syscalls, so the backend
   **silently falls back to managed sockets**. Pass `--security-opt seccomp=unconfined`, and trust
   `/config` rather than the flag you passed.
@@ -80,5 +114,9 @@ A/B measured the old code as its own "after". Use worktrees.
 ## Interpreting a result
 
 Report a difference only if the per-side pass ranges are **disjoint**. `Run-Matrix.ps1` prints which leg
-pairs actually separate; for everything else, compare the spread against the delta by eye. On this host,
-anything under ~6% is unproven by default.
+pairs actually separate; for everything else, compare the spread against the delta by eye.
+
+**The noise floor is a property of the host, not of the project.** On the previous laptop it was ~6%, and
+once 58%. On the current desktop per-leg spreads run 0.2-2.4%, so a 2% effect is detectable here and was
+unprovable there. Re-establish it on any new machine - run the same leg several times before running
+anything else - rather than inheriting a number from this file.
