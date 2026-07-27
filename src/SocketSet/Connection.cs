@@ -30,6 +30,14 @@ public abstract class Connection : IBufferWriter<byte>
     /// <summary>Send/receive-closed state, mutated through the context Close* methods.</summary>
     internal SocketSet.SocketFlags Flags;
 
+    /// <summary>Non-null when the application opted this connection into pipe mode with
+    /// <c>ctx.UsePipe(...)</c> from OnAccept/OnConnect. When set, received data goes to the pipe instead
+    /// of <see cref="SocketSet.OnReceive"/>, and an outbound pump sends whatever the application writes.
+    /// Null - the default - leaves every existing code path untouched.</summary>
+#if NET
+    internal PipeIoBridge? PipeIo;
+#endif
+
     /// <summary>The per-connection TLS engine, or null for a plaintext connection. Owned and touched only
     /// by the owning shard's IO loop (created at accept/connect; handshake driven, then encrypt/decrypt).
     /// Backends store it here so the shared receive/send interception is uniform across transports.</summary>

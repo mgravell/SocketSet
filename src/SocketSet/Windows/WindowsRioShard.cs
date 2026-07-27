@@ -415,7 +415,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         if (conn.Opened)
         {
             conn.Opened = false;
-            try { Parent.OnClosed(conn); }
+            try { Parent.DispatchClosed(conn); }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
         }
 
@@ -782,7 +782,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
         byte* rp = _recvBuffer.Address(conn.RecvBuf);
         var ctx = new SocketSet.ReceiveContext(conn, rp, _recvBufSize, bytes);
-        Parent.OnReceive(ref ctx);
+        Parent.DispatchReceive(ref ctx);
 
         int rb = ctx.ResponseBytes;
         if (rb <= 0 || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0) return true;

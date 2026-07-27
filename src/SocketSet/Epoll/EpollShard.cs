@@ -314,7 +314,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         if (conn.Opened)
         {
             conn.Opened = false;
-            try { Parent.OnClosed(conn); }
+            try { Parent.DispatchClosed(conn); }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
         }
 
@@ -610,7 +610,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         if (conn.Tls is not null) return DeliverTls(conn, data, bytes);
 
         var ctx = new SocketSet.ReceiveContext(conn, data, _bufSize, bytes);
-        Parent.OnReceive(ref ctx);
+        Parent.DispatchReceive(ref ctx);
         int rb = ctx.ResponseBytes;
         if (rb <= 0 || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0) return true;
         if (conn.Fd < 0 || conn.Closing) return false;
@@ -836,7 +836,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
             fixed (byte* pp = plain)
             {
                 var ctx = new SocketSet.ReceiveContext(conn, pp, plain.Length, plainLen);
-                Parent.OnReceive(ref ctx);
+                Parent.DispatchReceive(ref ctx);
                 int rb = ctx.ResponseBytes;
                 if (rb > 0 && conn.Fd >= 0 && !conn.Closing
                     && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)

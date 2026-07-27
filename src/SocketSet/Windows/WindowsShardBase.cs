@@ -252,7 +252,7 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
             fixed (byte* pp = plain)
             {
                 var ctx = new SocketSet.ReceiveContext(conn, pp, plain.Length, plainLen);
-                Parent.OnReceive(ref ctx);
+                Parent.DispatchReceive(ref ctx);
                 int rb = ctx.ResponseBytes;
                 if (rb > 0 && !conn.Closing && conn.Socket != 0
                     && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)

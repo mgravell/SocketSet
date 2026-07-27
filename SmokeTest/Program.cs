@@ -24,6 +24,7 @@ int churn = 0;      // >0: overlapping-churn soak for this many seconds (reconne
 string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 string host = "127.0.0.1"; // client connect target (server always binds Any)
 int port = 10000;
+bool pipeMode = false;   // --pipe: accepted connections use ctx.UsePipe(IDuplexPipe) instead of OnReceive
 bool resp = false;          // >0: run the dumb RESP PING client against --host/--port
 string? tlsTrust = null;    // path to a PEM cert the TLS client should trust (external-server test)
 string tlsHost = "localhost"; // TargetHost for SNI + hostname verification
@@ -148,6 +149,9 @@ for (int i = 0; i < args.Length; i++)
 #endif
         case "--pipeline":
             window = int.MaxValue; // unbounded (deadlock-prone on a symmetric echo — for comparison)
+            break;
+        case "--pipe":
+            pipeMode = true;
             break;
         case "--poke":
             poke = true;
@@ -354,6 +358,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --window N        client keeps up to N messages in flight (1=ping/pong default, N=bounded pipeline)");
     Console.WriteLine("  --pipeline        unbounded in-flight (throughput, but can wedge a symmetric echo; use --window instead)");
     Console.WriteLine("  --poke            server echoes out-of-band via Connection.Send from a background thread");
+    Console.WriteLine("  --pipe            accepted connections use ctx.UsePipe(IDuplexPipe); the server echoes over");
+    Console.WriteLine("                    the pipe instead of OnReceive (caller-supplied-buffer path)");
     Console.WriteLine("  --adopt           bind the listener here and hand its handle to ListenHandle (socket-activation style)");
     Console.WriteLine("  --verify N        run the out-of-band Send correctness harness with an N-byte payload");
     Console.WriteLine("  --verify-echo N   round-trip N bytes of a known pattern through the echo path and");
@@ -440,7 +446,7 @@ if (uds is not null) Console.WriteLine("note: UDS not supported on this target f
 listenEp = new IPEndPoint(IPAddress.Any, port);
 connectEp = new IPEndPoint(IPAddress.Parse(host), port);
 #endif
-using var set = new EchoServer(options) { GreetingSize = size, Window = window, PokeMode = poke, CloseAfterMessages = closeAfter };
+using var set = new EchoServer(options) { GreetingSize = size, Window = window, PokeMode = poke, PipeMode = pipeMode, CloseAfterMessages = closeAfter };
 string mode = window == 1 ? "ping/pong" : window == int.MaxValue ? "pipeline(unbounded)" : $"pipeline(window={window})";
 Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +

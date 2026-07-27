@@ -218,7 +218,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         fixed (byte* buf = conn.RecvBuffer)
         {
             var ctx = new SocketSet.ReceiveContext(conn, buf, _bufferSize, n);
-            Parent.OnReceive(ref ctx);
+            Parent.DispatchReceive(ref ctx);
             response = ctx.ResponseBytes;
         }
 
@@ -515,7 +515,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             fixed (byte* pp = plainBuf)
             {
                 var ctx = new SocketSet.ReceiveContext(conn, pp, plainBuf.Length, plainLen);
-                Parent.OnReceive(ref ctx);
+                Parent.DispatchReceive(ref ctx);
                 response = ctx.ResponseBytes;
             }
             if (response > 0) SendEncrypted(conn, new ReadOnlySpan<byte>(plainBuf, 0, response));
@@ -574,7 +574,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         if (conn.Opened)
         {
             conn.Opened = false;
-            try { Parent.OnClosed(conn); }
+            try { Parent.DispatchClosed(conn); }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
         }
 

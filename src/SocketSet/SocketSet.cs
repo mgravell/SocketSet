@@ -1,5 +1,8 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
+#if NET
+using System.IO.Pipelines; // pipe mode is net-only: the netfx build does not reference System.IO.Pipelines
+#endif
 using System.Net;
 using System.Net.Sockets;
 
@@ -201,6 +204,30 @@ public abstract partial class SocketSet : IDisposable
     /// for bookkeeping (the <paramref name="connection"/>'s <see cref="Connection.UserToken"/> is
     /// still readable). After it returns the connection is recycled — do not retain it.
     /// </summary>
+    /// <summary>
+    /// Receive dispatch. A connection in pipe mode (<c>ctx.UsePipe(...)</c>) has its bytes written to the
+    /// pipe; everything else goes to <see cref="OnReceive"/> exactly as before. Backends call this rather
+    /// than OnReceive directly so the choice is made in one place instead of at every call site.
+    /// </summary>
+    internal void DispatchReceive(ref ReceiveContext ctx)
+    {
+#if NET
+        var pipe = ctx.Connection.PipeIo;
+        if (pipe is not null) { pipe.OnReceived(ctx.Payload); return; }
+#endif
+        OnReceive(ref ctx);
+    }
+
+    /// <summary>Close dispatch: completes a pipe-mode connection's halves so whoever is awaiting either
+    /// end unblocks, then runs the application's <see cref="OnClosed"/>.</summary>
+    internal void DispatchClosed(Connection connection)
+    {
+#if NET
+        connection.PipeIo?.OnConnectionClosed();
+#endif
+        OnClosed(connection);
+    }
+
     protected internal virtual void OnClosed(Connection connection)
     {
     }
@@ -224,6 +251,33 @@ public abstract partial class SocketSet : IDisposable
 
         /// <summary>Disable reading, for one-way (server-to-client) transports.</summary>
         public readonly void CloseInput() => connection.Flags |= SocketFlags.ReceiveClosed;
+
+        /// <summary>
+        /// Drive this connection's I/O through <paramref name="pipe"/> instead of the
+        /// <see cref="OnReceive"/>/<see cref="OnWrite"/> callbacks. Entirely optional and per-connection:
+        /// a connection that never calls this behaves exactly as before.
+        ///
+        /// <paramref name="pipe"/> is the TRANSPORT-side endpoint (Kestrel's <c>Application</c> half):
+        /// received bytes are written to <c>pipe.Output</c>, and whatever the application writes to the
+        /// other end is read from <c>pipe.Input</c> and sent. Handing us the caller's own pipe is the
+        /// point - it removes the intermediate pipe-plus-copy that a transport bridge would otherwise need.
+        ///
+        /// Set <paramref name="pinned"/> when the pipe's memory is already pinned (Kestrel's
+        /// <c>PinnedBlockMemoryPool</c>, or a pool over the pinned object heap) so a backend can skip
+        /// per-operation pinning. It is advisory: backends that copy ignore it.
+        ///
+        /// Not compatible with the instant-response <c>RawBuffer</c> path or with multiple receives in
+        /// flight - both hand out transport-owned memory whose lifetime does not match a pipe segment's.
+        /// While in pipe mode, do not also write through <see cref="Connection.Send(System.ReadOnlySpan{byte})"/>
+        /// or the IBufferWriter surface: the outbound pump owns ordering on that half.
+        /// </summary>
+#if NET
+        public readonly void UsePipe(IDuplexPipe pipe, bool pinned = false)
+        {
+            ArgumentNullException.ThrowIfNull(pipe);
+            PipeIoBridge.Attach(connection, pipe, pinned);
+        }
+#endif
 
         /// <summary>
         /// A library-owned outbound buffer. Write an initial payload here and set
@@ -258,6 +312,19 @@ public abstract partial class SocketSet : IDisposable
 
         /// <summary>Disable reading, for one-way (server-to-client) transports.</summary>
         public readonly void CloseInput() => connection.Flags |= SocketFlags.ReceiveClosed;
+
+        /// <summary>
+        /// Drive this connection's I/O through <paramref name="pipe"/> instead of the
+        /// <see cref="OnReceive"/>/<see cref="OnWrite"/> callbacks — the client-side counterpart of
+        /// <c>AcceptContext.UsePipe</c>; see that overload for the full contract.
+        /// </summary>
+#if NET
+        public readonly void UsePipe(IDuplexPipe pipe, bool pinned = false)
+        {
+            ArgumentNullException.ThrowIfNull(pipe);
+            PipeIoBridge.Attach(connection, pipe, pinned);
+        }
+#endif
 
         /// <summary>
         /// A library-owned outbound buffer. Write an initial handshake/greeting here and set

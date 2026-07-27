@@ -524,7 +524,56 @@ This also reframes the shard-count result: throughput scaled near-linearly with 
 flat at 32 = the pinned core count) precisely BECAUSE each connection's sends are serialised. Parallelism
 across connections was the only lever available.
 
-### 2b. BYO-buffer: caller-supplied (pinned) pipes, and killing the copies below them
+### 2a. BYO-buffer, phase 1: `ctx.UsePipe(IDuplexPipe, pinned)` - LANDED 2026-07-27 (fallback path)
+
+Opt-in per connection from OnAccept/OnConnect. The pipe handed in is the TRANSPORT-side endpoint
+(Kestrel's `Application` half): the transport writes received bytes to `pipe.Output` and reads outbound
+bytes from `pipe.Input`. A connection that never calls it is completely unaffected, so this cannot regress
+the existing path - and the whole feature is `#if NET` (netfx does not reference System.IO.Pipelines).
+
+**This is deliberately the BAD path.** `PipeIoBridge` is written entirely against the existing public
+surface - `Connection.Send(in ReadOnlySequence<byte>)` outbound, the normal receive callback inbound - so
+it works on EVERY backend today, including ones that can never do better (RIO takes registered buffer ids,
+never foreign addresses; DPDK would be similar). It costs one copy per direction, which is precisely what
+the per-backend fast paths are supposed to remove. Having it first means each backend's fast path has a
+correctness reference and a number to beat rather than being designed blind.
+
+Verified byte-exact (4MB echo) on IOCP, RIO, managed, and IOCP+SChannel TLS. Confirmed the path is
+actually taken rather than silently ignored: with `--pipe`, receive completions HALVE (2,080,047 ->
+990,511) because the server half no longer enters `OnReceive`, while round-trip bytes still balance.
+Costs about 5% throughput versus the callback path at 512B ping/pong - the extra copy and the thread hops.
+
+Known limitations, all for phase 2:
+
+- **Inbound backpressure is advisory.** The receive callback runs on the loop thread and cannot block, so
+  a flush that does not complete synchronously is observed asynchronously while writing continues into the
+  PipeWriter's buffer. Honouring it means PARKING the receive, which needs backend cooperation.
+- **`pinned` is recorded and unused.** Nothing in the fallback pins anything, because it copies.
+- **Read depth and the instant-response RawBuffer path are incompatible by construction** - both hand out
+  transport-owned memory whose lifetime does not match a pipe segment's.
+- Applications must not mix pipe mode with direct `Connection.Send`/IBufferWriter on the same connection;
+  the outbound pump owns ordering on that half.
+
+### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
+
+**Status: designed, not started.** IOCP is the right first driver because the shape already fits: its send
+path takes a `WSABUF` ARRAY, and a `ReadOnlySequence<byte>` is exactly an array of segments. Outbound
+becomes "build WSABUFs over the sequence's segments and issue one WSASend", with no staging copy at all.
+
+- **Outbound:** replace the `Send(in ReadOnlySequence)` copy with WSABUFs pointing straight at pipe
+  memory. The send must not complete-and-`AdvanceTo` until the WSASend completes, so the pump has to hold
+  the `ReadResult` across the operation - this is the real design change, and it is what `pinned` is for
+  (skip per-buffer pinning when the pool is already pinned; otherwise pin for the operation's duration).
+- **Inbound:** `pipe.Output.GetMemory(hint)` -> pin -> WSARecv straight into it -> `Advance` -> flush,
+  instead of receiving into the shard's slab and copying. This is where parking the receive on a pending
+  flush becomes both possible and necessary.
+- **RIO cannot follow** on the outbound half: `RIO_BUF` addresses a REGISTERED buffer by id, never a raw
+  address, so foreign pipe memory is unusable unless the caller's pool is registered up front. RIO keeps
+  the fallback, which is exactly why the fallback exists.
+- Measure against the fallback's own numbers, not against the callback path, so the comparison isolates
+  what zero-copy buys rather than what pipe mode costs.
+
+### 2c. BYO-buffer: original notes on caller-supplied (pinned) pipes and the copies below them
 
 > **DE-PRIORITISED 2026-07-27. The three measurements below were run, and they refute the premise.**
 >

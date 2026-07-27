@@ -1,3 +1,4 @@
+using System.Buffers;   // BuffersExtensions.Write, for PipeWriter as an IBufferWriter<byte>
 using System.Collections.Concurrent;
 using SocketSets;
 
@@ -15,6 +16,10 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
     /// per-connection send serialization) rather than the inline response path.
     /// </summary>
     public bool PokeMode { get; set; }
+
+    /// <summary>Opt accepted connections into pipe mode (ctx.UsePipe) and echo over the pipe instead of
+    /// OnReceive. Exercises the caller-supplied-IDuplexPipe path end to end.</summary>
+    public bool PipeMode { get; set; }
 
     private readonly BlockingCollection<(Connection Conn, byte[] Data)> _pokes = new();
     private int _pokeStarted;
@@ -84,7 +89,66 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
         Interlocked.Increment(ref _live);
         Interlocked.Increment(ref _liveServer);
         Volatile.Write(ref _alpnServer, ctx.Connection.NegotiatedProtocol);
+#if NET
+        // Opt this connection into pipe mode and echo over the pipe instead of OnReceive. Applied to
+        // ACCEPTED connections only, so the client half keeps the ordinary callback path and any
+        // byte-verification failure is attributable to the new path rather than to both ends changing.
+        if (PipeMode) StartPipeEcho(ref ctx);
+#endif
     }
+
+#if NET
+    /// <summary>
+    /// Exercise <c>ctx.UsePipe</c>: build a duplex pair, hand the TRANSPORT side to the connection, and
+    /// echo on the application side.
+    ///
+    /// Orientation is the whole trick here. The transport WRITES what it receives to <c>pipe.Output</c>
+    /// and READS what it should send from <c>pipe.Input</c> — so the transport's Output is the inbound
+    /// pipe's Writer, and its Input is the outbound pipe's Reader. The application gets the mirror.
+    /// </summary>
+    private void StartPipeEcho(ref AcceptContext ctx)
+    {
+        var inbound = new System.IO.Pipelines.Pipe();   // transport writes -> app reads
+        var outbound = new System.IO.Pipelines.Pipe();  // app writes -> transport reads
+        ctx.UsePipe(new DuplexPipe(outbound.Reader, inbound.Writer));
+
+        var appIn = inbound.Reader;
+        var appOut = outbound.Writer;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    var result = await appIn.ReadAsync().ConfigureAwait(false);
+                    var buffer = result.Buffer;
+                    if (!buffer.IsEmpty)
+                    {
+                        foreach (var seg in buffer) appOut.Write(seg.Span);
+                        Interlocked.Add(ref _echoed, (long)buffer.Length);
+                        var f = await appOut.FlushAsync().ConfigureAwait(false);
+                        if (f.IsCompleted || f.IsCanceled) { appIn.AdvanceTo(buffer.End); break; }
+                    }
+                    appIn.AdvanceTo(buffer.End);
+                    if (result.IsCompleted || result.IsCanceled) break;
+                }
+            }
+            catch { /* connection went away mid-echo; teardown below */ }
+            finally
+            {
+                try { await appIn.CompleteAsync().ConfigureAwait(false); } catch { }
+                try { await appOut.CompleteAsync().ConfigureAwait(false); } catch { }
+            }
+        });
+    }
+
+    private sealed class DuplexPipe(System.IO.Pipelines.PipeReader input, System.IO.Pipelines.PipeWriter output)
+        : System.IO.Pipelines.IDuplexPipe
+    {
+        public System.IO.Pipelines.PipeReader Input => input;
+        public System.IO.Pipelines.PipeWriter Output => output;
+    }
+#endif
 
     protected override void OnClosed(Connection connection)
     {

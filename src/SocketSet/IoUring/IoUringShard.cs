@@ -199,7 +199,7 @@ internal sealed class IoUringShard : SocketSetShard
         if (conn.Opened)
         {
             conn.Opened = false;
-            try { Parent.OnClosed(conn); }
+            try { Parent.DispatchClosed(conn); }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine(ex.Message); }
         }
 
@@ -780,7 +780,7 @@ internal sealed class IoUringShard : SocketSetShard
             fixed (byte* pp = pbuf)
             {
                 var ctx = new SocketSet.ReceiveContext(conn, pp, pbuf.Length, plen);
-                Parent.OnReceive(ref ctx);
+                Parent.DispatchReceive(ref ctx);
                 response = ctx.ResponseBytes;
             }
             if (response > 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
@@ -969,7 +969,7 @@ internal sealed class IoUringShard : SocketSetShard
                 fixed (byte* p = conn.KtlsRecv)
                 {
                     var ctx = new SocketSet.ReceiveContext(conn, p, conn.KtlsRecv.Length, n);
-                    Parent.OnReceive(ref ctx);
+                    Parent.DispatchReceive(ref ctx);
                     response = ctx.ResponseBytes;
                 }
                 if (response > 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
@@ -1383,7 +1383,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         byte* rp = _readBuffer.GetBufferAddress(bid);
         var ctx = new SocketSet.ReceiveContext(conn, rp, _readBuffer.BufferSize, res);
-        Parent.OnReceive(ref ctx);
+        Parent.DispatchReceive(ref ctx);
 
         int rb = ctx.ResponseBytes;
         if (rb <= 0 || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0) return false;
