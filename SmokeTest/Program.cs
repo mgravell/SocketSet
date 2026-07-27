@@ -29,6 +29,9 @@ string? tlsTrust = null;    // path to a PEM cert the TLS client should trust (e
 string tlsHost = "localhost"; // TargetHost for SNI + hostname verification
 bool ktls = false;          // use kernel-TLS (kTLS) offload (io_uring only)
 string[]? alpn = null;      // ALPN ids offered by BOTH ends (self-test: the overlap is the whole list)
+int? writeBuffersOverride = null; // --write-buffers: pool depth, decoupled from --page (see below)
+int? bufferPagesOverride = null;  // --buffer-pages:  ditto
+int? recvBufferOverride = null;   // --recv-buffer: per-socket receive buffer size, decoupled from --page
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
 {
@@ -205,8 +208,33 @@ for (int i = 0; i < args.Length; i++)
         case "--tls-host" when i + 1 < args.Length: // SNI + hostname-verify name (default localhost)
             tlsHost = args[++i];
             break;
+
+        // Pool depths, independent of --page. --page deliberately rescales these to hold pinned memory
+        // per shard constant, which makes page size and pool depth move TOGETHER and so makes it
+        // impossible to tell "a bigger page helped" from "fewer buffers hurt". These break the coupling.
+        // Applied after the parse loop, so order relative to --page does not matter.
+        case "--write-buffers" when i + 1 < args.Length && int.TryParse(args[i + 1], out var wbo):
+            writeBuffersOverride = Math.Max(1, wbo);
+            i++;
+            break;
+        case "--buffer-pages" when i + 1 < args.Length && int.TryParse(args[i + 1], out var bpo):
+            bufferPagesOverride = Math.Max(1, bpo);
+            i++;
+            break;
+        // Receive buffer size, decoupled from the send page. One per socket for the connection lifetime,
+        // so it multiplies by SocketsPerShard where the send page does not.
+        case "--recv-buffer" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rbo):
+            recvBufferOverride = Math.Max(1, rbo);
+            i++;
+            break;
     }
 }
+
+// Pool overrides last: --page rewrites these as a side effect, so an explicit value must win regardless
+// of where it appeared on the command line.
+if (writeBuffersOverride is int wbv) options.WriteBuffersPerShard = wbv;
+if (bufferPagesOverride is int bpv) options.BufferPagesPerShard = bpv;
+if (recvBufferOverride is int rbv) options.ReceiveBufferSize = rbv;
 
 if (resp)
 {
@@ -335,6 +363,12 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --churn S         overlapping-churn soak for S seconds: keep the population topped up so");
     Console.WriteLine("                    reconnects race in-flight teardowns (stresses slot reuse / ABA)");
     Console.WriteLine("  --sockets N       sockets per shard (small = tight table = immediate slot reuse under churn)");
+    Console.WriteLine("  --write-buffers N write buffers per shard, independent of --page (which rescales them to");
+    Console.WriteLine("                    hold pinned memory constant). Exhausting this pool CLOSES connections.");
+    Console.WriteLine("  --buffer-pages N  read/buffer pages per shard, likewise independent of --page");
+    Console.WriteLine("  --recv-buffer N   per-socket receive buffer size (IOCP/RIO), independent of --page.");
+    Console.WriteLine("                    There is one per SOCKET, so this multiplies by --sockets; the send");
+    Console.WriteLine("                    page does not. A big page wants a small recv buffer.");
     Console.WriteLine("  --iocp / --rio    force the Windows IOCP / RIO backend (RIO is TCP-only; default auto-detects)");
     Console.WriteLine("  --epoll           force the Linux epoll backend (io_uring's fallback)");
     Console.WriteLine("  TLS (self-signed loopback: server presents the cert, client trusts exactly it):");

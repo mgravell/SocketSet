@@ -51,6 +51,23 @@ internal sealed class DemoConfig
     public int Port { get; private set; } = 5080;
     public bool Help { get; private set; }
 
+    /// <summary>Send/write page size; 0 leaves the library default. RIO cannot scatter-gather, so one
+    /// send is one page and this is the only lever it has on large responses - measured 2026-07-27, a
+    /// 64KB page is worth 4.68x at a 256KB payload. Exposed here so the bridged path can be swept the
+    /// same way the bare responder can.</summary>
+    public int PageSize { get; private set; }
+
+    /// <summary>Per-socket receive buffer size; 0 follows <see cref="PageSize"/> (the library default).
+    /// Separate because there is one per SOCKET, so it multiplies by SocketsPerShard where the send page
+    /// does not: coupling them made a 64KB page cost 3.1GB rather than 283MB.</summary>
+    public int RecvBufferSize { get; private set; }
+
+    /// <summary>Write buffers per shard; 0 leaves the library default (1024). The write slab is this
+    /// times <see cref="PageSize"/>, which is the OTHER memory term - at a 64KB page, 1024 buffers is
+    /// 64MB per shard. Shrinking it is not free: running the pool dry currently closes the connection
+    /// rather than queueing.</summary>
+    public int WriteBuffers { get; private set; }
+
     public string Scheme => Tls ? "https" : "http";
 
     private DemoConfig() { }
@@ -86,6 +103,9 @@ internal sealed class DemoConfig
                 case "--port" when i + 1 < args.Length && int.TryParse(args[i + 1], out var p): cfg.Port = p; i++; break;
                 case "--pin": cfg.Pin = true; break;
                 case "--no-pin": cfg.Pin = false; break;
+                case "--page" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pg): cfg.PageSize = pg; i++; break;
+                case "--recv-buffer" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rb): cfg.RecvBufferSize = rb; i++; break;
+                case "--write-buffers" when i + 1 < args.Length && int.TryParse(args[i + 1], out var wb): cfg.WriteBuffers = wb; i++; break;
 
                 case "-h":
                 case "--help": cfg.Help = true; break;
@@ -114,6 +134,8 @@ internal sealed class DemoConfig
             throw new PlatformNotSupportedException("--iocp / --rio need Windows.");
         if (Which is Backend.IoUring or Backend.Epoll && !OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("--io-uring / --epoll need Linux.");
+        if ((PageSize > 0 || RecvBufferSize > 0 || WriteBuffers > 0) && VanillaKestrel)
+            throw new ArgumentException("--page / --recv-buffer / --write-buffers configure the SocketSet transport; they cannot combine with --kestrel.");
     }
 
     /// <summary>
@@ -159,9 +181,15 @@ internal sealed class DemoConfig
             (true, false, false) => OperatingSystem.IsWindows() ? "schannel (sspi)" : "openssl",
         };
 
+        // Buffer sizes are appended only when overridden, so the strings the bench harnesses match on
+        // (transport=, tls=, shards=) are unchanged for every existing leg.
+        string bufs = (PageSize > 0 ? $" page={PageSize}" : "")
+                    + (RecvBufferSize > 0 ? $" recvbuf={RecvBufferSize}" : "")
+                    + (WriteBuffers > 0 ? $" writebufs={WriteBuffers}" : "");
+
         return VanillaKestrel
             ? $"transport={transport} tls={tls} port={Port}"
-            : $"transport={transport} tls={tls} shards={Shards} pin={Pin} port={Port}";
+            : $"transport={transport} tls={tls} shards={Shards} pin={Pin} port={Port}{bufs}";
     }
 
     public static void PrintUsage()
@@ -184,6 +212,12 @@ internal sealed class DemoConfig
         Console.WriteLine("    --shards N       SocketSet worker threads (default 2, or $SS_SHARDS)");
         Console.WriteLine("    --pin/--no-pin   pin worker threads to cores (default off, or $SS_PIN=1)");
         Console.WriteLine("    --port N         listen port (default 5080)");
+        Console.WriteLine("    --page N         send/write page size (default 4096). RIO cannot scatter-gather, so");
+        Console.WriteLine("                     one send is one page and this is its only lever on big responses");
+        Console.WriteLine("    --recv-buffer N  per-socket receive buffer (default: follows --page). Keep this SMALL:");
+        Console.WriteLine("                     there is one per socket, so it multiplies by sockets-per-shard");
+        Console.WriteLine("    --write-buffers N  write buffers per shard (default 1024). Slab = this x --page, so");
+        Console.WriteLine("                     a big page wants fewer; running dry currently CLOSES connections");
         Console.WriteLine();
         Console.WriteLine("  The TLS certificate is a throwaway self-signed one for localhost, so clients must");
         Console.WriteLine("  skip verification: curl -k https://127.0.0.1:5080/plaintext");

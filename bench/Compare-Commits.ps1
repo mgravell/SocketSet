@@ -61,12 +61,25 @@ $clientMask = ((([int64]1 -shl $cpuCount) - 1) -bxor $serverMask)
 $env:DOTNET_PROCESSOR_COUNT = "$half"
 $env:GOMAXPROCS = "$half"
 
-$root = Join-Path ([System.IO.Path]::GetTempPath()) "ss-ab-$(Get-Date -Format yyyyMMddHHmmss)"
+# STABLE path, deliberately not timestamped. Each side builds a SmokeTest.exe that has to listen, and on
+# Windows that means a firewall prompt for any path the firewall has not seen before. A timestamped root
+# gives every run a brand-new path, so it prompts EVERY time and leaves behind a dead allow-rule for a
+# directory that no longer exists - and a pending firewall dialog is a documented 2.8x benchmark
+# confounder (see README). Fixed paths can be allow-listed once. The tradeoff is that a killed run leaves
+# a worktree behind, so New-Side clears the path before reusing it.
+$root = Join-Path ([System.IO.Path]::GetTempPath()) "ss-ab"
 $worktrees = @()
+
+& git -C $repo worktree prune 2>$null
 
 function New-Side([string]$name, [string]$commit) {
     $path = Join-Path $root $name
     Write-Host "  worktree $name -> $commit" -ForegroundColor DarkGray
+    # Reclaim the fixed path from any previous run that did not get to clean up.
+    if (Test-Path $path) {
+        & git -C $repo worktree remove --force $path 2>$null
+        Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue
+    }
     & git -C $repo worktree add --detach --quiet $path $commit
     if ($LASTEXITCODE -ne 0) { throw "git worktree add failed for $commit" }
     $script:worktrees += $path

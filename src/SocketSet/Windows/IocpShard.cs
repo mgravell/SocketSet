@@ -141,7 +141,9 @@ internal sealed unsafe class IocpShard : SocketSetShard
         _socketsPerShard = options.SocketsPerShard;
         _writeCount = options.WriteBuffersPerShard;
         _writeBufSize = options.BufferPageSize;
-        _recvBufSize = options.BufferPageSize;
+        // Receive buffers are per-socket and held for the connection lifetime, so their size multiplies by
+        // SocketsPerShard; the send page does not. See SocketSetOptions.ReceiveBufferSize.
+        _recvBufSize = options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize;
         _recvCount = _socketsPerShard;         // one recv buffer per connection (recv is always armed)
         _opCount = _socketsPerShard * 2;       // recv + send per connection
         _listenBacklog = options.ListenBacklog;

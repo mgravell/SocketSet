@@ -310,17 +310,60 @@ such mechanism, so for RIO the page IS the unit of transfer and its size is ever
 With a 64 KB page RIO beats IOCP at every payload (4,449 vs 4,357 at 16 KB; 10,969 vs 5,972 at 256 KB),
 inverting the current standing. RIO is not a weak backend; it has been starved.
 
-**This does NOT translate into a default change yet, for a reason the benchmark could not see.** Page
-size and pool depth trade against each other, and the harness holds total pinned memory constant by
-scaling buffer counts down as the page grows (`WriteBuffersPerShard = 4MB/page`). At the shipped defaults
-`SocketsPerShard` is 4096 against `WriteBuffersPerShard` 1024 - already 4:1 oversubscribed - and a 64 KB
-page at constant memory would make that **64:1**. This run used `-c 64` over 12 shards, about **5
-connections per shard**, so it never approached pool pressure.
+### 5. The two sizes were one option, and splitting them makes the win free
 
-That matters more than a throughput regression would, because **write-pool exhaustion currently CLOSES
-the connection** (`CloseClient` in both `SendResponse` and `StartPendingSend`) rather than queueing or
-applying backpressure. Getting the sizing wrong drops connections rather than slowing them down. The
-missing measurement is high connections-per-shard at a large page.
+The 4.68x above cost 11.2x the memory: a 12-shard RIO server went from **283 MB to 3,163 MB** resident.
+The cause was that `_writeBufSize` and `_recvBufSize` both read `Options.BufferPageSize`, and receive
+buffers are **one per socket for the connection's lifetime** - at `SocketsPerShard` 4096 across 12 shards
+a 64 KB receive buffer is 3.0 GB, against 192 MB at 4 KB. The receive slab was 97% of the growth and
+gains nothing from being large; only the SEND page does.
+
+`SocketSetOptions.ReceiveBufferSize` now splits them (0 = follow `BufferPageSize`, so no behaviour change
+unless set). Measured, 12 shards, `-c 64`, median of 3:
+
+| leg | 512 B | 16 KB | 256 KB | RSS |
+|---|---:|---:|---:|---:|
+| rio, 4 KB page | 153.2 | 1,637.0 | 2,367.6 | 283 MB |
+| rio, 64 KB page (coupled) | 153.5 | 4,462.8 | 10,835.7 | 3,163 MB |
+| **rio, 64 KB page + 4 KB recv** | 153.2 | 4,365.8 | **11,030.2** | **283 MB** |
+| iocp, 4 KB page | 151.4 | 4,335.2 | 5,628.5 | 70 MB |
+| iocp, 64 KB page + 4 KB recv | 151.6 | 4,345.5 | 5,922.5 | 70 MB |
+
+**The split is free**: full throughput of the expensive config at the memory of the cheap one - 4.66x at
+256 KB, 2.67x at 16 KB, no regression at 512 B, zero errors. IOCP gains ~5% at 256 KB at unchanged memory.
+
+### 6. Under load, the LARGE page is the safe one - the current default is not
+
+The write slab is `WriteBuffersPerShard x page`, which is the other memory term (at the library default of
+1024 buffers, a 64 KB page is 64 MB per shard - AspNetDemo at 12 shards measured 1,030 MB). Shrinking that
+pool looked dangerous, because **write-pool exhaustion closes the connection** (`CloseClient` in
+`SendResponse` and `StartPendingSend`) instead of queueing. Measured at 12 shards, 256 KB payload, errors
+being the metric that matters:
+
+| config | -c 64 | -c 512 | -c 2048 | errors @2048 | RSS |
+|---|---:|---:|---:|---:|---:|
+| **4 KB page, 1024 buffers (today's default)** | 2,392.0 | 1,506.3 | 1,281.9 | **208** | 283 MB |
+| 64 KB page + 4 KB recv, 1024 buffers | 11,357.4 | 5,189.8 | 3,624.0 | **0** | 1,003 MB |
+| 64 KB page + 4 KB recv, 256 buffers | 11,461.2 | 5,474.5 | 3,467.4 | **0** | 427 MB |
+| 64 KB page + 4 KB recv, 64 buffers | 11,475.9 | 5,199.7 | 3,477.6 | 1 | 283 MB |
+
+**The prediction was wrong and the opposite is true.** The configuration that drops connections is the one
+shipping today - 208 of them at 2048 connections - while every large-page configuration is clean at 0-1.
+
+The mechanism, in hindsight: RIO holds exactly ONE write page per in-flight send, and at a 4 KB page a
+256 KB response occupies that page across **64 sequential round trips**. At 64 KB it needs 4. Pool
+*occupancy time* collapses, so a bigger page relieves pool pressure rather than adding to it. The original
+reasoning counted buffers and ignored how long each is held.
+
+So `64 KB page + 4 KB recv + 256 write buffers` is faster at every concurrency tested, has strictly better
+error behaviour than the shipped default, and costs 144 MB across 12 shards.
+
+**Still not changed as a default**, deliberately: these are Windows measurements at one payload shape on
+loopback, `BufferPageSize` is shared with io_uring and epoll where it has not been swept, and the 208
+errors on the current default are a pre-existing defect that wants fixing on its own terms (queue rather
+than close) rather than being papered over by a page-size change. The knobs are now plumbed end to end -
+`SmokeTest` and `AspNetDemo` both take `--page` / `--recv-buffer` / `--write-buffers`, and `/config`
+reports them so a harness can verify the setting actually took.
 
 ## Not measured: connection establishment
 

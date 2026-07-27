@@ -57,6 +57,63 @@ backends that cannot take foreign memory at all — RIO takes only registered `B
 
 ---
 
+## Dynamic shard growth (MinShards -> MaxShards)
+
+**Status: proposed, not started. Intended behaviour from the outset; architecture surveyed 2026-07-27.**
+
+Today `Options.Shards` is a fixed count materialised in the `SocketSet` constructor and never changed.
+The intent is for it to become **MinShards**: start at a reasonable count, and when a connection cannot be
+placed because every shard is full, spin up another (double-checked, synchronised) up to **MaxShards** and
+place it there. Shards then ramp with load instead of being sized for the worst case up front.
+
+**Why it matters beyond elasticity.** Per-shard memory is `SocketsPerShard x buffer sizes`, pre-allocated
+and pinned. That product is what makes buffer sizing painful: at `SocketsPerShard` 4096 a 64KB receive
+buffer costs 256MB *per shard* (measured 2026-07-27 - a 12-shard RIO server went 283MB -> 3,163MB
+resident when the receive buffer followed a 64KB page). Growth lets `SocketsPerShard` be small, so each
+shard's slabs are small and you only pay for shards that exist. It converts a worst-case allocation into
+a demand-driven one, and it removes a hard failure: `TryPlace` currently returns null and the caller
+drops or throws.
+
+**The hook already exists** - `SocketSet.TryPlace` ends with
+`return null; // every shard full (we may grow here later; for now the caller drops/throws)`. That is the
+insertion point, and placement is already capacity-aware (it walks for a shard with room rather than
+committing to one round-robin pick).
+
+**Accept is NOT the obstacle it looks like, on Windows.** The concern is that accept only listens on
+shards that existed at `Listen` time. That is true for exactly one of the two paths:
+
+- *Multi-bind / reuse-port* (io_uring, IP): `Listen` binds a listener on EVERY shard and the kernel
+  balances. A new shard needs the listen endpoints replayed onto it, so the set must remember what it was
+  asked to listen on. This is the real work.
+- *Single-listener* (Windows IOCP/RIO, `ListenHandle`, AF_UNIX): one shard owns the listener and bounces
+  each accepted socket via `Parent.TryPlace()`, which re-reads `_shards` on every call
+  (`IocpShard.cs:717`). **A new shard receives connections immediately with no listener changes.** So on
+  the platform where the memory pressure actually bites, this part is free.
+
+**What the work actually is:**
+
+1. `_shards` becomes a swappable array (copy-on-write + `Volatile.Write`) so the hot readers - `TryPlace`,
+   `RoundRobin` - stay lock-free and simply observe a longer array. Growth takes a lock; reads never do.
+2. Starting a shard on a live set. The constructor's `CountdownEvent` startup gate assumes a fixed count
+   and runs before anything is serving; growth needs an equivalent that does not stall the caller placing
+   a connection. Note `UsesWorkerThreads` backends start a thread per shard and the managed backend
+   initialises inline - two different paths.
+3. Listen replay for the multi-bind path (remember endpoints + tokens; apply on new shards).
+4. Teardown: `Dispose` must cover shards added after construction, including one being created
+   concurrently with disposal.
+5. Failure policy: if shard creation fails or `MaxShards` is reached, `TryPlace` still has to return null
+   and the existing drop/throw path stands.
+6. `MaxShards` currently exists on the FACTORY as a backend capability cap (the managed backend wants
+   exactly 1) - a growth cap is a different thing and needs its own option; do not overload that name.
+
+**Shrink is explicitly out of scope** unless asked for: idle shards holding pinned slabs is the mirror
+problem, and reclaiming a shard means draining its connections first.
+
+**Sequencing caveat, and it is the same one as everything else here:** this is a cross-cutting change
+touching all four backends' startup/teardown. TLS was written twice, epoll made the send machinery a
+third copy, `fa97dd4` paid an ownership rule out three times. Landing dynamic shards before the
+IOCP/RIO factoring below means writing it N times too.
+
 ## Factor the shared IOCP/RIO data path
 
 **Status:** proposed, not started.
@@ -337,19 +394,45 @@ pool pressure.
 That is dangerous rather than merely slow, because **write-pool exhaustion closes the connection**
 (`CloseClient` in `SendResponse` and `StartPendingSend`) instead of queueing. See item 0b.
 
-**To land this:**
+**RESOLVED 2026-07-27, except the default itself.**
 
-1. Measure high connections-per-shard at a 64KB page and find where the pool goes dry.
-2. Decide the memory budget explicitly - 64KB x 1024 buffers is 64MB per shard, x12 shards is 768MB, so
-   constant-memory means fewer buffers and constant-buffers means much more memory. One of them has to give.
-3. Make `BufferPageSize` effectively **per-backend** (RIO large, IOCP small) rather than one global
-   constant, since the matrix shows they want opposite things.
-4. Sweep past 64KB - RIO is still improving monotonically at the top of the range, so the peak is unknown.
-5. `AspNetDemo` has no `--page` option, so none of this reaches the bridged numbers until it does.
+1. *The memory blocker is gone.* `_writeBufSize` and `_recvBufSize` were the same option, and receive
+   buffers are one per SOCKET - so a 64KB page cost 3,163MB instead of 283MB, 97% of it receive slab that
+   gains nothing from being large. `SocketSetOptions.ReceiveBufferSize` splits them (0 = follow
+   `BufferPageSize`). A 64KB send page with a 4KB receive buffer gives the full 4.66x at **283MB, the same
+   as today**.
+2. *Pool pressure: the prediction was wrong, and instructively so.* A shallow pool at a big page was
+   expected to drop connections. Measured at 12 shards / 256KB / `-c 2048`, the config that drops
+   connections is **today's default** (208 errors); every large-page config is clean at 0-1. RIO holds one
+   write page per in-flight send, and at 4KB a 256KB response holds it across 64 sequential round trips
+   versus 4 at 64KB - occupancy time collapses, so a bigger page RELIEVES pool pressure. Counting buffers
+   without counting holding time is what got it backwards.
+3. *Plumbed end to end.* `SmokeTest` and `AspNetDemo` both accept `--page` / `--recv-buffer` /
+   `--write-buffers`; `/config` reports them so a harness can verify the setting took, and combining them
+   with `--kestrel` is rejected.
+
+**What is deliberately NOT done: changing the default.** `64KB page + 4KB recv + 256 write buffers` is
+faster at every concurrency tested and has strictly better error behaviour than what ships. It is still
+not the default because: these are Windows measurements at one payload shape on loopback;
+`BufferPageSize` is shared with io_uring and epoll, where it has not been swept; and the 208 errors on the
+current default are a pre-existing defect that deserves fixing on its own terms (item 0b) rather than
+being masked by a page-size change.
+
+**Remaining:**
+
+- Sweep past 64KB - RIO was still improving monotonically at the top of the range, so the peak is unknown.
+- Sweep page size on io_uring/epoll before touching a shared default.
+- Decide the mechanism for a per-backend default. The backends want opposite things (RIO large, IOCP
+  small/indifferent) and `BufferPageSize` is one global constant with a real default of 4096, so there is
+  no way to distinguish "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend
+  chooses) or a factory-supplied default; that changes public option semantics and wants its own commit.
 
 ### 0b. Write-pool exhaustion closes the connection instead of applying backpressure
 
-**Status: proposed, not started. Surfaced by item 0 on 2026-07-27.**
+**Status: proposed, not started. Surfaced by item 0 on 2026-07-27, and MEASURED: the shipped defaults drop
+208 connections at `-c 2048` with 256KB responses on 12 shards.** Not a hypothetical - it is the current
+default configuration, and it is the only configuration tested that failed. Large-page configs came in at
+0-1 errors, which means a page-size change would MASK this rather than fix it. Fix it on its own terms.
 
 `WindowsRioShard.SendResponse` and `StartPendingSend` both do
 `if (!_writeBuffer.TryLease(...)) { CloseClient(slot); return; }`, and `IocpShard` has the same shape. So
@@ -530,6 +613,38 @@ numbers above. Real hardware required before drawing conclusions about kTLS itse
 The rigs are in-repo and runnable: `bench/run-matrix.sh` (transport matrix) and `bench/run-tls-sizes.sh`
 (payload sweep). Everything above was measured in a container on a WSL2 kernel over loopback, which is
 adequate for correctness and weak for performance.
+
+## Check UDS on Windows
+
+**Status: unverified, suspected broken. Raised 2026-07-27.**
+
+AF_UNIX is solid on Linux (io_uring and epoll both exercise it in the smoke matrix). On Windows it has
+never been observed working, and it may never have been exercised - the claim has not been tested either
+way, which is the point of this item.
+
+Scope, so the test is not run against the wrong thing:
+
+- **IOCP only.** RIO is TCP/UDP and cannot do AF_UNIX; the code already routes AF_UNIX to the IOCP
+  backend, so `--rio` plus a UDS endpoint is out of scope rather than a bug.
+- **Filesystem paths only.** The abstract namespace (`@name`) is a Linux extension - Windows AF_UNIX is
+  filesystem-path only, and the interop already says so (`sockaddr_un (Windows AF_UNIX - filesystem path
+  only, no abstract namespace)`). A Windows UDS test must use a real path.
+- **Single listener.** AF_UNIX cannot multi-bind on any platform, so it takes the
+  one-shard-listens-and-bounces path rather than reuse-port.
+
+**Reproduce first:** `SmokeTest --iocp -s -c 8 -u C:\Users\<you>\AppData\Local\Temp\ss-uds.sock -t 10`,
+then the same with `--verify` and `--verify-echo`. Record what actually happens - bind failure, accept
+failure, silent hang, or success - rather than assuming.
+
+**Things known to differ on Windows** and worth checking against whatever fails: `AcceptEx` /
+`GetAcceptExSockaddrs` behaviour on AF_UNIX, `ConnectEx` needing an explicit prior bind, stale socket
+files needing removal before bind (the shared helper does this for the Linux backends - confirm the
+Windows path calls it), and path-length limits. Datagram AF_UNIX and `SO_PEERCRED` do not exist on
+Windows at all.
+
+If it turns out never to have worked, the honest options are to fix it or to say so in the README and
+have the factory reject AF_UNIX on Windows loudly - what is not acceptable is the current state, where
+nobody knows.
 
 ## Smaller / previously flagged
 

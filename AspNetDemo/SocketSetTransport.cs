@@ -51,6 +51,11 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
             PinWorkerThreads = _config.Pin,
             Tls = _tls, // null = plaintext; otherwise TLS terminates here, below Kestrel
         };
+        // 0 = leave the library default. Kept as an override rather than a value so the demo does not
+        // silently pin a default that the library later changes.
+        if (_config.PageSize > 0) options.BufferPageSize = _config.PageSize;
+        if (_config.RecvBufferSize > 0) options.ReceiveBufferSize = _config.RecvBufferSize;
+        if (_config.WriteBuffers > 0) options.WriteBuffersPerShard = _config.WriteBuffers;
         _set = new TransportSet(options, this);
         _set.Listen(EndPoint);
         Console.WriteLine($"[socketset transport] {_config.Describe()}");
