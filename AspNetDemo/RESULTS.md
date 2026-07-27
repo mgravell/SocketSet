@@ -146,6 +146,86 @@ that per-record crypto dominates per-syscall overhead - at 512 bytes the transpo
 layer are both drowned by fixed costs. Connection churn would also need to come back, since handshake
 cost is where these TLS stacks genuinely differ and it is entirely out of scope here.
 
+## Windows: payload sweep, and finding the real bottleneck (2026-07-26)
+
+Real hardware this time - no container, no WSL2 - so this is the strongest data in this file.
+`bench/Run-TlsSizes.ps1`, `-c 64`, 16 shards, server pinned to logical CPUs 0-15, generator to 16-31,
+first pass discarded, median of the rest.
+
+### Goodput MiB/s, payload sweep
+
+| payload | kestrel | kestrel+tls | iocp | iocp+tls | rio+tls |
+|---|---:|---:|---:|---:|---:|
+| 16 KB | ~3,740 | ~3,430 | ~1,449 | ~1,486 | ~1,524 |
+| 256 KB | ~9,417 | ~7,493 | ~1,927 | ~1,939 | ~2,045 |
+
+The tell is that **plaintext and TLS are within ~1% of each other on our transports, across two different
+backends**. When the cipher is invisible, the constraint is upstream of it. Kestrel meanwhile pays a
+visible ~12-20% for SslStream, which is what a TLS cost is supposed to look like.
+
+### Shard scaling (goodput MiB/s)
+
+| payload | s2 | s4 | s8 | s16 | s32 |
+|---|---:|---:|---:|---:|---:|
+| 16 KB, iocp | 447 | 767 | 1,165 | 1,455 | 1,445 |
+| 16 KB, iocp+tls | 425 | 725 | 1,118 | 1,434 | 1,417 |
+| 256 KB, iocp | 527 | 1,001 | 1,528 | 1,899 | 2,054 |
+| 256 KB, iocp+tls | 567 | 1,090 | 1,549 | 1,937 | 2,116 |
+
+Near-linear to 8, plateauing at 16 = the pinned core count, nothing from 32. Shard count was *not*
+self-inflicted harm (a hypothesis this refuted). It scales that way **because** per-connection sends were
+serialised - parallelism across connections was the only lever available.
+
+### Isolating the bridge
+
+Bare SocketSet HTTP responder (`SmokeTest --http`, no Kestrel, no bridge) vs the same transport behind
+the AspNetDemo bridge, same client, same pinning, same payload:
+
+| | 16 KB | 256 KB |
+|---|---:|---:|
+| bare responder | 1,655 | 2,454 |
+| AspNetDemo iocp/s16 | 1,455 | 1,899 |
+
+So the bridge costs **12% at 16 KB, 23% at 256 KB** - not the ~4x it had been blamed for. The gap was in
+the transport itself.
+
+### The cause: sends were quantised to one write page
+
+`BufferPageSize` defaults to 4096 and the send path kept **one page in flight per connection**, so a
+256 KB response left as 64 sequential `WSASend`s, each costing a completion-port round trip. Kestrel
+issues one `SendAsync` over the whole buffer.
+
+Page-size sweep on the bare responder at 256 KB (median of 2 scored passes):
+
+| page | goodput |
+|---|---:|
+| 4 KB | 885 |
+| 16 KB | 2,503 |
+| 64 KB | 3,556 |
+
+Page size is a trade-off rather than a dial, though: at a 16 KB payload the best page is 16 KB
+(2,103 MiB/s) and 64 KB is *worse* (1,273), because most of the page is wasted.
+
+### Fix: one scatter-gather WSASend per send
+
+`WSASend` always took a buffer array; only the call site passed 1. A send is now a set of pages issued as
+one call with up to 64 `WSABUF`s, segments packed (so small queued responses still coalesce) and partial
+sends resuming across pages. Bare responder, **default 4 KB page**:
+
+| payload | before | after |
+|---|---:|---:|
+| 16 KB | 1,655 | 1,739 |
+| 256 KB | 2,454 | **3,843** (+57%) |
+
+**Correction.** The commit for this change (`d2cec1e`) claims 4.3x by comparing against the 885 MiB/s
+figure above. That is not a like-for-like comparison: the 885 run was taken via `--page 4096`, which also
+raises `OutOfBandWriteBuffersPerShard` and `BufferPagesPerShard` from 256 to 1024, so the pools differed.
+Against the default configuration the honest number is **2,454 -> 3,843, i.e. +57%** - still the largest
+single win found, but not 4.3x. (Why the larger pools measured *slower* is unexplained and worth a look.)
+
+End-to-end through AspNetDemo the win does not show (256 KB: 1,899 -> 2,041): the bridge is now the
+binding constraint, having gone from ~23% of the gap to ~47%. The bottleneck moved rather than vanished.
+
 ## Confounders found
 
 Each produced *believable* numbers, which is the dangerous kind of wrong.
