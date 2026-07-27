@@ -28,10 +28,12 @@ the kernel rejects with `-EINVAL`, so *every* recv failed silently); scatter-gat
 response left as 64 sequential `WSASend`s. Issuing one call with up to 64 `WSABUF`s gave **+133% at 16KB
 and +162% at 256KB**, validated with `bench/Compare-Commits.ps1`. See `AspNetDemo/RESULTS.md`.
 
-**The biggest measured, attributable win still on the table: finish the same fix for RIO.** It was written
-up as covering IOCP and RIO; only IOCP got it. `WindowsRioShard.IssueSend` still posts
-`RIOSend(conn.Rq, &buf, 1, ...)`. Measured 2026-07-27: RIO *leads* IOCP at 512B (142.7 vs 138.0 MiB/s) and
-trails it **2.5x at 16KB** (1,521 vs 3,741) and **2.2x at 256KB** (2,052 vs 4,483). See item 0.
+**RIO's large-payload gap is real but has no cheap fix.** RIO *leads* IOCP at 512B (142.7 vs 138.0 MiB/s)
+and trails it **2.5x at 16KB** (1,521 vs 3,741) and **2.2x at 256KB** (2,052 vs 4,483), because its send
+is still quantised to one write page. The obvious fix - port IOCP's scatter-gather - was attempted on
+2026-07-27 and **is impossible**: Windows caps `RIOCreateRequestQueue`'s `maxSendDataBuffers` at 1 and
+returns WSAEINVAL for anything higher. The viable alternative is multiple *outstanding* single-buffer
+sends, which is a different and larger change. See item 0 before picking this up.
 
 **In flight and UNMEASURED:** `fa97dd4` makes the out-of-band flush snapshot rent from `ArrayPool`
 instead of allocating. Its A/B was contaminated by a power loss mid-run and is void. Re-run:
@@ -203,6 +205,45 @@ kernel or the environment.
 
 **Highest expected value of anything on this list.**
 
+### 1c. Configurable read depth (multiple outstanding receives) - IOCP and RIO
+
+**Status: proposed, not started. Feasibility confirmed 2026-07-27.**
+
+Both Windows backends currently keep **exactly one receive outstanding per connection**: `RecvBuf` is a
+single slab index leased for the connection lifetime and `RecvArmed` is a bool, so the cycle is strictly
+complete -> deliver -> re-arm. RIO additionally hard-caps it, `RIOCreateRequestQueue(sock, 1, 1, ...)`.
+
+io_uring does not have this limitation and never did - `IoUringShard.ArmRecv` uses
+`IORING_RECV_MULTISHOT` against a provided-buffer ring, which is unbounded depth with no re-arm step. So
+this is a Windows-only gap, and the backend that most wants fixing is the one whose entire design premise
+is deep queues.
+
+**Why it should help.** Between a completion and its re-arm there is a window with no buffer posted.
+Data arriving then lands in the kernel socket buffer and is copied out on the next receive rather than
+going straight into ours. At high message rates that window is hit constantly. It should also help the
+fragmented-input case directly: successive segments land in successive pre-posted placeholders instead of
+coalescing in the kernel buffer.
+
+**Feasible on RIO** - `maxOutstandingReceive` accepts 4 and 16 (unlike `maxRecvDataBuffers`, capped at 1;
+see item 0 for how that was established).
+
+**Design points:**
+
+- A `ReadDepth` option, defaulting to 1 so the change is opt-in until measured.
+- `RecvBuf` becomes a ring of N leases per connection; the recv slab grows N x `SocketsPerShard`. That is
+  the dominant cost.
+- **Ordering becomes load-bearing.** Completions for one socket arrive in submission order and one loop
+  thread drains them, so order holds - but it stops being structural. TLS is unforgiving here: records are
+  sequence-numbered, so a single out-of-order delivery kills the connection rather than degrading it.
+- RIO pays non-paged pool for `maxOutstandingReceive` per connection, on top of anything item 0 adds.
+
+**Do first: build a receive-heavy benchmark.** None of the current rigs would show this. `/plaintext` is
+ceiling-bound on this host, and both payload sweeps are response-heavy - large sends, tiny requests. Read
+depth is a receive-side optimisation, so measuring it needs a large-request workload that does not exist
+in `bench/` yet. `SmokeTest --verify-echo` is the closest thing in-tree and it is a correctness test.
+Building the code first would repeat the pattern this file keeps warning about: a plausible mechanism
+with no measurement able to confirm or refute it.
+
 ### 2. Re-run the size sweep now the plaintext controls are in
 
 The first sweep had one plaintext control and it was the wrong one, so nothing at >=16KB is fully
@@ -219,7 +260,8 @@ interpretable yet. Plaintext `kestrel` and `epoll` legs added 2026-07-26; just n
   page". This entry claimed both backends were covered; only one was, and nothing recorded the difference
   until the 2026-07-27 sweep went looking for it.
 
-**What RIO's half is worth**, from `bench/Run-TlsSizes.ps1 -Shards 12` (goodput MiB/s, median of 3):
+**What RIO's page quantisation costs**, from `bench/Run-TlsSizes.ps1 -Shards 12` (goodput MiB/s, median
+of 3):
 
 | payload | rio/s12 | iocp/s12 | RIO vs IOCP |
 |---|---:|---:|---:|
@@ -232,8 +274,51 @@ to the one backend that still has it. Spreads 0.3-3.3%, so this is not close to 
 plaintext `rio` (and at 256KB is marginally faster), confirming the constraint is the send path and not
 the cipher.
 
-`RIOSend` takes a buffer array exactly as `WSASend` does. The shape to copy is `IocpShard.IssueSendPages`,
-in-tree. **This is the highest-value item on this list.**
+#### RIO CANNOT do scatter-gather. Attempted 2026-07-27, refuted by the OS.
+
+This entry used to end "RIOSend takes a buffer array exactly as WSASend does; copy
+`IocpShard.IssueSendPages`". **That is wrong**, and it was wrong when first written. `RIOSend` takes an
+array in its *signature*, but the buffer count is fixed at request-queue creation by
+`RIOCreateRequestQueue`'s `maxSendDataBuffers`, and Windows accepts only **1**.
+
+Measured directly - the full port of `IssueSendPages` was written, and every connection failed to
+establish. Probing the parameter in isolation:
+
+| `maxSendDataBuffers` | result |
+|---|---|
+| 1 | RQ created |
+| 2, 3, 4, 8, 16, 64 | **WSAEINVAL (10022)** |
+
+`maxRecvDataBuffers` is capped at 1 the same way. This matches Microsoft's own note on
+`RIOCreateRequestQueue` that the Registered I/O extensions currently support a value of 1 for both. So
+the IOCP fix has no RIO analogue: one `RIOSend` is one contiguous buffer, permanently.
+
+#### What IS available: depth, not width
+
+The *outstanding operation* counts are not capped that way. Probed on the same host, same call:
+
+| parameter | 1 | 4 | 16 | 64 |
+|---|---|---|---|---|
+| `maxOutstandingSend` | ok | ok | ok | ok |
+| `maxOutstandingReceive` | ok | ok | ok | - |
+
+So the RIO-idiomatic fix for the same problem is **K single-buffer sends in flight** rather than one
+send of K buffers: post each write page as its own `RIOSend` without waiting for the previous completion,
+and let the RQ ring hold them. Completions for one RQ arrive in submission order, and the shard has one
+loop thread draining the CQ, so stream ordering is preserved - but that ordering guarantee becomes
+load-bearing rather than structural, which is the main risk to design around. This is a different change
+from the IOCP one, not a port of it:
+
+- `SendBusy` becomes a count (or a small ring), not a bool; `TryFinalize` must wait for all of them.
+- Partial sends complete per-page, so the `SendSent`/`SendTotal` cursor becomes per-page bookkeeping.
+- Teardown must reclaim every page still outstanding, not just page 0.
+- `RIO_MSG_DEFER` already batches the kernel kick, so K submissions still cost one commit.
+
+**Unknown until measured:** whether K deep single-buffer sends recover the 2.2-2.5x, or whether RIO's
+per-send cost means the win is smaller than IOCP's scatter-gather win. Worth a spike before a full
+implementation - and note the cheaper partial mitigation available today is simply a larger
+`BufferPageSize` for RIO, since one send is one page and page size is then the only lever (the
+2026-07-26 sweep put a 64KB page at 4.0x a 4KB page at 256KB, at the cost of waste at small payloads).
 
 ---
 

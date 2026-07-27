@@ -186,8 +186,15 @@ run. `rio+tls` tracks plaintext `rio` almost exactly and at 256 KB is marginally
 old 16 KB numbers correctly. Without a plaintext RIO leg this pattern is indistinguishable from "SChannel
 is slow on RIO".
 
-**Expected value of finishing it: 2.2-2.5x on RIO at >=16 KB.** `RIOSend` takes a buffer array exactly as
-`WSASend` does; the shape to copy is already in-tree in `IocpShard`.
+**But the IOCP fix does not port, and this was tested rather than assumed.** `RIOSend` takes a buffer
+array in its signature, yet the count is fixed at request-queue creation by `RIOCreateRequestQueue`'s
+`maxSendDataBuffers`, and Windows accepts only 1 - `2, 3, 4, 8, 16, 64` all return **WSAEINVAL (10022)**.
+A full port of `IssueSendPages` was written on 2026-07-27 and every connection failed to establish. So
+"RIO has the same shape as WSASend" was wrong, and the 2.2-2.5x is not recoverable by copying `IocpShard`.
+
+What RIO *does* allow is depth: `maxOutstandingSend` accepts 4/16/64. The alternative is K single-buffer
+sends in flight instead of one send of K buffers - a different, larger change, and unmeasured. See
+`TODO.md` item 0.
 
 ### What the scatter-gather fix bought, and what is left
 
@@ -356,9 +363,12 @@ Page size is a trade-off rather than a dial, though: at a 16 KB payload the best
 one call with up to 64 `WSABUF`s, segments packed (so small queued responses still coalesce) and partial
 sends resuming across pages.
 
-> **IOCP only.** This was written up as applying to IOCP and RIO alike. It was never applied to RIO, which
-> still posts `RIOSend(conn.Rq, &buf, 1, ...)`. The 2026-07-27 sweep measures what that costs: **2.2-2.5x
-> at >=16 KB**. See the RIO section above.
+> **IOCP only, and necessarily so.** This was written up as applying to IOCP and RIO alike. It was never
+> applied to RIO, and on 2026-07-27 it turned out it *cannot* be: RIO fixes its buffers-per-send at
+> request-queue creation and Windows only permits 1. The claim that "`RIOSend` likewise takes a buffer
+> array" confused the signature with the implementation. The 2026-07-27 sweep measures what RIO's page
+> quantisation costs (**2.2-2.5x at >=16 KB**) and the RIO section above records what is actually
+> available instead.
 
 Measured with `bench/Compare-Commits.ps1` - the two commits built in isolated git worktrees and measured
 back to back on mains, median of 3 scored passes, **default 4 KB page**:
@@ -468,8 +478,9 @@ approaches the effect being claimed.
 
 ## Open
 
-- **Finish RIO's scatter-gather send.** Quantified at 2.2-2.5x at >=16 KB. The largest measured,
-  attributable win currently on the table.
+- **RIO's large-payload gap (2.2-2.5x at >=16 KB).** Quantified and attributed, but the obvious fix is
+  ruled out - RIO cannot do scatter-gather. Options are K outstanding single-buffer sends (larger change,
+  unmeasured) or simply a bigger `BufferPageSize` for RIO. See `TODO.md` item 0.
 - **The 256 KB gap to Kestrel (4,483 vs 11,489 MiB/s).** Hypothesis is that the three copies in the
   out-of-band path dominate, which is what BYO-buffer targets. Not yet established: part of that gap is
   the AspNetDemo bridge rather than the transport, and a purely per-byte cost should not *widen* as a
