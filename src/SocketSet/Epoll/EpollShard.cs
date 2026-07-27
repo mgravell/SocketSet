@@ -247,7 +247,13 @@ internal sealed unsafe class EpollShard : SocketSetShard
         while (_newListeners.TryDequeue(out var l)) StartListen(l.Fd, l.Token);
         while (_connects.TryDequeue(out var c)) StartConnect(c.Fd, c.Endpoint, c.Token);
         while (_incoming.TryDequeue(out var a)) AdoptAccepted(a.Fd, a.Token);
-        while (_flush.TryDequeue(out var f)) PumpFlush(f.Slot, f.Generation, f.Data, f.Len);
+        // f.Data is rented (see OutboundConnection.Flush) and owned by this loop now: return it however
+        // PumpFlush exits, including the drop paths where the slot was re-tenanted.
+        while (_flush.TryDequeue(out var f))
+        {
+            try { PumpFlush(f.Slot, f.Generation, f.Data, f.Len); }
+            finally { ArrayPool<byte>.Shared.Return(f.Data); }
+        }
         while (_closes.TryDequeue(out var x)) RequestClose(x.Slot, x.Generation);
     }
 

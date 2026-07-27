@@ -275,8 +275,13 @@ internal sealed unsafe class IocpShard : SocketSetShard
             if (conn.Generation == c.Generation && conn.Socket != 0) CloseClient(c.Slot);
         }
 
+        // f.Data is rented (see OutboundConnection.Flush) and owned by this loop now: return it however
+        // PumpFlush exits, including the drop paths where the slot was re-tenanted.
         while (_flush.TryDequeue(out var f))
-            PumpFlush(f.Slot, f.Generation, f.Data, f.Len);
+        {
+            try { PumpFlush(f.Slot, f.Generation, f.Data, f.Len); }
+            finally { ArrayPool<byte>.Shared.Return(f.Data); }
+        }
     }
 
     // Defer a synchronously-completed recv/send (no port packet was posted for it). Loop-thread-only.

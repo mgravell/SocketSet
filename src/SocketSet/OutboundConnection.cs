@@ -26,8 +26,16 @@ internal abstract class OutboundConnection : Connection
     /// <summary>True once the connection is torn down (its slot freed); gates Flush.</summary>
     protected abstract bool IsClosed { get; }
 
-    /// <summary>Hand <paramref name="length"/> bytes (a private copy the loop now owns) to the owning IO
-    /// loop to send, in order. Called from <see cref="Flush"/> on any thread. Returns false if closed.</summary>
+    /// <summary>
+    /// Hand <paramref name="length"/> bytes to the owning IO loop to send, in order. Called from
+    /// <see cref="Flush"/> on any thread.
+    ///
+    /// OWNERSHIP: <paramref name="data"/> is rented from <see cref="ArrayPool{T}"/>. Returning true
+    /// transfers it to the loop, which MUST return it to the pool once drained. Returning false transfers
+    /// nothing - the caller returns it instead. <paramref name="data"/> may be longer than
+    /// <paramref name="length"/>, as rented arrays usually are; only the first
+    /// <paramref name="length"/> bytes are meaningful.
+    /// </summary>
     protected abstract bool SubmitOutbound(byte[] data, int length);
 
     public override Span<byte> GetSpan(int sizeHint = 0) => (_ob ??= new()).GetSpan(sizeHint);
@@ -41,9 +49,20 @@ internal abstract class OutboundConnection : Connection
         var w = _ob;
         if (w is null || w.WrittenCount == 0) return !IsClosed; // nothing staged since the last flush
         if (IsClosed) { w.Clear(); return false; }               // closed under the writer → drop
-        var data = w.WrittenSpan.ToArray();                      // private snapshot; w's buffer is reused after Clear
+        // A private snapshot is required (the accumulator's buffer is reused the moment Clear returns),
+        // but it does not have to be a fresh allocation. This used to be ToArray(), which allocated an
+        // unpooled array the size of the whole response on every flush - on the ASP.NET bridge that is
+        // the ThreadPool thread also running Kestrel, so it was gen0 pressure landing exactly where the
+        // request pipeline runs. Renting keeps the snapshot and drops the allocation.
+        int length = w.WrittenCount;
+        byte[] data = ArrayPool<byte>.Shared.Rent(length);
+        w.WrittenSpan.CopyTo(data);
         w.Clear();
-        return SubmitOutbound(data, data.Length);
+
+        // Ownership passes to the loop only on success; on refusal it never entered the queue.
+        if (SubmitOutbound(data, length)) return true;
+        ArrayPool<byte>.Shared.Return(data);
+        return false;
     }
 }
 #endif

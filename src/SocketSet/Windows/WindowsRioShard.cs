@@ -383,7 +383,13 @@ internal sealed unsafe class WindowsRioShard : SocketSetShard
             var conn = _conns[c.Slot - 1];
             if (conn.Generation == c.Generation && conn.Socket != 0) CloseClient(c.Slot);
         }
-        while (_flush.TryDequeue(out var f)) PumpFlush(f.Slot, f.Generation, f.Data, f.Len);
+        // f.Data is rented (see OutboundConnection.Flush) and owned by this loop now: return it however
+        // PumpFlush exits, including the drop paths where the slot was re-tenanted.
+        while (_flush.TryDequeue(out var f))
+        {
+            try { PumpFlush(f.Slot, f.Generation, f.Data, f.Len); }
+            finally { ArrayPool<byte>.Shared.Return(f.Data); }
+        }
     }
 
     // =====================================================================
