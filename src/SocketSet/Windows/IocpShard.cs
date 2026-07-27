@@ -391,7 +391,6 @@ internal sealed unsafe class IocpShard : SocketSetShard
         conn.SkipOnSuccess = false;
         conn.RecvBuf = -1;
         conn.SendBuf = -1;
-        conn.SendPageCount = 0;
         conn.Pending?.Clear();
         conn.Tls = null;      // disposed by TryFinalize; cleared here so a rolled-back claim starts clean
         conn.IsClient = false;
@@ -454,7 +453,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
         if (!conn.Closing || conn.RecvArmed || conn.SendBusy) return;
 
         if (conn.RecvBuf >= 0) { _recvBuffer.Release(conn.RecvBuf); conn.RecvBuf = -1; }
-        ReleaseSendPages(conn); // every page of any send that was still in flight
+        if (conn.SendBuf >= 0) { _writeBuffer.Release(conn.SendBuf); conn.SendBuf = -1; }
         // Return any queued (pooled) echo staging buffers before recycling the slot.
         if (conn.Pending is { } pending)
             while (pending.Count > 0) ArrayPool<byte>.Shared.Return(pending.Dequeue().Array!);
@@ -863,49 +862,28 @@ internal sealed unsafe class IocpShard : SocketSetShard
         return !conn.Closing;
     }
 
-    // Send the whole of an already-filled write buffer (initial send / echo) as a one-page send.
+    // Send the whole of an already-filled write buffer (initial send / echo). Manages send state.
     private void SubmitSendBuffer(IocpConnection conn, uint slot, int wi, int len)
     {
-        conn.SendPages[0] = wi;
-        conn.SendLens[0] = len;
-        conn.SendPageCount = 1;
         conn.SendBuf = wi;
         conn.SendSent = 0;
         conn.SendTotal = len;
         conn.SendBusy = true;
-        IssueSendPages(conn, slot);
+        IssueSend(conn, slot, _writeBuffer.Address(wi), len, wi);
     }
 
-    /// <summary>
-    /// Post the in-flight send as ONE WSASend over all its pages, resuming at <c>SendSent</c>. This is
-    /// the whole point of the page array: a 256KB response is one call with 64 WSABUFs rather than 64
-    /// sequential calls. On a synchronous outcome (success with FILE_SKIP, or any failure) no packet
-    /// posts, so the completion is deferred inline - a synchronous failure flows through as
-    /// HandleSend(failed) -> FailSend, exactly like an async error.
-    /// </summary>
-    private void IssueSendPages(IocpConnection conn, uint slot)
+    // Post a WSASend for p[0..len]; op->Buf carries the write-pool index. On a synchronous outcome
+    // (success with FILE_SKIP, or any failure) no packet posts, so the completion is deferred inline —
+    // a synchronous failure flows through as HandleSend(failed) → FailSend, same as an async error.
+    private void IssueSend(IocpConnection conn, uint slot, byte* p, int len, int wi)
     {
         IocpOp* op = SendOp(slot);
         op->Kind = OpKind.Send;
         op->Slot = slot;
-        op->Buf = conn.SendPages[0];
-
-        // Skip whatever a previous partial send already delivered, then describe the remainder.
-        Win32.WSABUF* bufs = stackalloc Win32.WSABUF[IocpConnection.MaxSendPages];
-        int n = 0, skip = conn.SendSent;
-        for (int i = 0; i < conn.SendPageCount; i++)
-        {
-            int len = conn.SendLens[i];
-            if (skip >= len) { skip -= len; continue; } // this page is fully acknowledged
-            bufs[n].buf = _writeBuffer.Address(conn.SendPages[i]) + skip;
-            bufs[n].len = (uint)(len - skip);
-            n++;
-            skip = 0;
-        }
-        if (n == 0) { CompleteWrite(conn, slot); return; } // nothing left outstanding
-
+        op->Buf = wi;
+        Win32.WSABUF b; b.len = (uint)len; b.buf = p;
         uint sent = 0;
-        int rc = Win32.WSASend(conn.Socket, bufs, (uint)n, &sent, 0, &op->Overlapped, null);
+        int rc = Win32.WSASend(conn.Socket, &b, 1, &sent, 0, &op->Overlapped, null);
         if (rc == 0)
         {
             if (conn.SkipOnSuccess) QueueInline(OpKind.Send, slot, sent, failed: false);
@@ -916,51 +894,10 @@ internal sealed unsafe class IocpShard : SocketSetShard
         // WSA_IO_PENDING → an async completion will arrive.
     }
 
-    /// <summary>Release every page of the in-flight send and mark the connection idle.</summary>
-    private void ReleaseSendPages(IocpConnection conn)
-    {
-        for (int i = 0; i < conn.SendPageCount; i++) _writeBuffer.Release(conn.SendPages[i]);
-        conn.SendPageCount = 0;
-        conn.SendBuf = -1;
-    }
-
-    /// <summary>
-    /// Pack queued responses into the send pages, spilling into freshly-leased pages as needed. Packing
-    /// rather than one-segment-per-page is what keeps a pipelined echo cheap: several small responses
-    /// still coalesce into a single page, and only a large run spills. Returns the bytes added.
-    /// </summary>
-    private int DrainPendingIntoPages(IocpConnection conn)
-    {
-        if (conn.Pending is not { Count: > 0 } pending) return 0;
-        int added = 0;
-        while (pending.Count > 0)
-        {
-            var seg = pending.Peek();
-            int pi = conn.SendPageCount - 1;
-            int used = pi >= 0 ? conn.SendLens[pi] : _writeBufSize; // no page yet -> force a lease
-            if (pi < 0 || used + seg.Count > _writeBufSize)
-            {
-                if (conn.SendPageCount >= IocpConnection.MaxSendPages) break; // cap this send; rest follows
-                if (!_writeBuffer.TryLease(out int wi, out _)) break;         // pool dry; send what we have
-                pi = conn.SendPageCount++;
-                conn.SendPages[pi] = wi;
-                conn.SendLens[pi] = 0;
-                used = 0;
-            }
-            // A staged segment never exceeds one page (StageOutbound chunks it), so it always fits here.
-            pending.Dequeue();
-            Marshal.Copy(seg.Array!, seg.Offset, (nint)(_writeBuffer.Address(conn.SendPages[pi]) + used), seg.Count);
-            conn.SendLens[pi] = used + seg.Count;
-            added += seg.Count;
-            ArrayPool<byte>.Shared.Return(seg.Array!);
-        }
-        return added;
-    }
-
-    // A send failed synchronously: release its buffers, clear the send slot, tear the connection down.
+    // A send failed synchronously: release its buffer, clear the send slot, tear the connection down.
     private void FailSend(IocpConnection conn, uint slot)
     {
-        ReleaseSendPages(conn);
+        if (conn.SendBuf >= 0) { _writeBuffer.Release(conn.SendBuf); conn.SendBuf = -1; }
         conn.SendBusy = false;
         CloseClient(slot);
     }
@@ -968,10 +905,11 @@ internal sealed unsafe class IocpShard : SocketSetShard
     private void HandleSend(uint slot, uint bytes, bool failed)
     {
         var conn = _conns[slot - 1];
+        int wi = conn.SendBuf;
 
         if (conn.Closing)
         {
-            ReleaseSendPages(conn);
+            if (wi >= 0) { _writeBuffer.Release(wi); conn.SendBuf = -1; }
             conn.SendBusy = false;
             TryFinalize(conn, slot);
             return;
@@ -983,9 +921,9 @@ internal sealed unsafe class IocpShard : SocketSetShard
         if (conn.SendSent < conn.SendTotal)
         {
             if (bytes == 0) { FailSend(conn, slot); return; } // no progress → dead peer
-            // Partial send: re-post the remainder. IssueSendPages skips the acknowledged prefix across
-            // pages, so a partial write that lands mid-page resumes at the right byte.
-            IssueSendPages(conn, slot);
+            // Partial send: resubmit the remainder from the same buffer (still one send in flight).
+            byte* p = _writeBuffer.Address(wi) + conn.SendSent;
+            IssueSend(conn, slot, p, conn.SendTotal - conn.SendSent, wi);
             return;
         }
 
@@ -996,12 +934,7 @@ internal sealed unsafe class IocpShard : SocketSetShard
     // into it); failing that, drain a queued echo into it; failing both, release it and go idle.
     private void CompleteWrite(IocpConnection conn, uint slot)
     {
-        // Keep page 0 (OnWrite needs somewhere to write); hand the rest back now that they are on the wire.
-        for (int i = 1; i < conn.SendPageCount; i++) _writeBuffer.Release(conn.SendPages[i]);
-        conn.SendPageCount = 1;
-        conn.SendLens[0] = 0;
-        int wi = conn.SendPages[0];
-        conn.SendBuf = wi;
+        int wi = conn.SendBuf;
         byte* wp = _writeBuffer.Address(wi);
 
         // On a TLS connection OnWrite is suppressed until the deferred open has fired: until then the app
@@ -1027,30 +960,35 @@ internal sealed unsafe class IocpShard : SocketSetShard
             next = 0;
         }
 
-        if (next > 0)
+        if (next == 0 && conn.Pending is { Count: > 0 } pending)
         {
-            // OnWrite filled page 0 directly; send it as a one-page send.
-            conn.SendLens[0] = next;
-            conn.SendSent = 0;
-            conn.SendTotal = next; // reuse page 0; SendBusy stays set
-            IssueSendPages(conn, slot);
-            return;
+            // Coalesce as many queued responses as fit into the write page into ONE WSASend. Under
+            // pipelining this is the batching lever: it cuts send syscalls N:1, and — since the peer
+            // then drains a bigger chunk per recv — its recv-op count too (the measured deficit vs the
+            // managed backend). No added latency: it only batches work already waiting. The first item
+            // always fits (a response never exceeds the recv page, which equals this write page), so the
+            // loop never stalls at next == 0.
+            while (pending.Count > 0)
+            {
+                var seg = pending.Peek();
+                if (next + seg.Count > _writeBufSize) break;
+                pending.Dequeue();
+                Marshal.Copy(seg.Array!, seg.Offset, (nint)(wp + next), seg.Count);
+                next += seg.Count;
+                ArrayPool<byte>.Shared.Return(seg.Array!); // done with the pooled staging buffer
+            }
         }
 
-        // Coalesce queued responses. This is the batching lever under pipelining - it cuts send syscalls
-        // N:1 and, because the peer then drains a bigger chunk per recv, its recv-op count too. It now
-        // also SPILLS past one page, so a large queued run goes out as one multi-buffer WSASend instead
-        // of ceil(size/page) sequential ones.
-        int total = DrainPendingIntoPages(conn);
-        if (total > 0)
+        if (next > 0)
         {
             conn.SendSent = 0;
-            conn.SendTotal = total;
-            IssueSendPages(conn, slot);
+            conn.SendTotal = next; // reuse wi; SendBusy stays set
+            IssueSend(conn, slot, wp, next, wi);
         }
         else
         {
-            ReleaseSendPages(conn);
+            _writeBuffer.Release(wi);
+            conn.SendBuf = -1;
             conn.SendBusy = false;
         }
     }
@@ -1102,29 +1040,30 @@ internal sealed unsafe class IocpShard : SocketSetShard
         }
     }
 
-    // Start draining Pending into freshly-leased write pages (precondition: !SendBusy). Used to kick an
-    // out-of-band flush when the connection is otherwise idle; spills across pages exactly as
-    // CompleteWrite does, so a large flush is one multi-buffer WSASend.
+    // Start draining Pending into a freshly-leased write page (precondition: !SendBusy). Coalesces as in
+    // CompleteWrite; used to kick an out-of-band flush when the connection is otherwise idle.
     private void StartPendingSend(IocpConnection conn, uint slot)
     {
-        if (conn.Pending is not { Count: > 0 }) return;
-        conn.SendPageCount = 0;
-        int total = DrainPendingIntoPages(conn);
-        if (total == 0)
+        if (conn.Pending is not { Count: > 0 } pending) return;
+        if (!_writeBuffer.TryLease(out int wi, out byte* wp))
         {
-            // DrainPendingIntoPages only fails to place the first segment if the pool is dry.
             System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
-            ReleaseSendPages(conn);
             CloseClient(slot);
             return;
         }
-        conn.SendBuf = conn.SendPages[0];
-        conn.SendSent = 0;
-        conn.SendTotal = total;
-        conn.SendBusy = true;
-        IssueSendPages(conn, slot);
+        int next = 0;
+        while (pending.Count > 0)
+        {
+            var seg = pending.Peek();
+            if (next + seg.Count > _writeBufSize) break;
+            pending.Dequeue();
+            Marshal.Copy(seg.Array!, seg.Offset, (nint)(wp + next), seg.Count);
+            next += seg.Count;
+            ArrayPool<byte>.Shared.Return(seg.Array!);
+        }
+        if (next > 0) SubmitSendBuffer(conn, slot, wi, next);
+        else _writeBuffer.Release(wi);
     }
-
 
     // =====================================================================
     // TLS interception (see TlsFilter)

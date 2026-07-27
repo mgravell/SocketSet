@@ -149,6 +149,12 @@ cost is where these TLS stacks genuinely differ and it is entirely out of scope 
 ## Windows: payload sweep, and finding the real bottleneck (2026-07-26)
 
 Real hardware this time - no container, no WSL2 - so this is the strongest data in this file.
+
+> **All Windows figures below were taken ON BATTERY** (ASUS GZ302, Strix Halo). Battery and mains differ
+> by a large and *variable* sustained power limit on this class of laptop, not a few percent. Treat the
+> absolute numbers as a floor, and treat any comparison BETWEEN runs as suspect - within-run relative
+> comparisons are the only ones the power state cannot distort. Re-measure on mains before quoting
+> anything as a headline.
 `bench/Run-TlsSizes.ps1`, `-c 64`, 16 shards, server pinned to logical CPUs 0-15, generator to 16-31,
 first pass discarded, median of the rest.
 

@@ -58,27 +58,10 @@ internal sealed class IocpConnection : OutboundConnection
     // A stream socket must not have two sends racing (they can reorder), so at most one send is in
     // flight per connection. An echo that arrives while one is busy is copied out and queued here.
     public bool SendBusy;
-    public int SendBuf = -1;   // write-pool index of page 0 of the in-flight send (-1 when idle)
+    public int SendBuf = -1;   // write-pool index of the in-flight send
     public int SendSent;       // bytes of the current send already acknowledged (partial-send cursor)
-    public int SendTotal;      // total bytes of the current send, across all its pages
+    public int SendTotal;      // total bytes of the current send
     public Queue<ArraySegment<byte>>? Pending;
-
-    /// <summary>
-    /// Pages making up the single in-flight send, issued as ONE WSASend with this many WSABUFs.
-    ///
-    /// Sending one page at a time is what made large responses slow: with a 4KB page and one send in
-    /// flight per connection, a 256KB response left as 64 sequential WSASends, each costing a
-    /// completion-port round trip. Measured 2026-07-26, page size alone moved the bare responder from
-    /// 885 to 3556 MiB/s at 256KB. WSASend has always taken a buffer ARRAY; only the call site did not.
-    ///
-    /// Segments are packed, not one-per-page: several small queued responses still coalesce into a page
-    /// (the batching that keeps a pipelined echo cheap), and the run simply spills into further pages.
-    /// </summary>
-    public const int MaxSendPages = 64; // 256KB per send at a 4KB page
-
-    public readonly int[] SendPages = new int[MaxSendPages];
-    public readonly int[] SendLens = new int[MaxSendPages];
-    public int SendPageCount;
 
     public IocpConnection(IocpShard shard, uint slot)
     {
