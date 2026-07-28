@@ -507,8 +507,36 @@ both Kestrel controls hold ~2%, and at 64KB everything is tight. **The bridged p
 not merely slow** - a defect signature, and a new one.
 
 *So the percentages below are now earned rather than provisional*, and the paragraph following this one
-(which told you not to trust them) is superseded. Kept for the reasoning. The one open question is
-unchanged: **which component owns the decline.**
+(which told you not to trust them) is superseded. Kept for the reasoning.
+
+**AND THE COMPONENT IS NOW IDENTIFIED: IT IS THE BRIDGE. This entry is answered (2026-07-28).**
+`bench/run-bare-vs-bridged.sh` ran the bare responder at the SAME 12 shards, same load, same pinning, same
+client, **in the same session** as the bridged sweep - the isolation this entry asked for by name instead
+of the cross-run comparison it refused:
+
+| backend | 64 KB | 256 KB | change |
+|---|---:|---:|---:|
+| bare epoll | 10,744.8 | 11,437.3 | **+6.4%** |
+| bare io_uring | 10,832.8 | 10,349.4 | -4.5% (ranges overlap: flat) |
+| bridged epoll | 10,532.0 | 6,655.5 | -36.8% |
+| bridged io_uring | 10,568.0 | 7,817.6 | -26.0% |
+
+**The bare transport does not collapse; only the bridged path does.** As the bridge's own cost that is
+**2.0-2.4% at 64KB and 24.5-41.8% at 256KB** - and the 41.8% independently reproduces the ~42% measured
+for the bridge on WINDOWS against tuned RIO (11,030 bare vs 6,348 bridged). Two OSes, two transports, one
+number for one component.
+
+*The validity check that voided the last attempt passes:* bare beats bridged at every cell, so there is no
+"bridge costs negative time" anomaly and the tables may be subtracted.
+
+*And the instability is the bridge as well:* bare 256KB spreads are 2.7-3.0% against 9-17% bridged. The
+bridge charges a variable 24-42%, which is a defect signature rather than an overhead.
+
+**Consequence for the backlog:** this converges with `2b-result` from the opposite direction. Zero-copy
+send removed one copy and bought +3.5%; the bare-vs-bridged split says the remaining cost is not copies at
+all. **The next lever is fewer thread hops / fewer pipes, not fewer copies** - and the strongest form of
+that is "no bridge at all", i.e. Kestrel talking to the transport directly, which `2b-result` already
+flagged as out of scope here. Anything else aimed at this 24-42% should be justified against that.
 
 **A MECHANISM WAS FOUND AND FIXED (2026-07-28), AND THIS ENTRY MUST BE RE-MEASURED BEFORE IT IS TRUSTED.**
 io_uring took a pinned GC allocation of the WHOLE response, once per response, whenever the response did

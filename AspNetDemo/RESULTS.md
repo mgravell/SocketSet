@@ -773,11 +773,56 @@ spread 9-17% across passes (`iouring+tls` 3648-4255) while both Kestrel controls
 not merely slower - it is **unstable**, and only at the payload where it collapses. That is a defect
 signature rather than a throughput result, and no allocation story explains it.
 
-**What remains open is unchanged and is now the only open part:** which component owns the decline. The
-transport, post-fix, RISES with payload on the bare responder (8,578 at 16KB to 12,707 at 256KB) while
-doing the same per-byte copying into write pages - so per-byte copies do not explain a falling curve, and
-the copy-count reading should not be revived. See the matched-shard-count bare-vs-bridged isolation
-(`bench/run-bare-vs-bridged.sh`), which is the comparison this file has twice refused to make cross-run.
+**What remains open is unchanged and is now the only open part:** which component owns the decline. That
+is answered in the next section.
+
+### RESOLVED: the 64KB -> 256KB decline is the BRIDGE, and so is the instability (2026-07-28)
+
+The comparison this file twice refused to make cross-run, made properly: `bench/run-bare-vs-bridged.sh`
+runs the BARE responder at the **same 12 shards**, same `-c 64`, same duration, same CPU split, same
+client, same payloads, **in the same session** as the bridged sweep above. Six scored passes each.
+
+| backend | 64 KB | 256 KB | change |
+|---|---:|---:|---:|
+| bare epoll | 10,744.8 [10636-10880] | 11,437.3 [11290-11602] | **+6.4%** |
+| bare io_uring | 10,832.8 [10401-10931] | 10,349.4 [10290-10594] | -4.5% (ranges overlap: flat) |
+| bridged epoll | 10,532.0 | 6,655.5 | **-36.8%** |
+| bridged io_uring | 10,568.0 | 7,817.6 | **-26.0%** |
+
+**The bare transport does not collapse.** epoll rises, io_uring is flat within its own spread. The
+collapse exists only with the bridge in the path, so the bridge owns it.
+
+Read as the bridge's own cost, it does not degrade gently - it detonates:
+
+| backend | bridge cost at 64 KB | bridge cost at 256 KB |
+|---|---:|---:|
+| epoll | 2.0% | **41.8%** |
+| io_uring | 2.4% | **24.5%** |
+
+That 41.8% is independent corroboration of a number this file already had from the other platform: on
+Windows, bare tuned RIO at 256KB does 11,030 against 6,348 bridged, i.e. **~42%**. Two operating systems,
+two transports, the same figure for the same component.
+
+**The validity check that voided the previous attempt passes this time.** The reason the earlier
+comparison was refused is that bridged io_uring at 16KB measured FASTER than bare, and a bridge cannot
+cost negative time. Here bare beats bridged at **every** cell (by 2.0-2.5% at 64KB and 24-42% at 256KB),
+so the two harnesses are comparable and the subtraction is legitimate.
+
+**The instability is the bridge too**, which is the part that makes this a defect rather than an overhead.
+Bare 256KB spreads are tight - epoll 2.7%, io_uring 3.0% - against 9-17% for the same transports bridged.
+So the bridge is not just charging 24-42% at large payloads, it is charging a *variable* amount.
+
+**What this rules out.** Not the transport's per-byte copying: the bare responder copies every outbound
+byte into write pages too and does not decline. Not the allocation defect: fixed, and shown above to be
+unreachable through the bridge. Not the client, the box, or the payload shape: the Kestrel controls rise
+in the same reshuffled passes. What is left is what `2b-result` reached independently from the other
+direction - two `Pipe`s, the scheduling hops between them, and Kestrel's own pipeline - and the honest
+reading of both is that **the bridge cost is structural, and zero-copy send addresses the wrong part of
+it** (it removed one copy for +3.5% at 16KB).
+
+*Caveat carried forward:* bare epoll at 256KB (11,437) now measures ~10% ABOVE bare io_uring (10,349),
+ranges disjoint, where the 8-shard post-fix sweep had them level. Different shard count, so this is not a
+contradiction, but "they are level at 256KB" is an 8-shard statement and should not be quoted at 12.
 
 ### SUPERSEDED: "epoll beats io_uring by 58% at 256KB" was this defect, not a structural difference
 
