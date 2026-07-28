@@ -568,33 +568,72 @@ amortises, so a drop here can only be the boundary:
 **A 70,000-byte response carries 17% more data than a 60,000-byte one and delivers 33% LESS goodput.**
 Ranges hugely disjoint. That is a hard discontinuity at the one-page boundary, and it is the whole effect.
 
-### The code-level cause, and why this is a defect rather than a tuning knob
+### The code-level cause: a per-response PINNED ALLOCATION, measured directly
 
-`IoUringShard.cs:589` states it: ordering is enforced by **a single in-flight send per connection**
-(`SendBusy`), with anything arriving during a send queued to `conn.Pending` and submitted only when the
-current one completes. So a response that fits one page costs **one** round trip through the completion
-queue, and a response that does not costs **two** - the remainder coalesces into one pending chain, which
-is why 5 pages and 2 pages cost the same and 1 page costs half. Every measured shape follows from that.
+An earlier version of this section blamed the single-in-flight-send gate (`SendBusy`) and claimed the
+cliff was a second completion round trip. **That was wrong, and instrumentation (`SS_URING_STATS=1`)
+falsified it outright.** Recording the error because the reasoning was plausible and still wrong:
 
-The writev itself is not the constraint: `PumpFlush` already sends the whole chain as one `IORING_OP_WRITEV`
-and only splits above `IovMax` (1024 iovecs), which a 256KB response at a 4KB page (64 segments) never
-approaches. So this is not scatter-gather quantisation as on RIO - it is the send gate.
+| page (16KB body) | send SQEs/resp | iov segments/resp | queued behind in-flight | partial resubmits |
+|---|---:|---:|---:|---:|
+| 4 KB | **1.000** | **1.000** | 0.000 | 0.000 |
+| 16 KB | **1.000** | **1.000** | 0.000 | 0.000 |
+| 64 KB | **1.000** | **1.000** | 0.000 | 0.000 |
+| 256 KB | **1.000** | **1.000** | 0.000 | 0.000 |
 
-Two consequences worth acting on:
+Every page size costs **exactly one** send SQE carrying **exactly one** iovec segment. Nothing is ever
+queued behind an in-flight send; no send is ever resubmitted. So there is no extra round trip to remove,
+the `SendBusy` gate is never even reached, and the response is never split into page-sized segments.
 
-- **Raising the default page is a workaround, not a fix.** It only moves the boundary, so the "right"
-  default becomes a function of expected payload - which is not something a library can know. Removing
-  the extra round trip (more than one send in flight, or not flushing a partial response on page-full)
-  would make page size stop mattering, and is worth ~2x at 16KB with no user tuning. The code comment
-  anticipates this: *"IO_LINK may earn its keep in massive-throughput scenarios later"*. It has.
-- **This is a strong candidate for the large-payload decline in TODO item 1**, which has been chased as an
-  io_uring+TLS peculiarity, then as a container artifact, then as the Kestrel bridge. A goodput cliff that
-  triggers when responses outgrow a buffer is exactly the reported shape. Not yet established for the
-  *bridged* legs or for epoll, and it should not be assumed - but it is the first mechanism on file that
-  predicts the direction.
+The actual variable is *which memory that single segment points at*:
 
-Behaviourally the mechanism is confirmed; the attribution to `SendBusy` is from inspection plus the fact
-that it predicts all three results. Counting send submissions per response would nail it outright.
+| page (16KB body) | pooled page/resp | **pinned GC alloc/resp** | goodput |
+|---|---:|---:|---:|
+| 4 KB | 0.000 | **1.000** | 4,363.7 |
+| 16 KB | 0.000 | **1.000** | 4,364.6 |
+| 64 KB | 1.000 | 0.000 | **8,586.6** |
+| 256 KB | 1.000 | 0.000 | ~8,600 |
+
+**A response that fits one pooled write page is sent from the pool. A response that does not becomes a
+pinned GC allocation of the WHOLE response, one per response.** That is the cliff, and it is exactly
+binary - which is why 5 pages and 2 pages cost the same as each other and twice as much as 1.
+
+Confirmed against the boundary at a *fixed* 64KB page, where the switch and the goodput cliff coincide:
+
+| body | segment source | goodput |
+|---|---|---:|
+| 60,000 | pooled page | **11,341.6** |
+| 70,000 | **pinned GC alloc** | 7,610.6 |
+
+And at a 256KB body *every* page allocates - including a 256KB page, because headers push the response
+over - which is precisely why only `p512K` jumped in the sweep above. The "does it fit in one page"
+reading was right; the reason is allocation, not round trips.
+
+This also rejoins `fa97dd4`, whose pre-registered reading was "if it moves throughput, allocation was the
+cost". It did, and this is the same finding arriving from a different direction: at 256KB the per-response
+allocation is a Large Object Heap allocation, pinned, on every single response.
+
+### What to fix, and it is not the send gate
+
+The machinery to do this properly **already exists and is simply not used on this path**: `PumpFlush`
+sends a chain of up to `IovMax` (1024) iovec segments in one `IORING_OP_WRITEV`, and `HandleWriteV`
+already handles partial writes across a multi-segment chain. So an oversized response could be assembled
+from **N pooled pages sent as one N-segment writev** instead of one big pinned allocation. Same syscall
+count, same round trips, no allocation, and page size would stop selecting between two cost regimes.
+
+Notably this needs **no change to ordering, `SendBusy`, `IO_LINK`, or connection teardown** - the reason
+the earlier (wrong) diagnosis mattered is that it pointed at a far riskier change than the real defect
+requires.
+
+Two further consequences:
+
+- **Raising the default page is a workaround.** It only moves the boundary, making the right default a
+  function of expected payload - which a library cannot know, and which silently punishes any user whose
+  responses grow past whatever is picked. Worse for streaming workloads (downloads, video), where the
+  response is unbounded and every one of them would allocate its full size, pinned.
+- **Still a candidate for TODO item 1's large-payload decline**, and a stronger one now that the mechanism
+  is measured rather than inferred: the cliff fires exactly when responses outgrow the buffer. Not yet
+  established for the bridged legs or for epoll, and must not be assumed.
 
 ### What this does NOT establish: that the 256KB bridged collapse is the bridge
 

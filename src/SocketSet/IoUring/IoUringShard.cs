@@ -118,8 +118,36 @@ internal sealed class IoUringShard : SocketSetShard
     // function of payload size x concurrency. SS_URING_STATS=1 reports it at shutdown - a behavioural
     // fact, measurable even on a host too noisy to time.
     private static long s_oobHit, s_oobMiss;
+    // Send accounting, to answer "how many completion round trips does ONE response cost?" - the quantity
+    // behind the page-size cliff. s_sendSubmit counts every send SQE; the rest decompose it by cause.
+    private static long s_opSend, s_opWriteV, s_pendEnqueue, s_pendDrain, s_partialResubmit;
+    private static long s_segPooled, s_segManaged;
+    private static long s_iovSegs; // total iovec segments across all writevs: segments/response is the
+                                   // real independent variable, since sends/response is constant at 1.
+    private static int s_statsReported;
+
+    private static void DumpStats(string tag)
+    {
+        long snd = Interlocked.Read(ref s_opSend), wv = Interlocked.Read(ref s_opWriteV);
+        if (snd + wv == 0) return;
+        Console.Error.WriteLine($"[uring-stats:{tag}] send SQEs={snd + wv:n0} " +
+            $"(OP_SEND={snd:n0} OP_WRITEV={wv:n0} iov-segments={Interlocked.Read(ref s_iovSegs):n0} " +
+            $"queued-behind-inflight={Interlocked.Read(ref s_pendEnqueue):n0} " +
+            $"drained={Interlocked.Read(ref s_pendDrain):n0} " +
+            $"partial-write-resubmits={Interlocked.Read(ref s_partialResubmit):n0}) " +
+            $"segs: pooled-page={Interlocked.Read(ref s_segPooled):n0} pinned-managed={Interlocked.Read(ref s_segManaged):n0}");
+    }
     private static readonly bool ReportStats =
         Environment.GetEnvironmentVariable("SS_URING_STATS") == "1";
+
+    // Periodic dump, because the shutdown-only report is not dependable: after sustained load the process
+    // does not always exit on SIGINT (suspected teardown stall - see TODO), and a measurement that needs a
+    // clean shutdown to be readable is one that vanishes precisely under load.
+    // MUST be declared after ReportStats: static field initializers run in declaration order, so reading
+    // ReportStats from an earlier initializer sees false and silently disables the timer.
+    private static readonly Timer? StatsTimer = ReportStats
+        ? new Timer(static _ => DumpStats("periodic"), null, 2000, 2000)
+        : null;
 
     public unsafe IoUringShard(SocketSetOptions options)
     {
@@ -431,6 +459,17 @@ internal sealed class IoUringShard : SocketSetShard
 
     private void Submit(in LibC.io_uring_sqe sqe)
     {
+        // Send accounting (SS_URING_STATS=1). Every send SQE is one completion round trip, so
+        // sends-per-response is the quantity the page-size cliff is really about: a response that fits one
+        // page should cost exactly one. Counted at the single funnel so no send path can be missed.
+        if (ReportStats)
+        {
+            // Split by opcode: SEND is the single-buffer path, WRITEV the scatter-gather chain path.
+            // Which one a response takes is the thing page size actually selects.
+            if (sqe.opcode == LibC.IORING_OP_SEND) Interlocked.Increment(ref s_opSend);
+            else if (sqe.opcode == LibC.IORING_OP_WRITEV) Interlocked.Increment(ref s_opWriteV);
+        }
+
         // Fast path: place directly in the SQ. If the ring is momentarily full
         // (a completion batch can generate more SQEs than capacity), defer to the
         // pending queue rather than fault — it is drained at the top of every loop
@@ -593,6 +632,7 @@ internal sealed class IoUringShard : SocketSetShard
         // IO_LINK may earn its keep in massive-throughput scenarios later, but for now: KISS.
         if (conn.SendBusy)
         {
+            if (ReportStats) Interlocked.Increment(ref s_pendEnqueue);
             (conn.Pending ??= new()).Enqueue(new PendingJob { Chain = chain, AppData = appData });
             return;
         }
@@ -615,8 +655,16 @@ internal sealed class IoUringShard : SocketSetShard
             iov[i].iov_base = seg.Page >= 0 ? OutOfBandAddress(seg.Page) : PinnedAddress(seg.Managed!);
             iov[i].iov_len = (nuint)seg.Length;
             total += seg.Length;
+            // Which memory does a segment actually come from? A pooled page is free; a managed segment is
+            // a pinned GC allocation made per response. This is the branch the page size selects.
+            if (ReportStats)
+            {
+                if (seg.Page >= 0) Interlocked.Increment(ref s_segPooled);
+                else Interlocked.Increment(ref s_segManaged);
+            }
         }
 
+        if (ReportStats) Interlocked.Add(ref s_iovSegs, n);
         conn.WriteV = new WriteVState
         {
             Iov = iov, TotalIov = n, Cursor = 0, Sent = 0, Total = total, Chain = chain, AppData = appData,
@@ -686,7 +734,11 @@ internal sealed class IoUringShard : SocketSetShard
     // Pick the next queued job, or go idle. SendBusy stays set iff a job was dispatched.
     private void DrainNext(IoUringConnection conn, uint slot, int fd)
     {
-        if (conn.Pending is { Count: > 0 } pending) SubmitPendingJob(conn, slot, fd, pending.Dequeue());
+        if (conn.Pending is { Count: > 0 } pending)
+        {
+            if (ReportStats) Interlocked.Increment(ref s_pendDrain);
+            SubmitPendingJob(conn, slot, fd, pending.Dequeue());
+        }
         else conn.SendBusy = false;
     }
 
@@ -996,6 +1048,7 @@ internal sealed class IoUringShard : SocketSetShard
             {
                 var copy = ArrayPool<byte>.Shared.Rent(len);
                 Marshal.Copy((IntPtr)rp, copy, 0, len);
+                if (ReportStats) Interlocked.Increment(ref s_pendEnqueue);
                 (conn.Pending ??= new()).Enqueue(new PendingJob { Seg = new ArraySegment<byte>(copy, 0, len) });
                 return;
             }
@@ -1120,12 +1173,16 @@ internal sealed class IoUringShard : SocketSetShard
 
     protected override void OnShutdown()
     {
-        if (ReportStats)
+        // The counters are process-wide, but OnShutdown runs per shard - so let exactly one shard report,
+        // or an 8-shard run prints the same global totals eight times and reads like eight measurements.
+        if (ReportStats && Interlocked.Exchange(ref s_statsReported, 1) == 0)
         {
             long hit = Interlocked.Read(ref s_oobHit), miss = Interlocked.Read(ref s_oobMiss);
             if (hit + miss > 0)
                 Console.Error.WriteLine($"[uring-stats] tls out-of-band chunks: pooled={hit:n0} " +
                     $"pinned-alloc={miss:n0} ({100.0 * miss / (hit + miss):n1}% miss)");
+
+            DumpStats("shutdown");
         }
         Cleanup();
     }
@@ -1398,6 +1455,7 @@ internal sealed class IoUringShard : SocketSetShard
             // CompleteWrite) or dropped (TryFinalize). Rent may over-size, so Seg carries the true length.
             var copy = ArrayPool<byte>.Shared.Rent(rb);
             Marshal.Copy((IntPtr)rp, copy, 0, rb);
+            if (ReportStats) Interlocked.Increment(ref s_pendEnqueue);
             (conn.Pending ??= new()).Enqueue(new PendingJob { Seg = new ArraySegment<byte>(copy, 0, rb) });
             return false;
         }
@@ -1645,6 +1703,7 @@ internal sealed class IoUringShard : SocketSetShard
             }
 
             ws.Cursor = c;
+            if (ReportStats) Interlocked.Increment(ref s_partialResubmit);
             SubmitWriteV(slot, fd, ws.Iov + c, ws.TotalIov - c);
             return;
         }

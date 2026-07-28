@@ -413,6 +413,22 @@ Goodput MiB/s, median of 3 scored passes, Docker/loopback (`bench/run-tls-sizes.
 Unlike the small-message numbers these repeat tightly (~1-10% between passes), so the large-payload
 shape is worth acting on.
 
+### 0c. io_uring does not always exit on SIGINT after sustained load — OBSERVED 2026-07-28, not diagnosed
+
+Noticed while building the send instrumentation, so it is a side-observation rather than a hunted bug, but
+it reproduced every time. `SmokeTest --http --io-uring -n 8` shuts down promptly on SIGINT when idle, and
+**fails to exit within 80s** on SIGINT after serving ~200k requests over 64 keep-alive connections. The
+banner is the only thing in the log; no shutdown report is ever printed.
+
+Suspicion (untested): teardown waits on `RecvArmed`/`SendBusy`/`CancelPending` clearing per connection
+(`TryFinalize`), and something is not clearing for at least one connection after load. If so it is a real
+leak of connection state, not just a shutdown nuisance - the same condition would strand a slot during
+normal operation.
+
+Practical consequence right now: **do not build a measurement that can only be read at shutdown.** The
+`SS_URING_STATS=1` reporter therefore dumps on a 2s timer as well as at shutdown; the shutdown-only
+version silently produced no data at all under exactly the load that mattered.
+
 ### 1. io_uring+TLS large-payload behaviour — REFRAMED 2026-07-28: the scope was wrong twice over
 
 **Status: the entry below is superseded. It is not io_uring-specific, not TLS-specific, and not
@@ -688,17 +704,30 @@ much stronger than when this entry was written**, and what is left is mechanism,
   7,610.6, i.e. **17% more data for 33% less goodput**, ranges hugely disjoint. Full tables in
   `AspNetDemo/RESULTS.md`.
 
-  The cause is named in the code: `IoUringShard.cs:589` enforces ordering with **one in-flight send per
-  connection** (`SendBusy`), remainder queued to `Pending`. One page = one completion round trip; more
-  than one page = two, coalesced - which is exactly why 5 pages and 2 pages cost the same and 1 page costs
-  half. The writev is NOT the constraint: `PumpFlush` already sends the whole chain as a single
-  `IORING_OP_WRITEV` and splits only above `IovMax` (1024), which 64 segments never reaches.
+  **The cause is a PER-RESPONSE PINNED ALLOCATION, measured 2026-07-28 with `SS_URING_STATS=1`.** An
+  earlier entry blamed the `SendBusy` single-in-flight-send gate and a second completion round trip; that
+  was **wrong and is retracted**. Direct counts: every page size costs exactly **1.000 send SQE** carrying
+  exactly **1.000 iovec segment**, with **zero** queued behind an in-flight send and **zero** partial
+  resubmits. There is no extra round trip and the gate is never reached.
 
-  **So raising the default page only moves the boundary.** It makes the right default a function of
-  expected payload, which a library cannot know. Removing the extra round trip - more than one send in
-  flight, or not flushing a partial response on page-full - would make page size stop mattering and is
-  worth ~2x at 16KB with no user tuning. The code comment already anticipates it ("IO_LINK may earn its
-  keep in massive-throughput scenarios later"). **This should be settled before the default moves.**
+  What page size actually selects is where that one segment points: a response that FITS a pooled write
+  page is sent from the pool; one that does not becomes **a pinned GC allocation of the whole response,
+  one per response** (0.000 vs 1.000 pinned-alloc/resp either side of the boundary, coinciding exactly
+  with the goodput cliff at a fixed page). At 256KB that is a pinned Large Object Heap allocation on every
+  response - the same cost `fa97dd4` identified, arriving from another direction.
+
+  **The fix is smaller and safer than the wrong diagnosis implied.** The machinery already exists and is
+  simply unused here: `PumpFlush` sends up to `IovMax` (1024) segments in one `IORING_OP_WRITEV` and
+  `HandleWriteV` already handles partial writes across a multi-segment chain. An oversized response should
+  be assembled from **N pooled pages sent as one N-segment writev** instead of one big pinned allocation:
+  same syscall count, same round trips, no allocation. **No change to ordering, `SendBusy`, `IO_LINK` or
+  teardown is required** - so the risky option-B rewrite that the earlier diagnosis motivated is not
+  needed for this.
+
+  **So raising the default page only moves the boundary**, making the right default a function of expected
+  payload - which a library cannot know, and which is worst for exactly the streaming workloads (downloads,
+  video) where responses are unbounded and each would allocate its full size, pinned. **Settle this before
+  the default moves.**
 - ~~Confirm the page/pool-depth co-variation is inert on Linux.~~ **DONE 2026-07-28: it is inert, and the
   2.0x is the page.** With all pools pinned at 1024 the io_uring 16KB ratio is 1.97x against 1.98x
   uncontrolled. Two things had to be fixed to run it: the sweep rescales **three** pools, not one
