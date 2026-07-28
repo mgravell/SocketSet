@@ -441,6 +441,14 @@ all sends through two threads. Bridged io_uring at 16KB measures FASTER than bar
 bridge cannot cost negative time. **Next step is a clean bare-vs-bridged isolation in one session at a
 matched shard count**, not another sweep.
 
+**A MECHANISM NOW EXISTS THAT PREDICTS THIS SHAPE (2026-07-28).** io_uring has a hard goodput cliff the
+moment a response outgrows one buffer page - 17% more data for 33% less goodput across the boundary -
+caused by the single-in-flight-send gate costing a second completion round trip. See item 0. A decline
+that starts when responses get large is exactly what that produces, and it is the first mechanism on file
+that predicts the *direction* rather than explaining it away. **Test it before chasing the bridge again:**
+re-run the bridged legs with a page larger than the payload and see whether the collapse disappears. It
+does NOT yet explain the epoll legs or the bridged legs specifically, and must not be assumed to.
+
 **And it needs six scored passes, not three.** This entry is entirely about 256KB behaviour, which is
 precisely where three passes were shown (2026-07-28) to manufacture falsely tight ranges: the true
 per-cell spread at 256KB is ~8% while three consecutive passes can span 1.2%. The table above is a
@@ -672,8 +680,25 @@ much stronger than when this entry was written**, and what is left is mechanism,
 **Remaining:**
 
 - Sweep past 64KB - RIO was still improving monotonically at the top of the range, so the peak is unknown.
-  io_uring's 16KB-payload result suggests the useful question is "does the response fit in ONE page",
-  which makes the right default depend on expected payload rather than being a single global optimum.
+- **"Does the response fit in ONE page" is CONFIRMED as the mechanism on io_uring (2026-07-28), and it
+  turns item 0 from a tuning question into a defect.** Three pre-registered predictions, all held: only a
+  page that FITS jumps (at a 256KB payload p256K buys nothing, p512K buys 1.48x); once it fits, more page
+  buys nothing (p64K/p256K/p512K overlap at 16KB); and at a fixed p64K, walking the payload across the
+  ~65.4KB boundary makes goodput fall off a cliff - 60,000 bytes at 11,341.6 MiB/s against 70,000 bytes at
+  7,610.6, i.e. **17% more data for 33% less goodput**, ranges hugely disjoint. Full tables in
+  `AspNetDemo/RESULTS.md`.
+
+  The cause is named in the code: `IoUringShard.cs:589` enforces ordering with **one in-flight send per
+  connection** (`SendBusy`), remainder queued to `Pending`. One page = one completion round trip; more
+  than one page = two, coalesced - which is exactly why 5 pages and 2 pages cost the same and 1 page costs
+  half. The writev is NOT the constraint: `PumpFlush` already sends the whole chain as a single
+  `IORING_OP_WRITEV` and splits only above `IovMax` (1024), which 64 segments never reaches.
+
+  **So raising the default page only moves the boundary.** It makes the right default a function of
+  expected payload, which a library cannot know. Removing the extra round trip - more than one send in
+  flight, or not flushing a partial response on page-full - would make page size stop mattering and is
+  worth ~2x at 16KB with no user tuning. The code comment already anticipates it ("IO_LINK may earn its
+  keep in massive-throughput scenarios later"). **This should be settled before the default moves.**
 - ~~Confirm the page/pool-depth co-variation is inert on Linux.~~ **DONE 2026-07-28: it is inert, and the
   2.0x is the page.** With all pools pinned at 1024 the io_uring 16KB ratio is 1.97x against 1.98x
   uncontrolled. Two things had to be fixed to run it: the sweep rescales **three** pools, not one

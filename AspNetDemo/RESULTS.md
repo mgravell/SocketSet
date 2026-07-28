@@ -534,6 +534,68 @@ at 16KB" are far outside an 8% band - but it does mean **any 256KB claim in the 
 file or elsewhere, that rests on three passes should be treated as unproven.** Small-payload cells are not
 affected: 16KB spreads run ~1.5% over the same pass count.
 
+### The mechanism, pre-registered and confirmed: it is "does the response fit in ONE page"
+
+The 2x is not "bigger pages are faster". Three predictions were written down before the runs, and all
+three held. io_uring, bare responder, pools pinned so page is the only variable.
+
+**1. A page that FITS jumps; a page that merely gets bigger does not.** At a 256KB payload the response is
+body + headers, so it needs a page *larger* than 256KB to fit:
+
+| page at 256KB payload | pages spanned | goodput |
+|---|---|---:|
+| 64 KB | 5 | 7,686.8 [7642-7873] |
+| 256 KB | 2 (headers spill) | 7,838.8 [7766-7940] |
+| **512 KB** | **1** | **11,409.3** [10649-12955] |
+
+p256K is a 4x bigger page than p64K and buys nothing. p512K is only 2x bigger than p256K and buys 1.48x,
+disjoint from both. The step is at the fit, not at the size.
+
+**2. Once it fits, more page buys nothing.** At a 16KB payload, where 64KB already fits: p64K 8,623.1
+[8522-8658], p256K 8,684.7 [8596-8868], p512K 8,583.3 [8582-8785]. All overlap.
+
+**3. The sharpest one - hold the page fixed and walk the payload across the boundary.** p64K, so the
+boundary is ~65.4KB once headers are counted. Goodput normally *rises* with payload as per-request cost
+amortises, so a drop here can only be the boundary:
+
+| payload | pages | goodput |
+|---|---|---:|
+| 32,768 | 1 | 9,432.1 [9424-9899] |
+| 60,000 | 1 | **11,341.6** [11226-12018] |
+| 70,000 | 2 | **7,610.6** [7587-7758] |
+| 131,072 | 3 | 6,474.6 [6373-6661] |
+
+**A 70,000-byte response carries 17% more data than a 60,000-byte one and delivers 33% LESS goodput.**
+Ranges hugely disjoint. That is a hard discontinuity at the one-page boundary, and it is the whole effect.
+
+### The code-level cause, and why this is a defect rather than a tuning knob
+
+`IoUringShard.cs:589` states it: ordering is enforced by **a single in-flight send per connection**
+(`SendBusy`), with anything arriving during a send queued to `conn.Pending` and submitted only when the
+current one completes. So a response that fits one page costs **one** round trip through the completion
+queue, and a response that does not costs **two** - the remainder coalesces into one pending chain, which
+is why 5 pages and 2 pages cost the same and 1 page costs half. Every measured shape follows from that.
+
+The writev itself is not the constraint: `PumpFlush` already sends the whole chain as one `IORING_OP_WRITEV`
+and only splits above `IovMax` (1024 iovecs), which a 256KB response at a 4KB page (64 segments) never
+approaches. So this is not scatter-gather quantisation as on RIO - it is the send gate.
+
+Two consequences worth acting on:
+
+- **Raising the default page is a workaround, not a fix.** It only moves the boundary, so the "right"
+  default becomes a function of expected payload - which is not something a library can know. Removing
+  the extra round trip (more than one send in flight, or not flushing a partial response on page-full)
+  would make page size stop mattering, and is worth ~2x at 16KB with no user tuning. The code comment
+  anticipates this: *"IO_LINK may earn its keep in massive-throughput scenarios later"*. It has.
+- **This is a strong candidate for the large-payload decline in TODO item 1**, which has been chased as an
+  io_uring+TLS peculiarity, then as a container artifact, then as the Kestrel bridge. A goodput cliff that
+  triggers when responses outgrow a buffer is exactly the reported shape. Not yet established for the
+  *bridged* legs or for epoll, and it should not be assumed - but it is the first mechanism on file that
+  predicts the direction.
+
+Behaviourally the mechanism is confirmed; the attribution to `SendBusy` is from inspection plus the fact
+that it predicts all three results. Counting send submissions per response would nail it outright.
+
 ### What this does NOT establish: that the 256KB bridged collapse is the bridge
 
 The payload sweep through AspNetDemo shows every SocketSet leg collapsing at 256KB. On the bare responder
