@@ -21,10 +21,80 @@ Orientation for picking this up cold.
    `BufferPageSize` is shared with them and has only been swept on Windows.
 4. **Dynamic shard growth.** Specified, untouched.
 
-### NEXT SESSION IS A LINUX ONE — here is exactly what to run and what to expect
+### THE LINUX HOST IS NOW BARE METAL, AND THE FIRST JOB IS A BASELINE (state as of 2026-07-28)
 
-The page-size default (item 0) is blocked on one thing only: `BufferPageSize` is shared with io_uring and
-epoll and has been swept **only on Windows**. Everything else about it is settled.
+**The environment changed underneath this plan.** Linux measurement moved off Docker-on-WSL2 onto bare
+metal: Pop!_OS 24.04, kernel 7.0.11, the *same* Ryzen 9 7900X desktop as the Windows numbers. io_uring
+selects natively with no seccomp workaround. Setup, tooling and the traps specific to this box are in
+`bench/README.md` ("The Linux bench host") — read that before running anything; the short version is that
+the CPU governor ships as `powersave`, the SMT split in the shell rigs was measuring server and client on
+the same physical cores (fixed, `bench/cpu-split.sh`), and `perf` needs a non-obvious package.
+
+**Consequence: there is no Linux baseline.** Every Linux figure on file predates *both* the host change
+(2026-07-27) and the OS change (2026-07-28), and was taken in a container on a WSL2 kernel. The tables
+below are kept for their reasoning, not their numbers. Nothing can be compared against them.
+
+**So the first job is a baseline run, before any Linux code changes.** Rationale beyond the obvious: a
+lot of recent work landed on IOCP and has *not* reached the Linux backends, so a baseline taken now is
+also the "before" for that catch-up work. `bench/run-matrix.sh` (now with a `SHARDS` dimension) does it
+and simultaneously delivers items 2 and 5. It also re-establishes the noise floor, which every
+disjoint-ranges claim in this file depends on and which is a property of the host, not the project.
+
+### What has NOT reached the Linux backends (verified by inspection 2026-07-28, not recalled)
+
+| feature | IOCP | RIO | io_uring | epoll |
+|---|---|---|---|---|
+| kTLS | - | - | **yes** | **no references at all** |
+| `ReceiveBufferSize` (send/recv split) | yes | yes | no | no |
+| write-pool exhaustion: stage and retry | yes | yes | no | no |
+| BYO-buffer zero-copy SEND | yes | n/a by design | no | no |
+| BYO-buffer zero-copy RECEIVE | **no** | **no** | **no** | **no** |
+
+Reading of that table:
+
+- **epoll has no kTLS path whatsoever** — this is a missing feature, not a missing harness leg. Do not
+  add an `epoll+ktls` leg expecting it to work.
+- **kTLS is TX-only even on io_uring**, now confirmed against the kernel's own counters rather than
+  inferred from the code: `TlsTxSw` moves, `TlsRxSw` stays at zero. Every kTLS number on file measures a
+  half-offloaded path. That is what item 4 is about, and it now has direct evidence.
+- **`ReceiveBufferSize` and stage-and-retry are Windows-only.** The first is exactly what blocks the page
+  default (below). The second may not be needed on Linux at all — io_uring falls back to a pinned GC
+  allocation when its page pool is dry rather than dropping the connection, and epoll sends straight from
+  the TLS output buffer — but "probably does not apply" is a hypothesis, not a check.
+- **Zero-copy RECEIVE does not exist on any backend, and the reason is the API shape, not the backlog.**
+  `Connection` has a `TrySendZeroCopy` and no receive counterpart. Inbound always lands in the transport's
+  own slab and `PipeIoBridge.OnReceived(ReadOnlySpan<byte>)` copies it into `pipe.Output.Write(data)` —
+  on IOCP exactly as on epoll. Under backpressure it is worse than one copy: a `PipeWriter` permits only
+  one outstanding flush, so a receive arriving during a pending flush is rented from `ArrayPool` and
+  copied a SECOND time into `_staged`.
+
+  Reversing it means asking the pipe for memory (`pipe.Output.GetMemory`) and pinning it *before* arming
+  the receive, which inverts who owns the buffer at arm time and is why item 2b lists inbound zero-copy as
+  needing receive-parking. Parking is also the only thing that would make inbound backpressure real rather
+  than advisory — the same mechanism buys both, which is an argument for doing it as one piece of work.
+
+  Note the asymmetry this creates between the two buffer models: on the **callback** path receive is
+  already copy-free (the callback gets a span over transport-owned memory), so this cost is specific to
+  the **pipe** path, i.e. specific to the ASP.NET-shaped caller. That is the reverse of the send side,
+  where the pipe path is the one that got zero-copy first.
+
+### Both buffer models are wanted, and they are not competing
+
+Stated 2026-07-28, and worth recording because the file's history keeps re-deciding it: the BYO-buffer
+work and the library-owned-buffer path are **both** the destination, for different callers.
+
+- **Caller-supplied pipes** (`ctx.UsePipe`) fit ASP.NET Core exactly, because Kestrel's transport contract
+  already is a pair of pipes. That is what phases 2a/2b are for.
+- **Library-owned raw buffers** are what an echo server or a Redis-style client wants: it has no pipe, it
+  wants the transport's memory handed to it, and the pipe model would only add a copy and a thread hop.
+
+So the callback path is not a legacy path to be migrated off. Supporting both is the goal, and a change
+that improves one at the expense of the other is a regression even if the benchmark it was aimed at moved.
+
+### The page-size default (item 0) — still the blocked item, and here is the block
+
+`BufferPageSize` is shared with io_uring and epoll and has been swept **only on Windows**. Everything else
+about it is settled.
 
 **1. Sweep page size on both Linux backends.** `bench/run-tls-sizes.sh` is the rig. Compare 4KB / 16KB /
 64KB at 512B / 16KB / 256KB payloads, exactly as the Windows matrix in `AspNetDemo/RESULTS.md` does.
@@ -44,16 +114,20 @@ On Windows that coupling cost 3.0GB at a 64KB page because the receive slab is p
 ~16MB per shard and probably fine. **Measure the resident set before assuming** — that is exactly the
 assumption that was wrong on Windows. epoll's sizing needs the same look.
 
-**3. Pipe mode already works on Linux** through the universal fallback (`PipeIoBridge`), so
-`SmokeTest --epoll --verify-echo N --pipe -z 65536` should pass as-is; worth running because the 64KB
-chunk size is what exposed the flush-concurrency fault on Windows. Zero-copy send is IOCP-only. io_uring
-is the natural second driver — its send is already a writev over segments, so pointing those segments at
-pinned pipe memory is a smaller change there than it was on IOCP.
+**3. Pipe mode on Linux — CONFIRMED WORKING 2026-07-28, nothing to do.** `SmokeTest --verify-echo
+1048576 --pipe -z 65536` round-trips byte-exact on **both** epoll and io_uring through the universal
+fallback (`PipeIoBridge`), with `pipe=True` in the banner so the flag is known to have been honoured. The
+64KB chunk size is the one that exposed the flush-concurrency fault on Windows, so this was the run worth
+making. Zero-copy send remains IOCP-only; io_uring is the natural second driver, since its send is
+already a writev over segments and pointing those segments at pinned pipe memory is a smaller change
+there than it was on IOCP.
 
 **4. While there, the standing Linux backlog:** item 1 (io_uring TLS large-payload, investigated but never
-reproduced outside a container), item 2 (re-run the size sweep now the plaintext controls exist), item 4
-(kTLS RECVMSG + cmsg receive arm), item 5 (real-hardware run — everything Linux on file is a container on
-a WSL2 kernel over loopback).
+reproduced outside a container — and the container is now gone, so this is finally testable), item 2
+(re-run the size sweep now the plaintext controls exist), item 4 (kTLS RECVMSG + cmsg receive arm, whose
+premise is now confirmed by `TlsRxSw` staying at zero), item 5 (**mostly delivered by the host change** —
+what remains is specifically a second machine with a real NIC, since loopback cannot show kTLS device
+offload no matter how good the host is).
 
 **Read `bench/README.md` first.** Nine confounders, and one of them was reproduced on 2026-07-28 by
 someone who had already read it — see item 0b. Any harness opening thousands of connections per cell needs

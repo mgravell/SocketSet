@@ -422,7 +422,17 @@ unmeasured**, and the handshake is exactly where SChannel, SslStream and OpenSSL
 exercises only the record layer. Measuring handshakes properly wants a bounded connection count with
 explicit port accounting, or a second machine.
 
-## Linux: epoll vs io_uring vs kTLS (2026-07-26)
+## Linux: epoll vs io_uring vs kTLS (2026-07-26, SUPERSEDED — old host AND old OS)
+
+> **SUPERSEDED 2026-07-28, twice over.** These numbers are from the *laptop*, not the current desktop
+> (the host changed 2026-07-27), and from a Docker container on a WSL2 kernel rather than the bare-metal
+> Pop!_OS install that replaced it. Nothing here can be compared with anything measured since, and no
+> Linux baseline exists on the current host until `bench/run-matrix.sh` is re-run. Kept for the method and
+> the retraction, not the figures.
+>
+> One thing here does survive and is worth carrying: the TLS legs were **not separable** — 37.4% worst
+> within-leg spread against a 7.7% between-leg range. On bare metal with the governor pinned to
+> `performance`, that spread should collapse; if it does not, the instrument is still wrong.
 
 Run with `bench/run-matrix.sh` inside a Docker container (`--security-opt seccomp=unconfined`, without
 which Docker's seccomp blocks io_uring and the backend silently falls back to managed sockets). Same
@@ -472,6 +482,24 @@ That explanation is plausible, fits the code, and **is not supported by the data
 passes kTLS lands at 75,834, within noise of everything else. The 58k figure was one arm of a bimodal
 distribution being read as a result. The mechanism may still be real; this measurement says nothing about
 it either way.
+
+### kTLS is TX-only, and that is ours (measured 2026-07-28, bare metal)
+
+Independent of the throughput numbers above, and it changes how all of them should be read. `/config`
+reports that kTLS was *configured*; `/proc/net/tls_stat` reports what the kernel actually did. Driving
+traffic through the `--ktls` leg:
+
+| counter | before | after 2 connections | meaning |
+|---|---:|---:|---|
+| `TlsTxSw` | 1 | 3 | transmit **is** offloaded into the kernel |
+| `TlsRxSw` | 0 | 0 | receive is **not** offloaded, at all |
+| `TlsTxDevice` | 0 | 0 | no NIC offload — loopback, and permanently so here |
+
+So "kTLS" in every figure in this file means **TX-only offload**. That is a property of our integration,
+not of kTLS: the path drives receive as io_uring `POLL` + `SSL_read` in userspace instead of the
+`RECVMSG` + `TLS_GET_RECORD_TYPE` cmsg design in `TlsFilter`'s notes. It is the direct evidence for TODO
+item 4, which until now rested on a code reading. `bench/ktls-verify.sh` gates the kTLS legs on this
+counter so a socket the kernel never took cannot be measured as if it had been.
 
 ### What would move this forward
 

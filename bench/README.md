@@ -14,10 +14,11 @@ itself as an error.
 | `Compare-Commits.ps1` | *"Did this change help?"* Two commits, isolated worktrees, back to back. **Use this for any before/after claim.** |
 | `Run-TlsSizes.ps1` | Windows: how transports/TLS scale with payload size (and shard count). |
 | `Run-Matrix.ps1` | Windows: fixed-size transport × TLS matrix. |
-| `run-matrix.sh`, `run-tls-sizes.sh` | Linux equivalents of the two above. |
+| `run-matrix.sh`, `run-tls-sizes.sh` | Linux equivalents of the two above. Both take `SHARDS="4 8 12"`. |
+| `cpu-split.sh`, `ktls-verify.sh` | Sourced by the Linux scripts; not run directly. See below. |
 
 All of them fetch `bombardier` into `.tools/` on first run. Linux scripts need `jq curl taskset shuf`
-(`gawk` for the nicer pivot).
+(`gawk` for the nicer pivot, `lscpu` for the CPU split — without it the split falls back and warns).
 
 ## The rules, and why each exists
 
@@ -102,6 +103,53 @@ doing more work. **Measure cost per request at saturation**, where there are no 
 - **CPU pinning.** Server and load generator get disjoint halves, and both runtimes are told the true
   core count via `DOTNET_PROCESSOR_COUNT`/`GOMAXPROCS` — they size their ThreadPool and GC heaps at
   startup, *before* affinity is applied, and are otherwise oversubscribed against their own pinning.
+  **"Disjoint" means disjoint physical CORES, and the obvious arithmetic does not give you that on
+  Linux** — see `cpu-split.sh` and the host section below.
+
+## The Linux bench host (from 2026-07-28)
+
+Linux measurement moved from a Docker container on a WSL2 kernel to **bare metal**: Pop!_OS 24.04,
+kernel 7.0.11-76070011, the same Ryzen 9 7900X desktop (12C/24T, 124 GB) the Windows numbers come from.
+io_uring is available with no seccomp workaround. Two consequences, both load-bearing:
+
+- **The Docker seccomp caveat does not apply here** — but it applied to *every Linux figure recorded
+  before this date*, all of which are also from the older laptop. There is no Linux baseline on this host.
+- **Two backends, one box, no NIC.** Still loopback, so kTLS's inline-offload win remains unmeasurable
+  regardless of the OS change. That needs two machines and is the whole of TODO item 5's remainder.
+
+### Setup this host needs, and why each one bites
+
+- **CPU governor.** Ships as `amd-pstate-epp` / `powersave` with EPP `balance_performance`. Set both to
+  `performance` (`/sys/devices/system/cpu/cpu*/cpufreq/{scaling_governor,energy_performance_preference}`)
+  or the clock moves under you and the whole disjoint-ranges discipline is measuring the governor.
+  **Does not survive a reboot** — re-check it rather than assuming.
+- **SMT enumeration.** Linux numbers CPUs 0-11 as *one thread of each of the twelve physical cores* and
+  12-23 as their siblings, so a lower/upper-half split gives the server and the load generator the SAME
+  cores. Windows enumerates siblings adjacently, which is why the `.ps1` rigs get away with the same
+  arithmetic. `cpu-split.sh` splits by core: `0-5,12-17` against `6-11,18-23`.
+- **`DOTNET_ROOT`.** The SDK lives in `~/.dotnet`; the built apphosts look in `/usr/share/dotnet` and die
+  with a *missing runtime* error that reads like a broken install. Exported from `.bashrc`, which is
+  interactive-only — a script launched from a non-interactive context still needs it.
+- **`tls` kernel module.** Not loaded by default. Without it kTLS cannot engage, and `/config` will still
+  cheerfully report `tls=ktls`. `sudo modprobe tls`, persist via `/etc/modules-load.d/tls.conf`.
+- **`perf`.** System76's `linux-tools-common` is a docs-only stub, so there is no `/usr/bin/perf` wrapper
+  and the `command-not-found` suggestion is wrong. Install `linux-tools-generic-hwe-24.04` and symlink
+  `/usr/lib/linux-tools/<ver>/perf`. For kernel frames you also need
+  `kernel.perf_event_paranoid=1` and `kernel.kptr_restrict=0`, else perf silently degrades to `cycles:u`
+  and you profile user space only. Add `DOTNET_PerfMapEnabled=1` so JIT frames resolve.
+
+### `/config` proves configuration; `/proc/net/tls_stat` proves behaviour
+
+The harnesses refuse a leg whose `/config` does not match what was asked for. That catches a backend that
+silently fell back — but for kTLS it cannot catch a socket the kernel never took, because the demo would
+report `tls=ktls (openssl + kernel offload)` either way and would serve HTTPS correctly in userspace at
+userspace speed. `/proc/net/tls_stat` is the kernel's own accounting, and `ktls-verify.sh` gates on it.
+
+**Measured 2026-07-28, and it changes how every kTLS figure should be read:** traffic through the kTLS leg
+moves `TlsTxSw` and leaves `TlsRxSw` at **zero**. Transmit is offloaded into the kernel; receive is not
+offloaded at all, because that path drives receive as io_uring `POLL` + `SSL_read` in userspace. So kTLS
+here means **TX-only offload** — a property of our integration, not of kTLS. `TlsTxDevice` stays 0 and
+always will on loopback.
 
 ## Two PowerShell traps
 

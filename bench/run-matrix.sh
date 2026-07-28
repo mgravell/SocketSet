@@ -11,10 +11,14 @@
 #   * every leg is measured N times in a RESHUFFLED order and reported as a median with spread, and the
 #     spread is compared against the between-leg range so "this does not rank transports" is explicit.
 #   * keep-alive only: connection churn exhausts the ephemeral-port pool and corrupts later legs.
+#   * kTLS legs are additionally checked against /proc/net/tls_stat, because /config can only report what
+#     was CONFIGURED - see bench/ktls-verify.sh.
+#   * CPU pinning splits by physical core, not logical index - see bench/cpu-split.sh.
 #
 # io_uring note: Docker's default seccomp profile BLOCKS the io_uring syscalls, so the backend silently
 # falls back to managed sockets. Run the container with --security-opt seccomp=unconfined, and trust the
-# /config check rather than the flag you passed.
+# /config check rather than the flag you passed. (The current bench host runs Linux on bare metal, so
+# this does not apply there - but every Linux result recorded before 2026-07-28 was measured under it.)
 set -uo pipefail
 
 DURATION=${DURATION:-10s}
@@ -24,6 +28,12 @@ REPS=${REPS:-4}            # first pass is host warm-up and is discarded
 WARMUP_PASSES=${WARMUP_PASSES:-1}
 PORT=${PORT:-5080}
 FILTER=${FILTER:-}
+# Sweepable, matching Run-TlsSizes.ps1's -Shards. Kestrel legs ignore it (its transport has no shards);
+# SocketSet legs are expanded one leg per shard count, named e.g. "epoll+tls/s8". Worth sweeping because
+# more shards is not obviously better: each shard is a dedicated loop thread competing with the
+# ThreadPool that runs Kestrel and the bridge pump, on the same pinned cores. The top of the range should
+# be the SERVER half's logical CPU count - 12 on the current host, hence 4/8/12.
+SHARDS=${SHARDS:-"4 8 12"}
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${OUT:-$REPO/bench/results}"
 BOMB="$REPO/bench/.tools/bombardier"
@@ -49,16 +59,33 @@ dotnet build "$REPO/AspNetDemo/AspNetDemo.csproj" -c Release -v q --nologo >/dev
 NCPU=$(nproc)
 source "$REPO/bench/cpu-split.sh"
 
-# --- legs: name|demo args|expected transport|expected tls ---
-LEGS=(
-  "kestrel|--kestrel|kestrel-sockets|off"
-  "kestrel+tls|--kestrel --tls|kestrel-sockets|kestrel/sslstream"
-  "epoll|--epoll|socketset/epoll|off"
-  "epoll+tls|--epoll --tls|socketset/epoll|openssl"
-  "iouring|--io-uring|socketset/io_uring|off"
-  "iouring+tls|--io-uring --tls|socketset/io_uring|openssl"
-  "iouring+ktls|--ktls|socketset/auto(iouring)|ktls (openssl + kernel offload)"
+source "$REPO/bench/ktls-verify.sh"
+KTLS_CHECKABLE=1; ktls_available || KTLS_CHECKABLE=0
+
+# --- legs: name|demo args|expected transport|expected tls|shardable ---
+# "shardable" is 1 for the SocketSet legs (expanded one leg per SHARDS entry) and 0 for the Kestrel
+# controls, whose transport has no shard concept and whose /config omits the field entirely.
+BASE_LEGS=(
+  "kestrel|--kestrel|kestrel-sockets|off|0"
+  "kestrel+tls|--kestrel --tls|kestrel-sockets|kestrel/sslstream|0"
+  "epoll|--epoll|socketset/epoll|off|1"
+  "epoll+tls|--epoll --tls|socketset/epoll|openssl|1"
+  "iouring|--io-uring|socketset/io_uring|off|1"
+  "iouring+tls|--io-uring --tls|socketset/io_uring|openssl|1"
+  "iouring+ktls|--ktls|socketset/auto(iouring)|ktls (openssl + kernel offload)|1"
 )
+
+# Expand the shard dimension. Legs carry their expected shard count so /config can be checked for it -
+# a --shards that was ignored would otherwise be indistinguishable from one that took.
+LEGS=()
+for spec in "${BASE_LEGS[@]}"; do
+  IFS='|' read -r _n _a _xt _xtls _sh <<<"$spec"
+  if [[ "$_sh" == "1" ]]; then
+    for s in $SHARDS; do LEGS+=("$_n/s$s|$_a --shards $s|$_xt|$_xtls|$s"); done
+  else
+    LEGS+=("$_n|$_a|$_xt|$_xtls|")
+  fi
+done
 
 echo "leg,rep,order,rps,lat_mean_us,lat_p50_us,lat_p99_us,req2xx,errors,status,config" > "$CSV"
 
@@ -72,11 +99,14 @@ wait_config() {  # $1=scheme
   return 1
 }
 
-run_leg() {  # $1=name $2=args $3=expect_transport $4=expect_tls $5=rep $6=order
-  local name="$1" args="$2" xt="$3" xtls="$4" rep="$5" order="$6"
+run_leg() {  # $1=name $2=args $3=expect_transport $4=expect_tls $5=expect_shards $6=rep $7=order
+  local name="$1" args="$2" xt="$3" xtls="$4" xsh="$5" rep="$6" order="$7"
   local scheme=http; [[ "$args" == *--tls* || "$args" == *--ktls* ]] && scheme=https
+  # Shard-expanded legs are named "epoll+tls/s8"; the slash is a path separator, so log files use a
+  # flattened form. (Caught by a smoke run - the first sharded run wrote no logs and reported NO /config.)
+  local fn="${name//\//-}"
 
-  taskset -c "$SERVER_CPUS" "$DEMO" $args --port "$PORT" >"$LOGS/$name.r$rep.server.log" 2>&1 &
+  taskset -c "$SERVER_CPUS" "$DEMO" $args --port "$PORT" >"$LOGS/$fn.r$rep.server.log" 2>&1 &
   local pid=$!
   local cfg; cfg=$(wait_config "$scheme") || {
     echo "  $name: NO /config"; echo "$name,$rep,$order,,,,,,,NOSTART," >> "$CSV"
@@ -88,12 +118,32 @@ run_leg() {  # $1=name $2=args $3=expect_transport $4=expect_tls $5=rep $6=order
     echo "$name,$rep,$order,,,,,,,MISMATCH,\"$cfg\"" >> "$CSV"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
   fi
+  if [[ -n "$xsh" && "$cfg" != *"shards=$xsh "* ]]; then
+    echo "  $name: SHARD MISMATCH (wanted shards=$xsh) -> $cfg"
+    echo "$name,$rep,$order,,,,,,,SHARD-MISMATCH,\"$cfg\"" >> "$CSV"
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
+  fi
+
+  local ktls_before=""
+  [[ "$args" == *--ktls* && $KTLS_CHECKABLE == 1 ]] && ktls_before=$(ktls_tx_count)
 
   taskset -c "$CLIENT_CPUS" "$BOMB" -k -l -o json -p r -c "$CONNECTIONS" -d "$WARMUP" -t 5s \
     "$scheme://127.0.0.1:$PORT/plaintext" >/dev/null 2>&1
+
+  # The warm-up pass has now opened real connections, so the kernel has either taken the TLS sockets or
+  # it has not. /config only proves kTLS was CONFIGURED; this proves it ENGAGED. Checked here rather than
+  # after the scored pass so a silently-userspace leg costs a warm-up rather than a full measurement.
+  if [[ -n "$ktls_before" ]]; then
+    local ktls_after; ktls_after=$(ktls_tx_count)
+    if [[ -n "$ktls_after" && "$ktls_after" == "$ktls_before" ]]; then
+      echo "  $name: KTLS-NOT-ENGAGED (TlsTxSw stayed at $ktls_before) -> measuring userspace OpenSSL"
+      echo "$name,$rep,$order,,,,,,,KTLS-NOT-ENGAGED,\"TlsTxSw=$ktls_before\"" >> "$CSV"
+      kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
+    fi
+  fi
   local j; j=$(taskset -c "$CLIENT_CPUS" "$BOMB" -k -l -o json -p r -c "$CONNECTIONS" -d "$DURATION" -t 5s \
-    "$scheme://127.0.0.1:$PORT/plaintext" 2>"$LOGS/$name.r$rep.err")
-  echo "$j" > "$LOGS/$name.r$rep.json"
+    "$scheme://127.0.0.1:$PORT/plaintext" 2>"$LOGS/$fn.r$rep.err")
+  echo "$j" > "$LOGS/$fn.r$rep.json"
 
   kill $pid 2>/dev/null; wait $pid 2>/dev/null
   sleep 1
@@ -112,7 +162,9 @@ echo
 echo "matrix: ${#LEGS[@]} legs x $REPS passes (first $WARMUP_PASSES discarded as host warm-up)"
 echo "  cpus     : $NCPU  server=$SERVER_CPUS client=$CLIENT_CPUS (split by physical core)"
 echo "             DOTNET_PROCESSOR_COUNT=$DOTNET_PROCESSOR_COUNT GOMAXPROCS=$GOMAXPROCS"
+echo "  shards   : $SHARDS (SocketSet legs only; kestrel has no shards)"
 echo "  load     : -c $CONNECTIONS -d $DURATION (warmup $WARMUP), keep-alive only"
+echo "  ktls     : $([[ $KTLS_CHECKABLE == 1 ]] && echo "verified against /proc/net/tls_stat" || echo "UNVERIFIABLE - tls module not loaded")"
 echo "  csv      : $CSV"
 echo
 
@@ -122,10 +174,10 @@ for ((rep=1; rep<=REPS; rep++)); do
   mapfile -t SHUFFLED < <(printf '%s\n' "${LEGS[@]}" | shuf)
   order=0
   for spec in "${SHUFFLED[@]}"; do
-    IFS='|' read -r name args xt xtls <<<"$spec"
+    IFS='|' read -r name args xt xtls xsh <<<"$spec"
     [[ -n "$FILTER" && "$name" != *$FILTER* ]] && continue
     order=$((order+1))
-    run_leg "$name" "$args" "$xt" "$xtls" "$rep" "$order"
+    run_leg "$name" "$args" "$xt" "$xtls" "$xsh" "$rep" "$order"
   done
 done
 
