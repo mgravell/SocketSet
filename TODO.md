@@ -606,6 +606,40 @@ The value of the leg is that it is the vehicle phase 2 needs, and a like-for-lik
 work must be measured against THIS, not against the callback path, or it will be credited with what pipe
 mode already costs.
 
+### 2b-result. IOCP zero-copy send: LANDED 2026-07-28, worth +3.5% at 16KB and nothing elsewhere
+
+Measured against the `--byo` bridge (the like-for-like baseline), IOCP, 12 shards, `-c 64`, median of 3:
+
+| payload | classic bridge | byo + zero-copy | delta | classic passes | byo passes |
+|---|---:|---:|---:|---|---|
+| 512 B | 141.7 | 138.5 | -2.3% | 140,144,142 | 140,139,138 |
+| 16 KB | 3,615.4 | **3,741.7** | **+3.5%** | 3671,3615,3587 | 3742,3748,3741 |
+| 256 KB | 4,271.9 | 4,094.7 | -4.1% | 4314,4272,4139 | 4018,4329,4095 |
+
+Only the 16KB row has disjoint ranges, so **+3.5% is the only defensible claim**; the other two are noise.
+
+**Against the ~42% bridge cost this was aimed at, that is a poor return, and the reason is the finding.**
+The bridge's cost is not mostly copies — it is the two Pipes, the scheduling hops between them, and
+Kestrel's own pipeline. Removing one of the two copies bought 3.5%. This is the third independent arrival
+at the same conclusion (the others being `fa97dd4`'s A/B and page size moving RIO 4.68x without changing
+bytes copied): **per-byte copying is not what costs on this path.**
+
+Two things worth trying before concluding the approach is exhausted, in rough order of expected value:
+
+1. **The 64-segment cap probably binds at 256KB.** Kestrel's pool hands out 4KB blocks, so a 256KB
+   response is ~64 segments — right at `MaxSendPages`. Anything over declines and silently falls back to
+   copying, which would explain why the largest payload gained nothing. Fix by sending a PREFIX of the
+   sequence instead of declining: the pump advances only by what was actually sent, which needs
+   `TrySendZeroCopy` to report bytes rather than a bare bool. Instrument the decline rate first — do not
+   assume it binds.
+2. **Inbound zero-copy** (receive straight into `pipe.Output.GetMemory()`) removes the OTHER copy and, more
+   interestingly, removes the staging introduced for backpressure. It also needs receive-parking, which is
+   the only mechanism that makes backpressure real rather than advisory.
+
+If neither moves it, the honest conclusion is that the bridge cost is structural — pipes and thread hops —
+and the way to recover it is to not have a bridge, i.e. for Kestrel to talk to the transport directly,
+which is out of scope here.
+
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 
 **Status: designed, not started. Now the highest-value item on this list, with a measured target.**
