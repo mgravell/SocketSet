@@ -154,7 +154,12 @@ internal sealed class IoUringShard : SocketSetShard
         _socketsPerShard = options.SocketsPerShard;
         _entriesPerShard = options.EntriesPerShard;
         _readPages = options.BufferPagesPerShard;
-        _readPageSize = options.BufferPageSize;
+        // Receive size is allowed to differ from the send page (SocketSetOptions.ReceiveBufferSize).
+        // io_uring does not NEED the split the way epoll and the Windows backends do - its read pool is
+        // per-SHARD (BufferPagesPerShard entries, 256) rather than per-socket, so a 64KB page is ~16MB per
+        // shard here against 256MB there - but honouring it keeps the option meaning one thing on every
+        // backend, and stops the harness banner reporting a recvbuf= the backend then ignores.
+        _readPageSize = options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize;
         _writeCount = options.WriteBuffersPerShard;
         _writeBufSize = options.BufferPageSize;
         _obWriteCount = options.OutOfBandWriteBuffersPerShard;

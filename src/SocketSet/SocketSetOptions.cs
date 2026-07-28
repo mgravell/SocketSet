@@ -23,8 +23,16 @@ public class SocketSetOptions
     public int BufferPagesPerShard { get; set; } = 256;
 
     /// <summary>
-    /// IOCP/RIO: size of each per-connection receive buffer. <c>0</c> (the default) means "follow
+    /// Size of each receive buffer, independent of the send page. <c>0</c> (the default) means "follow
     /// <see cref="BufferPageSize"/>", which is the historical behaviour.
+    ///
+    /// Honoured by IOCP, RIO, epoll and io_uring - the latter two only since 2026-07-28; before that both
+    /// silently used <see cref="BufferPageSize"/> for everything, while the bench banner still printed a
+    /// <c>recvbuf=</c> the backend ignored. It MATTERS on the three backends whose receive buffer is
+    /// per-SOCKET: IOCP, RIO and epoll all size that slab <see cref="SocketsPerShard"/> x this, so at 4096
+    /// sockets a 64KB receive buffer is 256MB per shard. io_uring's read pool is per-SHARD
+    /// (<see cref="BufferPagesPerShard"/> entries) and is ~16MB at the same size, so it honours the option
+    /// for uniformity rather than need.
     ///
     /// It exists because those two sizes want to be different and used to be the same knob. The SEND page
     /// wants to be large on RIO: RIO cannot scatter-gather (Windows caps `maxSendDataBuffers` at 1), so

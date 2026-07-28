@@ -50,7 +50,15 @@ internal sealed unsafe class EpollShard : SocketSetShard
     private const ulong KindConn = 2UL << 32;
 
     private readonly int _socketsPerShard;
-    private readonly int _bufSize;
+    private readonly int _bufSize;      // SEND page: write scratch, and the OnWrite/OnAccept buffer
+    // RECEIVE buffer, which is a DIFFERENT quantity and must be allowed to stay small. _recvBuffer is one
+    // per LIVE CONNECTION (SocketsPerShard of them, 4096 by default), so this size multiplies by the slot
+    // table, not by a pool depth: at a 64KB page that is 256MB per shard. It is the same per-socket
+    // scaling that took a 12-shard RIO server from 283MB to 3,163MB on Windows, and it is why
+    // SocketSetOptions.ReceiveBufferSize exists. epoll did not honour it until 2026-07-28; the reason the
+    // RSS table in AspNetDemo/RESULTS.md showed epoll "flat" across page sizes is that the slab is
+    // calloc'd (lazily faulted) and -c 64 touches 64 of the 4096 buffers.
+    private readonly int _recvBufSize;
     private readonly int _listenBacklog;
 
     private readonly EpollConnection[] _conns;
@@ -85,6 +93,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
     {
         _socketsPerShard = options.SocketsPerShard;
         _bufSize = options.BufferPageSize;
+        _recvBufSize = options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize;
         _listenBacklog = options.ListenBacklog;
 
         // Pre-allocate the connection table: one pooled instance per slot, reused across lifetimes so
@@ -112,7 +121,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "epoll_ctl(eventfd) failed");
 
         _events = (byte*)NativeMemory.AllocZeroed((nuint)(MaxEvents * LibC.EpollEventSize));
-        _recvBuffer = new PinnedWriteBufferPool(_socketsPerShard, _bufSize);
+        _recvBuffer = new PinnedWriteBufferPool(_socketsPerShard, _recvBufSize);
         _writeBuffer = new PinnedWriteBufferPool(Math.Max(8, Parent.Options.WriteBuffersPerShard), _bufSize);
         if (Parent.Options.Tls is not null)
         {
@@ -583,7 +592,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         byte* buf = _recvBuffer.Address(conn.RecvBuf);
         for (int i = 0; i < ReadBurst; i++)
         {
-            nint n = LibC.recv(conn.Fd, buf, (nuint)_bufSize, 0);
+            nint n = LibC.recv(conn.Fd, buf, (nuint)_recvBufSize, 0);
             if (n > 0)
             {
                 if (!Deliver(conn, buf, (int)n)) return;
@@ -591,7 +600,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
                 if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
                 // A short read means the socket buffer is drained; skip the extra syscall that would
                 // only return EAGAIN. Safe under level-triggering: if more arrives we get another wake.
-                if (n < _bufSize) return;
+                if (n < _recvBufSize) return;
                 continue;
             }
             if (n == 0) { CloseClient(conn.Slot); return; } // orderly EOF from the peer
@@ -609,7 +618,9 @@ internal sealed unsafe class EpollShard : SocketSetShard
     {
         if (conn.Tls is not null) return DeliverTls(conn, data, bytes);
 
-        var ctx = new SocketSet.ReceiveContext(conn, data, _bufSize, bytes);
+        // Capacity is the RECEIVE buffer's - an in-place response is written back into the buffer the
+        // bytes arrived in, so it is bounded by that, not by the send page.
+        var ctx = new SocketSet.ReceiveContext(conn, data, _recvBufSize, bytes);
         Parent.DispatchReceive(ref ctx);
         int rb = ctx.ResponseBytes;
         if (rb <= 0 || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0) return true;
