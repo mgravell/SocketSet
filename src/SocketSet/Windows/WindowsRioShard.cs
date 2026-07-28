@@ -354,6 +354,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     private void DrainCrossThread()
     {
+        DrainAwaitingPage(); // retry anyone who was waiting on a write page before taking on more work
         while (_incoming.TryDequeue(out var inbound)) AdoptAccepted(inbound.Socket, inbound.Token);
         while (_pendingConnects.TryDequeue(out var pc)) StartConnect(pc.Socket, pc.Endpoint, pc.Token);
         while (_closes.TryDequeue(out var c))
@@ -802,9 +803,11 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     {
         if (!_writeBuffer.TryLease(out int wi, out byte* wp))
         {
-            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
-            CloseClient(slot);
-            return false;
+            // Pool dry: stage the bytes and retry on a later pass instead of tearing down a healthy
+            // connection. See WindowsShardBase._awaitingPage.
+            StageOutbound(conn, new ReadOnlySpan<byte>(src, len));
+            MarkAwaitingPage(conn);
+            return true;
         }
         Buffer.MemoryCopy(src, wp, _writeBufSize, len);
         SubmitSendBuffer(conn, slot, wi, len);
@@ -901,8 +904,9 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         if (conn.Pending is not { Count: > 0 } pending) return;
         if (!_writeBuffer.TryLease(out int wi, out byte* wp))
         {
-            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
-            CloseClient(slot);
+            // Pool dry: leave the bytes staged in Pending and retry on a later pass. This used to close
+            // the connection - see WindowsShardBase._awaitingPage for why that was wrong.
+            MarkAwaitingPage(conn);
             return;
         }
         int next = 0;

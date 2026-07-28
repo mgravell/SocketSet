@@ -347,21 +347,33 @@ being the metric that matters:
 | 64 KB page + 4 KB recv, 256 buffers | 11,461.2 | 5,474.5 | 3,467.4 | **0** | 427 MB |
 | 64 KB page + 4 KB recv, 64 buffers | 11,475.9 | 5,199.7 | 3,477.6 | 1 | 283 MB |
 
-**The prediction was wrong and the opposite is true.** The configuration that drops connections is the one
-shipping today - 208 of them at 2048 connections - while every large-page configuration is clean at 0-1.
+> **RETRACTED 2026-07-28: the error column above is a harness artifact, not a server defect.** The claim
+> made here — that the shipped defaults "drop 208 connections at -c 2048" — is withdrawn. Re-run in
+> isolation, that exact configuration served **73,852 requests with zero errors of any kind**. The
+> harness that produced the error counts (`Run-PoolPressure.ps1`, written the same day) runs twelve
+> 2048-connection cells back to back with **no ephemeral-port gate**, where `Run-Matrix.ps1` has three
+> `Wait-Ports` calls for exactly this reason. Windows has ~16k ephemeral ports with a multi-minute
+> TIME_WAIT and that run opens on the order of 74,000 connections, so the errors are client-side port
+> pressure. This is confounder 2 in this very document, reproduced by the person who wrote the warning.
+>
+> What survives: the goodput column (the large-page configurations really are 2.7-4.8x faster), and the
+> mechanism below. What does not: any claim about connection drops, in either direction.
+
+**The prediction about pool depth was wrong in an interesting way**, independent of the error counts: a
+larger page does not starve the pool, it relieves it.
 
 The mechanism, in hindsight: RIO holds exactly ONE write page per in-flight send, and at a 4 KB page a
 256 KB response occupies that page across **64 sequential round trips**. At 64 KB it needs 4. Pool
 *occupancy time* collapses, so a bigger page relieves pool pressure rather than adding to it. The original
 reasoning counted buffers and ignored how long each is held.
 
-So `64 KB page + 4 KB recv + 256 write buffers` is faster at every concurrency tested, has strictly better
-error behaviour than the shipped default, and costs 144 MB across 12 shards.
+So `64 KB page + 4 KB recv + 256 write buffers` is faster at every concurrency tested and costs 144 MB
+across 12 shards. (An earlier version of this line also claimed "strictly better error behaviour"; that
+rested on the retracted error counts and is withdrawn.)
 
 **Still not changed as a default**, deliberately: these are Windows measurements at one payload shape on
-loopback, `BufferPageSize` is shared with io_uring and epoll where it has not been swept, and the 208
-errors on the current default are a pre-existing defect that wants fixing on its own terms (queue rather
-than close) rather than being papered over by a page-size change. The knobs are now plumbed end to end -
+loopback, and `BufferPageSize` is shared with io_uring and epoll where it has not been swept. The knobs
+are now plumbed end to end -
 `SmokeTest` and `AspNetDemo` both take `--page` / `--recv-buffer` / `--write-buffers`, and `/config`
 reports them so a harness can verify the setting actually took.
 

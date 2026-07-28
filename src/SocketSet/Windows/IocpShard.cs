@@ -241,6 +241,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
     private void DrainCrossThread()
     {
+        DrainAwaitingPage(); // retry anyone who was waiting on a write page before taking on more work
         while (_incoming.TryDequeue(out var inbound))
             AdoptAccepted(inbound.Socket, inbound.Token);
 
@@ -974,9 +975,11 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     {
         if (!_writeBuffer.TryLease(out int wi, out byte* wp))
         {
-            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
-            CloseClient(slot);
-            return false;
+            // Pool dry: stage the bytes and retry on a later pass instead of tearing down a healthy
+            // connection. See WindowsShardBase._awaitingPage.
+            StageOutbound(conn, new ReadOnlySpan<byte>(src, len));
+            MarkAwaitingPage(conn);
+            return true;
         }
 
         Buffer.MemoryCopy(src, wp, _writeBufSize, len);
@@ -1201,10 +1204,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         int total = DrainPendingIntoPages(conn);
         if (total == 0)
         {
-            // DrainPendingIntoPages only fails to place the first segment if the pool is dry.
-            System.Diagnostics.Debug.WriteLine("Write buffer pool exhausted; closing connection.");
+            // Pool dry (DrainPendingIntoPages only fails to place the FIRST segment when it is). Leave the
+            // bytes staged in Pending and retry on a later pass; this used to close the connection.
             ReleaseSendPages(conn);
-            CloseClient(slot);
+            MarkAwaitingPage(conn);
             return;
         }
         conn.SendBuf = conn.SendPages[0];

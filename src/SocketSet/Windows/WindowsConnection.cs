@@ -75,6 +75,12 @@ internal abstract class WindowsConnection : OutboundConnection
     public int SendTotal;      // total bytes of the current send
     public Queue<ArraySegment<byte>>? Pending;
 
+    /// <summary>This connection wanted a write page and the pool was dry, so its bytes are staged in
+    /// <see cref="Pending"/> and it is queued for retry on a later loop pass. Loop-thread only. Exists
+    /// because the alternative — what this replaced — was tearing down a healthy connection because a
+    /// buffer happened to be unavailable for a moment.</summary>
+    public bool AwaitingPage;
+
     protected WindowsConnection(IWindowsShard shard, uint slot)
     {
         _shard = shard;

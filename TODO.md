@@ -13,9 +13,10 @@ Orientation for picking this up cold.
 1. **BYO-buffer phase 2 — IOCP zero-copy (item 2b).** Highest value, with a *measured* target: the Kestrel
    bridge costs ~42% on the fastest configuration (bare tuned RIO 11,030 MiB/s at 256KB vs 6,348 bridged).
    The vehicle is already built and A/B'd at parity, so the comparison is clean.
-2. **Write-pool exhaustion drops connections (item 0b).** A correctness defect in the SHIPPED defaults —
-   208 dropped connections at `-c 2048`. Must be fixed before any page-size default moves, because a
-   larger page masks it rather than fixing it.
+2. **Write-pool exhaustion drops connections (item 0b).** DONE 2026-07-28. Note the justification was
+   wrong: the "208 dropped connections" that motivated it were my own harness missing an ephemeral-port
+   gate, not a server defect. The change — stage and retry instead of closing — is right on its own
+   terms and is verified against a 4-buffer pool; the measurement that argued for it was not.
 3. **Page-size defaults (item 0).** Blocked on 0b, and on sweeping page size for io_uring/epoll, since
    `BufferPageSize` is shared with them and has only been swept on Windows.
 4. **Dynamic shard growth.** Specified, untouched.
@@ -461,8 +462,8 @@ oversubscribed already); holding pinned memory constant at a 64KB page means ~64
 **64:1**. The sweep ran `-c 64` over 12 shards - about 5 connections per shard - so it never went near
 pool pressure.
 
-That is dangerous rather than merely slow, because **write-pool exhaustion closes the connection**
-(`CloseClient` in `SendResponse` and `StartPendingSend`) instead of queueing. See item 0b.
+That used to be dangerous rather than merely slow, because write-pool exhaustion CLOSED the connection.
+Fixed 2026-07-28 (item 0b): it now stages and retries. So a shallow pool costs latency, not connections.
 
 **RESOLVED 2026-07-27, except the default itself.**
 
@@ -472,21 +473,23 @@ That is dangerous rather than merely slow, because **write-pool exhaustion close
    `BufferPageSize`). A 64KB send page with a 4KB receive buffer gives the full 4.66x at **283MB, the same
    as today**.
 2. *Pool pressure: the prediction was wrong, and instructively so.* A shallow pool at a big page was
-   expected to drop connections. Measured at 12 shards / 256KB / `-c 2048`, the config that drops
-   connections is **today's default** (208 errors); every large-page config is clean at 0-1. RIO holds one
-   write page per in-flight send, and at 4KB a 256KB response holds it across 64 sequential round trips
-   versus 4 at 64KB - occupancy time collapses, so a bigger page RELIEVES pool pressure. Counting buffers
-   without counting holding time is what got it backwards.
+   expected to starve. It does not: RIO holds one write page per in-flight send, and at 4KB a 256KB
+   response holds it across 64 sequential round trips versus 4 at 64KB, so occupancy time collapses and a
+   bigger page RELIEVES pool pressure. Counting buffers without counting holding time is what got it
+   backwards. **Note the error counts that originally accompanied this were a harness artifact (no
+   ephemeral-port gate) and are withdrawn — see item 0b.** The goodput comparison stands; nothing about
+   connection drops does.
 3. *Plumbed end to end.* `SmokeTest` and `AspNetDemo` both accept `--page` / `--recv-buffer` /
    `--write-buffers`; `/config` reports them so a harness can verify the setting took, and combining them
    with `--kestrel` is rejected.
 
 **What is deliberately NOT done: changing the default.** `64KB page + 4KB recv + 256 write buffers` is
 faster at every concurrency tested and has strictly better error behaviour than what ships. It is still
-not the default because: these are Windows measurements at one payload shape on loopback;
-`BufferPageSize` is shared with io_uring and epoll, where it has not been swept; and the 208 errors on the
-current default are a pre-existing defect that deserves fixing on its own terms (item 0b) rather than
-being masked by a page-size change.
+not the default because these are Windows measurements at one payload shape on loopback, and
+`BufferPageSize` is shared with io_uring and epoll where it has not been swept.
+
+(An earlier version of this paragraph also cited "208 errors on the current default" as a blocking
+defect. That was a harness artifact — see item 0b — and is not a reason for or against anything.)
 
 **Remaining:**
 
@@ -499,10 +502,29 @@ being masked by a page-size change.
 
 ### 0b. Write-pool exhaustion closes the connection instead of applying backpressure
 
-**Status: proposed, not started. Surfaced by item 0 on 2026-07-27, and MEASURED: the shipped defaults drop
-208 connections at `-c 2048` with 256KB responses on 12 shards.** Not a hypothetical - it is the current
-default configuration, and it is the only configuration tested that failed. Large-page configs came in at
-0-1 errors, which means a page-size change would MASK this rather than fix it. Fix it on its own terms.
+**Status: DONE 2026-07-28. The justification I gave for it was wrong; the change is right anyway.**
+
+*The wrong part.* This entry claimed the shipped defaults "drop 208 connections at `-c 2048`". That was
+read off an error column without checking what the errors were. In isolation the same configuration
+serves 73,852 requests with **zero** errors. The counts came from `Run-PoolPressure.ps1`, a harness
+written the same day with **no ephemeral-port gate**, where `Run-Matrix.ps1` has three `Wait-Ports` calls
+precisely because Windows has ~16k ephemeral ports with a multi-minute TIME_WAIT — and that run opens
+about 74,000 connections. Client-side port pressure, i.e. confounder 2 of `AspNetDemo/RESULTS.md`,
+reproduced by someone who had read the warning. **Any harness that opens thousands of connections per
+cell needs the port gate; copy it from `Run-Matrix.ps1`.**
+
+*The right part.* Closing a healthy connection because a write page was briefly unavailable is wrong on
+its own terms, whatever the error counts said. Both Windows backends now stage the bytes into `Pending`
+and queue the connection for retry (`WindowsShardBase.MarkAwaitingPage` / `DrainAwaitingPage`, drained
+once per loop pass), instead of calling `CloseClient`. Retrying per pass rather than hooking every buffer
+release is deliberate: pages are freed by whichever connection finishes a send, usually not one that is
+waiting, so a per-release hook would fan out to every waiter anyway.
+
+Verified directly rather than incidentally: a **4-buffer** write pool — which under the old code would
+have torn connections down almost immediately — now round-trips 4MB byte-exact on both IOCP and RIO.
+
+Still open: the drop path is invisible in Release (`Debug.WriteLine`), and there is no counter for how
+often a connection had to wait. Worth adding before anyone tunes pool depth against it.
 
 `WindowsRioShard.SendResponse` and `StartPendingSend` both do
 `if (!_writeBuffer.TryLease(...)) { CloseClient(slot); return; }`, and `IocpShard` has the same shape. So

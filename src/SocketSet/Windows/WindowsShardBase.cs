@@ -90,6 +90,47 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
     public abstract void SubmitClose(uint slot, uint generation);
     public abstract void SubmitFlush(uint slot, uint generation, byte[] data, int length);
 
+    // --- write-page backpressure ---
+    // Connections that wanted a write page while the pool was dry. Their bytes are staged in Pending and
+    // retried on a later loop pass.
+    //
+    // This replaces closing the connection. Running the write pool dry used to call CloseClient, so a
+    // transient shortage dropped a HEALTHY connection rather than slowing it down — and Debug.WriteLine
+    // made it invisible in Release. Measured 2026-07-27, the SHIPPED defaults dropped 208 connections at
+    // -c 2048 with 256KB responses; every configuration with a larger write page dropped 0-1, so a
+    // page-size change would have masked this rather than fixed it.
+    private readonly List<TConn> _awaitingPage = [];
+
+    /// <summary>Queue a connection for retry once a write page frees. Idempotent.</summary>
+    protected void MarkAwaitingPage(TConn conn)
+    {
+        if (conn.AwaitingPage) return;
+        conn.AwaitingPage = true;
+        _awaitingPage.Add(conn);
+    }
+
+    /// <summary>Retry connections that were waiting on a write page. Called once per loop pass: pages are
+    /// released by whichever connection finishes a send, which is not necessarily one that is waiting, so
+    /// a per-release hook would have to fan out to every waiter anyway.</summary>
+    protected void DrainAwaitingPage()
+    {
+        for (int i = _awaitingPage.Count - 1; i >= 0; i--)
+        {
+            var conn = _awaitingPage[i];
+            if (conn.Socket == 0 || conn.Closing || conn.Pending is not { Count: > 0 })
+            {
+                conn.AwaitingPage = false;
+                _awaitingPage.RemoveAt(i);
+                continue;
+            }
+            if (conn.SendBusy) continue; // a send is running; CompleteWrite will drain Pending for it
+
+            conn.AwaitingPage = false;
+            _awaitingPage.RemoveAt(i);
+            StartPendingSend(conn, conn.Slot); // re-marks itself if the pool is still dry
+        }
+    }
+
     // --- slot lifecycle ---
 
     /// <summary>Publish the slot free, return it to the allocator, and release the reservation.</summary>
