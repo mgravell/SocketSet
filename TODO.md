@@ -4,9 +4,27 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## START HERE (state as of 2026-07-27)
+## START HERE (state as of 2026-07-28)
 
 Orientation for picking this up cold.
+
+**The agreed order of work, and why:**
+
+1. **BYO-buffer phase 2 — IOCP zero-copy (item 2b).** Highest value, with a *measured* target: the Kestrel
+   bridge costs ~42% on the fastest configuration (bare tuned RIO 11,030 MiB/s at 256KB vs 6,348 bridged).
+   The vehicle is already built and A/B'd at parity, so the comparison is clean.
+2. **Write-pool exhaustion drops connections (item 0b).** A correctness defect in the SHIPPED defaults —
+   208 dropped connections at `-c 2048`. Must be fixed before any page-size default moves, because a
+   larger page masks it rather than fixing it.
+3. **Page-size defaults (item 0).** Blocked on 0b, and on sweeping page size for io_uring/epoll, since
+   `BufferPageSize` is shared with them and has only been swept on Windows.
+4. **Dynamic shard growth.** Specified, untouched.
+
+**One correction worth carrying forward, because it was made twice.** "Copies are not the constraint"
+(established by `fa97dd4`'s A/B and by page size moving RIO 4.68x without changing bytes copied) is TRUE,
+and was wrongly used to de-prioritise BYO-buffer. BYO-buffer's target was never the per-byte copies in
+isolation — it is the BRIDGE, which was 14-19% when measured against the untuned transport and is ~42%
+against the tuned one. Both statements hold; they are about different things.
 
 **The benchmark host changed on 2026-07-27** - from a laptop (16C/32T) to a desktop (Ryzen 9 7900X,
 12C/24T, mains). Every Windows number recorded before that date is from the old machine and **cannot be
@@ -48,16 +66,20 @@ snapshot matters because the old `ToArray()` allocated the whole response per fl
 is a **Large Object Heap allocation on every response**.
 
 Its pre-registered reading was "if it moves throughput, allocation was the cost; if it does not, copies
-dominate". It moved throughput, so **allocation was the cost and copies are not the constraint** - which
-is the finding that de-prioritises BYO-buffer. See item 2b.
+dominate". It moved throughput, so **allocation was the cost and per-byte copies are not the constraint**.
+Note what that does and does not imply — see the correction at the top of this section: it rules out
+chasing copies for their own sake, but not the caller-supplied-pipe work, whose target is the bridge.
 
 **Before trusting any measurement, read `bench/README.md`.** It documents the eight confounders that each
 produced clean-looking wrong numbers, and the noise floor (~6% between identical builds on this host).
 
-**Direction of travel:** BYO-buffer, in measured steps — see 2b. The end goal is that a caller supplies
-the memory (ideally pinned/registered) and we stop copying into it. Accepting single-shot reads, or
-bypassing provided buffers, is an acceptable price for minimal copy. A robust fallback is required for
-backends that cannot take foreign memory at all — RIO takes only registered `BufferId`s, never addresses.
+**Direction of travel:** BYO-buffer, in measured steps — see 2a/2b. The API (`ctx.UsePipe`) and the
+universal copying fallback landed 2026-07-27; what remains is the per-backend zero-copy path, IOCP first.
+The end goal is that a caller supplies the memory (ideally pinned/registered) and we stop copying into it.
+Accepting single-shot reads, or bypassing provided buffers, is an acceptable price for minimal copy. A
+robust fallback is required for backends that cannot take foreign memory at all — RIO takes only
+registered `BufferId`s, never addresses, which is exactly why the fallback is a permanent path and not a
+stepping stone.
 
 ---
 
