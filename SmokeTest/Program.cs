@@ -253,7 +253,17 @@ if (args.Contains("--http"))
     // at matching sizes under the same load generator.
     using var http = new HttpBench(options, size);
     http.Listen(new IPEndPoint(IPAddress.Any, port));
-    Console.WriteLine($"http-bench: backend={options.Factory.GetType().Name} listening on {port} (Ctrl+C to stop)");
+    // Report the buffer GEOMETRY, not just the backend. AspNetDemo has /config for this; the bare
+    // responder has only this line, and a page-size sweep that cannot confirm --page actually took is
+    // precisely the "trust the flag you passed" failure that bench/README.md rule 5 exists to prevent.
+    // Note --page also rescales WriteBuffersPerShard (to hold pinned memory constant), so printing both
+    // is what lets a harness tell a page change from a pool-depth change.
+    Console.WriteLine(
+        $"http-bench: backend={options.Factory.GetType().Name} shards={options.Shards}"
+        + $" page={options.BufferPageSize}"
+        + $" recvbuf={(options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize)}"
+        + $" writebufs={options.WriteBuffersPerShard} body={size}"
+        + $" listening on {port} (Ctrl+C to stop)");
     var httpStop = new ManualResetEventSlim();
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; httpStop.Set(); };
     httpStop.Wait();
