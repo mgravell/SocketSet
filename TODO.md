@@ -21,6 +21,44 @@ Orientation for picking this up cold.
    `BufferPageSize` is shared with them and has only been swept on Windows.
 4. **Dynamic shard growth.** Specified, untouched.
 
+### NEXT SESSION IS A LINUX ONE — here is exactly what to run and what to expect
+
+The page-size default (item 0) is blocked on one thing only: `BufferPageSize` is shared with io_uring and
+epoll and has been swept **only on Windows**. Everything else about it is settled.
+
+**1. Sweep page size on both Linux backends.** `bench/run-tls-sizes.sh` is the rig. Compare 4KB / 16KB /
+64KB at 512B / 16KB / 256KB payloads, exactly as the Windows matrix in `AspNetDemo/RESULTS.md` does.
+
+*Pre-registered expectation, so the result can falsify something:* **both should be roughly
+page-INSENSITIVE**, unlike RIO. io_uring already dispatches one writev over an `OutChain` of segments —
+the same scatter-gather shape that made IOCP page-insensitive — and epoll sends directly from the TLS
+output buffer with no page copy at all. If either turns out page-SENSITIVE, that is a finding worth
+chasing, not a tuning result. If both are insensitive, the shared default can move on the Windows
+evidence alone, because Linux does not care.
+
+**2. Check whether Linux needs the send/receive split.** `SocketSetOptions.ReceiveBufferSize` is honoured
+only by IOCP and RIO. Both Linux backends still take one size for everything
+(`EpollShard._bufSize`, `IoUringShard._readPageSize`/`_writeBufSize` — all `options.BufferPageSize`).
+On Windows that coupling cost 3.0GB at a 64KB page because the receive slab is per-SOCKET
+(`SocketsPerShard` 4096). io_uring's read pool is per-SHARD (`BufferPagesPerShard`, 256), so 64KB there is
+~16MB per shard and probably fine. **Measure the resident set before assuming** — that is exactly the
+assumption that was wrong on Windows. epoll's sizing needs the same look.
+
+**3. Pipe mode already works on Linux** through the universal fallback (`PipeIoBridge`), so
+`SmokeTest --epoll --verify-echo N --pipe -z 65536` should pass as-is; worth running because the 64KB
+chunk size is what exposed the flush-concurrency fault on Windows. Zero-copy send is IOCP-only. io_uring
+is the natural second driver — its send is already a writev over segments, so pointing those segments at
+pinned pipe memory is a smaller change there than it was on IOCP.
+
+**4. While there, the standing Linux backlog:** item 1 (io_uring TLS large-payload, investigated but never
+reproduced outside a container), item 2 (re-run the size sweep now the plaintext controls exist), item 4
+(kTLS RECVMSG + cmsg receive arm), item 5 (real-hardware run — everything Linux on file is a container on
+a WSL2 kernel over loopback).
+
+**Read `bench/README.md` first.** Nine confounders, and one of them was reproduced on 2026-07-28 by
+someone who had already read it — see item 0b. Any harness opening thousands of connections per cell needs
+the ephemeral-port gate from `Run-Matrix.ps1`.
+
 **One correction worth carrying forward, because it was made twice.** "Copies are not the constraint"
 (established by `fa97dd4`'s A/B and by page size moving RIO 4.68x without changing bytes copied) is TRUE,
 and was wrongly used to de-prioritise BYO-buffer. BYO-buffer's target was never the per-byte copies in
