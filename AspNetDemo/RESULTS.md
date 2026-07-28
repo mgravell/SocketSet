@@ -422,6 +422,76 @@ unmeasured**, and the handshake is exactly where SChannel, SslStream and OpenSSL
 exercises only the record layer. Measuring handshakes properly wants a bounded connection count with
 explicit port accounting, or a second machine.
 
+## Linux page size x payload, on the bare responder (2026-07-28)
+
+`bench/run-page-sizes.sh`, `SmokeTest --http` - no Kestrel, no bridge, no pipes. 8 shards, `-c 64`, four
+passes with the first discarded, reshuffled, median of three. Goodput MiB/s, min-max in brackets.
+
+| payload | epoll p4K | epoll p16K | epoll p64K | iouring p4K | iouring p16K | iouring p64K |
+|---|---:|---:|---:|---:|---:|---:|
+| 512 B | 475.6 | 475.7 | 477.3 | 461.7 | 467.5 | 467.5 |
+| 16 KB | 9,096.1 | 9,036.5 | 9,027.2 | 4,459.9 [4302-4530] | 4,396.1 [4377-4423] | **8,825.6** [8651-8858] |
+| 256 KB | 12,640.8 | 12,647.4 | 12,676.7 | 8,016.4 | 7,853.3 | 7,824.3 |
+
+### epoll is page-insensitive; io_uring is NOT, and that falsifies the prediction
+
+TODO pre-registered that **both** Linux backends would be roughly page-insensitive, because io_uring
+already dispatches one writev over an `OutChain` of segments - the same scatter-gather shape that made
+IOCP page-insensitive - and epoll sends straight from its buffer with no page copy.
+
+- **epoll: confirmed.** Every payload, all three pages overlap. Nothing to tune.
+- **io_uring: falsified.** At a 16KB payload a 64KB page is **2.0x** a 4KB one, ranges disjoint.
+
+Note p16K is *no better* than p4K at a 16KB payload. The response is headers + body, so a 16KB body
+overflows a 16KB page and spills into a second one: the penalty behaves like "more than one page" rather
+than "many pages" (5 pages at p4K and 2 at p16K cost the same; 1 page at p64K costs half). At 256KB every
+page size spans multiple pages and all three converge, which fits - the per-request penalty is amortised
+over a much larger response.
+
+### Memory: the Windows blocker does not exist here, and a big page makes io_uring CHEAPER
+
+RSS sampled under load (`-c 64`, 256KB responses, 8 shards). Idle RSS is useless for this - untouched
+pages are not resident - so these are measured with traffic flowing.
+
+| backend | page 4KB | page 64KB |
+|---|---:|---:|
+| epoll | 72 MB | 73 MB |
+| io_uring | 122 MB | **77 MB** |
+
+On Windows a 64KB page took a 12-shard RIO server from 283MB to 3,163MB, because the receive slab is
+per-SOCKET at `SocketsPerShard` 4096. **Neither Linux backend does that**: epoll is flat, and io_uring is
+**37% cheaper** at the larger page. That is the same effect already recorded for RIO's pool pressure -
+a bigger page collapses buffer occupancy time, so the path falls back to pinned GC allocations far less
+often. Counting buffers without counting holding time gets it backwards.
+
+Single sample per cell, one payload shape, so treat as indicative rather than a measurement of record.
+
+### What this does NOT establish: that the 256KB bridged collapse is the bridge
+
+The payload sweep through AspNetDemo shows every SocketSet leg collapsing at 256KB. On the bare responder
+there is **no collapse** - epoll rises 9,096 -> 12,641 from 16KB to 256KB and io_uring rises
+4,460 -> 8,016. It is tempting to conclude the bridge owns the cliff. **That conclusion is not supported**,
+for three reasons, and the third is the one that actually kills it:
+
+1. The two runs used different shard counts (bridged `s12`, bare `s8`).
+2. They are different runs minutes apart, and rule 1 of `bench/README.md` says that is not evidence.
+3. **`HttpBench` has a bottleneck of its own that was not accounted for.** It funnels every connection's
+   sends through TWO background threads. At 16KB, epoll at every page and io_uring at p64K all land at
+   ~570k rps - that is the harness ceiling, not the transport.
+
+The tell: bridged io_uring at 16KB (7,054 MiB/s) is **faster** than bare io_uring at 16KB (4,460). A
+bridge cannot cost negative time, so the cross-rig comparison is measuring something other than the
+bridge. **A clean isolation needs both configurations in ONE session at a MATCHED shard count**, and
+ideally a bare responder that does not serialise sends through two threads.
+
+### What DOES survive: epoll beats io_uring by 58% at 256KB on the bare transport
+
+12,640.8 vs 8,016.4 at p4K, and the same picture at every page size. Ranges are hugely disjoint and both
+legs run at ~50k and ~32k rps - far below the ~570k harness ceiling, so neither is limited by `HttpBench`.
+This is a transport-level difference and it matches the structural note in TODO item 1: io_uring copies
+every outbound byte into write pages, epoll sends directly from its buffer. That note was written about
+the TLS path; this is plaintext, and the same shape appears.
+
 ## Linux baseline on bare metal (2026-07-28) — THE current Linux reference
 
 First Linux measurement on the current host: Pop!_OS 24.04, kernel 7.0.11, Ryzen 9 7900X 12C/24T, bare

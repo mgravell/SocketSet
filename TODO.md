@@ -413,7 +413,35 @@ Goodput MiB/s, median of 3 scored passes, Docker/loopback (`bench/run-tls-sizes.
 Unlike the small-message numbers these repeat tightly (~1-10% between passes), so the large-payload
 shape is worth acting on.
 
-### 1. io_uring+TLS large-payload behaviour — INVESTIGATED 2026-07-26, NOT CONFIRMED
+### 1. io_uring+TLS large-payload behaviour — REFRAMED 2026-07-28: the scope was wrong twice over
+
+**Status: the entry below is superseded. It is not io_uring-specific, not TLS-specific, and not
+container-specific — and the component that owns it is still not identified.**
+
+Measured on bare metal 2026-07-28 through AspNetDemo (`bench/run-tls-sizes.sh`), 64KB -> 256KB:
+
+| leg | 64 KB | 256 KB | change |
+|---|---:|---:|---:|
+| epoll (PLAINTEXT) | 10,523.3 | 6,689.0 | **-36%** |
+| iouring (PLAINTEXT) | 10,483.5 | 7,979.9 | **-24%** |
+| epoll+tls | 9,200.7 | 4,343.3 | **-53%** |
+| iouring+tls | 8,493.2 | 4,040.5 | **-52%** |
+| kestrel | 10,057.2 | 12,469.7 | **+24%** |
+| kestrel+tls | 6,764.6 | 7,819.0 | **+16%** |
+
+Ranges disjoint. Both Kestrel controls RISE in the same reshuffled passes, which rules out the client,
+the box and the payload shape. So the decline is real and it affects **every SocketSet leg including
+plaintext epoll** — the original entry's framing as an io_uring+TLS peculiarity was wrong, and its
+"could not reproduce" was a property of the container, not of the defect.
+
+**But the component is NOT identified, and the obvious inference does not hold.** The bare responder
+shows no collapse at all (see `AspNetDemo/RESULTS.md`), which looks like a clean indictment of the Kestrel
+bridge — except that comparison is cross-run, cross-shard-count, and confounded by `HttpBench` funnelling
+all sends through two threads. Bridged io_uring at 16KB measures FASTER than bare io_uring at 16KB, and a
+bridge cannot cost negative time. **Next step is a clean bare-vs-bridged isolation in one session at a
+matched shard count**, not another sweep.
+
+*Original entry follows.*
 
 **Status: could not reproduce in a container. Do not treat the regression below as established.**
 
@@ -612,10 +640,36 @@ not the default because these are Windows measurements at one payload shape on l
 (An earlier version of this paragraph also cited "208 errors on the current default" as a blocking
 defect. That was a harness artifact — see item 0b — and is not a reason for or against anything.)
 
+**LINUX SWEPT 2026-07-28 — the memory objection is gone, and every backend now wants the same thing.**
+
+`bench/run-page-sizes.sh` on the bare responder (full tables in `AspNetDemo/RESULTS.md`):
+
+| backend | page sensitivity | RSS at 64KB page vs 4KB |
+|---|---|---|
+| RIO | wants 64KB badly (4.68x at 256KB) | was the blocker; solved by `ReceiveBufferSize` |
+| IOCP | indifferent (+-2%) | n/a |
+| epoll | **indifferent** at every payload | **flat** (72 -> 73 MB) |
+| io_uring | **wants 64KB: 2.0x at a 16KB payload** | **37% CHEAPER** (122 -> 77 MB) |
+
+Two things change here. First, the pre-registered "both Linux backends are page-insensitive" was **half
+wrong** — io_uring is sensitive, so the shared default could not have been decided on Windows evidence
+alone. Second, and more useful: **the memory argument against a larger default does not exist on Linux at
+all.** It was the whole reason this was frightening, and it was a Windows-specific consequence of the
+receive slab being per-SOCKET. On Linux a bigger page is free on epoll and actively cheaper on io_uring,
+because collapsing buffer occupancy time reduces the fallback pinned allocations.
+
+So every backend now benefits from or is indifferent to a 64KB page, and none of them pays for it in
+memory once `ReceiveBufferSize` covers the Windows receive slab. **The case for raising the default is
+much stronger than when this entry was written**, and what is left is mechanism, not evidence.
+
 **Remaining:**
 
 - Sweep past 64KB - RIO was still improving monotonically at the top of the range, so the peak is unknown.
-- Sweep page size on io_uring/epoll before touching a shared default.
+  io_uring's 16KB-payload result suggests the useful question is "does the response fit in ONE page",
+  which makes the right default depend on expected payload rather than being a single global optimum.
+- Confirm the page/pool-depth co-variation is inert on Linux as it was on Windows: `--page` also rescales
+  `WriteBuffersPerShard` to 4MB/page (1024 buffers at 4KB, 64 at 64KB), so the sweep moved two things.
+  `FIXED_WRITE_BUFFERS` in the rig pins it; that control has not been run yet.
 - Decide the mechanism for a per-backend default. The backends want opposite things (RIO large, IOCP
   small/indifferent) and `BufferPageSize` is one global constant with a real default of 4096, so there is
   no way to distinguish "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend
