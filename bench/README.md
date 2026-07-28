@@ -99,7 +99,8 @@ doing more work. **Measure cost per request at saturation**, where there are no 
   **silently falls back to managed sockets**. Pass `--security-opt seccomp=unconfined`, and trust
   `/config` rather than the flag you passed.
 - **Idle sleep.** The Windows harnesses call `SetThreadExecutionState`; a host that sleeps mid-run
-  produces a partial pass that reads as ordinary.
+  produces a partial pass that reads as ordinary. **The `.sh` rigs have no equivalent** — see the Linux
+  host section, where sleep is worse than a bad pass.
 - **CPU pinning.** Server and load generator get disjoint halves, and both runtimes are told the true
   core count via `DOTNET_PROCESSOR_COUNT`/`GOMAXPROCS` — they size their ThreadPool and GC heaps at
   startup, *before* affinity is applied, and are otherwise oversubscribed against their own pinning.
@@ -123,6 +124,13 @@ io_uring is available with no seccomp workaround. Two consequences, both load-be
   `performance` (`/sys/devices/system/cpu/cpu*/cpufreq/{scaling_governor,energy_performance_preference}`)
   or the clock moves under you and the whole disjoint-ranges discipline is measuring the governor.
   **Does not survive a reboot** — re-check it rather than assuming.
+- **Suspend, which on this box is a REBOOT.** GNOME shipped with a 30-minute idle suspend on AC, and this
+  machine has never once resumed from it — a suspend means a hard reset, a lost session, and a run that
+  ends with no partial results and no log of why. Disabled 2026-07-28 with
+  `gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'` (user-level
+  dconf, survives reboots, no sudo). Unlike the Windows rigs there is no `SetThreadExecutionState`
+  equivalent here, so nothing in the harness will hold the box awake for you. If a long sweep vanished,
+  check `uptime` before you look for a bug.
 - **SMT enumeration.** Linux numbers CPUs 0-11 as *one thread of each of the twelve physical cores* and
   12-23 as their siblings, so a lower/upper-half split gives the server and the load generator the SAME
   cores. Windows enumerates siblings adjacently, which is why the `.ps1` rigs get away with the same
@@ -163,6 +171,17 @@ always will on loopback.
 
 Report a difference only if the per-side pass ranges are **disjoint**. `Run-Matrix.ps1` prints which leg
 pairs actually separate; for everything else, compare the spread against the delta by eye.
+
+**Disjointness is only as good as the pass count, and the required count grows with payload.** Measured
+2026-07-28 on bare io_uring: at a **256KB** payload the true per-cell spread is **~8%**, but any three
+consecutive passes can span as little as **1.2%**. Three passes there produce a falsely tight range, and
+two such ranges can be disjoint while describing *identical* configurations - which is exactly what
+happened when the same `p4096` cell was run in two sessions (8,016 [8007-8102] vs 7,846 [7759-7850]).
+Small payloads do not have this problem: 16KB cells spread ~1.5% over the same three passes.
+
+So: **at 256KB use six scored passes, not three**, and treat any existing low-single-digit 256KB claim
+built on three passes as unproven. This bites hardest on cross-session comparisons, because a
+same-session mistake at least shares a warm-up state.
 
 **The noise floor is a property of the host, not of the project.** On the previous laptop it was ~6%, and
 once 58%. On the current desktop per-leg spreads run 0.2-2.4%, so a 2% effect is detectable here and was

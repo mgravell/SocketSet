@@ -32,6 +32,7 @@ bool ktls = false;          // use kernel-TLS (kTLS) offload (io_uring only)
 string[]? alpn = null;      // ALPN ids offered by BOTH ends (self-test: the overlap is the whole list)
 int? writeBuffersOverride = null; // --write-buffers: pool depth, decoupled from --page (see below)
 int? bufferPagesOverride = null;  // --buffer-pages:  ditto
+int? oobWriteBuffersOverride = null; // --oob-write-buffers: the third pool --page rescales
 int? recvBufferOverride = null;   // --recv-buffer: per-socket receive buffer size, decoupled from --page
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
@@ -225,6 +226,14 @@ for (int i = 0; i < args.Length; i++)
             bufferPagesOverride = Math.Max(1, bpo);
             i++;
             break;
+        // The third pool --page rescales. It had no override, which made the co-variation control
+        // INCOMPLETE: io_uring reads all three (BufferPagesPerShard as its read pool,
+        // WriteBuffersPerShard and OutOfBandWriteBuffersPerShard for sends), so pinning only the first
+        // two still let a pool depth move with the page.
+        case "--oob-write-buffers" when i + 1 < args.Length && int.TryParse(args[i + 1], out var obo):
+            oobWriteBuffersOverride = Math.Max(1, obo);
+            i++;
+            break;
         // Receive buffer size, decoupled from the send page. One per socket for the connection lifetime,
         // so it multiplies by SocketsPerShard where the send page does not.
         case "--recv-buffer" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rbo):
@@ -238,6 +247,7 @@ for (int i = 0; i < args.Length; i++)
 // of where it appeared on the command line.
 if (writeBuffersOverride is int wbv) options.WriteBuffersPerShard = wbv;
 if (bufferPagesOverride is int bpv) options.BufferPagesPerShard = bpv;
+if (oobWriteBuffersOverride is int obv) options.OutOfBandWriteBuffersPerShard = obv;
 if (recvBufferOverride is int rbv) options.ReceiveBufferSize = rbv;
 
 if (resp)
@@ -256,13 +266,18 @@ if (args.Contains("--http"))
     // Report the buffer GEOMETRY, not just the backend. AspNetDemo has /config for this; the bare
     // responder has only this line, and a page-size sweep that cannot confirm --page actually took is
     // precisely the "trust the flag you passed" failure that bench/README.md rule 5 exists to prevent.
-    // Note --page also rescales WriteBuffersPerShard (to hold pinned memory constant), so printing both
-    // is what lets a harness tell a page change from a pool-depth change.
+    // Note --page also rescales THREE pool depths (to hold pinned memory constant), so printing all of
+    // them is what lets a harness tell a page change from a pool-depth change. io_uring reads every one:
+    // readpages is its receive pool, writebufs and oobwritebufs its send pools. epoll reads none of them
+    // (only BufferPageSize), which is why an epoll page sweep needs no co-variation control and an
+    // io_uring one does.
     Console.WriteLine(
         $"http-bench: backend={options.Factory.GetType().Name} shards={options.Shards}"
         + $" page={options.BufferPageSize}"
         + $" recvbuf={(options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize)}"
-        + $" writebufs={options.WriteBuffersPerShard} body={size}"
+        + $" writebufs={options.WriteBuffersPerShard}"
+        + $" oobwritebufs={options.OutOfBandWriteBuffersPerShard}"
+        + $" readpages={options.BufferPagesPerShard} body={size}"
         + $" listening on {port} (Ctrl+C to stop)");
     var httpStop = new ManualResetEventSlim();
     Console.CancelKeyPress += (_, e) => { e.Cancel = true; httpStop.Set(); };
@@ -382,6 +397,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --write-buffers N write buffers per shard, independent of --page (which rescales them to");
     Console.WriteLine("                    hold pinned memory constant). Exhausting this pool CLOSES connections.");
     Console.WriteLine("  --buffer-pages N  read/buffer pages per shard, likewise independent of --page");
+    Console.WriteLine("  --oob-write-buffers N  out-of-band write buffers per shard, likewise. --page rescales");
+    Console.WriteLine("                    all THREE pools, so a page sweep must pin all three to be a control.");
     Console.WriteLine("  --recv-buffer N   per-socket receive buffer size (IOCP/RIO), independent of --page.");
     Console.WriteLine("                    There is one per SOCKET, so this multiplies by --sockets; the send");
     Console.WriteLine("                    page does not. A big page wants a small recv buffer.");

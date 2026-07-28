@@ -441,6 +441,13 @@ all sends through two threads. Bridged io_uring at 16KB measures FASTER than bar
 bridge cannot cost negative time. **Next step is a clean bare-vs-bridged isolation in one session at a
 matched shard count**, not another sweep.
 
+**And it needs six scored passes, not three.** This entry is entirely about 256KB behaviour, which is
+precisely where three passes were shown (2026-07-28) to manufacture falsely tight ranges: the true
+per-cell spread at 256KB is ~8% while three consecutive passes can span 1.2%. The table above is a
+three-pass table, so the individual `-36%` / `-24%` figures carry more precision than they have earned.
+The *direction* survives easily - every SocketSet leg falls while both Kestrel controls rise, which no
+8% band explains - but do not quote the percentages until they are re-measured at six passes.
+
 *Original entry follows.*
 
 **Status: could not reproduce in a container. Do not treat the regression below as established.**
@@ -667,9 +674,16 @@ much stronger than when this entry was written**, and what is left is mechanism,
 - Sweep past 64KB - RIO was still improving monotonically at the top of the range, so the peak is unknown.
   io_uring's 16KB-payload result suggests the useful question is "does the response fit in ONE page",
   which makes the right default depend on expected payload rather than being a single global optimum.
-- Confirm the page/pool-depth co-variation is inert on Linux as it was on Windows: `--page` also rescales
-  `WriteBuffersPerShard` to 4MB/page (1024 buffers at 4KB, 64 at 64KB), so the sweep moved two things.
-  `FIXED_WRITE_BUFFERS` in the rig pins it; that control has not been run yet.
+- ~~Confirm the page/pool-depth co-variation is inert on Linux.~~ **DONE 2026-07-28: it is inert, and the
+  2.0x is the page.** With all pools pinned at 1024 the io_uring 16KB ratio is 1.97x against 1.98x
+  uncontrolled. Two things had to be fixed to run it: the sweep rescales **three** pools, not one
+  (`OutOfBandWriteBuffersPerShard` had no override at all - `--oob-write-buffers` added), and the old
+  `FIXED_WRITE_BUFFERS` knob pinned only one of them, so it was not a control. `FIXED_POOL_DEPTH` pins
+  all three and the rig now aborts a cell whose banner disagrees. Only io_uring ever needed this: epoll
+  reads `BufferPageSize` and none of the pools, so `--page` moves one quantity for it.
+- **The memory claim needs rewording, not retracting.** "A 64KB page is 37% cheaper" is mostly the pool
+  rescale: at matched depth the page itself saves ~9MB of ~41MB. True of what ships; not a property of
+  the page. Reworded in `AspNetDemo/RESULTS.md`.
 - Decide the mechanism for a per-backend default. The backends want opposite things (RIO large, IOCP
   small/indifferent) and `BufferPageSize` is one global constant with a real default of 4096, so there is
   no way to distinguish "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend

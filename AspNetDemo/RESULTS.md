@@ -466,6 +466,74 @@ often. Counting buffers without counting holding time gets it backwards.
 
 Single sample per cell, one payload shape, so treat as indicative rather than a measurement of record.
 
+**Decomposed 2026-07-28 (see the control section below), and the attribution was mostly wrong.** The
+saving is real but it is overwhelmingly the *pool rescale*, not the page. Re-measured at a 16KB payload,
+8 shards, `-c 64`, sampling peak RSS under load:
+
+| config | RSS under load |
+|---|---:|
+| p4K, depth 1024 (shipped) | 98.5 MB |
+| p64K, depth 64 (shipped - page rescales the pool) | **57.2 MB** |
+| p64K, depth 1024 (pool pinned - page is the only change) | 87.8 MB |
+
+So of the 41 MB the shipped 64KB page saves, only ~9 MB is attributable to the page itself; the other
+~31 MB is the pool rescaling from 1024 buffers to 64. The headline "a big page is CHEAPER" survives as a
+statement about **what ships**, because the rescale is shipped behaviour and is what a user would get -
+but it is not a property of the page, and the earlier wording implied it was.
+
+Note also that pinned pool size and resident set are only loosely related: at p64K/depth-1024 the three
+pools total ~192 MB per shard, ~1.5 GB across 8 shards, and RSS is 87.8 MB. Untouched pages are not
+resident, which is the same reason idle RSS is useless here.
+
+### The co-variation control: it IS the page (2026-07-28)
+
+The sweep above varied two things at once. `--page N` rescales **three** pool depths to 4MB/N -
+`WriteBuffersPerShard`, `OutOfBandWriteBuffersPerShard`, `BufferPagesPerShard` - so a 4KB page ships 1024
+buffers and a 64KB page ships 64, a 16x swing alongside the page change. On Windows depth was shown inert
+at 256KB, but that was one payload on a different backend.
+
+**Only io_uring needed the control.** Checked by inspection rather than assumed: `IoUringShard` reads all
+three pools (`BufferPagesPerShard` is its receive pool, the other two its send pools), while `EpollShard`
+reads only `BufferPageSize`. So `--page` moves exactly one quantity for epoll - its sweep was never
+confounded and its "insensitive at every page" result needs no control.
+
+`FIXED_POOL_DEPTH=1024` pins all three, so `p4096` is configured identically to the uncontrolled run and
+only `p64K`/`p16K` change. io_uring, 16KB payload:
+
+| | p4K | p64K | ratio |
+|---|---:|---:|---:|
+| uncontrolled (depth 1024 / 64) | 4,459.9 [4302-4530] | 8,825.6 [8651-8858] | **1.98x** |
+| controlled (depth 1024 / 1024) | 4,363.7 [4338-4403] | 8,586.6 [8545-8698] | **1.97x** |
+
+**Pool depth contributed nothing.** Deepening p64K's pools 16x moved it 8,825.6 -> 8,586.6, and those
+ranges overlap, so there is no difference to claim. The 2x is the page size, and the "does the response
+fit in ONE page" reading of the p16K result stands.
+
+### 3 scored passes is not enough at a 256KB payload
+
+An accident of the control run: `p4096` was identically configured in both sessions, giving a free
+cross-session repeatability check. At 512B and 16KB it reproduced (ranges overlap). At 256KB it did not -
+8,016.4 [8007-8102] against 7,845.6 [7759-7850], **disjoint**, which by the rule at the top of this file
+would license a 2.1% claim about two identical configurations.
+
+Re-run at 256KB with **six** scored passes, all three pages:
+
+| page | median | min-max |
+|---|---:|---|
+| p4K | 7,685.7 | [7405-8003] |
+| p16K | 7,770.3 | [7684-8024] |
+| p64K | 7,758.4 | [7604-7997] |
+
+Two results. First, **io_uring is page-insensitive at 256KB** - all three overlap heavily, and the p16K
+dip that looked disjoint on three passes was noise. Second, and the more useful one: the per-cell spread
+at 256KB is **~8%**, but any three consecutive passes can span as little as 1.2%. Three passes at this
+payload manufacture falsely tight ranges, and disjointness computed from them is not evidence.
+
+This does not disturb the large findings here - "epoll beats io_uring by 58% at 256KB" and "p64K is 2.0x
+at 16KB" are far outside an 8% band - but it does mean **any 256KB claim in the low single digits, in this
+file or elsewhere, that rests on three passes should be treated as unproven.** Small-payload cells are not
+affected: 16KB spreads run ~1.5% over the same pass count.
+
 ### What this does NOT establish: that the 256KB bridged collapse is the bridge
 
 The payload sweep through AspNetDemo shows every SocketSet leg collapsing at 256KB. On the bare responder
