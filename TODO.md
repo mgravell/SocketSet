@@ -66,10 +66,13 @@ Reading of that table:
 - **kTLS is TX-only even on io_uring**, now confirmed against the kernel's own counters rather than
   inferred from the code: `TlsTxSw` moves, `TlsRxSw` stays at zero. Every kTLS number on file measures a
   half-offloaded path. That is what item 4 is about, and it now has direct evidence.
-- **`ReceiveBufferSize` and stage-and-retry are Windows-only.** The first is exactly what blocks the page
-  default (below). The second may not be needed on Linux at all — io_uring falls back to a pinned GC
-  allocation when its page pool is dry rather than dropping the connection, and epoll sends straight from
-  the TLS output buffer — but "probably does not apply" is a hypothesis, not a check.
+- **`ReceiveBufferSize` and stage-and-retry are Windows-only**, and both hypotheses about them have now
+  been CHECKED rather than left as guesses (2026-07-28, by inspection):
+  - *`ReceiveBufferSize`*: **epoll needs it, io_uring does not** — epoll's receive slab is per-SOCKET,
+    exactly like Windows'. See item 0 step 2; this is what blocks the page default on Linux.
+  - *Stage-and-retry*: **confirmed not needed on io_uring.** `IoUringConnection.EnsureRoom` falls back to a
+    pinned-heap page when the pool is dry (`IoUringConnection.cs:226`) rather than closing, so pool depth
+    costs allocation there, never connections. The Windows hazard genuinely does not exist on this path.
 - **Zero-copy RECEIVE does not exist on any backend, and the reason is the API shape, not the backlog.**
   `Connection` has a `TrySendZeroCopy` and no receive counterpart. Inbound always lands in the transport's
   own slab and `PipeIoBridge.OnReceived(ReadOnlySpan<byte>)` copies it into `pipe.Output.Write(data)` —
@@ -115,13 +118,25 @@ output buffer with no page copy at all. If either turns out page-SENSITIVE, that
 chasing, not a tuning result. If both are insensitive, the shared default can move on the Windows
 evidence alone, because Linux does not care.
 
-**2. Check whether Linux needs the send/receive split.** `SocketSetOptions.ReceiveBufferSize` is honoured
-only by IOCP and RIO. Both Linux backends still take one size for everything
-(`EpollShard._bufSize`, `IoUringShard._readPageSize`/`_writeBufSize` — all `options.BufferPageSize`).
-On Windows that coupling cost 3.0GB at a 64KB page because the receive slab is per-SOCKET
-(`SocketsPerShard` 4096). io_uring's read pool is per-SHARD (`BufferPagesPerShard`, 256), so 64KB there is
-~16MB per shard and probably fine. **Measure the resident set before assuming** — that is exactly the
-assumption that was wrong on Windows. epoll's sizing needs the same look.
+**2. Check whether Linux needs the send/receive split. ANSWERED BY INSPECTION 2026-07-28: epoll needs it,
+io_uring does not.** `SocketSetOptions.ReceiveBufferSize` is honoured only by IOCP and RIO. Both Linux
+backends still take one size for everything (`EpollShard._bufSize`,
+`IoUringShard._readPageSize`/`_writeBufSize` — all `options.BufferPageSize`).
+
+- **io_uring is fine, as guessed.** Its read pool is per-SHARD — `ManagedBufferPool(entries:
+  BufferPagesPerShard=256)` — so a 64KB page is ~16MB per shard.
+- **epoll is NOT fine, and this was the wrong guess.** `EpollShard._recvBuffer` is
+  `PinnedWriteBufferPool(_socketsPerShard, _bufSize)`, commented *"one per live connection"*, leased at
+  accept and released at close. That is **the same per-SOCKET scaling that cost RIO 3.0GB**: 4096 x 64KB =
+  256MB per shard at a 64KB page. So `ReceiveBufferSize` must reach epoll before the page default moves.
+
+**And the RSS table in `AspNetDemo/RESULTS.md` did not catch it, for a reason worth keeping.** The slab is
+`NativeMemory.AllocZeroed` (an anonymous `mmap` at this size), so pages fault in on first touch: at `-c 64`
+only 64 of 4096 buffers per shard are ever touched, making resident receive memory `connections x page`
+rather than `SocketsPerShard x page`. The predicted p4K->p64K delta at 64 connections is ~3.8MB against an
+observed 1MB — present, and below the noise. **"Measure the resident set before assuming" was the right
+instruction and was followed; the measurement was simply run at a concurrency that could not show it.**
+Correction and the pre-registered high-concurrency prediction are in `AspNetDemo/RESULTS.md`.
 
 **3. Pipe mode on Linux — CONFIRMED WORKING 2026-07-28, nothing to do.** `SmokeTest --verify-echo
 1048576 --pipe -z 65536` round-trips byte-exact on **both** epoll and io_uring through the universal
@@ -420,10 +435,28 @@ it reproduced every time. `SmokeTest --http --io-uring -n 8` shuts down promptly
 **fails to exit within 80s** on SIGINT after serving ~200k requests over 64 keep-alive connections. The
 banner is the only thing in the log; no shutdown report is ever printed.
 
-Suspicion (untested): teardown waits on `RecvArmed`/`SendBusy`/`CancelPending` clearing per connection
-(`TryFinalize`), and something is not clearing for at least one connection after load. If so it is a real
-leak of connection state, not just a shutdown nuisance - the same condition would strand a slot during
-normal operation.
+**That suspicion is REFUTED by inspection (2026-07-28), and the refutation is structural.** The entry used
+to read: "teardown waits on `RecvArmed`/`SendBusy`/`CancelPending` clearing per connection
+(`TryFinalize`), and something is not clearing after load". **Nothing waits on that.** Shard pump threads
+are created at exactly one site (`SocketSet.cs:49-61`) with `IsBackground = true`, and `SocketSet.Dispose`
+only calls `shard.Stop()` — it never joins them. A background thread cannot hold a .NET process open, so a
+slot that never finalizes cannot be the cause of the hang no matter how stuck it is.
+
+Note what that does and does not clear. It does NOT clear a connection-state leak: if `RecvArmed`/
+`SendBusy`/`CancelPending` really do fail to clear under load, that still strands a slot during normal
+operation, which is the part that would matter in production. It only says that defect, if real, is not
+this symptom's mechanism. **They are two separate investigations and the file had merged them.**
+
+"No shutdown report is ever printed" fits loop threads not exiting — but by the above that is a *fellow
+symptom*, not the cause. What can actually hold the process: the main thread after `httpStop.Wait()`
+returns (`SmokeTest/Program.cs:284`, then `HttpBench` — a `SocketSet` — disposes), a finalizer at exit, or
+the SIGINT handler never running at all.
+
+**Cheapest thing that would settle it in one run**, and it needs no debugger (none is installed on this
+host — no `gdb`, no `eu-stack`, no `dotnet-dump`): reproduce, then read
+`/proc/<pid>/task/*/comm` alongside `/proc/<pid>/task/*/wchan`. That names every thread and what each is
+blocked in, which separates "stuck in `io_uring_enter`" from "stuck in `futex`" from "stuck in `close()`"
+without guessing. `dotnet-trace` and `dotnet-counters` are installed if more is needed.
 
 Practical consequence right now: **do not build a measurement that can only be read at shutdown.** The
 `SS_URING_STATS=1` reporter therefore dumps on a 2s timer as well as at shutdown; the shutdown-only

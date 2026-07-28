@@ -466,6 +466,40 @@ often. Counting buffers without counting holding time gets it backwards.
 
 Single sample per cell, one payload shape, so treat as indicative rather than a measurement of record.
 
+#### CORRECTION 2026-07-28: "neither Linux backend does that" is WRONG about epoll, and 64 connections is why it looked right
+
+Established by inspection, not by recall. **epoll has exactly the Windows shape**: `EpollShard._recvBuffer`
+is `new PinnedWriteBufferPool(_socketsPerShard, _bufSize)` - the field's own comment says *"one per live
+connection"* - leased at accept (`EpollShard.cs:405`) and released only at close (332). So its receive slab
+is `SocketsPerShard` x `BufferPageSize` **per shard**, 4096 x 64KB = **256 MB per shard** at a 64KB page,
+which is the per-SOCKET scaling that cost RIO 3.0 GB. Only io_uring is genuinely different: its read pool
+is per-SHARD (`ManagedBufferPool(entries: BufferPagesPerShard=256)`, `RawIOUringRing.cs:184`), so 64KB
+there is ~16 MB per shard.
+
+| backend | receive slab | count | at a 64KB page, per shard |
+|---|---|---|---:|
+| IOCP / RIO | per-socket | `SocketsPerShard` (4096) | 256 MB, **resident** (registered/locked) |
+| epoll | **per-socket** | `SocketsPerShard` (4096) | 256 MB **virtual** |
+| io_uring | per-shard | `BufferPagesPerShard` (256) | 16 MB |
+
+**Why the measurement missed it, and why that is not a measurement error.** The slab is one
+`NativeMemory.AllocZeroed` - `calloc`, which for a slab this size is an anonymous `mmap`, so pages are
+faulted in only on first touch. At `-c 64` over 8 shards, 64 of the 4096 per-socket buffers are ever
+touched. Resident receive memory is therefore ~`connections x page`, not `SocketsPerShard x page`. The row
+above is a true reading of a configuration that could not have exposed the scaling.
+
+That also retro-fits the number quantitatively: predicted delta between p4K and p64K at 64 connections is
+64 x 60KB = **~3.8 MB**, against an observed 72 -> 73 MB. The effect was present and below the noise.
+
+**Pre-registered, NOT yet measured:** epoll RSS should diverge as `connections x page`, so at ~2,048
+connections p64K should cost ~123 MB more resident than p4K, while io_uring should stay flat (its pool
+does not scale with connections at all). If epoll instead stays flat at high connection counts, this
+correction is wrong and the original claim stands.
+
+**Consequence if it holds:** `SocketSetOptions.ReceiveBufferSize` - the send/receive split added for
+exactly this on Windows - is **needed on epoll too**, and the standing claim that "the memory argument
+against a larger default does not exist on Linux at all" is true only of io_uring.
+
 **Decomposed 2026-07-28 (see the control section below), and the attribution was mostly wrong.** The
 saving is real but it is overwhelmingly the *pool rescale*, not the page. Re-measured at a 16KB payload,
 8 shards, `-c 64`, sampling peak RSS under load:
