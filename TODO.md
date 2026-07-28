@@ -757,9 +757,10 @@ much stronger than when this entry was written**, and what is left is mechanism,
     turn one send into N sequential sends - the same quantisation that already costs it 2.2-2.5x.
   - **IOCP probably should**: it scatter-gathers (up to 64 `WSABUF`s), which is the shape that benefits.
     Untested - this host is Linux.
-  - **epoll measured indifferent**, so it keeps the contiguous default; harmless either way, but it does
-    mean epoll still takes a per-response allocation on this path, which is worth removing on GC grounds
-    even though it does not show up in goodput.
+  - **epoll needs nothing**: it does not share this defect at all. It goes through `OutboundConnection`,
+    which accumulates into a pooled buffer writer and rents its flush snapshot from `ArrayPool` (the
+    `fa97dd4` work), so a large response never becomes a pinned per-response allocation. That is why it
+    was page-insensitive from the start. It keeps the contiguous default.
 - ~~Confirm the page/pool-depth co-variation is inert on Linux.~~ **DONE 2026-07-28: it is inert, and the
   2.0x is the page.** With all pools pinned at 1024 the io_uring 16KB ratio is 1.97x against 1.98x
   uncontrolled. Two things had to be fixed to run it: the sweep rescales **three** pools, not one

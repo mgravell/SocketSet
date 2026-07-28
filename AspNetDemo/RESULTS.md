@@ -691,8 +691,11 @@ Verified byte-exact on both Linux backends, callback and `--pipe`, at a 64KB chu
 **Scope, deliberately narrow.** The behaviour is opt-in per backend (`Connection.GetWriteSpan`), enabled
 for io_uring only. RIO caps `maxSendDataBuffers` at 1, so chaining segments there would turn one send into
 N sequential sends - precisely the quantisation that already costs RIO 2.2-2.5x at large payloads. IOCP
-scatter-gathers and would probably benefit, and epoll measured indifferent; **neither is enabled, and
-Windows is untested from this host.** Those are the obvious follow-ups.
+scatter-gathers and would probably benefit, but **is untested from this Linux host.**
+
+epoll needs nothing: it routes through `OutboundConnection`, which accumulates into a pooled buffer writer
+and rents its flush snapshot from `ArrayPool` rather than allocating per response - which is *why* it was
+page-insensitive from the first sweep. Only the io_uring writer had the allocating branch.
 
 ### SUPERSEDED: "epoll beats io_uring by 58% at 256KB" was this defect, not a structural difference
 
