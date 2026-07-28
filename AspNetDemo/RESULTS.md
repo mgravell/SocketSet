@@ -731,6 +731,54 @@ epoll needs nothing: it routes through `OutboundConnection`, which accumulates i
 and rents its flush snapshot from `ArrayPool` rather than allocating per response - which is *why* it was
 page-insensitive from the first sweep. Only the io_uring writer had the allocating branch.
 
+### The bridged sweep RE-MEASURED on the fixed transport, six passes (2026-07-28): nothing moved, and that is the finding
+
+TODO item 1 said its 64KB -> 256KB table could not be trusted, because every number in it was taken
+against a transport that allocated once per response, and demanded a re-run at six scored passes (three
+having been shown to manufacture falsely tight ranges at 256KB). Done: `bench/run-tls-sizes.sh`,
+`SIZES="65536 262144" REPS=7 SHARDS=12`, 98 cells, zero errors, pass 1 discarded.
+
+Goodput MiB/s, median of 6 scored passes, min-max in brackets:
+
+| leg | 64 KB | 256 KB | change | pre-fix change (3 passes) |
+|---|---:|---:|---:|---:|
+| epoll | 10,532.0 [10417-10723] | 6,655.5 [6083-6700] | **-36.8%** | -36% |
+| iouring | 10,568.0 [10451-10722] | 7,817.6 [7351-8098] | **-26.0%** | -24% |
+| epoll+tls | 9,201.3 [9102-9269] | 4,342.9 [4306-4359] | **-52.8%** | -53% |
+| iouring+tls | 8,531.7 [8458-8656] | 3,934.4 [3648-4255] | **-53.9%** | -52% |
+| kestrel | 10,018.3 [9966-10241] | 12,515.8 [12425-12666] | **+24.9%** | +24% |
+| kestrel+tls | 6,682.8 [6464-6844] | 8,030.4 [7893-8146] | **+20.2%** | +16% |
+
+**Every cell reproduces its pre-fix value within ~2%.** The allocation fix that gave the bare responder
++96% at 16KB and +58-65% at 256KB is worth **nothing** here, and the shape item 1 describes - every
+SocketSet leg falling while both Kestrel controls rise - survives intact at six passes. The percentages
+have now earned the precision they are quoted with.
+
+**Why the fix could not move it, mechanically.** The defect was `Connection.WriteAll` asking for
+`data.Length` as one contiguous span, which made `EnsureRoom` take its `want > pageSize` branch. Through
+the bridge that branch is unreachable: both bridges send a `ReadOnlySequence<byte>` of PIPE segments, and
+`Connection.Send(in ReadOnlySequence)` loops `WriteAll` **per segment** over ~4KB blocks - the same 4KB
+block size already noted in this file as the reason a 256KB response is ~64 segments. `want` is therefore
+never above a 4KB page. **Only a caller writing one large contiguous span could trigger the defect**, which
+is exactly what the bare responder does (`HttpBench` queues to two sender threads that call
+`c.Send(Response)` on the whole response). So the fix is real, and it is real for callback-style callers;
+the ASP.NET-shaped caller never had the problem.
+
+That also removes the discomfort item 1 recorded about its own data: the table did not need re-running
+because the transport had changed under it, and now it has been re-run and it stands.
+
+**One thing the six passes add that three could not: a variance asymmetry.** At 256KB the SocketSet legs
+spread 9-17% across passes (`iouring+tls` 3648-4255) while both Kestrel controls hold ~2%
+(`kestrel` 12425-12666). At 64KB every leg is tight, SocketSet included. So the bridged path at 256KB is
+not merely slower - it is **unstable**, and only at the payload where it collapses. That is a defect
+signature rather than a throughput result, and no allocation story explains it.
+
+**What remains open is unchanged and is now the only open part:** which component owns the decline. The
+transport, post-fix, RISES with payload on the bare responder (8,578 at 16KB to 12,707 at 256KB) while
+doing the same per-byte copying into write pages - so per-byte copies do not explain a falling curve, and
+the copy-count reading should not be revived. See the matched-shard-count bare-vs-bridged isolation
+(`bench/run-bare-vs-bridged.sh`), which is the comparison this file has twice refused to make cross-run.
+
 ### SUPERSEDED: "epoll beats io_uring by 58% at 256KB" was this defect, not a structural difference
 
 The section below concluded that io_uring trails epoll at 256KB because it copies every outbound byte into

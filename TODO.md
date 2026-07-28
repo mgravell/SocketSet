@@ -490,6 +490,26 @@ all sends through two threads. Bridged io_uring at 16KB measures FASTER than bar
 bridge cannot cost negative time. **Next step is a clean bare-vs-bridged isolation in one session at a
 matched shard count**, not another sweep.
 
+**RE-MEASURED 2026-07-28 AT SIX PASSES ON THE FIXED TRANSPORT: THE TABLE ABOVE STANDS, AND THE FIX IS
+IRRELEVANT TO IT.** 98 cells, zero errors. Every leg reproduces its pre-fix value within ~2%: epoll
+-36.8%, iouring -26.0%, epoll+tls -52.8%, iouring+tls -53.9%, against kestrel **+24.9%** and kestrel+tls
+**+20.2%**. Full table in `AspNetDemo/RESULTS.md`.
+
+*Why the fix could not move it, and this is a general point about which callers the defect could reach:*
+the allocating branch (`EnsureRoom`'s `want > pageSize`) needs a caller that writes **one large contiguous
+span**. Both bridges send a `ReadOnlySequence` of ~4KB PIPE segments and `Connection.Send(in
+ReadOnlySequence)` loops `WriteAll` per segment, so `want` is never above a 4KB page. **The bridged path
+never had the defect**; the bare responder (which `Send`s the whole response as one span) did. So the fix
+is real for callback-style callers and worth nothing to the ASP.NET-shaped one.
+
+*What six passes added that three could not:* at 256KB the SocketSet legs spread 9-17% across passes while
+both Kestrel controls hold ~2%, and at 64KB everything is tight. **The bridged path is unstable at 256KB,
+not merely slow** - a defect signature, and a new one.
+
+*So the percentages below are now earned rather than provisional*, and the paragraph following this one
+(which told you not to trust them) is superseded. Kept for the reasoning. The one open question is
+unchanged: **which component owns the decline.**
+
 **A MECHANISM WAS FOUND AND FIXED (2026-07-28), AND THIS ENTRY MUST BE RE-MEASURED BEFORE IT IS TRUSTED.**
 io_uring took a pinned GC allocation of the WHOLE response, once per response, whenever the response did
 not fit one buffer page - a hard goodput cliff triggered by exactly "responses got large". See item 0; it
@@ -509,12 +529,11 @@ Two consequences for this entry, and the first is uncomfortable:
 What is untouched: both Kestrel controls RISE while every SocketSet leg falls, which no allocation story
 explains by itself. So there is still something here - it just cannot be characterised from pre-fix data.
 
-**And it needs six scored passes, not three.** This entry is entirely about 256KB behaviour, which is
-precisely where three passes were shown (2026-07-28) to manufacture falsely tight ranges: the true
-per-cell spread at 256KB is ~8% while three consecutive passes can span 1.2%. The table above is a
-three-pass table, so the individual `-36%` / `-24%` figures carry more precision than they have earned.
-The *direction* survives easily - every SocketSet leg falls while both Kestrel controls rise, which no
-8% band explains - but do not quote the percentages until they are re-measured at six passes.
+**~~And it needs six scored passes, not three.~~ DONE — see the six-pass re-measurement at the top of this
+entry.** The concern was right: the true per-cell spread at 256KB is 9-17% on the SocketSet legs while
+three consecutive passes can span 1.2%. Re-run at six, the figures land within ~2% of the three-pass ones
+anyway, so the direction *and* the magnitudes hold — and the spread itself turned out to carry a finding
+(SocketSet unstable at 256KB, Kestrel not).
 
 *Original entry follows.*
 
