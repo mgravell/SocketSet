@@ -54,7 +54,7 @@ what is worth doing:
 | feature | IOCP | RIO | io_uring | epoll |
 |---|---|---|---|---|
 | kTLS | - | - | **yes** | **no references at all** |
-| `ReceiveBufferSize` (send/recv split) | yes | yes | no | no |
+| `ReceiveBufferSize` (send/recv split) | yes | yes | **yes** (2026-07-28) | **yes** (2026-07-28) |
 | write-pool exhaustion: stage and retry | yes | yes | no | no |
 | BYO-buffer zero-copy SEND | yes | n/a by design | no | no |
 | BYO-buffer zero-copy RECEIVE | **no** | **no** | **no** | **no** |
@@ -125,18 +125,28 @@ backends still take one size for everything (`EpollShard._bufSize`,
 
 - **io_uring is fine, as guessed.** Its read pool is per-SHARD — `ManagedBufferPool(entries:
   BufferPagesPerShard=256)` — so a 64KB page is ~16MB per shard.
-- **epoll is NOT fine, and this was the wrong guess.** `EpollShard._recvBuffer` is
+- **epoll allocates the slab per-SOCKET, like Windows.** `EpollShard._recvBuffer` is
   `PinnedWriteBufferPool(_socketsPerShard, _bufSize)`, commented *"one per live connection"*, leased at
-  accept and released at close. That is **the same per-SOCKET scaling that cost RIO 3.0GB**: 4096 x 64KB =
-  256MB per shard at a 64KB page. So `ReceiveBufferSize` must reach epoll before the page default moves.
+  accept and released at close: 4096 x 64KB = 256MB per shard at a 64KB page. **But the resident cost is
+  workload-dependent, and that is the part worth knowing.**
 
-**And the RSS table in `AspNetDemo/RESULTS.md` did not catch it, for a reason worth keeping.** The slab is
-`NativeMemory.AllocZeroed` (an anonymous `mmap` at this size), so pages fault in on first touch: at `-c 64`
-only 64 of 4096 buffers per shard are ever touched, making resident receive memory `connections x page`
-rather than `SocketsPerShard x page`. The predicted p4K->p64K delta at 64 connections is ~3.8MB against an
-observed 1MB — present, and below the noise. **"Measure the resident set before assuming" was the right
-instruction and was followed; the measurement was simply run at a concurrency that could not show it.**
-Correction and the pre-registered high-concurrency prediction are in `AspNetDemo/RESULTS.md`.
+**MEASURED 2026-07-28 (`bench/run-recv-slab.sh`), and my own prediction was falsified before it was
+confirmed.** Predicted: RSS diverges as `connections x page`, ~123MB at 2048 connections. Measured at 2048
+connections with small GETs: **2.1MB**. Wrong variable - resident memory is `connections x TOUCHED depth`,
+and a ~100-byte GET touches ONE 4KB page of a 64KB buffer, so buffer size never enters. Re-run with 64KB
+POST bodies at 512 connections, it lands exactly: **+30.8MB against 30.7MB predicted (0.2%)**, and
+`--recv-buffer 4096` recovers all of it (78,952KB -> 48,288KB, against p4K's 48,176KB).
+
+**The axis is NOT per-socket vs per-shard - both the old claim and my correction had that wrong.** The
+Windows 3,163MB was measured at **`-c 64`**: 64 connections holding 3.0GB resident, so that slab is
+resident whether touched or not, because RIO *registers* it (locked pages). epoll's is `calloc`'d and
+faulted on touch. Same structure, different residency policy.
+
+**Practical reading:** on epoll a big page is free for small-request workloads and costs
+`connections x page` for large-request ones (uploads, proxies). Workload-dependent rather than
+unconditional - weaker than "epoll has the Windows problem", stronger than "Linux does not have it".
+`ReceiveBufferSize` makes it safe either way and both Linux backends now honour it. Full tables in
+`AspNetDemo/RESULTS.md`.
 
 **3. Pipe mode on Linux — CONFIRMED WORKING 2026-07-28, nothing to do.** `SmokeTest --verify-echo
 1048576 --pipe -z 65536` round-trips byte-exact on **both** epoll and io_uring through the universal

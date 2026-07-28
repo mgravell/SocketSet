@@ -491,14 +491,47 @@ above is a true reading of a configuration that could not have exposed the scali
 That also retro-fits the number quantitatively: predicted delta between p4K and p64K at 64 connections is
 64 x 60KB = **~3.8 MB**, against an observed 72 -> 73 MB. The effect was present and below the noise.
 
-**Pre-registered, NOT yet measured:** epoll RSS should diverge as `connections x page`, so at ~2,048
-connections p64K should cost ~123 MB more resident than p4K, while io_uring should stay flat (its pool
-does not scale with connections at all). If epoll instead stays flat at high connection counts, this
-correction is wrong and the original claim stands.
+**The pre-registered prediction was: RSS diverges as `connections x page`, so ~123 MB more at 2,048
+connections. MEASURED, AND FALSIFIED** (`bench/run-recv-slab.sh`, peak RSS under load):
 
-**Consequence if it holds:** `SocketSetOptions.ReceiveBufferSize` - the send/receive split added for
-exactly this on Windows - is **needed on epoll too**, and the standing claim that "the memory argument
-against a larger default does not exist on Linux at all" is true only of io_uring.
+| backend | page | c=64 | c=2048 | delta |
+|---|---|---:|---:|---:|
+| epoll | 4 KB | 45,696 KB | 70,452 KB | +24.8 MB |
+| epoll | 64 KB | 45,540 KB | 72,584 KB | +27.0 MB |
+| io_uring | 4 KB | 64,408 KB | 69,164 KB | +4.8 MB |
+| io_uring | 64 KB | 63,284 KB | 71,896 KB | +8.6 MB |
+
+epoll costs ~10 KB/connection more than io_uring, which is the per-socket buffer showing up - but the
+delta **does not grow with the page**: 2.1 MB between p4K and p64K where 123 MB was predicted.
+
+**The prediction had the wrong variable.** Resident memory is `connections x TOUCHED depth`, not
+`connections x buffer size`, and a bombardier `GET` is ~100 bytes - so each connection touches exactly ONE
+4 KB page of its 64 KB buffer. The buffer size never enters. Re-run with a workload that touches the
+buffer deeply - 64 KB POST bodies, 512 connections, 8 shards - it appears exactly as predicted:
+
+| epoll config | peak RSS | vs p4K |
+|---|---:|---:|
+| p4K (recv follows page) | 48,176 KB | - |
+| p64K (recv follows page) | 78,952 KB | **+30.8 MB** |
+| **p64K + `--recv-buffer 4096` (the split)** | 48,288 KB | **+0.1 MB** |
+
+`connections x (64KB - 4KB)` = 512 x 60 KB = 30.7 MB predicted, **30.8 MB measured** - within 0.2%. And
+the split recovers **all** of it, which is the same shape as the Windows fix (there: full throughput at
+283 MB instead of 3,163 MB).
+
+**So the real axis is NOT per-socket vs per-shard, and both the original claim and this correction had it
+wrong.** The decisive number is on the Windows side: that 3,163 MB was measured at **`-c 64`** - 64
+connections holding 3.0 GB resident, i.e. the slab is resident whether or not anything touches it, because
+RIO *registers* it (`RIORegisterBuffer` locks the pages). epoll's slab is `calloc`'d and faulted on touch.
+**Identical structure, different residency policy.** That is why Windows blew up at 64 connections and
+epoll needs 512 connections x 64 KB requests to show the same effect at 1% of the size.
+
+**What this means in practice.** On epoll a big page is genuinely free for small-request workloads (the
+common case, and what the flat table above measured), and costs `connections x page` for large-request
+ones - uploads, proxies, anything with real request bodies. That is a workload-dependent hazard rather
+than an unconditional one, which is weaker than this correction first claimed and stronger than the
+original "neither Linux backend does that". `SocketSetOptions.ReceiveBufferSize` is what makes it safe in
+either case, and epoll and io_uring both honour it as of 2026-07-28.
 
 **Decomposed 2026-07-28 (see the control section below), and the attribution was mostly wrong.** The
 saving is real but it is overwhelmingly the *pool rescale*, not the page. Re-measured at a 16KB payload,
