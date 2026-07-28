@@ -422,6 +422,94 @@ unmeasured**, and the handshake is exactly where SChannel, SslStream and OpenSSL
 exercises only the record layer. Measuring handshakes properly wants a bounded connection count with
 explicit port accounting, or a second machine.
 
+## Linux baseline on bare metal (2026-07-28) — THE current Linux reference
+
+First Linux measurement on the current host: Pop!_OS 24.04, kernel 7.0.11, Ryzen 9 7900X 12C/24T, bare
+metal, governor `performance`, server and load generator on disjoint physical cores (`0-5,12-17` against
+`6-11,18-23`, affinity verified on the live processes rather than assumed). `bench/run-matrix.sh`,
+`-c 128 -d 10s`, `GET /plaintext` (a 2-byte response, so this is the SMALL-MESSAGE end), four passes with
+the first discarded, reshuffled each pass, median of three.
+
+Nothing here is comparable with the 2026-07-26 section below: different machine, different OS, no
+container. Treat this as the baseline that catch-up work on the Linux backends is measured against.
+
+### The host is a usable instrument
+
+Within-leg spreads **0.2-5.7%, mostly ~2%**, against **37.4%** for the same harness in the container.
+That is the single most important line in this section: a 2% effect is now detectable on Linux, and was
+unprovable before. Comparable to the Windows desktop's 0.2-2.4%.
+
+Note the two noisiest legs are both `s12` (`iouring/s12` 5.7%, `epoll+tls/s12` 4.1%) while their `s8`
+counterparts sit at ~2%. Contention at one loop thread per logical CPU is the obvious suspect.
+
+### Throughput (median rps, 3 scored passes)
+
+| leg | s4 | s8 | s12 | best p99 |
+|---|---:|---:|---:|---:|
+| iouring | 497,820 | **823,328** | 805,866 | 656us |
+| epoll | 473,154 | 762,463 | **797,725** | 577us |
+| iouring+tls | 416,445 | 677,050 | **702,829** | 699us |
+| epoll+tls | 384,087 | 610,931 | **689,190** | 874us |
+| iouring+ktls | 324,720 | 524,187 | **597,486** | 796us |
+| kestrel | - | 779,303 | - | 469us |
+| kestrel+tls | - | 576,069 | - | 565us |
+
+**SocketSet beats stock Kestrel on both plaintext and TLS, and both separate on disjoint ranges:**
+`iouring/s8` 823,328 against `kestrel` 779,303 (**+5.6%**, min 822,872 > max 780,875), and
+`iouring+tls/s12` 702,829 against `kestrel+tls` 576,069 (**+22%**). The TLS margin is the larger and the
+more interesting one, since it compares TLS terminated in the transport (OpenSSL, our record layer)
+against Kestrel's `SslStream`.
+
+The 2026-07-26 container run concluded **parity** on plaintext (105k rps, three legs within 3%). That
+conclusion was an artifact of a ceiling at one-eighth this rate, and is superseded rather than refined.
+
+### kTLS is SLOWER than userspace TLS here, at every shard count
+
+| shards | iouring+tls | iouring+ktls | delta |
+|---|---:|---:|---:|
+| 4 | 416,445 | 324,720 | **-22.0%** |
+| 8 | 677,050 | 524,187 | **-22.6%** |
+| 12 | 702,829 | 597,486 | **-15.0%** |
+
+All three pairs separate. Latency is worse too, and by more than throughput: `iouring+ktls/s12` p99 is
+**3,169us against `iouring+tls/s12`'s 1,017us**.
+
+**This is the expected shape, not a defect**, and it is the small-message end of exactly the trade
+`bench/ktls-verify.sh` documents. At a 2-byte response the crypto is rounding error, so TX offload has
+nothing to win; meanwhile the kTLS path has given up io_uring's multishot receive and provided buffers in
+favour of `POLL` + `SSL_read`, one syscall per message. We are paying the RX cost and collecting none of
+the TX benefit.
+
+It does NOT answer whether kTLS is worth continuing with. Responses dominate requests in an ASP.NET
+workload, and TX is the offloaded half, so the question is whether the TX win crosses over the RX penalty
+as payload grows. That is `run-tls-sizes.sh`'s job, with `iouring+tls` as the control leg.
+
+### Shard count is not settled on Linux
+
+`s4 -> s8` is worth ~65% everywhere. `s8 -> s12` splits by leg:
+
+- **every TLS leg improves and separates** (`iouring+tls` +3.8%, `epoll+tls` +12.8%)
+- **`epoll` plaintext improves and separates** (762,463 -> 797,725)
+- **`iouring` plaintext does NOT separate** (823,328 vs 805,866, ranges overlap) - and the median moves
+  the wrong way
+- **p99 degrades at s12 on every leg**, from 656us to 840us on `iouring` and from 796us to 3,169us on
+  `iouring+ktls`
+
+Plausible mechanism, untested: the server half is 6 physical cores / 12 logical CPUs, so `s12` puts one
+loop thread on every logical CPU and leaves nothing for the ThreadPool that runs Kestrel and the bridge
+pump. Windows chose 12 because it was the server half's logical core count, never because it measured
+best. **A Linux shard default should not be copied from the Windows one**, and `s8` is the better
+starting guess here for throughput-per-latency.
+
+### What this baseline does NOT establish
+
+- **Whether the top legs are compressed by the load generator.** The legs span 153.6% and the top ones do
+  separate, so the box is not flattening everything - but `iouring/s8`, `epoll/s12` and `kestrel` sit
+  within 8% of one another at the top, and rule 7 of `bench/README.md` says to establish a ceiling by
+  sweeping concurrency rather than inferring it. A `-c 64/128/256` check on the top three would settle it.
+- **Anything about large payloads.** `/plaintext` is a 2-byte response.
+- **Anything about handshakes.** Keep-alive only, as everywhere else in this file.
+
 ## Linux: epoll vs io_uring vs kTLS (2026-07-26, SUPERSEDED — old host AND old OS)
 
 > **SUPERSEDED 2026-07-28, twice over.** These numbers are from the *laptop*, not the current desktop

@@ -34,11 +34,20 @@ the same physical cores (fixed, `bench/cpu-split.sh`), and `perf` needs a non-ob
 (2026-07-27) and the OS change (2026-07-28), and was taken in a container on a WSL2 kernel. The tables
 below are kept for their reasoning, not their numbers. Nothing can be compared against them.
 
-**So the first job is a baseline run, before any Linux code changes.** Rationale beyond the obvious: a
-lot of recent work landed on IOCP and has *not* reached the Linux backends, so a baseline taken now is
-also the "before" for that catch-up work. `bench/run-matrix.sh` (now with a `SHARDS` dimension) does it
-and simultaneously delivers items 2 and 5. It also re-establishes the noise floor, which every
-disjoint-ranges claim in this file depends on and which is a property of the host, not the project.
+**The baseline is DONE (2026-07-28)** — see `AspNetDemo/RESULTS.md`, "Linux baseline on bare metal", which
+is now THE Linux reference and the "before" for the catch-up work below. Four things from it that change
+what is worth doing:
+
+1. **The host is a usable instrument**: within-leg spreads 0.2-5.7% against 37.4% in the container. A 2%
+   effect is detectable on Linux now, and was not before.
+2. **SocketSet beats stock Kestrel on both plaintext (+5.6%) and TLS (+22%)**, separating on disjoint
+   ranges. The container's "parity" verdict was a ceiling at one-eighth the rate.
+3. **kTLS is 15-22% SLOWER than userspace TLS at small messages, with 3x the p99** - the expected shape
+   (we pay the RX syscall-per-message cost and collect no TX benefit when crypto is rounding error), but
+   now measured. Whether it crosses over at large payloads is the open question and the size sweep's job.
+4. **A Linux shard default must not be copied from Windows.** `s8` beats `s12` on `iouring` plaintext and
+   costs less latency everywhere; `s12` only wins on the TLS legs. Windows chose 12 as a core count, not
+   as a measurement.
 
 ### What has NOT reached the Linux backends (verified by inspection 2026-07-28, not recalled)
 
@@ -927,11 +936,25 @@ would make it competitive rather than merely present.
 Note loopback has no NIC, so kTLS's largest win - inline NIC offload - cannot appear in any of the
 numbers above. Real hardware required before drawing conclusions about kTLS itself.
 
-### 5. Real-hardware Linux run
+### 5. Real-hardware Linux run — PARTLY DONE 2026-07-28, and the rest has a route
 
 The rigs are in-repo and runnable: `bench/run-matrix.sh` (transport matrix) and `bench/run-tls-sizes.sh`
-(payload sweep). Everything above was measured in a container on a WSL2 kernel over loopback, which is
-adequate for correctness and weak for performance.
+(payload sweep).
+
+**Done:** the container-on-WSL2 objection is gone. Linux now runs on bare metal (Pop!_OS 24.04, kernel
+7.0.11) on the same desktop as the Windows numbers, with io_uring available natively. See
+`bench/README.md` for the host and its setup.
+
+**Not done, and not fixable here:** it is still ONE box over loopback. Two things stay structurally
+invisible no matter how good the host is — kTLS inline NIC offload (`TlsTxDevice` is 0 and always will
+be), and any effect where memory bandwidth is contended by a real NIC rather than shared by a client and
+server on the same silicon. Every large-payload conclusion in this file carries that caveat.
+
+**Route for the remainder (noted 2026-07-28):** a run on appropriate hardware is *planned to be
+investigated later*, once the work is in a state worth testing. So this is a dependency with a plausible
+path rather than a permanent ceiling — which is an argument for keeping the rigs and their
+`/config` + `tls_stat` gates in a state someone else could run cold, and for writing results up to a
+standard that survives being read by an expert audience.
 
 ## Check UDS on Windows
 
