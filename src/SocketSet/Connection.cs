@@ -138,11 +138,28 @@ public abstract class Connection : IBufferWriter<byte>
     }
 #endif
 
+    /// <summary>
+    /// The buffer <see cref="WriteAll"/> writes into. Defaults to asking for the whole remaining length as
+    /// one contiguous span, which is what a backend that cannot scatter-gather needs.
+    ///
+    /// A backend whose send takes a segment vector should override this to return its NATURAL buffer and
+    /// let an oversized write chain across pooled pages. <see cref="WriteAll"/> has always coped with a
+    /// short span, so it never required contiguity - but asking for the full length made the backend treat
+    /// it as a REQUIREMENT, and a response larger than one pool page then spilled to a right-sized pinned
+    /// GC allocation, one per response. That measured at exactly 1.000 pinned allocations per response and
+    /// half the goodput of the fitting case on io_uring.
+    ///
+    /// Deliberately opt-in per backend rather than global: RIO caps <c>maxSendDataBuffers</c> at 1, so
+    /// chaining segments there would turn one send into N sequential sends - the exact quantisation that
+    /// already costs RIO 2.2-2.5x at large payloads. Backends keep the contiguous default until measured.
+    /// </summary>
+    private protected virtual Span<byte> GetWriteSpan(int sizeHint) => GetSpan(sizeHint);
+
     private void WriteAll(ReadOnlySpan<byte> data)
     {
         while (!data.IsEmpty)
         {
-            var dst = GetSpan(data.Length);
+            var dst = GetWriteSpan(data.Length);
             int n = Math.Min(dst.Length, data.Length);
             data.Slice(0, n).CopyTo(dst);
             Advance(n);

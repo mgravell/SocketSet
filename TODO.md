@@ -457,13 +457,24 @@ all sends through two threads. Bridged io_uring at 16KB measures FASTER than bar
 bridge cannot cost negative time. **Next step is a clean bare-vs-bridged isolation in one session at a
 matched shard count**, not another sweep.
 
-**A MECHANISM NOW EXISTS THAT PREDICTS THIS SHAPE (2026-07-28).** io_uring has a hard goodput cliff the
-moment a response outgrows one buffer page - 17% more data for 33% less goodput across the boundary -
-caused by the single-in-flight-send gate costing a second completion round trip. See item 0. A decline
-that starts when responses get large is exactly what that produces, and it is the first mechanism on file
-that predicts the *direction* rather than explaining it away. **Test it before chasing the bridge again:**
-re-run the bridged legs with a page larger than the payload and see whether the collapse disappears. It
-does NOT yet explain the epoll legs or the bridged legs specifically, and must not be assumed to.
+**A MECHANISM WAS FOUND AND FIXED (2026-07-28), AND THIS ENTRY MUST BE RE-MEASURED BEFORE IT IS TRUSTED.**
+io_uring took a pinned GC allocation of the WHOLE response, once per response, whenever the response did
+not fit one buffer page - a hard goodput cliff triggered by exactly "responses got large". See item 0; it
+is fixed, and io_uring gained +58-65% at 256KB. (An earlier version of this paragraph blamed the
+single-in-flight-send gate and a second completion round trip. That was wrong: sends/response measured
+1.000 at every page size.)
+
+Two consequences for this entry, and the first is uncomfortable:
+
+- **The bare-vs-bridged comparison it calls for should be re-run on the FIXED transport**, because every
+  number in the table above was taken against a transport that allocated once per response at every
+  payload in the sweep. The decline may be smaller, gone, or unchanged - none of those can be assumed.
+- **The related claim "epoll beats io_uring by 58% at 256KB because io_uring copies every outbound byte
+  into write pages" is SUPERSEDED** - that gap was this defect, and the two now measure level. This
+  entry's structural framing borrowed that reasoning, so it no longer stands on its own.
+
+What is untouched: both Kestrel controls RISE while every SocketSet leg falls, which no allocation story
+explains by itself. So there is still something here - it just cannot be characterised from pre-fix data.
 
 **And it needs six scored passes, not three.** This entry is entirely about 256KB behaviour, which is
 precisely where three passes were shown (2026-07-28) to manufacture falsely tight ranges: the true
@@ -726,8 +737,29 @@ much stronger than when this entry was written**, and what is left is mechanism,
 
   **So raising the default page only moves the boundary**, making the right default a function of expected
   payload - which a library cannot know, and which is worst for exactly the streaming workloads (downloads,
-  video) where responses are unbounded and each would allocate its full size, pinned. **Settle this before
-  the default moves.**
+  video) where responses are unbounded and each would allocate its full size, pinned.
+
+  **FIXED 2026-07-28.** `Connection.WriteAll` asked for `data.Length` as one contiguous span; it never
+  needed contiguity (the loop always coped with a short span), but asking made `EnsureRoom` take its
+  `want > pageSize` branch and allocate. io_uring now overrides `Connection.GetWriteSpan` to hand back its
+  natural buffer, so an oversized write chains across pooled pages into one multi-segment `writev`.
+  Per response at a 4KB page with a 16KB body: 1 pinned alloc -> **0**, 1 segment -> 5 pooled pages, send
+  SQEs unchanged at 1.000. Goodput **+96% at 16KB** (4,363.7 -> 8,578.0) and **+58-65% at 256KB**
+  (7,685.7 -> 12,706.8 at p4K). Byte-exact echo passes on both backends, callback and `--pipe`.
+
+  **What this does to item 0: the io_uring half of the blocker is gone.** Page size no longer selects
+  between two cost regimes on io_uring - every page now lands in the same band at 16KB and at 256KB - so
+  the default no longer has to be chosen against expected payload for this backend's sake. RIO still wants
+  a large page for its own (different, real) reason.
+
+  **Deliberately opt-in per backend, and the follow-ups are the point:**
+  - **RIO must NOT get this** without measurement: `maxSendDataBuffers` is capped at 1, so chaining would
+    turn one send into N sequential sends - the same quantisation that already costs it 2.2-2.5x.
+  - **IOCP probably should**: it scatter-gathers (up to 64 `WSABUF`s), which is the shape that benefits.
+    Untested - this host is Linux.
+  - **epoll measured indifferent**, so it keeps the contiguous default; harmless either way, but it does
+    mean epoll still takes a per-response allocation on this path, which is worth removing on GC grounds
+    even though it does not show up in goodput.
 - ~~Confirm the page/pool-depth co-variation is inert on Linux.~~ **DONE 2026-07-28: it is inert, and the
   2.0x is the page.** With all pools pinned at 1024 the io_uring 16KB ratio is 1.97x against 1.98x
   uncontrolled. Two things had to be fixed to run it: the sweep rescales **three** pools, not one

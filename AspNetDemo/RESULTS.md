@@ -653,6 +653,55 @@ bridge cannot cost negative time, so the cross-rig comparison is measuring somet
 bridge. **A clean isolation needs both configurations in ONE session at a MATCHED shard count**, and
 ideally a bare responder that does not serialise sends through two threads.
 
+### FIXED 2026-07-28: chain pooled pages instead of allocating, and the cliff disappears
+
+`Connection.WriteAll` asked for `data.Length` as one contiguous span. It never needed contiguity - the
+loop has always coped with a short span - but asking for it made the backend treat it as a requirement,
+and `IoUringConnection.EnsureRoom` then took its `want > pageSize` branch and allocated the whole response
+on the pinned heap. The fix is for io_uring to hand `WriteAll` its natural buffer instead, so an oversized
+write chains across pooled pages and goes out as one multi-segment `writev`.
+
+Per-response accounting either side (16KB body, 200k requests):
+
+| page | before | after |
+|---|---|---|
+| 4 KB | 1 segment, **1 pinned alloc** | **5 pooled pages, 0 allocs** |
+| 16 KB | 1 segment, **1 pinned alloc** | **2 pooled pages, 0 allocs** |
+| 64 KB | 1 pooled page, 0 allocs | 1 pooled page, 0 allocs |
+
+Send SQEs stay at exactly 1.000 per response throughout - this removes an allocation, not a syscall.
+
+Goodput, io_uring, bare responder:
+
+| payload | page | before | after |
+|---|---|---:|---:|
+| 16 KB | 4 KB | 4,363.7 [4338-4403] | **8,578.0** [8546-8651] |
+| 16 KB | 16 KB | 4,364.6 [4325-4404] | **8,252.0** [8069-8533] |
+| 16 KB | 64 KB | 8,586.6 [8545-8698] | 8,763.8 [8484-8858] |
+| 256 KB | 4 KB | 7,685.7 [7405-8003] | **12,706.8** [12693-13019] |
+| 256 KB | 16 KB | 7,770.3 [7684-8024] | **12,829.0** [11595-12966] |
+| 256 KB | 64 KB | 7,758.4 [7604-7997] | 11,733.9 [10055-12842] |
+
+Roughly **+96% at 16KB** and **+58-65% at 256KB** for any page smaller than the response, and **page size
+stops selecting between two cost regimes** - the whole reason item 0 was blocked on io_uring. 512B is
+unchanged on both backends, and epoll is unchanged everywhere (it was never on the allocating path).
+
+Verified byte-exact on both Linux backends, callback and `--pipe`, at a 64KB chunk size.
+
+**Scope, deliberately narrow.** The behaviour is opt-in per backend (`Connection.GetWriteSpan`), enabled
+for io_uring only. RIO caps `maxSendDataBuffers` at 1, so chaining segments there would turn one send into
+N sequential sends - precisely the quantisation that already costs RIO 2.2-2.5x at large payloads. IOCP
+scatter-gathers and would probably benefit, and epoll measured indifferent; **neither is enabled, and
+Windows is untested from this host.** Those are the obvious follow-ups.
+
+### SUPERSEDED: "epoll beats io_uring by 58% at 256KB" was this defect, not a structural difference
+
+The section below concluded that io_uring trails epoll at 256KB because it copies every outbound byte into
+write pages while epoll sends straight from its buffer. **That gap was the per-response pinned allocation.**
+With it removed, io_uring at 256KB runs 11,734-12,829 against epoll's ~12,470 - level, at every page size.
+The structural reading was wrong, and the note TODO item 1 makes about io_uring's copy shape should not be
+leaned on until it is re-established against the fixed transport. *Original section follows.*
+
 ### What DOES survive: epoll beats io_uring by 58% at 256KB on the bare transport
 
 12,640.8 vs 8,016.4 at p4K, and the same picture at every page size. Ranges are hugely disjoint and both
