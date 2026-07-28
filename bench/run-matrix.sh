@@ -44,16 +44,10 @@ fi
 echo "building AspNetDemo (Release)..."
 dotnet build "$REPO/AspNetDemo/AspNetDemo.csproj" -c Release -v q --nologo >/dev/null || { echo "build failed"; exit 1; }
 
-# --- CPU split. Linux enumerates hyperthread siblings on the upper half of the CPU list on many hosts,
-# --- but the safe, portable split is simply lower/upper half of the online CPUs.
+# --- CPU split, by physical core rather than by logical index: see bench/cpu-split.sh for why the
+# --- obvious lower/upper-half split gives the server and the load generator the SAME cores here.
 NCPU=$(nproc)
-HALF=$(( NCPU / 2 ))
-if (( HALF < 1 )); then HALF=1; fi
-SERVER_CPUS="0-$((HALF-1))"
-CLIENT_CPUS="$HALF-$((NCPU-1))"
-if (( NCPU < 2 )); then SERVER_CPUS="0"; CLIENT_CPUS="0"; fi
-export DOTNET_PROCESSOR_COUNT=$HALF
-export GOMAXPROCS=$HALF
+source "$REPO/bench/cpu-split.sh"
 
 # --- legs: name|demo args|expected transport|expected tls ---
 LEGS=(
@@ -116,7 +110,8 @@ run_leg() {  # $1=name $2=args $3=expect_transport $4=expect_tls $5=rep $6=order
 
 echo
 echo "matrix: ${#LEGS[@]} legs x $REPS passes (first $WARMUP_PASSES discarded as host warm-up)"
-echo "  cpus     : $NCPU  server=$SERVER_CPUS client=$CLIENT_CPUS  DOTNET_PROCESSOR_COUNT=$HALF GOMAXPROCS=$HALF"
+echo "  cpus     : $NCPU  server=$SERVER_CPUS client=$CLIENT_CPUS (split by physical core)"
+echo "             DOTNET_PROCESSOR_COUNT=$DOTNET_PROCESSOR_COUNT GOMAXPROCS=$GOMAXPROCS"
 echo "  load     : -c $CONNECTIONS -d $DURATION (warmup $WARMUP), keep-alive only"
 echo "  csv      : $CSV"
 echo

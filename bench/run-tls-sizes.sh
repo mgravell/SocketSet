@@ -57,12 +57,10 @@ fi
 echo "building AspNetDemo (Release)..."
 dotnet build "$REPO/AspNetDemo/AspNetDemo.csproj" -c Release -v q --nologo >/dev/null || { echo "build failed"; exit 1; }
 
-NCPU=$(nproc); HALF=$(( NCPU / 2 )); (( HALF < 1 )) && HALF=1
-SERVER_CPUS="0-$((HALF-1))"; CLIENT_CPUS="$HALF-$((NCPU-1))"
-(( NCPU < 2 )) && { SERVER_CPUS=0; CLIENT_CPUS=0; }
-# Both runtimes size themselves from the CPU count seen at STARTUP, before affinity is applied.
-export DOTNET_PROCESSOR_COUNT=$HALF
-export GOMAXPROCS=$HALF
+# CPU split by physical core rather than by logical index - see bench/cpu-split.sh for why the obvious
+# lower/upper-half split gives the server and the load generator the SAME cores on this host.
+NCPU=$(nproc)
+source "$REPO/bench/cpu-split.sh"
 
 # name|demo args|expected transport|expected tls
 #
@@ -123,7 +121,8 @@ measure() { # $1=name $2=args $3=xt $4=xtls $5=size $6=rep
 
 echo
 echo "TLS message-size sweep: ${#LEGS[@]} legs x $(wc -w <<<"$SIZES") sizes x $REPS passes (pass 1 discarded)"
-echo "  cpus  : $NCPU  server=$SERVER_CPUS client=$CLIENT_CPUS  DOTNET_PROCESSOR_COUNT=$HALF"
+echo "  cpus  : $NCPU  server=$SERVER_CPUS client=$CLIENT_CPUS (split by physical core)"
+echo "          DOTNET_PROCESSOR_COUNT=$DOTNET_PROCESSOR_COUNT GOMAXPROCS=$GOMAXPROCS"
 echo "  load  : -c $CONNECTIONS -d $DURATION, keep-alive, GET /payload?n=<size>"
 echo "  csv   : $CSV"
 echo
