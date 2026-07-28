@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
-# TODO item 0c: io_uring does not always exit on SIGINT after sustained load. Observed 2026-07-28,
-# reproduced every time, never diagnosed. This script reproduces it and NAMES the blocked thread.
+# TODO item 0c, and it is CLOSED: the cause is inherited SIG_IGN, not io_uring and not load.
+#
+# ANSWER (2026-07-28), so nobody re-runs this expecting a mystery. A shell WITHOUT job control - any
+# non-interactive script, i.e. this one and every other rig here - starts background (&) children with
+# SIGINT and SIGQUIT set to SIG_IGN, per POSIX, so a terminal Ctrl+C cannot kill a background job. .NET
+# honours that inherited disposition and never raises CancelKeyPress. Hung process: SigIgn ...1006,
+# SigCgt ...44f8 (SIGINT not caught). Interactive: SigIgn ...1000, SigCgt ...44fe, exits in 250ms.
+# PosixSignalRegistration does not rescue it either - also declines an inherited SIG_IGN, correctly.
+# USE SIGTERM, which every rig already does, and which now takes a clean shutdown path.
+#
+# The script is kept because it is the instrument that found it and it re-verifies the conclusion: expect
+# BOTH cases to hang under SIGINT, identically, which is the proof that load is irrelevant. Swap the kill
+# to -TERM and both exit in 250ms.
 #
 # WHAT THE FILE USED TO SUSPECT, AND WHY THAT IS REFUTED. The entry blamed teardown waiting on
 # RecvArmed/SendBusy/CancelPending clearing per connection (IoUringShard.TryFinalize). Nothing waits on

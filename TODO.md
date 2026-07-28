@@ -8,18 +8,28 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 Orientation for picking this up cold.
 
-**The agreed order of work, and why:**
+**The agreed order of work — REVISED 2026-07-28 (end of day), because most of the old list is now done:**
 
-1. **BYO-buffer phase 2 — IOCP zero-copy (item 2b).** Highest value, with a *measured* target: the Kestrel
-   bridge costs ~42% on the fastest configuration (bare tuned RIO 11,030 MiB/s at 256KB vs 6,348 bridged).
-   The vehicle is already built and A/B'd at parity, so the comparison is clean.
-2. **Write-pool exhaustion drops connections (item 0b).** DONE 2026-07-28. Note the justification was
-   wrong: the "208 dropped connections" that motivated it were my own harness missing an ephemeral-port
-   gate, not a server defect. The change — stage and retry instead of closing — is right on its own
-   terms and is verified against a 4-buffer pool; the measurement that argued for it was not.
-3. **Page-size defaults (item 0).** Blocked on 0b, and on sweeping page size for io_uring/epoll, since
-   `BufferPageSize` is shared with them and has only been swept on Windows.
-4. **Dynamic shard growth.** Specified, untouched.
+1. ~~BYO-buffer phase 2, IOCP zero-copy (item 2b)~~ **DONE, and it under-delivered: +3.5% at 16KB and
+   nothing elsewhere.** See `2b-result`. That is the single most useful negative result on this list.
+2. ~~Write-pool exhaustion drops connections (item 0b)~~ **DONE**, with a wrong justification (the "208
+   dropped connections" were my harness missing an ephemeral-port gate). The change is right anyway.
+3. ~~Page-size defaults (item 0), blocked on the Linux sweep~~ **UNBLOCKED.** Linux is swept, io_uring's
+   page cliff is fixed, and `ReceiveBufferSize` now reaches every backend. What is left is **not evidence
+   but MECHANISM**: `BufferPageSize` is one global with a real default of 4096, so there is no way to tell
+   "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend chooses) or a
+   factory-supplied default, and that changes public option semantics — its own commit.
+4. ~~Item 1, the 64KB->256KB collapse~~ **ANSWERED: it is the bridge**, 2.0-2.4% at 64KB and 24.5-41.8% at
+   256KB, with the instability the bridge's too. See item 1 for the isolation.
+5. **Dynamic shard growth.** Specified, untouched. Now the largest *unstarted* item.
+
+**Where the remaining performance is, on the evidence rather than on intuition.** Three independent
+results now agree that the Kestrel bridge — not the transport, not copies, not allocation — is what costs
+on the ASP.NET path: zero-copy send removed one copy for +3.5%; the bare-vs-bridged isolation puts the
+bridge at 24-42% at 256KB while the bare transport does not decline at all; and the same ~42% appears on
+Windows against tuned RIO. **The next lever is fewer pipes and thread hops, not fewer copies** — and the
+strongest form of that is no bridge at all (Kestrel talking to the transport directly), which is out of
+scope here. Anything aimed at this number should be justified against that.
 
 ### THE LINUX HOST IS NOW BARE METAL, AND THE FIRST JOB IS A BASELINE (state as of 2026-07-28)
 
@@ -438,7 +448,38 @@ Goodput MiB/s, median of 3 scored passes, Docker/loopback (`bench/run-tls-sizes.
 Unlike the small-message numbers these repeat tightly (~1-10% between passes), so the large-payload
 shape is worth acting on.
 
-### 0c. io_uring does not always exit on SIGINT after sustained load — OBSERVED 2026-07-28, not diagnosed
+### 0c. ~~io_uring does not always exit on SIGINT after sustained load~~ — CLOSED 2026-07-28: NOT A DEFECT, and not io_uring, and not load
+
+**Diagnosed and closed the same day it was raised.** The process ignores SIGINT because it was *told* to:
+a shell **without job control** — which means any non-interactive script, i.e. every rig in `bench/` —
+starts background (`&`) children with SIGINT and SIGQUIT set to `SIG_IGN`. That is POSIX, so a Ctrl+C at
+the terminal cannot kill a background job. .NET honours the inherited disposition and never raises
+`CancelKeyPress`, so the process ignores SIGINT outright.
+
+Read from the kernel rather than inferred. Hung process: `SigIgn: ...1006` (0x2 SIGINT + 0x4 SIGQUIT on
+top of the usual 0x1000 SIGPIPE), `SigCgt: ...44f8` — SIGINT **not caught**. Same binary from an
+interactive shell: `SigIgn: ...1000`, `SigCgt: ...44fe`, exits in **250ms**. Nine foreground trials across
+shard counts and `taskset` all exited in 250ms; every scripted-background trial hung.
+
+**So all three parts of the original framing were wrong:** not io_uring (the backend is irrelevant), not
+"after sustained load" (idle hangs identically — the original idle-exits observation was an interactive
+run), and not a teardown stall. `TryFinalize` was already refuted structurally; this closes it empirically
+too. **There is no connection-state leak here** — the earlier note that one might still lurk was raised
+against a symptom that has turned out to have an unrelated cause, so it is not evidence of anything.
+
+**`PosixSignalRegistration` does not rescue SIGINT** — tried and measured; it also declines a signal
+inherited as `SIG_IGN`, which is the correct convention. **Use SIGTERM from a harness**; every rig already
+does (`kill $pid`).
+
+**What DID change (`SmokeTest/StopSignals.cs`).** SIGTERM's default disposition killed the process
+outright, so anything printed at shutdown was unreachable from a rig. It is now handled, shuts down
+cleanly, and a `[uring-stats:shutdown]` line was captured from a scripted run for the first time. **That
+retires the workaround this entry forced** — "do not build a measurement that can only be read at
+shutdown". The reporter's 2s timer is still worth keeping for a hard-killed process.
+
+*Original entry follows.*
+
+### ~~0c. io_uring does not always exit on SIGINT after sustained load~~ — OBSERVED 2026-07-28, not diagnosed
 
 Noticed while building the send instrumentation, so it is a side-observation rather than a hunted bug, but
 it reproduced every time. `SmokeTest --http --io-uring -n 8` shuts down promptly on SIGINT when idle, and

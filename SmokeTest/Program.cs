@@ -280,8 +280,9 @@ if (args.Contains("--http"))
         + $" readpages={options.BufferPagesPerShard} body={size}"
         + $" listening on {port} (Ctrl+C to stop)");
     var httpStop = new ManualResetEventSlim();
-    Console.CancelKeyPress += (_, e) => { e.Cancel = true; httpStop.Set(); };
+    using var httpSignals = StopSignals.Install(httpStop);
     httpStop.Wait();
+    Console.WriteLine("http-bench: stopping");
     return;
 }
 
