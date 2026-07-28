@@ -43,9 +43,41 @@ internal sealed class IocpConnection : WindowsConnection
     public readonly int[] SendLens = new int[MaxSendPages];
     public int SendPageCount;
 
+    // --- zero-copy send (pipe mode only; loop thread except where noted) ---
+    // The in-flight send points at the CALLER's memory (pipe segments) instead of write pages, so there is
+    // nothing to release back to the pool - only handles to unpin and a pump to signal. Set up on the pump
+    // thread by TrySendZeroCopy (pinning is thread-agnostic), consumed on the loop thread.
+
+    /// <summary>The in-flight send is zero-copy: <see cref="SendPages"/> is not in use and nothing is
+    /// returned to the write pool on completion.</summary>
+    public bool SendZeroCopy;
+
+    /// <summary>Pins held for the duration of a zero-copy send; disposed when it completes or fails.
+    /// Null entries beyond <see cref="ZcCount"/>. Only populated when the caller did NOT assert pinned
+    /// memory — an already-pinned pool needs no handle.</summary>
+    public System.Buffers.MemoryHandle[]? ZcHandles;
+
+    /// <summary>Segment addresses and lengths of the in-flight zero-copy send.</summary>
+    public readonly nint[] ZcPtrs = new nint[MaxSendPages];
+    public readonly int[] ZcLens = new int[MaxSendPages];
+    public int ZcCount;
+
+    /// <summary>Signals the outbound pump that the send completed (true) or the connection went away
+    /// (false). The pump must not AdvanceTo its reader until this fires — the socket was reading its
+    /// memory.</summary>
+    public TaskCompletionSource<bool>? ZcCompletion;
+
+    /// <summary>A zero-copy request accepted but not yet issued because a send was already in flight.
+    /// At most one can exist: the pump issues one send at a time and waits for it.</summary>
+    public bool ZcPending;
+
     public IocpConnection(IocpShard shard, uint slot) : base(shard, slot)
     {
         Shard = shard;
     }
+
+    internal override bool TrySendZeroCopy(in System.Buffers.ReadOnlySequence<byte> data, bool pinned,
+                                           out ValueTask<bool> completion)
+        => Shard.TrySendZeroCopy(this, in data, pinned, out completion);
 }
 #endif

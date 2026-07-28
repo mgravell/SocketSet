@@ -1,3 +1,4 @@
+using System.Buffers;   // BuffersExtensions.Write, for PipeWriter as an IBufferWriter<byte>
 using SocketSets;
 
 namespace SmokeTest;
@@ -60,7 +61,77 @@ public sealed class EchoVerify(SocketSetOptions options, long totalBytes, int ch
         return mism;
     }
 
-    protected override void OnAccept(ref AcceptContext ctx) => ctx.Connection.UserToken = new ServerState();
+    /// <summary>Opt the SERVER half into pipe mode (ctx.UsePipe). Only the server side, so a mismatch is
+    /// attributable to the new path rather than to both ends changing at once.</summary>
+    public bool PipeMode { get; set; }
+
+    protected override void OnAccept(ref AcceptContext ctx)
+    {
+        var s = new ServerState();
+        ctx.Connection.UserToken = s;
+#if NET
+        // The byte-exact harness is the ONLY thing that can catch a zero-copy send pointing at the wrong
+        // address or resuming a partial write at the wrong offset, so pipe mode has to be reachable from
+        // here. It was not until 2026-07-28: EchoVerify is a separate SocketSet from EchoServer, so
+        // `--verify-echo --pipe` silently ran the ordinary callback path and verified nothing about pipes.
+        if (PipeMode) StartPipeEcho(ref ctx, s);
+#endif
+    }
+
+#if NET
+    private void StartPipeEcho(ref AcceptContext ctx, ServerState s)
+    {
+        var inbound = new System.IO.Pipelines.Pipe();   // transport writes -> we read
+        var outbound = new System.IO.Pipelines.Pipe();  // we write -> transport reads
+        ctx.UsePipe(new DuplexPipe(outbound.Reader, inbound.Writer));
+
+        var appIn = inbound.Reader;
+        var appOut = outbound.Writer;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    var result = await appIn.ReadAsync().ConfigureAwait(false);
+                    var buffer = result.Buffer;
+                    if (!buffer.IsEmpty)
+                    {
+                        // Same verification the callback path does: check the inbound leg against the
+                        // pattern, then echo verbatim.
+                        foreach (var seg in buffer)
+                        {
+                            lock (s.Gate)
+                            {
+                                int m = CountMismatches(seg.Span, s.RecvOffset);
+                                if (m != 0) Interlocked.Add(ref _serverMismatches, m);
+                                s.RecvOffset += seg.Length;
+                            }
+                            appOut.Write(seg.Span);
+                        }
+                        var f = await appOut.FlushAsync().ConfigureAwait(false);
+                        if (f.IsCompleted || f.IsCanceled) { appIn.AdvanceTo(buffer.End); break; }
+                    }
+                    appIn.AdvanceTo(buffer.End);
+                    if (result.IsCompleted || result.IsCanceled) break;
+                }
+            }
+            catch { /* torn down mid-echo */ }
+            finally
+            {
+                try { await appIn.CompleteAsync().ConfigureAwait(false); } catch { }
+                try { await appOut.CompleteAsync().ConfigureAwait(false); } catch { }
+            }
+        });
+    }
+
+    private sealed class DuplexPipe(System.IO.Pipelines.PipeReader input, System.IO.Pipelines.PipeWriter output)
+        : System.IO.Pipelines.IDuplexPipe
+    {
+        public System.IO.Pipelines.PipeReader Input => input;
+        public System.IO.Pipelines.PipeWriter Output => output;
+    }
+#endif
 
     protected override void OnConnect(ref ConnectContext ctx)
     {

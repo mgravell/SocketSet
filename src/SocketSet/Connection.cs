@@ -114,6 +114,30 @@ public abstract class Connection : IBufferWriter<byte>
         return Flush();
     }
 
+#if NET
+    /// <summary>
+    /// Zero-copy send: hand the backend the caller's own memory instead of copying it into library
+    /// buffers. Used by pipe mode (<c>ctx.UsePipe</c>) so a response can go out straight from the
+    /// application's pipe segments.
+    ///
+    /// Returns false when this backend cannot do it — RIO addresses registered buffer ids rather than raw
+    /// addresses, the managed backend has no such path, and even IOCP declines a sequence with more
+    /// segments than one WSASend can carry. The caller must then fall back to
+    /// <see cref="Send(in System.Buffers.ReadOnlySequence{byte})"/>, which copies. Refusing rather than
+    /// silently copying is deliberate: the fallback has to stay the obvious, always-correct path.
+    ///
+    /// OWNERSHIP: on true, <paramref name="data"/> must stay valid and unmodified until
+    /// <paramref name="completion"/> completes — the socket is reading it directly. The caller must not
+    /// <c>AdvanceTo</c> its pipe reader before then. <paramref name="pinned"/> says the memory is already
+    /// pinned (a pinned-object-heap pool), letting the backend skip per-operation pinning.
+    /// </summary>
+    internal virtual bool TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned, out ValueTask<bool> completion)
+    {
+        completion = default;
+        return false;
+    }
+#endif
+
     private void WriteAll(ReadOnlySpan<byte> data)
     {
         while (!data.IsEmpty)

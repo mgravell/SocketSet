@@ -260,6 +260,22 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             try { PumpFlush(f.Slot, f.Generation, f.Data, f.Len); }
             finally { ArrayPool<byte>.Shared.Return(f.Data); }
         }
+
+        // Zero-copy sends. The pump already pinned the segments, so this only validates the slot and
+        // posts. A re-tenanted or closing slot must still unpin and release the pump, or the pump waits
+        // forever on a connection that no longer exists.
+        while (_zeroCopy.TryDequeue(out var z))
+        {
+            var conn = _conns[z.Slot - 1];
+            if (conn.Generation != z.Generation || conn.Socket == 0 || conn.Closing
+                || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
+            {
+                FinishZeroCopy(conn, ok: false);
+                continue;
+            }
+            if (conn.SendBusy) { conn.ZcPending = true; continue; } // issued from CompleteWrite
+            StartZeroCopy(conn, z.Slot);
+        }
     }
 
     // Defer a synchronously-completed recv/send (no port packet was posted for it). Loop-thread-only.
@@ -336,6 +352,134 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     {
         _incoming.Enqueue((socket, token));
         Poke();
+    }
+
+    // Zero-copy send requests marshaled from the outbound pump thread. The SEGMENTS are pinned on the
+    // calling thread (Memory.Pin is thread-agnostic) so the loop only has to build WSABUFs and post.
+    private readonly ConcurrentQueue<(uint Slot, uint Generation)> _zeroCopy = [];
+
+    /// <summary>
+    /// Accept a zero-copy send, or decline it so the caller copies instead. Called on the outbound pump
+    /// thread, not the loop.
+    ///
+    /// Declines, each for a reason worth stating:
+    ///  - TLS. The bytes must be ENCRYPTED before they reach the wire, so handing the socket the
+    ///    application's plaintext would put plaintext on the network. This is not a performance
+    ///    limitation, it is a correctness one.
+    ///  - More segments than one WSASend can carry (<see cref="IocpConnection.MaxSendPages"/>).
+    ///  - Connection closing, or a zero-copy send already outstanding.
+    /// </summary>
+    internal bool TrySendZeroCopy(IocpConnection conn, in ReadOnlySequence<byte> data, bool pinned,
+                                 out ValueTask<bool> completion)
+    {
+        completion = default;
+        if (conn.Tls is not null) return false;                       // must encrypt: see above
+        if (Volatile.Read(ref conn.Socket) == 0) return false;
+        if (data.IsEmpty) return false;
+
+        // Count first: pinning half a sequence and then discovering it is too fragmented would mean
+        // unwinding pins for nothing.
+        int n = 0;
+        foreach (var _ in data) if (++n > IocpConnection.MaxSendPages) return false;
+
+        var handles = pinned ? null : new System.Buffers.MemoryHandle[n];
+        int i = 0;
+        foreach (var seg in data)
+        {
+            if (seg.IsEmpty) continue;
+            if (handles is null)
+            {
+                // Caller asserts the memory is already pinned, so its address is stable without a handle.
+                conn.ZcPtrs[i] = (nint)System.Runtime.CompilerServices.Unsafe.AsPointer(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetReference(seg.Span));
+            }
+            else
+            {
+                var h = seg.Pin();
+                handles[i] = h;
+                conn.ZcPtrs[i] = (nint)h.Pointer;
+            }
+            conn.ZcLens[i] = seg.Length;
+            i++;
+        }
+        if (i == 0) { DisposeZc(handles, i); return false; }
+
+        conn.ZcHandles = handles;
+        conn.ZcCount = i;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        conn.ZcCompletion = tcs;
+        completion = new ValueTask<bool>(tcs.Task);
+
+        _zeroCopy.Enqueue((conn.Slot, Volatile.Read(ref conn.Generation)));
+        Poke();
+        return true;
+    }
+
+    private static void DisposeZc(System.Buffers.MemoryHandle[]? handles, int count)
+    {
+        if (handles is null) return;
+        for (int i = 0; i < count; i++) handles[i].Dispose();
+    }
+
+    /// <summary>Release a finished/abandoned zero-copy send and signal the pump. Loop thread.</summary>
+    private void FinishZeroCopy(IocpConnection conn, bool ok)
+    {
+        DisposeZc(conn.ZcHandles, conn.ZcCount);
+        conn.ZcHandles = null;
+        conn.ZcCount = 0;
+        conn.SendZeroCopy = false;
+        conn.ZcPending = false;
+        var tcs = conn.ZcCompletion;
+        conn.ZcCompletion = null;
+        tcs?.TrySetResult(ok);
+    }
+
+    /// <summary>Post the in-flight zero-copy send as ONE WSASend over the caller's own segments, resuming
+    /// at <c>SendSent</c>. The mirror of <see cref="IssueSendPages"/>, but the buffers are the
+    /// application's pipe memory rather than write pages, so nothing is leased or released here.</summary>
+    private void IssueSendZeroCopy(IocpConnection conn, uint slot)
+    {
+        IocpOp* op = SendOp(slot);
+        op->Kind = OpKind.Send;
+        op->Slot = slot;
+        op->Buf = -1; // no write-pool page backs this send
+
+        Win32.WSABUF* bufs = stackalloc Win32.WSABUF[IocpConnection.MaxSendPages];
+        int n = 0, skip = conn.SendSent;
+        for (int i = 0; i < conn.ZcCount; i++)
+        {
+            int len = conn.ZcLens[i];
+            if (skip >= len) { skip -= len; continue; }
+            bufs[n].buf = (byte*)conn.ZcPtrs[i] + skip;
+            bufs[n].len = (uint)(len - skip);
+            n++;
+            skip = 0;
+        }
+        if (n == 0) { conn.SendBusy = false; FinishZeroCopy(conn, ok: true); return; }
+
+        uint sent = 0;
+        int rc = Win32.WSASend(conn.Socket, bufs, (uint)n, &sent, 0, &op->Overlapped, null);
+        if (rc == 0)
+        {
+            if (conn.SkipOnSuccess) QueueInline(OpKind.Send, slot, sent, failed: false);
+            return;
+        }
+        if (Marshal.GetLastPInvokeError() != Win32.WSA_IO_PENDING)
+            QueueInline(OpKind.Send, slot, 0, failed: true);
+    }
+
+    /// <summary>Start a queued zero-copy send if the connection is idle. Loop thread.</summary>
+    private void StartZeroCopy(IocpConnection conn, uint slot)
+    {
+        if (conn.SendBusy || conn.Closing || conn.Socket == 0) return; // issued from CompleteWrite instead
+        conn.ZcPending = false;
+        conn.SendZeroCopy = true;
+        conn.SendBusy = true;
+        conn.SendSent = 0;
+        int total = 0;
+        for (int i = 0; i < conn.ZcCount; i++) total += conn.ZcLens[i];
+        conn.SendTotal = total;
+        IssueSendZeroCopy(conn, slot);
     }
 
     /// <summary>Marshal a close request onto the loop thread (from <see cref="WindowsConnection.Close"/>).</summary>
@@ -429,6 +573,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
         if (conn.RecvBuf >= 0) { _recvBuffer.Release(conn.RecvBuf); conn.RecvBuf = -1; }
         ReleaseSendPages(conn); // every page of any send that was still in flight
+        // Unpin and release any zero-copy send (in flight or merely queued), or its pump waits forever on
+        // a connection that no longer exists.
+        if (conn.SendZeroCopy || conn.ZcPending || conn.ZcCompletion is not null) FinishZeroCopy(conn, ok: false);
         // Return any queued (pooled) echo staging buffers before recycling the slot.
         if (conn.Pending is { } pending)
             while (pending.Count > 0) ArrayPool<byte>.Shared.Return(pending.Dequeue().Array!);
@@ -934,7 +1081,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // A send failed synchronously: release its buffers, clear the send slot, tear the connection down.
     private void FailSend(IocpConnection conn, uint slot)
     {
-        ReleaseSendPages(conn);
+        if (conn.SendZeroCopy) FinishZeroCopy(conn, ok: false); else ReleaseSendPages(conn);
         conn.SendBusy = false;
         CloseClient(slot);
     }
@@ -945,7 +1092,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
         if (conn.Closing)
         {
-            ReleaseSendPages(conn);
+            if (conn.SendZeroCopy) FinishZeroCopy(conn, ok: false); else ReleaseSendPages(conn);
             conn.SendBusy = false;
             TryFinalize(conn, slot);
             return;
@@ -957,9 +1104,19 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         if (conn.SendSent < conn.SendTotal)
         {
             if (bytes == 0) { FailSend(conn, slot); return; } // no progress → dead peer
-            // Partial send: re-post the remainder. IssueSendPages skips the acknowledged prefix across
-            // pages, so a partial write that lands mid-page resumes at the right byte.
-            IssueSendPages(conn, slot);
+            // Partial send: re-post the remainder. Both issuers skip the acknowledged prefix across
+            // their buffers, so a partial write that lands mid-buffer resumes at the right byte.
+            if (conn.SendZeroCopy) IssueSendZeroCopy(conn, slot); else IssueSendPages(conn, slot);
+            return;
+        }
+
+        if (conn.SendZeroCopy)
+        {
+            // Nothing to hand back to the write pool, and no OnWrite/echo drain: in pipe mode the pump
+            // owns the outbound half. Unpin, release the pump, and go idle — the pump's next ReadAsync is
+            // what produces the next send.
+            conn.SendBusy = false;
+            FinishZeroCopy(conn, ok: true);
             return;
         }
 
@@ -1026,6 +1183,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         {
             ReleaseSendPages(conn);
             conn.SendBusy = false;
+            // A zero-copy send that arrived while this one was in flight waits here for the connection to
+            // go idle, since only one send may be outstanding on a stream socket.
+            if (conn.ZcPending) StartZeroCopy(conn, slot);
         }
     }
 

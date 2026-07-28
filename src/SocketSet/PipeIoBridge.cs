@@ -71,33 +71,88 @@ internal sealed class PipeIoBridge
         return bridge;
     }
 
+    // Inbound serialization. A PipeWriter permits ONE outstanding FlushAsync: writing or flushing again
+    // while one is in flight throws "Concurrent reads or writes are not supported" and, from the loop
+    // thread, faults the whole shard. That is not hypothetical - it is what a 64KB chunk size did on
+    // 2026-07-28, once a test finally exercised pipe mode deeply enough to make a flush go async.
+    //
+    // The loop thread cannot wait for a flush, so bytes that arrive during one are STAGED here and written
+    // when it completes. That costs a copy, but only under backpressure, and only until a backend can park
+    // its receive instead (the proper fix, which needs per-backend cooperation).
+    private readonly object _inGate = new();
+    private bool _flushPending;
+    private readonly Queue<ArraySegment<byte>> _staged = new();
+
     /// <summary>Inbound data, on the loop thread, in place of <c>OnReceive</c>.</summary>
     internal void OnReceived(ReadOnlySpan<byte> data)
     {
         if (Volatile.Read(ref _completed) != 0 || data.IsEmpty) return;
 
-        _pipe.Output.Write(data);
-        var flush = _pipe.Output.FlushAsync();
-        if (flush.IsCompletedSuccessfully)
+        ValueTask<FlushResult> flush;
+        lock (_inGate)
         {
-            var r = flush.Result;
-            if (r.IsCompleted || r.IsCanceled) _conn.Close(); // reader is gone
-            return;
+            if (_flushPending)
+            {
+                // A flush is outstanding: touching the writer now would throw. Stage instead.
+                var buf = ArrayPool<byte>.Shared.Rent(data.Length);
+                data.CopyTo(buf);
+                _staged.Enqueue(new ArraySegment<byte>(buf, 0, data.Length));
+                return;
+            }
+
+            _pipe.Output.Write(data);
+            flush = _pipe.Output.FlushAsync();
+            if (flush.IsCompletedSuccessfully)
+            {
+                var r = flush.Result;
+                if (r.IsCompleted || r.IsCanceled) _conn.Close(); // reader is gone
+                return;
+            }
+            _flushPending = true;
         }
-        // Did not complete synchronously: the reader is behind. Observe it asynchronously rather than
-        // blocking the loop. Writing continues meanwhile - see the backpressure caveat on this type.
-        _ = ObserveFlushAsync(flush);
+        _ = DrainFlushesAsync(flush);
     }
 
-    private async Task ObserveFlushAsync(ValueTask<FlushResult> flush)
+    /// <summary>Await an outstanding flush, then write anything staged behind it and flush again, until
+    /// nothing is left. Runs off the loop thread; the lock only ever guards short bookkeeping.</summary>
+    private async Task DrainFlushesAsync(ValueTask<FlushResult> flush)
     {
-        try
+        while (true)
         {
-            var r = await flush.ConfigureAwait(false);
-            if (r.IsCompleted || r.IsCanceled) _conn.Close();
+            try
+            {
+                var r = await flush.ConfigureAwait(false);
+                if (r.IsCompleted || r.IsCanceled) { Fail(); return; }
+            }
+            catch { Fail(); return; }
+
+            lock (_inGate)
+            {
+                if (_staged.Count == 0) { _flushPending = false; return; } // caught up; loop may write again
+                while (_staged.Count > 0)
+                {
+                    var seg = _staged.Dequeue();
+                    _pipe.Output.Write(seg.AsSpan());
+                    ArrayPool<byte>.Shared.Return(seg.Array!);
+                }
+                flush = _pipe.Output.FlushAsync();
+                if (flush.IsCompletedSuccessfully)
+                {
+                    var r2 = flush.Result;
+                    if (r2.IsCompleted || r2.IsCanceled) { Fail(); return; }
+                    if (_staged.Count == 0) { _flushPending = false; return; }
+                    continue; // more arrived while we were writing; go round without awaiting
+                }
+            }
         }
-        catch
+
+        void Fail()
         {
+            lock (_inGate)
+            {
+                _flushPending = false;
+                while (_staged.Count > 0) ArrayPool<byte>.Shared.Return(_staged.Dequeue().Array!);
+            }
             _conn.Close();
         }
     }
@@ -115,9 +170,22 @@ internal sealed class PipeIoBridge
 
                 if (!buffer.IsEmpty)
                 {
-                    // One Send for the whole sequence: segments are written straight into library buffers
-                    // and dispatched as a single scatter-gather send, rather than one send per segment.
-                    if (!_conn.Send(in buffer))
+                    // Prefer zero-copy: the backend sends straight out of the pipe's own segments. It
+                    // declines when it cannot (RIO, managed, or a sequence too fragmented for one call),
+                    // and then we take the copying path, which is always correct.
+                    //
+                    // Note the ordering rule this creates: with zero-copy the socket is reading the pipe's
+                    // memory, so AdvanceTo must wait for the send to COMPLETE, not merely to be submitted.
+                    // That is the whole reason this awaits before advancing.
+                    if (_conn.TrySendZeroCopy(in buffer, Pinned, out var sent))
+                    {
+                        if (!await sent.ConfigureAwait(false))
+                        {
+                            input.AdvanceTo(buffer.Start); // connection gone; do not consume what we could not send
+                            break;
+                        }
+                    }
+                    else if (!_conn.Send(in buffer))
                     {
                         input.AdvanceTo(buffer.Start); // connection gone; do not consume what we cannot send
                         break;
@@ -147,6 +215,10 @@ internal sealed class PipeIoBridge
     private void Teardown(Exception? fault)
     {
         if (Interlocked.Exchange(ref _completed, 1) != 0) return;
+        lock (_inGate)
+        {
+            while (_staged.Count > 0) ArrayPool<byte>.Shared.Return(_staged.Dequeue().Array!);
+        }
         try { _pipe.Output.Complete(fault); } catch { }
         try { _pipe.Input.Complete(fault); } catch { }
     }

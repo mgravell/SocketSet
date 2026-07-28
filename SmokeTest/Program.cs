@@ -278,7 +278,7 @@ if (verify > 0)
 
 if (verifyEcho > 0)
 {
-    RunEchoVerify(options, verifyEcho, size, window, port);
+    RunEchoVerify(options, verifyEcho, size, window, port, pipeMode);
     return;
 }
 
@@ -324,13 +324,13 @@ static void RunVerify(SocketSetOptions opts, int payloadLen, int port)
     Console.WriteLine($"verify: received={set.Received}/{set.Expected} mismatches={set.Mismatches} => {(ok ? "PASS" : "FAIL")}");
 }
 
-static void RunEchoVerify(SocketSetOptions opts, long totalBytes, int chunk, int window, int port)
+static void RunEchoVerify(SocketSetOptions opts, long totalBytes, int chunk, int window, int port, bool pipeMode)
 {
-    using var set = new EchoVerify(opts, totalBytes, chunk, window);
+    using var set = new EchoVerify(opts, totalBytes, chunk, window) { PipeMode = pipeMode };
     var ep = new IPEndPoint(IPAddress.Loopback, port);
     set.Listen(ep);
     set.Connect(ep);
-    Console.WriteLine($"verify-echo: backend={opts.Factory.GetType().Name} total={totalBytes} chunk={chunk} window={window}");
+    Console.WriteLine($"verify-echo: backend={opts.Factory.GetType().Name} total={totalBytes} chunk={chunk} window={window} pipe={pipeMode}");
 
     var sw = Stopwatch.StartNew();
     while (set.RoundTripped < set.Expected && sw.Elapsed < TimeSpan.FromSeconds(30)) Thread.Sleep(10);
