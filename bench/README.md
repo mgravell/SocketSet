@@ -15,7 +15,20 @@ itself as an error.
 | `Run-TlsSizes.ps1` | Windows: how transports/TLS scale with payload size (and shard count). |
 | `Run-Matrix.ps1` | Windows: fixed-size transport × TLS matrix. |
 | `run-matrix.sh`, `run-tls-sizes.sh` | Linux equivalents of the two above. Both take `SHARDS="4 8 12"`. |
+| `run-bare-vs-bridged.sh` | *"Is this cost the transport or the Kestrel bridge?"* Bare responder at a MATCHED shard count, same session. |
+| `run-byo.sh` | *"Does zero-copy send buy anything?"* classic vs `--byo`, `/config`-gated both ways. |
+| `run-pipe-opts.sh` | *"Do the bridge's pipe options matter?"* Block size / pinned pool, byo-vs-byo. |
+| `run-recv-slab.sh` | *"Does the receive slab scale with connections?"* Peak RSS vs connections x page. |
+| `diagnose-sigint-hang.sh` | Reproduces TODO 0c and names the blocked thread. **Already answered** — see its header. |
 | `cpu-split.sh`, `ktls-verify.sh` | Sourced by the Linux scripts; not run directly. See below. |
+
+The five `run-*.sh` rigs added on 2026-07-28/29 are Linux-only as written (they use `taskset` and the
+Linux `/proc` interfaces). Their *headers* carry the pre-registered predictions and what would falsify
+them, which is the part worth reading before re-running one.
+
+**If you are picking this up on Windows after the Linux work:** read the section at the top of
+`../TODO.md` first. A shared-code change (`OutboundConnection.Flush`) has never been executed on Windows,
+so the smoke matrix comes before any measurement.
 
 All of them fetch `bombardier` into `.tools/` on first run. Linux scripts need `jq curl taskset shuf`
 (`gawk` for the nicer pivot, `lscpu` for the CPU split — without it the split falls back and warns).

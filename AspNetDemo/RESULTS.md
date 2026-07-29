@@ -239,6 +239,20 @@ costs epoll nearly twice what it costs io_uring; see the refutation below.
    because its 64-segment cap declines a 65-segment response - measured, not inferred. See the zero-copy
    section below.
 
+### The best-measured configuration on Linux today (2026-07-29)
+
+Not a default — a statement of what the code can do, and what it costs. io_uring, 12 shards, `-c 64`:
+
+| payload | shipped bridge (classic) | **`--byo --pipe-segment 65536`** | vs vanilla Kestrel |
+|---|---:|---:|---:|
+| 16 KB | 6,950.6 | **7,388.0** (+6.3%) | Kestrel 7,351.3 -> now level/ahead |
+| 256 KB | 7,950.2 | **12,363.6** (+55.5%) | Kestrel 12,450.5 -> **within 0.7%** |
+
+That closes the 256KB gap to vanilla Kestrel from **36%** to **0.7%**, from two changes: zero-copy send
+(+45.1%) and the pipe block size (+7.5%). Neither is on by default, and the second costs **2.7x resident
+memory at 2048 connections**, so this is a large-payload/modest-concurrency profile rather than a
+recommendation. 512B and 64KB are unmoved by both.
+
 ### Known gaps in this picture
 
 - **Nothing on Windows has been re-measured since the 2026-07-28 page-chaining fix** (the bench host is

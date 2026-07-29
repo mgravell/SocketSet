@@ -4,11 +4,88 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## READ FIRST IF YOU ARE ON WINDOWS (written 2026-07-29 for a cold start after an OS switch)
+
+**Windows has not run anything since 2026-07-27, and shared code changed underneath it.** Everything
+below was developed and measured on Linux. Two of the changes touch code IOCP and RIO execute, and neither
+has ever been run on Windows. **Correctness first, measurement second.**
+
+### 1. The one real risk: `OutboundConnection.Flush` changed, and IOCP/RIO inherit it
+
+`dd8cdce` stopped `Flush` renting a snapshot and copying into it; it now hands over the accumulator's own
+pooled array (`PooledBufferWriter.TakeArray`) and lets the writer re-rent. `EpollConnection` **and
+`WindowsConnection`** both derive from `OutboundConnection`, so IOCP and RIO took this change sight-unseen.
+
+Why it *should* be safe: the ownership contract is unchanged (the loop gets a pooled array it must return),
+and both consumers slice by the `length` argument explicitly. The one behavioural difference is that **the
+handed-over array can be much larger than `length`** (it grows by doubling) where the old snapshot was
+`Rent(length)`. Anything inferring payload size from `data.Length` would break — nothing found in review
+does, but that review was done on Linux.
+
+**Do this first:** the smoke matrix on all three Windows backends — `--verify-echo`, `--verify`, `--churn`,
+`--poke`, plaintext and TLS, IOCP + RIO (+ managed). If it passes, the change is good; if something
+truncates or over-sends, this is the first suspect.
+
+### 2. Then re-measure the Windows baseline — the copy removal should HELP Windows more than Linux
+
+On Linux this was worth **+16.3%** at 256KB. The Windows path had *more* copies to start with
+(accumulator → `Flush` snapshot → `StageOutbound` staging → write pages, i.e. 3-4), so removing one should
+show at least as well. Compare against the 2026-07-27 numbers in `AspNetDemo/RESULTS.md`
+(`iocp/s12` 4,483.4 and `rio/s12` 2,051.6 at 256KB). Use `Compare-Commits.ps1` for any before/after claim.
+
+### 3. The highest-value Windows experiment, and it may need NO code change
+
+IOCP's zero-copy send measured +3.5% at 16KB and nothing at 256KB, and 2026-07-29 found out why:
+**a 256KB response through Kestrel's default ~4KB pipe blocks is exactly 65.00 segments**, measured, and
+`IocpConnection.MaxSendPages` is **64**. So `TrySendZeroCopy` declined *every* 256KB response and silently
+fell back to copying.
+
+The demo now has `--pipe-segment <bytes>`, which sets the pipe block size. **At `--pipe-segment 65536` a
+256KB response is 5.00 segments — comfortably under the 64 cap.** So the first experiment is a flag, not a
+patch:
+
+```
+AspNetDemo --iocp --byo --pipe-segment 65536 --port 5080     # then bench/Run-TlsSizes.ps1 against it
+```
+
+*Pre-registered:* if the cap was the explanation, IOCP zero-copy should now engage at 256KB and gain
+something like io_uring's **+45.1%**. If it engages and does NOT gain, the cap was a real decline but not
+the cost, and `2b-result`'s "the bridge is structural" reading stands for IOCP. Either way, instrument
+first: confirm the path is *taken* rather than assuming — on io_uring that meant a `zero-copy=` segment
+counter, and IOCP has no equivalent yet, so add one or the run cannot be interpreted.
+
+Only if the flag route works is the code change (raise `MaxSendPages`, or send a PREFIX and have
+`TrySendZeroCopy` report bytes instead of a bool) worth making.
+
+### 4. What is NEW on Windows since it last ran, in one list
+
+- `OutboundConnection.Flush` hand-off (§1) — **untested on Windows**.
+- `SocketSetOptions.ReceiveBufferSize` now honoured by epoll, io_uring and managed too. **IOCP/RIO
+  behaviour is unchanged** — they always honoured it.
+- `AspNetDemo --pipe-segment N` / `--pipe-pinned` (+ `PinnedBlockMemoryPool`), reported in `/config`.
+  Cross-platform; on Linux the segment size is worth +6-8% at ≥16KB and costs **2.7x RSS at 2048
+  connections**, so it is a knob, not a default.
+- `SmokeTest --ktls-spike` gained `SS_KTLS_CLEAR_NO_RX` / `SS_KTLS_FORCE_TLS12`, and prints the loaded
+  OpenSSL version. Linux-only in effect (Windows uses SChannel).
+- `SmokeTest/StopSignals.cs` — SIGTERM shutdown. Unix-shaped; harmless on Windows.
+- io_uring-only, so not a Windows concern but they explain the numbers: page chaining
+  (`GetWriteSpan`), zero-copy send, the `zero-copy=` stat counter.
+
+### 5. Windows-specific traps that have already bitten
+
+`bench/README.md` has the full list; the two that cost the most time were the **ephemeral-port gate**
+(`Wait-Ports` in `Run-Matrix.ps1` — any harness opening thousands of connections per cell needs it, and
+omitting it once produced a fake "208 dropped connections" defect) and a **pending Firewall dialog**
+holding every leg to ~95k rps with no errors reported.
+
+---
+
 ## START HERE (state as of 2026-07-28)
 
 Orientation for picking this up cold.
 
-**The agreed order of work — REVISED 2026-07-28 (end of day), because most of the old list is now done:**
+**The agreed order of work — REVISED 2026-07-29 (end of day). If you are on Windows, read the section
+above this one first; item 3 below is what you are here to do.**
 
 1. ~~BYO-buffer phase 2, IOCP zero-copy (item 2b)~~ **DONE, and it under-delivered: +3.5% at 16KB and
    nothing elsewhere.** See `2b-result`. That is the single most useful negative result on this list.
@@ -21,7 +98,24 @@ Orientation for picking this up cold.
    factory-supplied default, and that changes public option semantics — its own commit.
 4. ~~Item 1, the 64KB->256KB collapse~~ **ANSWERED: it is the bridge**, 2.0-2.4% at 64KB and 24.5-41.8% at
    256KB, with the instability the bridge's too. See item 1 for the isolation.
-5. **Dynamic shard growth.** Specified, untouched. Now the largest *unstarted* item.
+5. ~~The bridge's pipes are unconfigured (item 2d)~~ **MEASURED 2026-07-29.** Block size is worth
+   **+7.5% at 256KB / +6.3% at 16KB** on io_uring (65.00 -> 5.00 iovec segments per response); pinning
+   adds +0.7%, not separable. Costs **2.7x RSS at 2048 connections**, so both stay flags rather than
+   defaults. `--pipe-segment` / `--pipe-pinned`, `bench/run-pipe-opts.sh`.
+6. **Windows validation + the IOCP 65-segment experiment.** THE NEXT THING. See the Windows section at the
+   top of this file: a shared-code change (`OutboundConnection.Flush`) has never run there, and the IOCP
+   zero-copy null result now has a measured explanation with a flag-only first test.
+7. **Zero-copy RECEIVE + receive parking.** The last structural term against vanilla Kestrel, which is
+   zero-copy in *both* directions while we still copy inbound (and copy a *second* time into `_staged`
+   under backpressure). Parking is also the only thing that makes inbound backpressure real rather than
+   advisory — the same mechanism buys both. Not started.
+8. **Dynamic shard growth.** Specified, untouched. Now the largest *unstarted* item.
+
+**Deliberately deprioritised: kTLS multishot (item 4).** It is unblocked (OpenSSL 3.2+ enables kTLS RX for
+TLS 1.3 — validated 2026-07-29), but kTLS measures **16-21% SLOWER** than userspace TLS even with both
+directions offloaded, the work is substantial, the system OpenSSL here is 3.0.13, and kTLS's actual payoff
+(NIC offload) is *structurally invisible* on loopback. It belongs to the real-hardware session (item 5),
+not to the next one.
 
 **Where the remaining performance is, on the evidence rather than on intuition.** Three independent
 results now agree that the Kestrel bridge — not the transport, not copies, not allocation — is what costs
