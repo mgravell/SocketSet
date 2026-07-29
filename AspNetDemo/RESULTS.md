@@ -64,14 +64,33 @@ multi-bind, and a loop thread per shard.
 ReadOnlySequence)` is not overridden anywhere, so every backend except IOCP copies the caller's pipe
 segments into its own writer:
 
-| backend | pipe -> our buffer | our buffer -> socket | total userspace copies |
-|---|---|---|---:|
-| *Kestrel (sockets)* | *none - there is no "our buffer"* | *none - SAEA sends the pipe segments* | ***0*** |
-| IOCP (`TrySendZeroCopy`) | **none** - `WSABUF`s point at pipe memory | - | **0** |
-| managed | `WriteAll` into `_wbuf` (ArrayPool) | none - SAEA `SetBuffer(_wbuf)` sends it | 1 |
-| io_uring | `WriteAll` into pooled pages | none - writev over those pages | 1 |
-| epoll | `WriteAll` into `OutboundConnection` | `Flush` rents + copies the snapshot | 2 |
-| RIO | `WriteAll` into a registered write page | none - `RIOSend` from the page | 1 (permanent) |
+| backend | the copies | total |
+|---|---|---:|
+| *Kestrel (sockets)* | *none - there is no "our buffer"; SAEA sends the pipe segments* | ***0*** |
+| IOCP with `--byo` (`TrySendZeroCopy`) | none - `WSABUF`s point straight at pipe memory | **0** |
+| io_uring | `WriteAll` into pooled pages; writev sends those pages | 1 |
+| managed | `WriteAll` into `_wbuf`; SAEA `SetBuffer(_wbuf)` sends it | 1 |
+| epoll | `WriteAll` into the accumulator, then `Flush` rents + copies a snapshot | 2 |
+| IOCP classic / RIO | accumulator -> `Flush` snapshot -> `StageOutbound` pooled staging -> drain into write pages | **3-4** |
+
+`IoUringConnection` derives from `Connection` and owns its `OutChain` writer, which is why it escapes the
+`Flush` snapshot; `EpollConnection` and `WindowsConnection` both derive from `OutboundConnection` and pay
+it.
+
+**A correlation worth testing, not yet a finding.** Bridge cost at 256KB tracks copy count across the two
+Linux backends: io_uring (1 copy) pays **24.5%**, epoll (2 copies) pays **41.8%** - and epoll is the
+*faster* of the two bare (11,437 vs 10,349), so it is not that epoll is simply weaker. Windows tuned RIO
+(3-4 copies) pays ~42%. Three points and a plausible mechanism, which is exactly the shape of argument
+this file has twice had to retract, so it is written down as a hypothesis with a direct test rather than
+as a conclusion: **remove epoll's `Flush` snapshot copy (hand ownership over via `PooledBufferWriter.
+TakeArray`, which exists for this) and re-measure at 256KB.** Pre-registered: if copies cost at large
+payloads, epoll's bridge cost should fall by roughly the io_uring-epoll gap (~15 points); if it does not
+move, the correlation is coincidence and BYO work aimed at the bridge is aimed at the wrong term.
+
+That test is much cheaper than BYO and it gates it: this is the same question IOCP's zero-copy measurement
+(+3.5% at 16KB, nothing at 256KB) was supposed to answer but could not, because IOCP caps at 64 `WSABUF`s
+and a 256KB response through Kestrel's 4KB blocks is ~64 segments - so it plausibly declined and fell back
+to copying at exactly the payload of interest.
 
 **The managed backend is one step from BYO, and it is the cheapest step available.** It already sends
 directly from the buffer it accumulated into - no staging copy, unlike epoll - so the only thing between
