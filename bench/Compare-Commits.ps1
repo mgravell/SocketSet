@@ -38,9 +38,21 @@ param(
     [int]$Connections = 64,
     [int]$Shards = 16,
     [string]$Duration = "5s",
+    # Per-MEASUREMENT warm-up load, discarded. Distinct from discarding pass 1: every measurement starts
+    # a fresh server process, so every one has a transient, not just the first.
+    [string]$WarmupDuration = "3s",
     # First pass per side is discarded as warm-up, so this is scored passes + 1.
     [int]$Repetitions = 4,
-    [int]$PortBase = 41000
+    [int]$PortBase = 41000,
+    # Measure the BRIDGED path (AspNetDemo through Kestrel) instead of the bare responder (SmokeTest
+    # --http). Added 2026-07-29 because the headline Windows tables are bridged numbers, and a change
+    # can land differently on the two: dd8cdce's copy removal is in OutboundConnection.Flush, which
+    # both paths use, but the bridge sends a ReadOnlySequence of ~4KB pipe segments where the bare
+    # responder sends one contiguous span - and that difference has already made one fix worth +58-65%
+    # on the bare path and exactly nothing on the bridged one (see TODO item 1).
+    [switch]$Bridged,
+    [ValidateSet("iocp", "rio")]
+    [string]$Backend = "iocp"
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,34 +95,58 @@ function New-Side([string]$name, [string]$commit) {
     & git -C $repo worktree add --detach --quiet $path $commit
     if ($LASTEXITCODE -ne 0) { throw "git worktree add failed for $commit" }
     $script:worktrees += $path
+    if ($Bridged) {
+        & dotnet build (Join-Path $path "AspNetDemo\AspNetDemo.csproj") -c Release -v q --nologo | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "build failed for $commit" }
+        return (Join-Path $path "AspNetDemo\bin\Release\net10.0\AspNetDemo.exe")
+    }
     & dotnet build (Join-Path $path "SmokeTest\SmokeTest.csproj") -f net10.0 -c Release -v q --nologo | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "build failed for $commit" }
     return (Join-Path $path "SmokeTest\bin\Release\net10.0\SmokeTest.exe")
 }
 
-function Measure-Side([string]$exe, [int]$portBase) {
-    $acc = @{}
-    $p = $portBase
-    foreach ($rep in 1..$Repetitions) {
-        foreach ($sz in $Sizes) {
-            $p++
-            $proc = Start-Process $exe -ArgumentList @("--http", "--iocp", "-n", "$Shards", "-z", "$sz", "--port", "$p") `
-                -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ab.out" -RedirectStandardError "$env:TEMP\ab.err"
-            try { $proc.ProcessorAffinity = [IntPtr]$serverMask } catch { }
-            Start-Sleep 4
-            $b = Start-Process $bombardier -ArgumentList @("-c", "$Connections", "-d", $Duration, "-o", "json", "-p", "r", "http://127.0.0.1:$p/") `
+# One measurement of one side at one payload. Split out of Measure-Side so the two sides can be
+# INTERLEAVED (see below) rather than run as two blocks.
+function Measure-One([string]$exe, [int]$port, [int]$sz) {
+    $argList = if ($Bridged) { @("--$Backend", "--shards", "$Shards", "--port", "$port") }
+               else { @("--http", "--$Backend", "-n", "$Shards", "-z", "$sz", "--port", "$port") }
+    $proc = Start-Process $exe -ArgumentList $argList `
+        -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ab.out" -RedirectStandardError "$env:TEMP\ab.err"
+    try { $proc.ProcessorAffinity = [IntPtr]$serverMask } catch { }
+    try {
+        $url = if ($Bridged) { "http://127.0.0.1:$port/payload?n=$sz" } else { "http://127.0.0.1:$port/" }
+        if ($Bridged) {
+            # Trust the banner, not the flag: refuse to measure a side whose transport is not the one asked for.
+            $cfg = $null
+            $deadline = (Get-Date).AddSeconds(40)
+            while ((Get-Date) -lt $deadline) {
+                $raw = & curl.exe -s --max-time 3 "http://127.0.0.1:$port/config" 2>$null
+                if ($LASTEXITCODE -eq 0 -and $raw) { try { $cfg = ($raw | ConvertFrom-Json).config; break } catch { } }
+                Start-Sleep -Milliseconds 400
+            }
+            if ($cfg -notlike "*transport=socketset/$Backend*") { Write-Warning "config mismatch: $cfg"; return $null }
+        }
+        else { Start-Sleep 4 }
+
+        # A warm-up load before the scored one, per measurement. Added 2026-07-29: without it this rig's
+        # per-side spread at 256KB was 6-10% where Run-TlsSizes.ps1 (which does warm up per leg) sees
+        # 2.2% on the same leg and host. Discarding pass 1 does not substitute - every measurement here
+        # starts a FRESH server process, so each one pays its own JIT and pool-fill transient, not just
+        # the first. A rig that can only resolve 10% cannot answer the questions it is pointed at.
+        foreach ($phase in @($WarmupDuration, $Duration)) {
+            $b = Start-Process $bombardier -ArgumentList @("-c", "$Connections", "-d", $phase, "-o", "json", "-p", "r", $url) `
                 -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ab.json" -RedirectStandardError "$env:TEMP\ab.jerr"
             try { $b.ProcessorAffinity = [IntPtr]$clientMask } catch { }
             $b.WaitForExit()
-            $j = Get-Content "$env:TEMP\ab.json" -Raw
-            if ($j -match '"result"' -and $rep -gt 1) {
-                $acc[$sz] = @($acc[$sz]) + [math]::Round((($j | ConvertFrom-Json).result.rps.mean * $sz / 1MB), 1)
-            }
-            try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
-            Start-Sleep 2
         }
+        $j = Get-Content "$env:TEMP\ab.json" -Raw
+        if ($j -notmatch '"result"') { return $null }
+        return [math]::Round((($j | ConvertFrom-Json).result.rps.mean * $sz / 1MB), 1)
     }
-    return $acc
+    finally {
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+        Start-Sleep 2
+    }
 }
 
 function Get-Median([double[]]$v) {
@@ -127,15 +163,38 @@ try {
 
     # Guard against the failure this harness exists because of: if the two builds are byte-identical, the
     # commits differ in nothing that affects this binary and any delta reported would be pure noise.
-    $hb = (Get-FileHash $exeBefore).Hash
-    $ha = (Get-FileHash $exeAfter).Hash
+    #
+    # In -Bridged mode hash SocketSet.dll, not the host exe: a transport-only change (dd8cdce touches
+    # OutboundConnection.cs and nothing else) leaves AspNetDemo.exe identical on both sides, and hashing
+    # it would abort a comparison that is perfectly valid.
+    $hashOf = { param($exe) if ($Bridged) { Join-Path (Split-Path $exe) "SocketSet.dll" } else { $exe } }
+    $hb = (Get-FileHash (& $hashOf $exeBefore)).Hash
+    $ha = (Get-FileHash (& $hashOf $exeAfter)).Hash
     if ($hb -eq $ha) {
         Write-Host "ABORT: both sides produced an identical binary - there is nothing to compare." -ForegroundColor Red
         return
     }
 
-    $rb = Measure-Side $exeBefore $PortBase
-    $ra = Measure-Side $exeAfter ($PortBase + 500)
+    # INTERLEAVED, changed 2026-07-29. This used to measure all of `before`, then all of `after`, which
+    # puts every before-pass earlier in wall-clock than every after-pass: anything that drifts over a run
+    # (thermals, a background task starting, the client's ephemeral-port pool filling) lands entirely on
+    # one side of the subtraction and is indistinguishable from the change. Alternating within each pass
+    # costs nothing and removes that whole class of error.
+    $rb = @{}; $ra = @{}
+    $p = $PortBase
+    foreach ($rep in 1..$Repetitions) {
+        foreach ($sz in $Sizes) {
+            $p += 2
+            # Swap which side goes first on alternate passes, so neither one is always the leg that runs
+            # into a still-settling host.
+            $order = if ($rep % 2 -eq 1) { @(@{ e = $exeBefore; a = $rb; o = 0 }, @{ e = $exeAfter; a = $ra; o = 1 }) }
+                     else { @(@{ e = $exeAfter; a = $ra; o = 1 }, @{ e = $exeBefore; a = $rb; o = 0 }) }
+            foreach ($side in $order) {
+                $v = Measure-One $side.e ($p + $side.o) $sz
+                if ($null -ne $v -and $rep -gt 1) { $side.a[$sz] = @($side.a[$sz]) + $v }
+            }
+        }
+    }
 
     Write-Host ""
     Write-Host "=== goodput MiB/s, median of $($Repetitions - 1) scored passes ===" -ForegroundColor Cyan

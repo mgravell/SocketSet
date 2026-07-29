@@ -27,6 +27,23 @@ happened, in one paragraph each:
    (overlapping ranges), where on Linux it was independently worth +7.5% - so on IOCP the flag is purely
    the enabler that gets a response under the cap, and none of the +117% belongs to the block size.
 
+4. **§2's premise was wrong, and the baseline re-measurement cannot answer what it was asked.** The plan
+   said "compare against the 2026-07-27 numbers" to see what the copy removal bought Windows. It does
+   re-measure cleanly - **both Kestrel controls reproduce within ~1%**, and IOCP is **+17.6% at 256KB** -
+   but **six** commits touching Windows-reachable code sit in that window (`963143b`, `ff1a1c1`,
+   `efcb1cc`, `30756c2`, `be09aed`, `dd8cdce`), and at least three of them can move a 256KB bridged
+   number. A cross-day delta spanning six commits is a changelog, not an attribution. `Compare-Commits.ps1`
+   gained a `-Bridged` switch (and interleaving) for the measurement that *can* attribute it.
+   **Generalise the lesson:** "compare against the last recorded number" is only an attribution when
+   nothing else landed in between, and this file's own commit list is the thing to check first.
+5. **And the attributing A/B FALSIFIES §2's prediction.** §2 said the copy removal "should HELP Windows
+   MORE than Linux" because the Windows path had 3-4 copies to Linux's 2. Isolated worktrees, one commit,
+   interleaved, run twice: **+0.8% and -0.0%**, ranges overlapping, with an epoll-sized +16.3% excluded.
+   So the +17.6% belongs to one of the other five commits and **which one is not established** - that is
+   the one loose end this session leaves. The copy-count correlation in `RESULTS.md`'s matrix does not
+   generalise to Windows, and this is now its second failed prediction (it also failed to explain why the
+   bridge costs epoll twice what it costs io_uring).
+
 **What that leaves open**, and it is now the top of the Windows list rather than the bottom:
 
 - **The mechanism decision from §3 is now forced.** The flag route worked, so "raise `MaxSendPages`, or

@@ -75,9 +75,11 @@ segments into its own writer:
 | IOCP classic / RIO | accumulator -> `StageOutbound` pooled staging -> drain into write pages (the `Flush` snapshot copy is gone) | **2-3** *(was 3-4)* |
 
 The epoll and Windows rows dropped by one on 2026-07-29 - see the test below, which is what removed it.
-**Windows now has the change CHECKED but not attributed**: the smoke matrix passes on IOCP/RIO/managed
-(see "Windows validation after the OS switch"), and an interleaved A/B on the out-of-band path gives
-overlapping ranges, so there is no Windows throughput delta to credit the copy removal with either way.
+**On Windows the change is correct and worth nothing measurable**: the smoke matrix passes on
+IOCP/RIO/managed, and two interleaved same-session A/Bs of that one commit on the bridged IOCP path give
++0.8% and -0.0% with overlapping ranges - an epoll-sized win is excluded. The copy-count correlation in
+the table above therefore does NOT predict Windows: removing one of 3-4 copies there did nothing, where
+removing one of 2 on epoll was worth +16.3%.
 
 `IoUringConnection` derives from `Connection` and owns its `OutChain` writer, which is why it escapes the
 `Flush` snapshot; `EpollConnection` and `WindowsConnection` both derive from `OutboundConnection` and pay
@@ -212,14 +214,24 @@ Bridge cost at 256KB is therefore **23.9% on io_uring and 40.3% on epoll** - ess
 copy removal, because both sides of the subtraction rose. Copy count does NOT explain why the same bridge
 costs epoll nearly twice what it costs io_uring; see the refutation below.
 
-### Headline numbers, Windows (2026-07-27, same silicon, NOT comparable with the above)
+### Headline numbers, Windows (2026-07-29, same silicon, NOT comparable with the above)
+
+Re-measured 2026-07-29 at 12 shards, 6 scored passes. Both Kestrel controls reproduce the 2026-07-27
+figures within ~1%, so the two Windows tables *are* comparable with each other - unlike the Linux rows
+above, which are a different OS.
 
 | leg | 16 KB | 256 KB |
 |---|---:|---:|
-| kestrel (bridged) | 4,007.7 | 11,488.9 |
-| iocp (bridged) | 3,741.1 | 4,483.4 |
-| rio (bridged, default 4KB page) | 1,521.1 | 2,051.6 |
-| **rio, bare, tuned** (64KB page + 4KB recv) | 4,365.8 | **11,030.2** |
+| kestrel (bridged) | 3,991.9 | 11,620.0 |
+| iocp (bridged) | 3,745.2 | 5,273.3 |
+| **iocp, bridged, `--byo --pipe-segment 65536`** | **9,042.4**\* | **11,393.3**\* |
+| rio (bridged, default 4KB page) | 1,530.9 | 2,108.2 |
+| *rio, bare, tuned* (64KB page + 4KB recv, 2026-07-27) | *4,365.8* | *11,030.2* |
+
+\* From `Run-Byo.ps1`, a different session from the rest of the column - so it is the right row to read
+for "what can this transport do on Windows", and the wrong one to subtract from the `kestrel` cell.
+Its 64KB figure is not comparable with the 16KB column either; it is the 64KB payload, which the sweep
+above does not cover.
 
 ### How to read all of it
 
@@ -377,6 +389,79 @@ that has run, no gap against Kestrel should be quoted from this table.
 **And 2b-result's reading is now retracted for IOCP.** "Zero-copy send removed one copy and bought +3.5%,
 so copies are not the cost" was measured on a path that declined at the payload of interest. Both halves
 of that sentence were true and the conclusion did not follow.
+
+### The Windows baseline, re-measured — and why it does NOT say what it was meant to
+
+`bench/Run-TlsSizes.ps1 -Shards 12 -Sizes 16384,262144 -Repetitions 7`, 6 scored passes, reshuffled leg
+order, zero errors across 84 cells. Goodput MiB/s, median [min-max]:
+
+| leg | 16 KB | 256 KB |
+|---|---:|---:|
+| kestrel | 3,991.9 [3990-4014] | 11,620.0 [10843-11779] |
+| kestrel+tls | 3,143.9 [3086-3171] | 7,096.6 [6999-7182] |
+| iocp/s12 | 3,745.2 [3704-3782] | 5,273.3 [5205-5320] |
+| iocp+tls/s12 | 3,331.2 [3259-3395] | 4,683.7 [4614-4817] |
+| rio/s12 | 1,530.9 [1521-1535] | 2,108.2 [2081-2127] |
+| rio+tls/s12 | 1,446.7 [1413-1462] | 2,182.7 [2172-2194] |
+
+Against the 2026-07-27 table, **both Kestrel controls reproduce to within ~1%** (3,991.9 vs 4,007.7;
+11,620.0 vs 11,488.9), which is the check that makes the rest of the column readable at all - the host,
+the harness and the client are behaving the same way two days later.
+
+On that basis: IOCP is **+17.6% at 256KB** (4,483.4 -> 5,273.3) and unchanged at 16KB (+0.1%); RIO is
++2.8% and +0.6%.
+
+**But that +17.6% CANNOT be attributed to the copy removal, and §2 of the cold-start plan was wrong to
+expect it could.** The plan said "compare against the 2026-07-27 numbers". Six commits touching
+Windows-reachable code sit in that window - `963143b` and `ff1a1c1` (the Windows shard factoring),
+`efcb1cc` (BYO phase 1, which edits both Windows shards), `30756c2` (IOCP zero-copy **and a backpressure
+bug fix**), `be09aed` (write-pool exhaustion: stage and retry instead of closing), and `dd8cdce`. Any of
+the last three could move a 256KB bridged number. A cross-day delta over six commits is a changelog, not
+an attribution.
+
+The attributing measurement is a same-session A/B of the one commit, on the bridged path - see below.
+
+### FALSIFIED: the copy removal is worth NOTHING measurable on the bridged Windows path
+
+The cold-start plan predicted the opposite, and said why: "the Windows path had *more* copies to start
+with (3-4), so removing one should show at least as well" as Linux epoll's +16.3%.
+
+`bench/Compare-Commits.ps1 -Before dd8cdce~1 -After dd8cdce -Bridged -Backend iocp -Sizes 262144
+-Shards 12 -Repetitions 7` - isolated worktrees, one commit, same session, sides interleaved and
+alternated within each pass. Run twice:
+
+| run | before | after | change |
+|---|---:|---:|---:|
+| first | 5,083.0 [5064-5392] | 5,124.1 [4929-5451] | +0.8% |
+| second (per-measurement warm-up added) | 5,248.8 [5039-5542] | 5,247.4 [4653-5306] | **-0.0%** |
+
+**Both centre on zero with heavily overlapping ranges, so there is no effect to report in either
+direction.** What the two runs *can* exclude is an epoll-sized win: +16.3% on the second run's before
+median would be 6,105 MiB/s, far outside the after side's entire range.
+
+So **the +17.6% in the table above does not belong to this commit**, and one of the other five in the
+window owns it. Which one is not established here.
+
+*A reading, not a measurement:* epoll went from 2 copies to 1 - halving them - for +16.3%. The Windows
+bridged path went 3-4 to 2-3, and still stages through `StageOutbound` before draining into write pages.
+Removing one of four is a smaller fraction of a larger total, and the staging step it does not remove is
+the one unique to this path. That is consistent with the +117.3% above, where what moved the number was
+not removing *a* copy but removing the whole copying path.
+
+*Two rig changes came out of this, both in `Compare-Commits.ps1`:* a `-Bridged` switch (it only ever
+measured the bare responder, while every headline Windows table is bridged), and **interleaving** - it
+used to measure all of `before` then all of `after`, which puts every before-pass earlier in wall-clock
+than every after-pass, so any drift lands entirely on one side of the subtraction. The per-measurement
+warm-up was added on the theory that it would tighten the 6-10% spread; **it did not** (9.6% and 12.4%
+on the second run), so that spread is a property of this measurement rather than of cold processes, and
+the rig cannot currently resolve anything below about 10% at 256KB. It is kept because the reasoning for
+it is still right; it just was not the cause.
+
+**One anomaly worth recording rather than explaining away:** at 256KB, `rio+tls` (2,182.7 [2172-2194])
+is **faster than plaintext `rio`** (2,108.2 [2081-2127]), and the ranges are disjoint. A TLS leg beating
+its own plaintext control is the signature `Run-TlsSizes.ps1`'s own header warns about - it means the two
+are bounded by different things, not that TLS is free. Both RIO legs are page-quantised (item 0d), which
+is the obvious suspect, but this is not diagnosed and should not be quoted as a TLS result.
 
 ## Environment (current baseline, 2026-07-27)
 
