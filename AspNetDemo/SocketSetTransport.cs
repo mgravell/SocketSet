@@ -30,11 +30,19 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
     private readonly Channel<ConnectionContext> _accepted =
         Channel.CreateUnbounded<ConnectionContext>(new UnboundedChannelOptions { SingleReader = true });
     private readonly DemoConfig _config;
+    // One pool per listener, shared by every connection's pipes: the point of a pinned pool is that blocks
+    // are recycled, so a per-connection pool would allocate pinned memory per connection and never reuse it.
+    private readonly System.Buffers.MemoryPool<byte>? _pipePool;
     private readonly SocketSets.Tls.TlsProvider? _tls;
     private TransportSet _set = null!;
 
+    public bool PipePinned => _config.PipePinned;
+
     public SocketSetConnectionListener(EndPoint endpoint, DemoConfig config, SocketSets.Tls.TlsProvider? tls)
     {
+        _pipePool = config.PipePinned
+            ? new PinnedBlockMemoryPool(config.PipeSegment > 0 ? config.PipeSegment : 4096)
+            : null;
         EndPoint = endpoint;
         _config = config;
         _tls = tls;
@@ -77,7 +85,7 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
         // With TLS this fires only after the handshake has completed, so conn.NegotiatedProtocol is
         // already settled by the time the features are built.
         Interlocked.Increment(ref Accepts);
-        var c = new SocketSetConnection(conn, _tls is not null, _config.ByoPipe);
+        var c = new SocketSetConnection(conn, _tls is not null, _config.ByoPipe, _config.PipeSegment, _pipePool);
         conn.UserToken = c;
         return c;
     }
@@ -136,7 +144,11 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
             // SocketSetConnection copying inbound and pumping outbound. The same two pipes either way -
             // this relocates the bridge rather than removing it, which is the point: it is the vehicle the
             // per-backend zero-copy work needs, and a like-for-like baseline to measure that against.
-            if (listener.ByoPipe) ctx.UsePipe(c.TransportSide);
+            // pinned: true is an ASSERTION to the transport that these addresses are stable, so it may
+            // skip per-segment GCHandle pinning. Only ever true when the pipes are actually backed by the
+            // pinned-block pool - asserting it over a movable pool would hand the kernel memory the GC can
+            // move underneath it.
+            if (listener.ByoPipe) ctx.UsePipe(c.TransportSide, listener.PipePinned);
             listener.PublishConnection(c);
         }
         protected override void OnReceive(ref ReceiveContext ctx) => listener.OnReceive(ctx.Connection, ctx.Payload);

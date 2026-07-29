@@ -73,6 +73,15 @@ internal sealed class DemoConfig
     /// be measured against each other on the same harness.</summary>
     public bool ByoPipe { get; private set; }
 
+    /// <summary>Pipe block size for the bridge's pipes (0 = framework default, ~4KB). At 4KB a 256KB
+    /// response is ~65 pipe segments; at 64KB it is ~5. Drives iovec count, WriteAll iterations and (on
+    /// the zero-copy send path) the number of per-segment pins.</summary>
+    public int PipeSegment { get; private set; }
+
+    /// <summary>Back the bridge's pipes with a pinned-block pool and assert `pinned: true` to the
+    /// transport, so a zero-copy send skips per-segment GCHandle pinning entirely.</summary>
+    public bool PipePinned { get; private set; }
+
     public string Scheme => Tls ? "https" : "http";
 
     private DemoConfig() { }
@@ -112,6 +121,9 @@ internal sealed class DemoConfig
                 case "--recv-buffer" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rb): cfg.RecvBufferSize = rb; i++; break;
                 case "--write-buffers" when i + 1 < args.Length && int.TryParse(args[i + 1], out var wb): cfg.WriteBuffers = wb; i++; break;
                 case "--byo": cfg.ByoPipe = true; break;
+                case "--pipe-segment" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ps):
+                    cfg.PipeSegment = ps; i++; break;
+                case "--pipe-pinned": cfg.PipePinned = true; break;
 
                 case "-h":
                 case "--help": cfg.Help = true; break;
@@ -194,7 +206,9 @@ internal sealed class DemoConfig
         string bufs = (PageSize > 0 ? $" page={PageSize}" : "")
                     + (RecvBufferSize > 0 ? $" recvbuf={RecvBufferSize}" : "")
                     + (WriteBuffers > 0 ? $" writebufs={WriteBuffers}" : "")
-                    + (ByoPipe ? " byo=pipe" : "");
+                    + (ByoPipe ? " byo=pipe" : "")
+                    + (PipeSegment > 0 ? $" pipeseg={PipeSegment}" : "")
+                    + (PipePinned ? " pipepinned=1" : "");
 
         return VanillaKestrel
             ? $"transport={transport} tls={tls} port={Port}"

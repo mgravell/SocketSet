@@ -51,15 +51,22 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
 
     private readonly bool _byo;
 
-    public SocketSetConnection(Connection conn, bool tls, bool byo = false)
+    public SocketSetConnection(Connection conn, bool tls, bool byo = false,
+                              int pipeSegment = 0, MemoryPool<byte>? pipePool = null)
     {
         _conn = conn;
         _byo = byo;
         var sched = PipeScheduler.ThreadPool;
-        _inbound = new Pipe(new PipeOptions(readerScheduler: sched, writerScheduler: sched,
-            useSynchronizationContext: false, pauseWriterThreshold: 1 << 20, resumeWriterThreshold: 1 << 19));
-        _outbound = new Pipe(new PipeOptions(readerScheduler: sched, writerScheduler: sched,
-            useSynchronizationContext: false));
+        // minimumSegmentSize and the pool are the two levers behind the "65 segments per 256KB response"
+        // measurement (see PinnedBlockMemoryPool). Both default to the framework's choices so an unflagged
+        // run is byte-for-byte the old behaviour.
+        var pool = pipePool ?? MemoryPool<byte>.Shared;
+        int seg = pipeSegment > 0 ? pipeSegment : -1; // -1 = PipeOptions' own default
+        _inbound = new Pipe(new PipeOptions(pool, readerScheduler: sched, writerScheduler: sched,
+            useSynchronizationContext: false, pauseWriterThreshold: 1 << 20, resumeWriterThreshold: 1 << 19,
+            minimumSegmentSize: seg));
+        _outbound = new Pipe(new PipeOptions(pool, readerScheduler: sched, writerScheduler: sched,
+            useSynchronizationContext: false, minimumSegmentSize: seg));
 
         Transport = this;
         // The transport's view is the mirror of Kestrel's: it WRITES what it receives (into the inbound

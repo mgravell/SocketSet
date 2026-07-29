@@ -1146,6 +1146,54 @@ still copy and Kestrel does not) is the obvious next term.
 takes one `GCHandle` pin per segment - 65 pins and 65 disposes per response here - and it still won by
 45%. A pinned-block pool (TODO 2d) removes that branch entirely, so this is a floor rather than a ceiling.
 
+### Pipe options: block size is worth +6-8%, pinning is not, and the memory bill is 2.7x (2026-07-29)
+
+The bridge's two `Pipe`s are ours to configure and were left at framework defaults. The zero-copy work
+produced the number that made this worth testing: a 256KB response is **exactly 65.00 iovec segments** at
+the default ~4KB block, and **5.00** at a 64KB block (`SS_URING_STATS`, measured both ways). Legs are
+byo-vs-byo so the reading isolates the pipe change rather than what pipe mode costs.
+`bench/run-pipe-opts.sh`, io_uring, 12 shards, `-c 64`, 4 scored passes, goodput MiB/s:
+
+| payload | classic | byo | **byo + 64KB seg** | byo + 64KB + pinned |
+|---|---:|---:|---:|---:|
+| 512 B | 327.6 | 321.4 | 321.2 | 329.9 |
+| 16 KB | 6,950.6 [6822-7005] | 6,741.6 [6685-6830] | **7,388.0** [7369-7439] | 7,108.2 [6950-7338] |
+| 64 KB | - | 10,626.4 | 10,452.5 | 10,589.2 |
+| 256 KB | 7,950.2 (earlier run) | 11,501.5 [11402-11638] | **12,363.6** [12325-12440] | 12,452.4 [12289-12501] |
+
+**Block size is the lever: +7.5% at 256KB and +6.3% at 16KB over byo, both disjoint.** 512B and 64KB are
+unmoved, which is the predicted shape - at those sizes a response is 1-2 segments either way.
+
+**Pinning is not.** `--pipe-pinned` adds +0.7% at 256KB with overlapping ranges. That is not a
+disappointment so much as an arithmetic consequence: pinning saves one `GCHandle` per segment, and the
+64KB block already cut segments from 65 to 5, so there were only 5 pins left to save. The two levers
+overlap; the segment one does the work. (Pinning *alone*, at 4KB blocks and 65 pins per response, was not
+measured separately - that is the open cell in this table.)
+
+**And byo alone is NOT universally better than the shipped bridge.** It is -3.0% at 16KB (ranges barely
+touching) and level at 512B; its win is concentrated at 256KB (+45%). It is **byo + big blocks** that
+beats classic everywhere measured.
+
+#### The bill: 2.7x resident memory at 2048 connections
+
+Peak RSS under load, io_uring, 8 shards, 16KB responses:
+
+| connections | byo (4KB blocks) | byo + 64KB seg | delta |
+|---|---:|---:|---:|
+| 64 | 164,824 KB | 181,124 KB | +16 MB |
+| 512 | 264,788 KB | 484,220 KB | **+219 MB** |
+| 2048 | 360,144 KB | 977,328 KB | **+617 MB** |
+
+About **300 KB per connection** - two pipes, each holding several 64KB blocks in flight rather than
+several 4KB ones. This is the same `connections x buffer-size` trade that the receive-slab work ran into,
+arriving from the other side of the bridge, and it is invisible to a throughput-only reading.
+
+**So there is no single right default, for the same reason page size had none:** the best block size is a
+function of expected payload *and* expected concurrency, and a library cannot know either. Large blocks
+are right for big responses at modest connection counts and wrong for a connection-heavy small-message
+server. Both are now flags (`--pipe-segment`, `--pipe-pinned`), reported in `/config`, and gated by the
+rig both ways so two legs cannot silently be the same configuration.
+
 ### SUPERSEDED: "epoll beats io_uring by 58% at 256KB" was this defect, not a structural difference
 
 The section below concluded that io_uring trails epoll at 256KB because it copies every outbound byte into
