@@ -1376,18 +1376,30 @@ active, plain `recv` returns plaintext, and `IORING_OP_RECV` + `IORING_RECV_MULT
 buffer ring should work unmodified** - that part of the external claim is mechanically sound, and it is
 the prize.
 
-**The claim's TLS-1.2/1.3 direction is suspect, and our evidence points the opposite way.** OpenSSL here is
-**3.0.13**, and 3.0.x is understood to decline KTLS *receive* for TLS 1.3 (post-handshake KeyUpdate is the
-usual reason given), while supporting it for TLS 1.2. If that is what is happening, then negotiating TLS
-1.3 - which we almost certainly do by default - is precisely *why* `TlsRxSw` is stuck at zero, and the
-advice "enforce TLS 1.3" would keep RX offload permanently off rather than enable it. **Not asserted:
-this is a hypothesis that fits the one number we have.**
+**MEASURED 2026-07-29, and the answer inverts the usual advice.** `SmokeTest --ktls-spike` (the standalone
+`KtlsProbe`, which does a plain socket-fd handshake and asks OpenSSL directly via
+`BIO_get_ktls_send/recv`) now takes two switches, so the candidates could be separated in seconds:
 
-**Cheapest decisive test, and it is small:** add a max-protocol-version knob, force TLS 1.2 on a kTLS leg,
-and watch `TlsRxSw`. If it moves off zero, OpenSSL's TLS-1.3 RX restriction is the blocker and the
-external advice is inverted for this OpenSSL version. If it stays at zero, something else declines RX and
-the version is a red herring. Note we cannot currently even see what was negotiated - "negotiated cipher
-suite is not reported" is already on the smaller-items list, and this is a second reason to fix it.
+| run | TLS version | client | server | probe |
+|---|---|---|---|---|
+| baseline | 1.3 | TX=True **RX=False** | TX=True **RX=False** | FAIL |
+| `SS_KTLS_CLEAR_NO_RX=1` | 1.3 | TX=True **RX=False** | TX=True **RX=False** | FAIL - no change |
+| **`SS_KTLS_FORCE_TLS12=1`** | **1.2** | TX=True **RX=True** | TX=True **RX=True** | **PASS** |
+| both | 1.2 | TX=True RX=True | TX=True RX=True | PASS |
+
+**So: OpenSSL 3.0.13 declines kTLS RX for TLS 1.3 and grants it for TLS 1.2.** The `SSL_MODE_NO_KTLS_RX`
+theory is refuted (clearing it changes nothing). The "you never called `SSL_read`" and "you used a memory
+BIO" theories were already excluded - this probe does neither, and still saw RX=False on 1.3.
+
+**The common advice "enforce TLS 1.3 to keep multishot" is therefore backwards on this OpenSSL**: 1.3 is
+exactly what keeps RX offload off. The honest options are (a) OpenSSL **3.2+**, which is *said* to support
+TLS 1.3 kTLS RX - unverified here, this box has 3.0.13 - or (b) cap at TLS 1.2, which is a real security
+and performance regression and is only sane as an experimental vehicle, not a shipping default.
+
+**And the property multishot needs is directly confirmed.** In the passing runs the probe completes a
+**plain `send` -> plain `recv` round-trip over the kTLS socket** - the kernel doing the crypto, no OpenSSL
+in the data path. That is precisely what `IORING_OP_RECV` + `IORING_RECV_MULTISHOT` over a provided-buffer
+ring requires, so the external claim's core mechanism holds; only its version advice was inverted.
 
 **If RX offload can be turned on, the follow-on work is small and the payoff is item 4's whole point:**
 

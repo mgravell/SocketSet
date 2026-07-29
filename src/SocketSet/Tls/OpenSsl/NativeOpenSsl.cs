@@ -43,6 +43,18 @@ internal static unsafe partial class NativeOpenSsl
     public const int BIO_CTRL_GET_KTLS_SEND = 73;     // BIO_get_ktls_send: is kernel TX-offload active?
     public const int BIO_CTRL_GET_KTLS_RECV = 76;     // BIO_get_ktls_recv: is kernel RX-offload active?
 
+    // --- SSL_CTX_ctrl commands (the macros SSL_CTX_set_mode / clear_mode / set_max_proto_version) ---
+    // Added 2026-07-29 to test WHY kTLS RX never engages here (TlsRxSw is 0 cumulative, and the standalone
+    // probe reports RX=False even over a plain socket BIO). Two candidate causes need distinguishing:
+    // a mode bit suppressing RX, and OpenSSL < 3.2 declining RX offload for TLS 1.3.
+    public const int SSL_CTRL_SET_MODE = 33;
+    public const int SSL_CTRL_CLEAR_MODE = 78;
+    public const int SSL_CTRL_SET_MAX_PROTO_VERSION = 124;
+    public const long SSL_MODE_NO_KTLS_TX = 0x00000200L;
+    public const long SSL_MODE_NO_KTLS_RX = 0x00000400L;
+    public const long TLS1_2_VERSION = 0x0303;
+    public const long TLS1_3_VERSION = 0x0304;
+
     static NativeOpenSsl()
     {
         NativeLibrary.SetDllImportResolver(typeof(NativeOpenSsl).Assembly, static (name, asm, path) =>
@@ -95,6 +107,7 @@ internal static unsafe partial class NativeOpenSsl
     // kTLS path: bind the SSL directly to a socket fd (socket BIO), toggle options, inspect the BIOs.
     [LibraryImport(Ssl)] public static partial int SSL_set_fd(IntPtr ssl, int fd);
     [LibraryImport(Ssl)] public static partial ulong SSL_CTX_set_options(IntPtr ctx, ulong options);
+    [LibraryImport(Ssl)] public static partial long SSL_CTX_ctrl(IntPtr ctx, int cmd, long larg, IntPtr parg);
     [LibraryImport(Ssl)] public static partial ulong SSL_set_options(IntPtr ssl, ulong options);
     [LibraryImport(Ssl)] public static partial IntPtr SSL_get_rbio(IntPtr ssl);
     [LibraryImport(Ssl)] public static partial IntPtr SSL_get_wbio(IntPtr ssl);

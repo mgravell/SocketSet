@@ -56,6 +56,29 @@ public static unsafe class KtlsProbe
         SSL_CTX_set_options(sctx, SSL_OP_ENABLE_KTLS);
         SSL_CTX_set_options(cctx, SSL_OP_ENABLE_KTLS);
 
+        // WHY kTLS RX never engages: two candidate causes, switchable here so the probe can distinguish
+        // them in seconds rather than by argument (2026-07-29). Baseline on this box is TX=True RX=False
+        // with a plain socket BIO, so the usual suspects - "you never called SSL_read, so OpenSSL never
+        // ran the deferred setsockopt(TLS_RX)" and "you used a memory BIO" - are already excluded: this
+        // probe does neither.
+        //   SS_KTLS_CLEAR_NO_RX=1 : clear SSL_MODE_NO_KTLS_RX, in case a mode bit is suppressing RX.
+        //   SS_KTLS_FORCE_TLS12=1 : cap at TLS 1.2. OpenSSL 3.0.x is understood to decline kTLS RECEIVE
+        //                           for TLS 1.3 (post-handshake KeyUpdate); 3.2+ is said to lift it. If
+        //                           RX flips to True only here, that is the cause - and note it inverts
+        //                           the common advice to "enforce TLS 1.3", which would keep RX off.
+        if (Environment.GetEnvironmentVariable("SS_KTLS_CLEAR_NO_RX") == "1")
+        {
+            SSL_CTX_ctrl(sctx, SSL_CTRL_CLEAR_MODE, SSL_MODE_NO_KTLS_RX, IntPtr.Zero);
+            SSL_CTX_ctrl(cctx, SSL_CTRL_CLEAR_MODE, SSL_MODE_NO_KTLS_RX, IntPtr.Zero);
+            Log("mode: cleared SSL_MODE_NO_KTLS_RX on both contexts");
+        }
+        if (Environment.GetEnvironmentVariable("SS_KTLS_FORCE_TLS12") == "1")
+        {
+            SSL_CTX_ctrl(sctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_2_VERSION, IntPtr.Zero);
+            SSL_CTX_ctrl(cctx, SSL_CTRL_SET_MAX_PROTO_VERSION, TLS1_2_VERSION, IntPtr.Zero);
+            Log("version: capped at TLS 1.2 on both contexts");
+        }
+
         // Server cert + key.
         nint x = LoadX509(certPem), k = LoadKey(keyPem);
         if (SSL_CTX_use_certificate(sctx, x) != 1 || SSL_CTX_use_PrivateKey(sctx, k) != 1)
