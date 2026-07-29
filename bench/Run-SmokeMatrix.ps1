@@ -84,7 +84,15 @@ $tests = @(
 
 # How each test's output is judged. "PASS"/"FAIL" is printed by the verify harnesses and by churn; the
 # poke leg prints neither, so it is judged on having actually moved bytes.
-function Test-CellOutput([string]$Name, [string]$Text) {
+function Test-CellOutput([string]$Name, [string]$Text, [int]$ExitCode = 0) {
+    # A hard crash must be NAMED, not left to fall through as "no result line". The RIO+TLS churn cell
+    # takes an intermittent access violation (TODO item 0e), and on the first run that reported as a
+    # missing output line - which reads like a harness problem rather than the process dying.
+    switch ($ExitCode) {
+        -1073741819 { return @($false, "ACCESS VIOLATION (0xC0000005) - see TODO item 0e") }
+        -1073740791 { return @($false, "STACK BUFFER OVERRUN (0xC0000409)") }
+        -1073741571 { return @($false, "STACK OVERFLOW (0xC00000FD)") }
+    }
     if ($Text -match "### UNHANDLED ###") { return @($false, "unhandled exception") }
     switch -Wildcard ($Name) {
         "verify-oob-*" {
@@ -162,7 +170,7 @@ foreach ($cell in $cells) {
         $ok = $false; $detail = "TIMEOUT after ${TimeoutSec}s (wedged)"
     }
     else {
-        $judged = Test-CellOutput $cell.Test $text
+        $judged = Test-CellOutput $cell.Test $text $p.ExitCode
         $ok = $judged[0]; $detail = $judged[1]
     }
 

@@ -4,6 +4,40 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## READ FIRST IF YOU ARE ON LINUX (written 2026-07-29, after a Windows session)
+
+Two things landed on Windows that you need to know about, in this order.
+
+### 1. There is an ACCESS VIOLATION in RIO+TLS under churn, on the shipped defaults — item 0e
+
+It is Windows-only (RIO), so it does not affect you directly, but it is the highest-priority item in this
+file and it is **not fixed**. If you are picking work, that is the work.
+
+### 2. `BufferPageSize` and three pool depths are now `0` = "backend chooses" — and Linux is UNVERIFIED
+
+`SocketSetFactory.DefaultGeometry` supplies whatever the caller left unset, resolved once in the
+`SocketSet` constructor (`SocketSetOptions.ResolvedFor`). **epoll and io_uring are unchanged BY
+CONSTRUCTION** — they inherit `BufferGeometry.Default`, whose values are exactly the old hard-coded
+defaults (page 4096, recv 4096, pools 1024/256/256). No Linux behaviour should move.
+
+"By construction" is not "verified", and it has never been run on Linux. **What to check, in order:**
+
+1. **The banner, not the flag.** `SmokeTest --http` and AspNetDemo's `/config` now print the RESOLVED
+   geometry (`/config` gained a `geometry` field). Confirm epoll and io_uring report
+   `page=4096 recvbuf=4096 writebufs=1024 oobwritebufs=256 readpages=256`. If any reads `0`, a read site
+   was missed and it is measuring something nobody chose.
+2. **The smoke matrix on both backends**, which is by hand there — there is no `.sh` equivalent of
+   `Run-SmokeMatrix.ps1` yet, and writing one is worth more than one run of it.
+3. **Then a size sweep against the last recorded numbers**, which should be flat. Anything that moves is
+   this change, since nothing else about those backends was touched.
+
+If Linux wants a different geometry — io_uring's read pool is per-SHARD, so it can afford a big page
+where epoll's per-SOCKET slab cannot — the mechanism is now there to say so: override `DefaultGeometry`
+on the factory, with a measurement attached. **Do not override it without one**; RIO's has a 4.68x
+throughput result and a correctness-gate failure behind it.
+
+---
+
 ## WINDOWS CATCH-UP: DONE 2026-07-29 (this section was the plan; this header is the result)
 
 **All three jobs below were carried out on 2026-07-29 and the section is kept for its reasoning.** What
@@ -166,11 +200,14 @@ above this one first; item 3 below is what you are here to do.**
    nothing elsewhere.** See `2b-result`. That is the single most useful negative result on this list.
 2. ~~Write-pool exhaustion drops connections (item 0b)~~ **DONE**, with a wrong justification (the "208
    dropped connections" were my harness missing an ephemeral-port gate). The change is right anyway.
-3. ~~Page-size defaults (item 0), blocked on the Linux sweep~~ **UNBLOCKED.** Linux is swept, io_uring's
-   page cliff is fixed, and `ReceiveBufferSize` now reaches every backend. What is left is **not evidence
-   but MECHANISM**: `BufferPageSize` is one global with a real default of 4096, so there is no way to tell
-   "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend chooses) or a
-   factory-supplied default, and that changes public option semantics — its own commit.
+3. ~~Page-size defaults (item 0), blocked on the Linux sweep~~ ~~UNBLOCKED, blocked on MECHANISM~~
+   **DONE on Windows 2026-07-29.** `BufferPageSize` and the three pool depths are now `0` = "backend
+   chooses", filled from `SocketSetFactory.DefaultGeometry` once in the `SocketSet` constructor. Every
+   backend keeps its exact previous geometry except **RIO**, which now asks for a 64KB page with a 4KB
+   receive buffer — and that **fixes item 0d**: `rio+tls/verify-oob-4m` went from a 15.2s failure to
+   passing in 0.2s. **UNVERIFIED ON LINUX** — epoll and io_uring are unchanged by construction (they take
+   `BufferGeometry.Default`, which is the old values), but nobody has run them. See the handover note
+   at the top of this file.
 4. ~~Item 1, the 64KB->256KB collapse~~ **ANSWERED: it is the bridge**, 2.0-2.4% at 64KB and 24.5-41.8% at
    256KB, with the instability the bridge's too. See item 1 for the isolation.
 5. ~~The bridge's pipes are unconfigured (item 2d)~~ **MEASURED 2026-07-29.** Block size is worth
@@ -1086,6 +1123,61 @@ much stronger than when this entry was written**, and what is left is mechanism,
   small/indifferent) and `BufferPageSize` is one global constant with a real default of 4096, so there is
   no way to distinguish "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend
   chooses) or a factory-supplied default; that changes public option semantics and wants its own commit.
+
+### 0e. ACCESS VIOLATION in RIO+TLS under connection churn — ON THE SHIPPED DEFAULTS (2026-07-29)
+
+**Status: reproduced, not diagnosed. This is the most serious defect on this list and it outranks
+everything else on it. It predates 2026-07-29 entirely.**
+
+`SmokeTest --rio --tls-schannel -s -c 64 --churn 10 --close-after 4 --sockets 128 --reset-close` exits
+with **0xC0000005 (access violation)**, intermittently, usually within the first second. Not a wedge, not
+a managed exception - the process dies. `### UNHANDLED ###` never prints, so a managed handler never saw
+it: this is a fault in unsafe/native-interop code, which on this path means the RIO submission or
+completion machinery.
+
+**Frequency, pristine build at `e104568` (before any of 2026-07-29's work), 6 reps per cell:**
+
+| page | write-buffers | pass | access violation |
+|---:|---:|---:|---:|
+| **4096** | **1024** *(the SHIPPED default)* | 5 | **1** |
+| 4096 | 512 | 3 | **3** |
+| 4096 | 128 | 6 | 0 |
+| 65536 | 512 | 2 | **4** |
+| 65536 | 256 | 3 | **3** |
+| 65536 | 128 | 3 | **3** |
+
+**Read that first row again: it happens on the configuration the library ships.** It is not caused by the
+64KB page and not by a shallow pool; both of those change the *rate*, not the existence.
+
+**Why it was never seen before**, and this is the transferable part: it is intermittent at roughly 1-in-6
+on the defaults, and `rio+tls/churn` is ONE cell that had only ever been run a handful of times. Four
+consecutive passes are entirely likely at that rate. **An intermittent fault in a suite you run once per
+change is indistinguishable from a flaky harness** - which is exactly how it read the first time
+(`Run-SmokeMatrix.ps1` reported "no churn result line", because the process died before printing one).
+The harness now names crash exit codes explicitly rather than letting them fall through.
+
+**What is established:**
+- Pre-existing: reproduced 3/8 on `e104568`, and 5/8 on today's HEAD. Nothing from 2026-07-29 causes it.
+- RIO-specific and TLS-specific: the same churn cell on `rio` plaintext, `iocp`, `iocp+tls` and both
+  managed legs has never crashed.
+- Churn-specific: the steady-state cells (`poke`, echo, out-of-band verify) do not crash at any size.
+- Fast: it usually dies inside 1s, i.e. during ramp-up, when reconnects race in-flight teardowns.
+
+**Where to start.** The churn cell exists to stress exactly what this is: reconnect `InitClient` on an
+external thread racing the loop thread still reaping the previous tenant's in-flight ops, with a tight
+`--sockets` table so slots recycle instantly. RIO's teardown carries extra state the IOCP path does not
+(`Rq`, `CommitPending`/`CommitRecv`/`CommitSend`), and a request queue whose lifetime is tied to a socket
+that churn is closing underneath it is the obvious suspect - a `RIOSend`/`RIOReceive` posted against an
+`Rq` belonging to a slot that has just been re-tenanted. `_toCommit` holding a connection across the
+close that frees its `Rq` would do it, and `FlushCommits` walks that list by `CollectionsMarshal.AsSpan`.
+That is a hypothesis from reading, **not** a diagnosis - none of it is confirmed.
+
+**Do not "fix" it by changing pool depths.** Depth moves the frequency around (128 at a 4KB page showed
+0/6) and that is exactly the kind of change that looks like a fix and is a mask. The bug is a lifetime
+race, and the evidence for that is that it happens at the shipped depth too.
+
+**Repro rig:** `scratchpad/av-repro.ps1` in the session notes, or just loop the command above ~8 times
+and watch for exit code -1073741819. It needs no special tooling; the exit code is the whole signal.
 
 ### 0d. RIO + TLS out-of-band send is starved at the default page — a CORRECTNESS-GATE failure (2026-07-29)
 

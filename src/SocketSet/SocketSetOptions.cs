@@ -19,12 +19,30 @@ public class SocketSetOptions
     public bool PinWorkerThreads { get; set; } = true;
     public SocketSetFactory Factory { get; set; } = SocketSetFactory.Default;
     public int EntriesPerShard { get; set; } = 4096;
-    public int BufferPageSize { get; set; } = 4096;
-    public int BufferPagesPerShard { get; set; } = 256;
 
     /// <summary>
-    /// Size of each receive buffer, independent of the send page. <c>0</c> (the default) means "follow
-    /// <see cref="BufferPageSize"/>", which is the historical behaviour.
+    /// Send/write page size. <c>0</c> (the default) means <b>let the backend choose</b> — see
+    /// <see cref="SocketSetFactory.DefaultGeometry"/>.
+    ///
+    /// The sentinel is the whole point. This was previously a plain <c>4096</c>, which made "the user
+    /// asked for 4096" and "the user said nothing" indistinguishable — and they want different answers,
+    /// because the right page is a property of the backend: RIO cannot scatter-gather and needs 64KB
+    /// (4.68x at 256KB, and at 4KB it fails the smoke matrix outright), while IOCP is page-insensitive.
+    ///
+    /// Read the RESOLVED value back from <see cref="SocketSet.Options"/> after construction, never from
+    /// the instance you passed in — that one still says 0, and a banner printing it would be reporting a
+    /// geometry the backend is not using.
+    /// </summary>
+    public int BufferPageSize { get; set; }
+
+    /// <summary>Read/provided buffers per shard (io_uring's read pool). <c>0</c> = backend chooses.</summary>
+    public int BufferPagesPerShard { get; set; }
+
+    /// <summary>
+    /// Size of each receive buffer, independent of the send page. <c>0</c> (the default) means "let the
+    /// backend choose" — which is NOT always "follow <see cref="BufferPageSize"/>" any more, and that is
+    /// deliberate: RIO asks for a 64KB send page with a 4KB receive buffer, because following the page
+    /// there is what turned 283 MB of resident memory into 3,164 MB.
     ///
     /// Honoured by IOCP, RIO, epoll and io_uring - the latter two only since 2026-07-28; before that both
     /// silently used <see cref="BufferPageSize"/> for everything, while the bench banner still printed a
@@ -65,15 +83,17 @@ public class SocketSetOptions
     /// exhaust the client ephemeral-port pool. Not for production (a RST can drop in-flight data).</summary>
     public bool ResetOnClose { get; set; }
 
-    /// <summary>Pre-allocated, pre-pinned outbound buffers per shard. Each in-flight
-    /// send holds one; sized to bound concurrent responses.</summary>
-    public int WriteBuffersPerShard { get; set; } = 1024;
+    /// <summary>Pre-allocated, pre-pinned outbound buffers per shard. Each in-flight send holds one, so
+    /// this also bounds how many connections per shard may have a send in flight at once. <c>0</c> =
+    /// backend chooses.</summary>
+    public int WriteBuffersPerShard { get; set; }
 
     /// <summary>io_uring only: pre-pinned buffers per shard for out-of-band writes (the
     /// <see cref="Connection"/> IBufferWriter/Flush path). Leased from arbitrary threads, so this
     /// pool is thread-safe — kept separate from <see cref="WriteBuffersPerShard"/> so the IO-thread
-    /// echo path never pays for synchronization. Exhausting it spills to managed (ArrayPool) memory.</summary>
-    public int OutOfBandWriteBuffersPerShard { get; set; } = 256;
+    /// echo path never pays for synchronization. Exhausting it spills to managed (ArrayPool) memory.
+    /// <c>0</c> = backend chooses.</summary>
+    public int OutOfBandWriteBuffersPerShard { get; set; }
 
     /// <summary>
     /// io_uring only: max read (provided) buffers a shard may hold in the write path at once,
@@ -82,4 +102,27 @@ public class SocketSetOptions
     /// never fully drains. Clamped below <see cref="BufferPagesPerShard"/>; 0 disables it.
     /// </summary>
     public int MaxBorrowedReadBuffers { get; set; } = 128;
+
+    /// <summary>
+    /// Fill every "backend chooses" sentinel from <paramref name="factory"/>'s geometry, returning a COPY
+    /// so the caller's instance is never mutated behind its back. Called once by the
+    /// <see cref="SocketSet"/> constructor before any shard is created, which is why no backend has to
+    /// know the sentinels exist — a shard only ever sees resolved values.
+    ///
+    /// A copy rather than in-place, for a reason worth keeping: options objects get reused across sets
+    /// (every bench rig builds one and constructs several), and resolving in place would silently bake
+    /// the FIRST backend's geometry into every later set — an A/B that then measured two backends with
+    /// one backend's buffers and reported the difference as theirs.
+    /// </summary>
+    internal SocketSetOptions ResolvedFor(SocketSetFactory factory)
+    {
+        var g = factory.DefaultGeometry;
+        var copy = (SocketSetOptions)MemberwiseClone();
+        if (copy.BufferPageSize <= 0) copy.BufferPageSize = g.PageSize;
+        if (copy.ReceiveBufferSize <= 0) copy.ReceiveBufferSize = g.ReceiveBufferSize;
+        if (copy.WriteBuffersPerShard <= 0) copy.WriteBuffersPerShard = g.WriteBuffersPerShard;
+        if (copy.OutOfBandWriteBuffersPerShard <= 0) copy.OutOfBandWriteBuffersPerShard = g.OutOfBandWriteBuffersPerShard;
+        if (copy.BufferPagesPerShard <= 0) copy.BufferPagesPerShard = g.BufferPagesPerShard;
+        return copy;
+    }
 }

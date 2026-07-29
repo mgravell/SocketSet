@@ -25,8 +25,15 @@ public abstract partial class SocketSet : IDisposable
 
     protected SocketSet(SocketSetOptions options)
     {
-        Options = options;
         var factory = options.Factory;
+
+        // Fill the "backend chooses" sentinels ONCE, before anything reads a size. Everything downstream -
+        // shards, and Options itself - sees resolved values only, so no backend knows the sentinels exist.
+        // Options exposes the RESOLVED copy deliberately: a banner that printed the caller's instance
+        // would report 0, or worse a size the backend is not using, which is the exact failure
+        // bench/README.md rule 1 exists to prevent.
+        options = options.ResolvedFor(factory);
+        Options = options;
 
         // Some backends cap the shard count (e.g. the managed fallback wants exactly 1).
         // (Math.Clamp isn't available on netfx; MaxShards is always >= 1 so this matches it.)

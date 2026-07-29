@@ -94,4 +94,18 @@ public abstract class SocketSetFactory
     /// reuse-port multi-bind that only io_uring does natively.
     /// </summary>
     public virtual int MaxShards => int.MaxValue;
+
+    /// <summary>
+    /// The buffer sizes and pool depths this backend wants when the caller has not chosen them. Every
+    /// zero-valued size on <see cref="SocketSetOptions"/> is filled from here, once, in the
+    /// <see cref="SocketSet"/> constructor - so a shard never sees a sentinel and no backend has to know
+    /// this mechanism exists.
+    ///
+    /// The base returns <see cref="BufferGeometry.Default"/>, which is exactly what every backend got
+    /// before backends could choose. **Override it only with a measurement**: the one override that
+    /// exists (RIO) is backed by a 4.68x throughput result AND a correctness-gate failure at the old
+    /// default, and the entry that motivated it spent days blocked on this mechanism rather than on
+    /// evidence.
+    /// </summary>
+    public virtual BufferGeometry DefaultGeometry => BufferGeometry.Default;
 }

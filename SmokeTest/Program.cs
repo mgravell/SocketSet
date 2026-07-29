@@ -281,13 +281,17 @@ if (args.Contains("--http"))
     // readpages is its receive pool, writebufs and oobwritebufs its send pools. epoll reads none of them
     // (only BufferPageSize), which is why an epoll page sweep needs no co-variation control and an
     // io_uring one does.
+    // RESOLVED options, not the ones passed in. Sizes left unset are now "backend chooses" sentinels, so
+    // the caller's instance reads 0 and RIO in particular runs a geometry nobody typed. Printing the
+    // input here would report a page the backend is not using - the failure this line exists to catch.
+    var geo = http.Options;
     Console.WriteLine(
-        $"http-bench: backend={options.Factory.GetType().Name} shards={options.Shards}"
-        + $" page={options.BufferPageSize}"
-        + $" recvbuf={(options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize)}"
-        + $" writebufs={options.WriteBuffersPerShard}"
-        + $" oobwritebufs={options.OutOfBandWriteBuffersPerShard}"
-        + $" readpages={options.BufferPagesPerShard} body={size}"
+        $"http-bench: backend={options.Factory.GetType().Name} shards={geo.Shards}"
+        + $" page={geo.BufferPageSize}"
+        + $" recvbuf={geo.ReceiveBufferSize}"
+        + $" writebufs={geo.WriteBuffersPerShard}"
+        + $" oobwritebufs={geo.OutOfBandWriteBuffersPerShard}"
+        + $" readpages={geo.BufferPagesPerShard} body={size}"
         + $" listening on {port} (Ctrl+C to stop)");
     var httpStop = new ManualResetEventSlim();
     using var httpSignals = StopSignals.Install(httpStop);
@@ -462,11 +466,16 @@ static void PinToCpus(string spec)
     }
 }
 
-if (size > options.BufferPageSize)
+// The effective page, which is NOT options.BufferPageSize any more: 0 means "backend chooses", so
+// reading the raw option here would clamp every payload to zero. Ask the factory what it will pick.
+int effectivePage = options.BufferPageSize > 0
+    ? options.BufferPageSize
+    : options.Factory.DefaultGeometry.PageSize;
+if (size > effectivePage)
 {
     // The response rides in a single read/write buffer page; keep the demo honest.
-    Console.WriteLine($"note: clamping --size {size} to buffer page size {options.BufferPageSize}");
-    size = options.BufferPageSize;
+    Console.WriteLine($"note: clamping --size {size} to buffer page size {effectivePage}");
+    size = effectivePage;
 }
 
 // The server always binds Any (so it accepts on the LAN, not just loopback); the client

@@ -65,13 +65,25 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
         if (_config.RecvBufferSize > 0) options.ReceiveBufferSize = _config.RecvBufferSize;
         if (_config.WriteBuffers > 0) options.WriteBuffersPerShard = _config.WriteBuffers;
         _set = new TransportSet(options, this);
+        // Publish what the backend RESOLVED, not what was asked for. Sizes left unset are "backend
+        // chooses" sentinels now, and RIO picks a 64KB page nobody typed - so a /config that echoed only
+        // the explicit flags would report a geometry the transport is not running, which is exactly the
+        // failure the harnesses gate on this string to catch.
+        var g = _set.Options;
+        ResolvedGeometry = $"page={g.BufferPageSize} recvbuf={g.ReceiveBufferSize} "
+            + $"writebufs={g.WriteBuffersPerShard} oobwritebufs={g.OutOfBandWriteBuffersPerShard} "
+            + $"readpages={g.BufferPagesPerShard}";
         _set.Listen(EndPoint);
-        Console.WriteLine($"[socketset transport] {_config.Describe()}");
+        Console.WriteLine($"[socketset transport] {_config.Describe()} [resolved] {ResolvedGeometry}");
     }
 
     // --- SocketSet callbacks (loop thread) → Kestrel bridge ---
 
     internal static int Accepts, Closes, ClosedEmpty, WriteFail, SendFalse;
+
+    /// <summary>The buffer geometry the backend actually resolved, for <c>/config</c>. Null on the
+    /// vanilla-Kestrel leg, which has no SocketSet and therefore no geometry to report.</summary>
+    internal static string? ResolvedGeometry;
 
     /// <summary>True when accepted connections should hand Kestrel's own pipes to the transport.</summary>
     internal bool ByoPipe => _config.ByoPipe;

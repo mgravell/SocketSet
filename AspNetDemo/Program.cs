@@ -92,6 +92,9 @@ app.MapGet("/payload", (int n = 1024) =>
 app.MapGet("/config", (HttpContext http) => Results.Json(new
 {
     config = cfg.Describe(),
+    // What the BACKEND chose, which is not always what was asked for: unset sizes are "backend chooses"
+    // sentinels, so RIO runs a 64KB page nobody typed. Gate on this, not on the flags you passed.
+    geometry = SocketSets.AspNet.SocketSetConnectionListener.ResolvedGeometry,
     certificate = cert?.Describe(),
     isHttps = http.Request.IsHttps,
     protocol = http.Request.Protocol,

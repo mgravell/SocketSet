@@ -285,6 +285,34 @@ recommendation. 512B and 64KB are unmoved by both.
 - **Linux bridged legs below 64KB have not been re-run at six passes.** The fix cannot affect them (see
   item 1), but they are three-pass numbers.
 
+## An ACCESS VIOLATION in RIO+TLS under churn, on the shipped defaults (2026-07-29)
+
+**Found while validating an unrelated change, and it is the most serious thing in this file.** The
+process dies with **0xC0000005**, intermittently, usually inside one second, under
+`--rio --tls-schannel` connection churn. No managed exception: `### UNHANDLED ###` never prints, so this
+is a fault in unsafe/native-interop code.
+
+Pristine build at `e104568` — i.e. before anything measured on 2026-07-29 — 6 reps per cell:
+
+| page | write-buffers | pass | access violation |
+|---:|---:|---:|---:|
+| **4096** | **1024** *(the SHIPPED default)* | 5 | **1** |
+| 4096 | 512 | 3 | **3** |
+| 4096 | 128 | 6 | 0 |
+| 65536 | 512 | 2 | **4** |
+| 65536 | 256 | 3 | **3** |
+
+**It happens on the configuration the library ships**, and neither the page size nor the pool depth
+causes it - they move the *rate*. Full analysis, what is excluded, and where to start: TODO item 0e.
+`bench/Repro-RioChurnCrash.ps1` reproduces it with nothing but an exit code.
+
+**Why no benchmark in this file ever caught it**, which is the transferable part: every rig here holds
+keep-alive connections and measures steady state. **Not one of them churns connections.** The only thing
+that opens and closes sockets in anger is the smoke matrix's `churn` cell, which runs once per invocation
+against an ~1-in-6 fault. An intermittent crash under a suite you run once is indistinguishable from a
+flaky harness - and that is exactly how it first read ("no churn result line"). `Run-SmokeMatrix.ps1` now
+names crash exit codes instead of letting them fall through as missing output.
+
 ## Windows validation after the OS switch (2026-07-29)
 
 Windows had run nothing since 2026-07-27 while shared code changed underneath it on Linux. This is the
