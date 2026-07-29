@@ -57,10 +57,41 @@ internal sealed class IocpConnection : WindowsConnection
     /// memory — an already-pinned pool needs no handle.</summary>
     public System.Buffers.MemoryHandle[]? ZcHandles;
 
-    /// <summary>Segment addresses and lengths of the in-flight zero-copy send.</summary>
-    public readonly nint[] ZcPtrs = new nint[MaxSendPages];
-    public readonly int[] ZcLens = new int[MaxSendPages];
+    /// <summary>
+    /// Segment cap for a ZERO-COPY send. Deliberately larger than <see cref="MaxSendPages"/>, and it has
+    /// to be: those two caps bound different things and only one of them was ever an OS limit.
+    ///
+    /// <see cref="MaxSendPages"/> bounds how many POOLED WRITE PAGES one send may span, so 64 x 4KB is a
+    /// 256KB send and spilling past it just means a second send of our own pages. The zero-copy cap
+    /// bounds how fragmented the CALLER's sequence may be, and the caller owns that: Kestrel's default
+    /// pipe blocks are ~4KB, so a 256KB response arrives as 65 segments - measured, exactly, on
+    /// 2026-07-29 - against a cap of 64. One segment over, and every such response silently fell back to
+    /// copying and paid 2.2x. Sharing one constant put an OS-shaped limit and a caller-shaped limit on
+    /// the same number, and the caller-shaped one lost.
+    ///
+    /// 256 covers a ~1MB response at 4KB blocks. It is not a guarantee - a sufficiently fragmented
+    /// sequence still declines, which is why <see cref="ZcPtrs"/> is a cap and not a contract - but it
+    /// moves the cliff off the payload sizes anyone measures.
+    /// </summary>
+    public const int MaxZeroCopySegments = 256;
+
+    /// <summary>Segment addresses and lengths of the in-flight zero-copy send. Allocated on FIRST USE
+    /// rather than per connection, which is what makes the larger cap affordable: these are useless to a
+    /// callback-path connection, and there is one connection object per slot per shard. Eager at 64 cost
+    /// 768 bytes on every connection whether or not it ever sent zero-copy (~37MB at 4096 sockets x 12
+    /// shards); lazy at 256 costs 3KB on the connections that actually use pipe mode and nothing on the
+    /// rest. Written on the pump thread before the request is enqueued, read on the loop thread after it
+    /// is dequeued, so the queue's release/acquire publishes them safely.</summary>
+    public nint[]? ZcPtrs;
+    public int[]? ZcLens;
     public int ZcCount;
+
+    /// <summary>Materialise the zero-copy segment arrays. Pump thread, before any segment is recorded.</summary>
+    public void EnsureZcArrays()
+    {
+        ZcPtrs ??= new nint[MaxZeroCopySegments];
+        ZcLens ??= new int[MaxZeroCopySegments];
+    }
 
     /// <summary>Signals the outbound pump that the send completed (true) or the connection went away
     /// (false). The pump must not AdvanceTo its reader until this fires — the socket was reading its

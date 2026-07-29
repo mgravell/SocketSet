@@ -224,7 +224,8 @@ above, which are a different OS.
 |---|---:|---:|
 | kestrel (bridged) | 3,991.9 | 11,620.0 |
 | iocp (bridged) | 3,745.2 | 5,273.3 |
-| **iocp, bridged, `--byo --pipe-segment 65536`** | **9,042.4**\* | **11,393.3**\* |
+| **iocp, bridged, `--byo --pipe-segment 65536`** | **9,042.4**\* | **11,136.2**\* (**-2.4%** vs a same-session kestrel) |
+| iocp, bridged, `--byo` (no flag, after the cap split) | - | 8,447.9\* |
 | rio (bridged, default 4KB page) | 1,530.9 | 2,108.2 |
 | *rio, bare, tuned* (64KB page + 4KB recv, 2026-07-27) | *4,365.8* | *11,030.2* |
 
@@ -383,8 +384,62 @@ segments per send: ~17 pins and 17 `WSABUF`s become ~2. Smaller effect, differen
 **What this does NOT yet establish**: where the tuned configuration sits against vanilla Kestrel. The
 2026-07-27 Windows table has kestrel at 11,488.9 MiB/s at 256KB, which is tantalisingly close to 11,393.3
 - but that is a **cross-day comparison** and this file has produced confident nonsense from those before.
-`Run-Byo.ps1` has since gained a `kestrel` leg so the control runs in the same reshuffled passes; until
-that has run, no gap against Kestrel should be quoted from this table.
+`Run-Byo.ps1` has since gained a `kestrel` leg so the control runs in the same reshuffled passes; **that
+has now run - see two sections down, and the answer is -2.4%.**
+
+### Splitting the zero-copy cap from the write-page cap: +61.1% with NO flag, and a tail-latency bill
+
+The +117.3% above needed `--pipe-segment 65536`, which configures *Kestrel's* pipes from the *demo's*
+command line. A library caller with its own pipes still fell off the same cliff. `MaxSendPages` was
+bounding two unrelated things through one constant: how many **pooled write pages** one send may span
+(an internal, OS-shaped limit) and how fragmented the **caller's sequence** may be (a caller-shaped one).
+Split into `MaxZeroCopySegments = 256`, with `ZcPtrs`/`ZcLens` allocated on **first use** rather than per
+connection - which makes the larger cap cost *less* than the old eager 64, since a callback-path
+connection now allocates nothing at all instead of 768 bytes.
+
+Same rig, 6 scored passes, `--iocp`, 12 shards, `-c 64`. The two untouched legs are the controls:
+
+| leg | before the split | after the split | |
+|---|---:|---:|---|
+| **byo** (default ~4KB pipe blocks, **no flag**) | 5,243.6 [5055-5507] | **8,447.9** [8228-8578] | **+61.1%, disjoint** |
+| byo-seg64k *(control)* | 11,393.3 [10878-11564] | 11,136.2 [11003-11230] | ranges overlap: unchanged |
+| classic *(control)* | 5,177.4 [5092-5268] | 4,918.2 [4724-5219] | ranges overlap: unchanged |
+
+Both controls hold across the two sessions, which is what licenses reading the `byo` row. The counter
+confirms the mechanism rather than inferring it: declines go from 194,804-at-mean-65.00 to **zero**, with
+the shipped pipe configuration and no flag.
+
+**And with a same-session vanilla-Kestrel control, the headline is finally sayable:**
+
+| leg @ 256KB | goodput | vs kestrel |
+|---|---:|---:|
+| kestrel *(control, same session)* | 11,411.5 [11385-11480] | - |
+| **iocp `--byo --pipe-segment 65536`** | **11,136.2** [11003-11230] | **-2.4%** (disjoint) |
+| iocp `--byo` (no flag) | 8,447.9 [8228-8578] | -26.0% |
+| iocp classic *(shipped)* | 4,918.2 [4724-5219] | **-56.9%** |
+
+**The gap to vanilla Kestrel at 256KB closes from 56.9% to 2.4%** - and unlike every previous version of
+that claim in this file, the control ran in the same reshuffled passes.
+
+#### The bill: p99 nearly triples on the no-flag path
+
+| leg | p99 median | range |
+|---|---:|---|
+| byo-seg64k | 4,509us | [3,000-4,515] |
+| kestrel | 6,009us | [3,114-7,162] |
+| classic | 6,291us | [5,778-7,209] |
+| **byo** (default blocks) | **15,255us** | [13,509-15,690] |
+
+**So the raised cap is a throughput win and a tail-latency regression, in the same change.** 65 pins, 65
+`WSABUF`s and one much longer send occupancy per response, against one send in flight per connection, is
+head-of-line blocking; at 64KB blocks the same response is ~5 segments and p99 is the *best* in the
+table. The honest reading is that the cap raise removes a **silent cliff** - a caller one segment over
+the line lost 2.2x with no way to see it - and that large pipe blocks remain the configuration worth
+recommending. Do not read +61.1% as "the flag is now unnecessary".
+
+**Still a cliff, just moved:** measured directly, a 1MB response is **257** segments and a 4MB response
+**1,025**, so both still decline at a 256 cap. That is why this is written as a cap and not a contract;
+removing the cliff entirely needs the send-a-PREFIX design in item 2f, not a bigger number.
 
 **And 2b-result's reading is now retracted for IOCP.** "Zero-copy send removed one copy and bought +3.5%,
 so copies are not the cost" was measured on a path that declined at the payload of interest. Both halves

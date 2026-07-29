@@ -44,11 +44,17 @@ happened, in one paragraph each:
    generalise to Windows, and this is now its second failed prediction (it also failed to explain why the
    bridge costs epoll twice what it costs io_uring).
 
+6. **And item 2f's first option is DONE, so the flag is no longer required for most of the win.**
+   Splitting the zero-copy segment cap from `MaxSendPages` gives **+61.1% at 256KB with no flag at all**,
+   and with a same-session Kestrel control the tuned configuration is **-2.4% against vanilla Kestrel**,
+   from -56.9% shipped. It also costs p99 (15.3ms against 6.3ms) on the no-flag path, so it removes a
+   silent cliff without replacing the recommendation. Details in item 2f.
+
 **What that leaves open**, and it is now the top of the Windows list rather than the bottom:
 
-- **The mechanism decision from §3 is now forced.** The flag route worked, so "raise `MaxSendPages`, or
-  send a PREFIX and have `TrySendZeroCopy` report bytes instead of a bool" is no longer speculative work -
-  it is what converts a 117% flag into a default. See item 2f (new).
+- **Options 2/3 of item 2f.** The cliff moved rather than went: a 1MB response is 257 segments, a 4MB one
+  1,025, so both still decline at a 256 cap - and the p99 result argues the PREFIX design would help tail
+  latency as well as removing the cliff.
 - **`--pipe-segment`'s memory bill is unmeasured on Windows.** On Linux it costs **2.7x RSS at 2048
   connections**, which is why it is a flag there. Nobody has measured that here, and a 117% result will
   tempt someone to default it. Measure before defaulting.
@@ -1396,7 +1402,40 @@ this counter. So this entry's prediction is confirmed, and by 2.6x more than "th
 - **The pin cost did not bite.** 65 `GCHandle` pins + disposes per response and it still won by 45%, so a
   pinned-block pool (item 2d) is upside on top, not a precondition.
 
-### 2f. Make IOCP's zero-copy send survive a fragmented sequence (raised 2026-07-29, and now the top IOCP item)
+### 2f. Make IOCP's zero-copy send survive a fragmented sequence (raised 2026-07-29)
+
+**Status: OPTION 1 DONE 2026-07-29 (+61.1% with no flag, and a p99 bill). Options 2 and 3 still open,
+and the p99 result is the argument for doing one of them.**
+
+`MaxZeroCopySegments = 256`, split from `MaxSendPages`, with `ZcPtrs`/`ZcLens` allocated on first use so
+the bigger cap costs *less* than the old eager 64 (a callback-path connection now allocates nothing
+rather than 768 bytes). Smoke matrix re-run: 47/48, the same pre-existing `rio+tls` cell.
+
+Measured, 6 scored passes, both untouched legs holding as controls:
+
+- **`--byo` with the shipped ~4KB pipe blocks: 5,243.6 -> 8,447.9 MiB/s at 256KB (+61.1%, disjoint)**,
+  declines 194,804 -> **zero**, no flag involved.
+- **With a same-session vanilla-Kestrel control, `--byo --pipe-segment 65536` is -2.4% against Kestrel
+  at 256KB**, where the shipped bridge is -56.9%.
+
+**But p99 on the no-flag path nearly triples** - 15,255us against 6,291us classic and 4,509us at 64KB
+blocks. 65 pins and one long send occupancy per response, against one send in flight per connection, is
+head-of-line blocking. So the split removes a *silent cliff* (a caller one segment over lost 2.2x with
+no way to see it); it does not make the flag unnecessary, and nobody should read it that way.
+
+**What is left, and the pre-registered prediction now has evidence behind it:** the cliff moved rather
+than went - a 1MB response is **257** segments and a 4MB response **1,025**, both measured, so both still
+decline at 256. Option 2 (send a PREFIX; `TrySendZeroCopy` reports bytes rather than a bool) is the one
+that removes it, and the p99 result says it should *also* help tail latency by capping how much one send
+occupies the connection. Option 3 (coalesce small trailing segments) remains the best-of-both.
+
+**New, and cheap, found while doing this:** `TrySendZeroCopy` allocates a `MemoryHandle[n]` **per
+response** on the pump thread whenever the caller has not asserted pinned memory. This repo has already
+measured +27% for removing one per-response allocation (`fa97dd4`), and the array can be pooled per
+connection exactly as `ZcPtrs` now is. `--pipe-pinned` sidesteps it entirely (the handles array is null
+when the pool is pinned), which is a second, independent reason to look at item 2d.
+
+*Original entry follows.*
 
 **Status: specified, not started. This is what converts a +117.3% flag into a default.**
 

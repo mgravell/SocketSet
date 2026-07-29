@@ -388,7 +388,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         Console.Error.WriteLine($"[iocp-stats:{tag}] zero-copy sends={zc:n0} segments={Interlocked.Read(ref s_zcSegs):n0} " +
             $"| declined: tls={Interlocked.Read(ref s_zcDeclineTls):n0} closed={Interlocked.Read(ref s_zcDeclineClosed):n0} " +
             $"empty={Interlocked.Read(ref s_zcDeclineEmpty):n0} too-fragmented={dseg:n0} " +
-            $"(cap={IocpConnection.MaxSendPages} mean-segs={(dseg > 0 ? (double)dsum / dseg : 0):n2} " +
+            // The ZERO-COPY cap, not MaxSendPages. Printing the wrong one here would be the exact failure
+            // this counter exists to prevent: a banner that reports a limit the code is not applying.
+            $"(cap={IocpConnection.MaxZeroCopySegments} mean-segs={(dseg > 0 ? (double)dsum / dseg : 0):n2} " +
             $"max-segs={Interlocked.Read(ref s_zcDeclineSegMax):n0}) " +
             $"| copying path: WSASends={classic:n0} WSABUFs={Interlocked.Read(ref s_sendPageBufs):n0}");
     }
@@ -438,13 +440,16 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         int n = 0;
         foreach (var _ in data)
         {
-            if (++n > IocpConnection.MaxSendPages)
+            if (++n > IocpConnection.MaxZeroCopySegments)
             {
                 if (ReportStats) RecordFragmentDecline(in data);
                 return false;
             }
         }
 
+        conn.EnsureZcArrays();
+        nint[] ptrs = conn.ZcPtrs!;
+        int[] lens = conn.ZcLens!;
         var handles = pinned ? null : new System.Buffers.MemoryHandle[n];
         int i = 0;
         foreach (var seg in data)
@@ -453,16 +458,16 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             if (handles is null)
             {
                 // Caller asserts the memory is already pinned, so its address is stable without a handle.
-                conn.ZcPtrs[i] = (nint)System.Runtime.CompilerServices.Unsafe.AsPointer(
+                ptrs[i] = (nint)System.Runtime.CompilerServices.Unsafe.AsPointer(
                     ref System.Runtime.InteropServices.MemoryMarshal.GetReference(seg.Span));
             }
             else
             {
                 var h = seg.Pin();
                 handles[i] = h;
-                conn.ZcPtrs[i] = (nint)h.Pointer;
+                ptrs[i] = (nint)h.Pointer;
             }
-            conn.ZcLens[i] = seg.Length;
+            lens[i] = seg.Length;
             i++;
         }
         if (i == 0) { DisposeZc(handles, i); return false; }
@@ -508,13 +513,15 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         op->Slot = slot;
         op->Buf = -1; // no write-pool page backs this send
 
-        Win32.WSABUF* bufs = stackalloc Win32.WSABUF[IocpConnection.MaxSendPages];
+        Win32.WSABUF* bufs = stackalloc Win32.WSABUF[IocpConnection.MaxZeroCopySegments];
+        nint[] ptrs = conn.ZcPtrs!;
+        int[] lens = conn.ZcLens!;
         int n = 0, skip = conn.SendSent;
         for (int i = 0; i < conn.ZcCount; i++)
         {
-            int len = conn.ZcLens[i];
+            int len = lens[i];
             if (skip >= len) { skip -= len; continue; }
-            bufs[n].buf = (byte*)conn.ZcPtrs[i] + skip;
+            bufs[n].buf = (byte*)ptrs[i] + skip;
             bufs[n].len = (uint)(len - skip);
             n++;
             skip = 0;
