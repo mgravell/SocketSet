@@ -39,7 +39,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 | `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
-| BYO zero-copy **send** | **yes** | impossible (registered ids) | no | no | no | ***yes - sends from the pipe*** |
+| BYO zero-copy **send** | **yes** | impossible (registered ids) | **yes** | no | no | ***yes - sends from the pipe*** |
 | BYO zero-copy **receive** | no | no | no | no | no | ***yes - into `GetMemory()`*** |
 | internal zero-copy echo | no | no | **yes** (borrowed read buffers) | no | no | *n/a* |
 | pipe mode (`UsePipe`) | yes | yes | yes | yes | yes | *it **is** pipes* |
@@ -68,7 +68,8 @@ segments into its own writer:
 |---|---|---:|
 | *Kestrel (sockets)* | *none - there is no "our buffer"; SAEA sends the pipe segments* | ***0*** |
 | IOCP with `--byo` (`TrySendZeroCopy`) | none - `WSABUF`s point straight at pipe memory | **0** |
-| io_uring | `WriteAll` into pooled pages; writev sends those pages | 1 |
+| io_uring with `--byo` (`TrySendZeroCopy`) | none - the writev's iovecs point straight at pipe memory | **0** |
+| io_uring, callback path | `WriteAll` into pooled pages; writev sends those pages | 1 |
 | managed | `WriteAll` into `_wbuf`; SAEA `SetBuffer(_wbuf)` sends it | 1 |
 | epoll | `WriteAll` into the accumulator; `Flush` **hands that buffer over** (was: rent + copy) | 1 *(was 2)* |
 | IOCP classic / RIO | accumulator -> `StageOutbound` pooled staging -> drain into write pages (the `Flush` snapshot copy is gone) | **2-3** *(was 3-4)* |
@@ -232,6 +233,11 @@ costs epoll nearly twice what it costs io_uring; see the refutation below.
    offload - kTLS's whole point - cannot appear at any size.
 6. **RIO is starved, not slow.** At its shipped page it is the worst leg in any table; at a 64KB page with
    a 4KB receive buffer it is the fastest thing measured on Windows.
+7. **Zero-copy send changes the 256KB picture completely, on the backend that can actually do it.**
+   io_uring with `--byo` does **11,536.1** at 256KB against 7,950.2 classic (**+45.1%**), cutting the gap
+   to vanilla Kestrel from 36% to **7.3%**. IOCP has the same feature and gains nothing at that payload
+   because its 64-segment cap declines a 65-segment response - measured, not inferred. See the zero-copy
+   section below.
 
 ### Known gaps in this picture
 
@@ -1085,6 +1091,60 @@ it** (it removed one copy for +3.5% at 16KB).
 *Caveat carried forward:* bare epoll at 256KB (11,437) now measures ~10% ABOVE bare io_uring (10,349),
 ranges disjoint, where the 8-shard post-fix sweep had them level. Different shard count, so this is not a
 contradiction, but "they are level at 256KB" is an 8-shard statement and should not be quoted at 12.
+
+### io_uring zero-copy send: +45.1% at 256KB — and it explains IOCP's null result exactly (2026-07-29)
+
+`Connection.TrySendZeroCopy` implemented for io_uring: the writev's iovecs point straight at the caller's
+pipe segments instead of at pooled pages we copied into. A/B against the same `--byo` bridge
+(`bench/run-byo.sh`, 12 shards, `-c 64`, 7 passes, first discarded), so the comparison isolates zero-copy
+rather than what pipe mode itself costs:
+
+| payload | classic | **byo + zero-copy** | change |
+|---|---:|---:|---:|
+| 64 KB | 10,423.2 [10362-10537] | 10,613.0 [10482-10673] | +1.8% |
+| 256 KB | 7,950.2 [7795-8158] | **11,536.1** [11520-11682] | **+45.1%** |
+
+The 256KB ranges are enormously disjoint (min 11,520 against max 8,158). 64KB is a marginal overlap and
+should not be quoted as more than "no worse".
+
+**Verified taken, not silently declined** - the failure mode this rig exists to catch, since a declined
+path measures identically to one that ran and did not pay. `/config` reports `byo=pipe`, and
+`SS_URING_STATS=1` over a 256KB load reports `OP_WRITEV=179,703` carrying `zero-copy=11,680,439` segments
+with **`pooled-page=0` and `pinned-managed=0`**: every outbound segment came from the caller, none from
+our buffers.
+
+#### 65.0 segments per response — and IOCP's cap is 64
+
+That same counter gives 11,680,439 / 179,703 = **exactly 65.0 iovec segments per response**: Kestrel's
+pool hands out 4KB blocks, so a 256KB body is 64 of them, plus one for the headers.
+
+`IocpConnection.MaxSendPages` is **64**. So IOCP's `TrySendZeroCopy` declined **every single 256KB
+response** and silently fell back to copying - which is exactly why it measured +3.5% at 16KB and nothing
+at 256KB. That was recorded in `2b-result` as a suspicion ("probably binds at 256KB... instrument the
+decline rate first - do not assume"). It is now measured, on the backend whose `IovMax` is 1024 and which
+therefore does not hit the ceiling.
+
+**Concrete prediction for whenever a Windows host is available:** raise `MaxSendPages` above 65 (or send a
+PREFIX of the sequence and have `TrySendZeroCopy` report bytes rather than a bare bool, which is the fix
+`2b-result` already sketched), and IOCP should show a large-payload gain of the same shape. If it does
+not, the segment cap was not the explanation after all.
+
+#### Two things this changes
+
+**The bare responder is no longer a ceiling, and the bare-vs-bridged subtraction does not apply to this
+leg.** Bridged byo at 256KB (11,536) now *exceeds* the bare responder (10,352), which sounds impossible
+until you notice they no longer run the same code: `HttpBench` uses the callback path and still copies
+every byte into pooled pages, while byo copies nothing. So "bridge cost = bare - bridged" is meaningless
+for byo; the bare number is just another configuration, and a slower one.
+
+**Against vanilla Kestrel at 256KB the gap is now 7.3%, from 36%.** Kestrel's own transport does 12,450.5;
+classic io_uring did 7,950 and byo does 11,536. Kestrel is zero-copy in both directions and pays no
+bridge, so it should still lead - and the residual is now small enough that the *receive* side (where we
+still copy and Kestrel does not) is the obvious next term.
+
+**The pin cost was pre-registered as possibly fatal and was not.** With an unpinned `MemoryPool` this
+takes one `GCHandle` pin per segment - 65 pins and 65 disposes per response here - and it still won by
+45%. A pinned-block pool (TODO 2d) removes that branch entirely, so this is a floor rather than a ceiling.
 
 ### SUPERSEDED: "epoll beats io_uring by 58% at 256KB" was this defect, not a structural difference
 

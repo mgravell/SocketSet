@@ -1123,6 +1123,46 @@ surface much larger than it looks, and `SmokeTest --pipe` is the only harness th
 Weigh that against the measured prize: the whole bridge is 24-42% at 256KB and ~2% at 64KB, so this is a
 large-payload play, not a general one.
 
+### 2b-result-2. io_uring zero-copy send: +45.1% at 256KB, and IOCP's null result is EXPLAINED (2026-07-29)
+
+**Status: DONE for io_uring send. The measurement that motivated de-prioritising this work was wrong for
+a specific, now-measured reason.**
+
+A/B against the same `--byo` bridge, 12 shards, `-c 64`, 6 scored passes:
+
+| payload | classic | byo + zero-copy | change |
+|---|---:|---:|---:|
+| 64 KB | 10,423.2 | 10,613.0 | +1.8% (ranges nearly overlap) |
+| 256 KB | 7,950.2 [7795-8158] | **11,536.1** [11520-11682] | **+45.1%** |
+
+Verified taken rather than declined: `zero-copy=11,680,439` segments, `pooled-page=0`,
+`pinned-managed=0`.
+
+**Why IOCP measured nothing at 256KB, now measured rather than suspected.** That same counter gives
+**exactly 65.0 segments per response** - Kestrel's 4KB blocks make a 256KB body 64 segments, plus one for
+headers. `IocpConnection.MaxSendPages` is **64**, so IOCP declined *every* 256KB response and fell back to
+copying. `2b-result` guessed this ("probably binds at 256KB... instrument the decline rate first"); it is
+now a number. io_uring's `IovMax` is 1024 and never hits it.
+
+**Follow-up for a Windows host, pre-registered:** raise `MaxSendPages` above 65, or implement the
+send-a-PREFIX fix `2b-result` sketched (`TrySendZeroCopy` reporting bytes instead of a bool), and IOCP
+should show a large-payload gain of the same shape. If it does not, the cap was not the explanation.
+
+**Consequences for the rest of this file:**
+
+- **"Per-byte copying is not the constraint" is now bounded, not general.** It held for allocations
+  (`fa97dd4`), for page size, and at 16KB. At 256KB, removing copies is worth +16.3% (epoll's `Flush`
+  snapshot) and +45.1% (io_uring zero-copy). The constraint is payload-dependent and the old wording
+  over-generalised from small-message evidence.
+- **The bare responder is no longer a ceiling.** Bridged byo (11,536) beats the bare responder (10,352)
+  because they no longer run the same code - `HttpBench` still copies via the callback path. Do not
+  compute "bridge cost = bare - bridged" for a byo leg.
+- **The gap to vanilla Kestrel at 256KB is 7.3%, from 36%** (12,450.5 vs 11,536.1). Kestrel is zero-copy
+  in BOTH directions and pays no bridge; the obvious next term is the receive side, where we still copy
+  and it does not - which is the zero-copy-receive/receive-parking work that has never been started.
+- **The pin cost did not bite.** 65 `GCHandle` pins + disposes per response and it still won by 45%, so a
+  pinned-block pool (item 2d) is upside on top, not a precondition.
+
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 
 **Status: designed, not started. Now the highest-value item on this list, with a measured target.**
