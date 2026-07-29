@@ -76,8 +76,9 @@ Reading of that table:
   is already shared, only the ~150-line readiness→`SSL_read` pump is missing, and epoll is the backend
   where kTLS should look best** — it has no multishot receive to forfeit, which is what makes kTLS cost
   io_uring ~15%.
-- **kTLS is TX-only even on io_uring**, now confirmed against the kernel's own counters rather than
-  inferred from the code: `TlsTxSw` moves, `TlsRxSw` stays at zero. Every kTLS number on file measures a
+- **kTLS is TX-only on the SYSTEM OpenSSL (3.0.13), and that is OpenSSL's limit, not ours** — measured
+  2026-07-29: a self-built 3.5.7 gives RX=True on TLS 1.3 and moves `TlsRxSw` off zero (0 -> 8). On 3.0.13
+  `TlsTxSw` moves and `TlsRxSw` stays at zero. Every kTLS number on file measures a
   half-offloaded path. That is what item 4 is about, and it now has direct evidence. **And per item 4b
   (2026-07-29) this is the ROOT of the "kTLS costs us multishot receive" story, not a side-effect of it:**
   multishot is unusable because RX is not offloaded, so OpenSSL must still see ciphertext and owns the
@@ -1376,9 +1377,30 @@ active, plain `recv` returns plaintext, and `IORING_OP_RECV` + `IORING_RECV_MULT
 buffer ring should work unmodified** - that part of the external claim is mechanically sound, and it is
 the prize.
 
-**MEASURED 2026-07-29, and the answer inverts the usual advice.** `SmokeTest --ktls-spike` (the standalone
-`KtlsProbe`, which does a plain socket-fd handshake and asks OpenSSL directly via
-`BIO_get_ktls_send/recv`) now takes two switches, so the candidates could be separated in seconds:
+**RESOLVED 2026-07-29: OpenSSL 3.0.13 declines kTLS RX for TLS 1.3; a self-built 3.5.7 grants it.**
+Validated by building OpenSSL 3.5.7 with `enable-ktls` and running the same probe against it - same box,
+same code, TLS 1.3 both times:
+
+| OpenSSL | client | server | probe |
+|---|---|---|---|
+| 3.0.13 (system) | TX=True **RX=False** | TX=True **RX=False** | FAIL |
+| **3.5.7 (self-built)** | TX=True **RX=True** | TX=True **RX=True** | **PASS** |
+
+**Confirmed end to end in the real transport, not just the probe:** the io_uring kTLS echo against 3.5.7
+moved `/proc/net/tls_stat`'s `TlsRxSw` off zero for the first time (**0 -> 8**) with the byte-exact echo
+still passing. So **Path A works** and no protocol downgrade is needed: TLS 1.3 + kTLS RX + multishot is
+available on OpenSSL 3.2+.
+
+*(A first attempt using the flatpak runtime's 3.5.7 reported TX=False AND RX=False - kTLS not engaging at
+all. That is not the same as declining RX, so it was discarded as inconclusive rather than quoted. The
+probe now prints the loaded version and whether the build has kTLS, so this cannot be misread again.)*
+
+**The backend now reports what it got**, once per process:
+`[ktls] openssl=3.0.13 tx=True rx=False -- RX NOT offloaded: ... OpenSSL 3.2+ is required ...`. A silent
+half-offload is what made every kTLS figure on file mean something other than it appeared to.
+
+*How it was narrowed, kept for the method.* `SmokeTest --ktls-spike` takes two switches, so the candidates
+could be separated in seconds:
 
 | run | TLS version | client | server | probe |
 |---|---|---|---|---|
@@ -1400,6 +1422,42 @@ and performance regression and is only sane as an experimental vehicle, not a sh
 **plain `send` -> plain `recv` round-trip over the kTLS socket** - the kernel doing the crypto, no OpenSSL
 in the data path. That is precisely what `IORING_OP_RECV` + `IORING_RECV_MULTISHOT` over a provided-buffer
 ring requires, so the external claim's core mechanism holds; only its version advice was inverted.
+
+#### The three ways out, and what each actually costs
+
+**A. Require OpenSSL 3.2+ for kTLS RX.** The cleanest if it works. **Being validated** - the probe now
+reports the loaded version and whether the build has kTLS at all (`OpenSSL_version_num` /
+`OpenSSL_version(OPENSSL_CFLAGS)`), because a first attempt using the flatpak runtime's 3.5.7 returned
+**TX=False RX=False** - kTLS not engaging *at all*, which is not the same as "declines RX" and must not be
+read as evidence either way. Settling it needs a build configured `enable-ktls`.
+
+**B. Extract the keys and call `setsockopt(SOL_TLS, TLS_RX)` ourselves, bypassing OpenSSL.** Possible, but
+**the API usually named for this is the wrong one**: `SSL_export_keying_material` is the RFC 5705 / RFC
+8446 §7.5 *exporter*. It derives fresh key material from the exporter master secret for other protocols
+(channel binding, DTLS-SRTP); it does **not** return the record-protection traffic keys, and keys obtained
+that way decrypt nothing. The actual route for TLS 1.3 is `SSL_CTX_set_keylog_callback` ->
+`CLIENT_TRAFFIC_SECRET_0` / `SERVER_TRAFFIC_SECRET_0` -> HKDF-Expand-Label("key") and ("iv") per RFC 8446
+§7.3 -> fill `tls12_crypto_info_aes_gcm_128/256`.
+
+Three things make it harder than the snippet suggests, and all three fail *silently* (garbage plaintext or
+a dead connection, not an error):
+  - **The record sequence number must be exact at handoff.** `rec_seq` has to be OpenSSL's current read
+    sequence, and the handoff must happen when OpenSSL holds no partially-consumed record - it may already
+    have eaten post-handshake records (NewSessionTicket) and advanced past them.
+  - **We inherit rekeying.** TLS 1.3 KeyUpdate arrives as a handshake record, so after handoff *we* must
+    notice it (via the cmsg path) and push new keys. This kernel does support it - `/proc/net/tls_stat`
+    here exposes `TlsRxRekeyOk` / `TlsRxRekeyError` / `TlsRxRekeyReceived` - but it becomes our job.
+  - **It is a reimplementation of part of OpenSSL's key schedule**, in a place where a mistake is a
+    security bug rather than a perf bug.
+  So: a legitimate fallback for old OpenSSL, not the first thing to reach for.
+
+**C. Cap at TLS 1.2 where kTLS RX matters.** Works today (measured above), needs no new code beyond a
+version knob - and is a real security/performance regression. Defensible as an experimental vehicle for
+measuring multishot+kTLS, not as a shipping default.
+
+**Recommended order: validate A; if it holds, require 3.2+ for the kTLS-RX path and keep the current
+TX-only behaviour as the fallback on older OpenSSL (which is what the code already does, correctly, by
+discovering capability rather than assuming it). B only if A is unavailable and the win is proven.**
 
 **If RX offload can be turned on, the follow-on work is small and the payoff is item 4's whole point:**
 

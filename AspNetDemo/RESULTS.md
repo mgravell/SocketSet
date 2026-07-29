@@ -35,7 +35,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 |---|---|---|---|---|---|---|
 | TLS in-transport | SChannel | SChannel | OpenSSL | OpenSSL | yes (per-conn gate) | *no - `SslStream` layered above* |
 | ALPN | yes | yes | yes | yes | yes | *yes (via `SslStream`)* |
-| kTLS | - | - | **yes, TX only** | **no code at all** | - | *no* |
+| kTLS | - | - | **yes** (TX always; **RX needs OpenSSL 3.2+**) | **no code at all** | - | *no* |
 | `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
@@ -1311,7 +1311,7 @@ passes kTLS lands at 75,834, within noise of everything else. The 58k figure was
 distribution being read as a result. The mechanism may still be real; this measurement says nothing about
 it either way.
 
-### kTLS is TX-only, and that is ours (measured 2026-07-28, bare metal)
+### kTLS is TX-only here — and the cause is OpenSSL's version, not ours (2026-07-28, corrected 2026-07-29)
 
 Independent of the throughput numbers above, and it changes how all of them should be read. `/config`
 reports that kTLS was *configured*; `/proc/net/tls_stat` reports what the kernel actually did. Driving
@@ -1323,11 +1323,35 @@ traffic through the `--ktls` leg:
 | `TlsRxSw` | 0 | 0 | receive is **not** offloaded, at all |
 | `TlsTxDevice` | 0 | 0 | no NIC offload — loopback, and permanently so here |
 
-So "kTLS" in every figure in this file means **TX-only offload**. That is a property of our integration,
-not of kTLS: the path drives receive as io_uring `POLL` + `SSL_read` in userspace instead of the
-`RECVMSG` + `TLS_GET_RECORD_TYPE` cmsg design in `TlsFilter`'s notes. It is the direct evidence for TODO
-item 4, which until now rested on a code reading. `bench/ktls-verify.sh` gates the kTLS legs on this
-counter so a socket the kernel never took cannot be measured as if it had been.
+So "kTLS" in every figure in this file means **TX-only offload**. `bench/ktls-verify.sh` gates the kTLS
+legs on this counter so a socket the kernel never took cannot be measured as if it had been.
+
+**CORRECTED 2026-07-29: "that is a property of our integration" was WRONG. It is OpenSSL's version.**
+This section blamed our receive path (io_uring `POLL` + `SSL_read` rather than the `RECVMSG` +
+`TLS_GET_RECORD_TYPE` design). That reversed cause and effect: we drive receive that way *because* RX was
+never offloaded, so OpenSSL still had to decrypt and therefore still had to own the reads.
+
+Measured with `SmokeTest --ktls-spike`, which asks OpenSSL directly via `BIO_get_ktls_send/recv`, same
+box, same probe, TLS 1.3 throughout - only the library differs:
+
+| OpenSSL | client | server | plaintext round-trip |
+|---|---|---|---|
+| 3.0.13 (system) | TX=True **RX=False** | TX=True **RX=False** | FAIL |
+| **3.5.7** (self-built, `enable-ktls`) | TX=True **RX=True** | TX=True **RX=True** | **PASS** |
+
+**OpenSSL 3.0.x declines kTLS RX for TLS 1.3; 3.2+ grants it.** Confirmed end to end in the real
+transport, not just the probe: running the io_uring kTLS echo against the 3.5.7 build moved `TlsRxSw` off
+zero for the first time (0 -> 8) while the byte-exact echo still passed.
+
+Two things were ruled out on the way, both by measurement rather than argument: clearing
+`SSL_MODE_NO_KTLS_RX` changes nothing, and a flatpak-supplied 3.5.7 reported TX=False *and* RX=False -
+kTLS not engaging at all, which is not the same as declining RX and was discarded as inconclusive rather
+than quoted. The common advice to "enforce TLS 1.3 so multishot keeps working" is therefore **backwards on
+OpenSSL 3.0.x**, where 1.3 is exactly what keeps RX off.
+
+The backend now says which it got, once per process - `[ktls] openssl=3.0.13 tx=True rx=False -- RX NOT
+offloaded...` - because a silent half-offload is what made every kTLS figure in this file mean something
+other than it appeared to, for months. See TODO item 4b.
 
 ### What would move this forward
 

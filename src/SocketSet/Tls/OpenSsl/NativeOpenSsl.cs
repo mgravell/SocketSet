@@ -108,6 +108,40 @@ internal static unsafe partial class NativeOpenSsl
     [LibraryImport(Ssl)] public static partial int SSL_set_fd(IntPtr ssl, int fd);
     [LibraryImport(Ssl)] public static partial ulong SSL_CTX_set_options(IntPtr ctx, ulong options);
     [LibraryImport(Ssl)] public static partial long SSL_CTX_ctrl(IntPtr ctx, int cmd, long larg, IntPtr parg);
+
+    /// <summary>Which libcrypto actually got loaded. The resolver tries several sonames, and kTLS RX
+    /// behaviour differs by version (3.0.x declines it for TLS 1.3), so "which OpenSSL is this?" is a
+    /// load-bearing question rather than trivia. Encoded as 0xMNN00PP0 in 3.x.</summary>
+    [LibraryImport(Crypto)] public static partial ulong OpenSSL_version_num();
+
+    /// <summary>OpenSSL_version(OPENSSL_CFLAGS) — the configure/compiler flags of the loaded build. Needed
+    /// because kTLS is a COMPILE-TIME option (`enable-ktls`): a build without it reports TX=False RX=False
+    /// and is indistinguishable from "this version declines kTLS" unless you look. Measured 2026-07-29,
+    /// when a 3.5.7 build reported both false and turned out to be built without kTLS at all.</summary>
+    [LibraryImport(Crypto)] public static partial IntPtr OpenSSL_version(int type);
+
+    public static string OpenSslCFlags()
+    {
+        try
+        {
+            var p = OpenSSL_version(1 /* OPENSSL_CFLAGS */);
+            return p == IntPtr.Zero ? "(null)" : (Marshal.PtrToStringUTF8(p) ?? "(null)");
+        }
+        catch (Exception ex) { return "unknown (" + ex.GetType().Name + ")"; }
+    }
+
+    /// <summary>Was the loaded OpenSSL built with kTLS support at all?</summary>
+    public static bool OpenSslHasKtls() => !OpenSslCFlags().Contains("OPENSSL_NO_KTLS", StringComparison.Ordinal);
+
+    public static string OpenSslVersionString()
+    {
+        try
+        {
+            ulong v = OpenSSL_version_num();
+            return $"{(v >> 28) & 0xF}.{(v >> 20) & 0xFF}.{(v >> 4) & 0xFF}";
+        }
+        catch (Exception ex) { return "unknown (" + ex.GetType().Name + ")"; }
+    }
     [LibraryImport(Ssl)] public static partial ulong SSL_set_options(IntPtr ssl, ulong options);
     [LibraryImport(Ssl)] public static partial IntPtr SSL_get_rbio(IntPtr ssl);
     [LibraryImport(Ssl)] public static partial IntPtr SSL_get_wbio(IntPtr ssl);

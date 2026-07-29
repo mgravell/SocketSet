@@ -125,6 +125,7 @@ internal sealed class IoUringShard : SocketSetShard
     private static long s_iovSegs; // total iovec segments across all writevs: segments/response is the
                                    // real independent variable, since sends/response is constant at 1.
     private static int s_statsReported;
+    private static int s_ktlsReported; // kTLS TX/RX offload state is reported once per process
 
     private static void DumpStats(string tag)
     {
@@ -1119,7 +1120,25 @@ internal sealed class IoUringShard : SocketSetShard
     // handshake, since POLL fires immediately if the socket already has bytes).
     private unsafe void KtlsComplete(IoUringConnection conn, uint slot, int fd)
     {
-        // (Diagnostics could assert BIO_get_ktls_send/recv here; TX-native assumes kTLS TX is active.)
+        // Report what the kernel ACTUALLY took, once per process. Until 2026-07-29 every kTLS number on
+        // file measured a HALF-offloaded path - TX in the kernel, RX still decrypted by OpenSSL - and
+        // nothing said so: `TlsRxSw` sat at 0 in /proc/net/tls_stat and had to be noticed by hand months
+        // later. The cause is not ours: OpenSSL < 3.2 declines kTLS RX for TLS 1.3. Measured on this box -
+        // 3.0.13 gives RX=False, a self-built 3.5.7 gives RX=True, same probe, TLS 1.3 both times.
+        //
+        // Capability is discovered rather than assumed (BIO_get_ktls_recv), so an old OpenSSL degrades to
+        // TX-only instead of breaking - but a silent degradation is exactly what made a year of kTLS
+        // measurements mean something other than what they appeared to. So it now says so out loud.
+        if (Interlocked.Exchange(ref s_ktlsReported, 1) == 0)
+        {
+            bool ktx = BIO_get_ktls_send(SSL_get_wbio(conn.KtlsSsl));
+            bool krx = BIO_get_ktls_recv(SSL_get_rbio(conn.KtlsSsl));
+            Console.Error.WriteLine(
+                $"[ktls] openssl={OpenSslVersionString()} tx={ktx} rx={krx}" +
+                (krx ? "" : " -- RX NOT offloaded: OpenSSL is decrypting in userspace, so receive runs " +
+                            "POLL+SSL_read (one syscall per message) and cannot use multishot. OpenSSL " +
+                            "3.2+ is required for kTLS RX on TLS 1.3; see TODO item 4b."));
+        }
         conn.KtlsReady = true;
         // No TlsFilter on this path, so publish the ALPN result straight from the SSL before the app sees
         // the connection open — Connection.NegotiatedProtocol falls back to this.

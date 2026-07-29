@@ -22,6 +22,10 @@ public static unsafe class KtlsProbe
         var sb = new StringBuilder();
         void Log(string m) { sb.Append(m).Append('\n'); }
 
+        Log($"openssl: {OpenSslVersionString()}  built-with-ktls={OpenSslHasKtls()}  (RX support is version-dependent - see TODO item 4b)");
+        if (!OpenSslHasKtls())
+            Log("  NB: this build has OPENSSL_NO_KTLS - TX=False RX=False below means 'not compiled in', NOT 'declined'.");
+
         // Self-signed cert for the server; client trusts exactly it.
         string certPem, keyPem;
         using (var rsa = RSA.Create(2048))
