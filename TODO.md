@@ -1089,28 +1089,46 @@ much stronger than when this entry was written**, and what is left is mechanism,
 
 ### 0d. RIO + TLS out-of-band send is starved at the default page — a CORRECTNESS-GATE failure (2026-07-29)
 
-**Status: DIAGNOSED 2026-07-29, not fixed. The only red cell in the Windows smoke matrix.**
+**Status: NOT diagnosed, but the search space is now small. Not fixed. The only red cell in the Windows
+smoke matrix.**
 
-**The mechanism, in one line: the send page must hold a whole ENCRYPTED RECORD, and 4KB does not.**
-`--verify` writes 7,000-byte segments, which encrypt to ~7,029 bytes; that spans two 4KB pages, and the
-receiver cannot decrypt a partial record, so it stalls until the second send arrives - with one send in
-flight per connection, a stall per record. A send-page sweep with the receive buffer pinned shows a
-**step, not a slope**: 3.01-4.87s at 4096, 0.18-0.53s at 8192, then flat (0.18-0.20s) through 65536.
-Plaintext never pays it because a partial buffer is immediately usable.
+**A mechanism was proposed and then REFUTED by its own confirming test, on the same day.** The proposal
+was "the send page must hold a whole encrypted record", the record being the caller's write size plus
+framing - which predicts the cliff moves with the write size. `--verify-seg` was added to test it, and
+**both directions fail**: a ~1KB record that fits a 4KB page eight times over is still slow at page 4096
+(2.34-5.07s), and a ~15KB record that cannot fit an 8KB page at all is already fast at page 8192
+(0.18-0.53s). Record framing is not the mechanism. Do not re-derive it.
 
-Established along the way, each of which killed a candidate:
-- **Not pool depth** - `--write-buffers`/`--oob-write-buffers` at 4096 change nothing.
-- **Not a busy loop** - `SS_RIO_STATS=1` (new; RIO had no instrumentation at all) shows 0.17 port-wakes
-  and 0.17 notify-rearms per send. It is waiting, not working.
-- **`--page` was moving the receive buffer too**, and separating them says the send page is ~25x and the
-  receive buffer ~2.6x independently. The original attribution held; the confound was secondary.
-- *Pre-registered and only partly right:* the step was predicted at 16384 (SChannel's maximum record).
-  It lands at 8192, so what matters is **the caller's write size plus overhead**, not the protocol
-  maximum. **The confirming test - vary the application write size, watch the step move - is not done.**
+**What IS established - the cliff is the send page, between 4096 and 8192, and nothing else:**
 
-**What would fix it:** scatter-gather, which RIO cannot have (`maxSendDataBuffers` capped at 1). So the
-realistic fix is the page-size default (item 0), and this is the strongest argument for it on file
-because it is a failed correctness cell rather than a throughput number.
+| | pools 1024 | pools 512 |
+|---|---|---|
+| page 4096 | 2.06-5.50s | 3.03-5.20s |
+| page 8192 | 0.51-0.53s | 0.18-0.56s |
+
+(`--page` silently rescales all three pool depths to 4MB/page, so every earlier "page" result was also a
+"pools" result. Crossed over, the effect follows the page and not the pools at all.)
+
+Excluded, each by measurement:
+- **Not pool depth**, in either direction - raising both write pools to 4096 at page 4096 changes
+  nothing, and the crossover above settles it.
+- **Not the TLS record size / caller write size** - the refutation above.
+- **Not a busy or over-kicking loop** - `SS_RIO_STATS=1` (new; RIO had no instrumentation at all) shows
+  0.17 port-wakes and 0.17 notify-rearms per send, 2.0 completions per send. It is waiting, not working.
+- **Not the receive buffer** as the main term. `--page` moves it too (it follows the page unless
+  `--recv-buffer` overrides); separated, the send page is ~25x and the receive buffer ~2.6x.
+- **TLS-only** - plaintext RIO at the same page does 12.58MB in 0.15s.
+- **RIO-only** - IOCP+TLS at page 4096 does the same in 0.24s.
+
+**Where to start, for whoever picks this up:** the question is what a RIO send of 4096 bytes waits for
+under TLS that a send of 8192 bytes does not, given the loop is idle and nothing is starved. That is a
+much smaller question than this entry started with, and it wants a profiler or an ETW trace rather than
+another flag sweep - four have now been run and each one only excluded something.
+
+**What would dissolve it regardless of cause:** scatter-gather, which RIO cannot have
+(`maxSendDataBuffers` capped at 1). So the practical fix is the page-size default (item 0), and this is
+the strongest argument for it on file, because it is a failed correctness cell and not a throughput
+number.
 
 *Original entry follows.*
 

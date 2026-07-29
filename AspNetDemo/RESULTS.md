@@ -324,7 +324,47 @@ What it is instead, measured on the same host in one session:
 | rio, page 4096 *(control)* | 0.08s | so it is TLS-specific |
 | iocp+tls, page 4096 *(control)* | 0.22s | so it is RIO-specific |
 
-#### DIAGNOSED later the same day: the send page must hold a whole ENCRYPTED RECORD, and 4KB does not
+#### RETRACTED, same day: the "encrypted record must fit the page" mechanism below is WRONG
+
+The section that follows was committed as a diagnosis and is refuted by its own confirming test. Read the
+retraction first; the original is kept because the four *negative* results in it stand and are what
+remains true.
+
+**The model said** the stall is "one encrypted record does not fit one send page", the record being the
+application's write size plus ~29 bytes of framing. That predicts the cliff MOVES with the write size.
+`--verify-seg` was added to test exactly that (4 reps per cell, `--recv-buffer` pinned at 4096):
+
+| | page 4096 | page 8192 |
+|---|---|---|
+| seg=1000 (~1029 B record - **model says fast at 4096**) | **2.34-5.07s** | 0.18-0.53s |
+| seg=7000 (~7029 B record) | 2.71-7.39s | 0.18-0.54s |
+| seg=15000 (~15029 B record - **model says slow at 8192**) | 2.10s | **0.18-0.53s** |
+
+**Both predictions fail.** A 1KB record that fits a 4KB page eight times over is still slow at 4096; a
+15KB record that cannot fit an 8KB page at all is already fast at 8192. The cliff sits between a 4096 and
+an 8192 byte send page and **does not move with the application's write size**, so record framing is not
+the mechanism.
+
+**And it is not the pool depths either**, which `--page` silently rescales (all three, to 4MB/page), so
+every "page" result had always also been a "pools" result. Crossed over, 4 reps each:
+
+| | pools 1024 (4k-native) | pools 512 (8k-native) |
+|---|---|---|
+| **page 4096** | 2.06-5.50s | 3.03-5.20s |
+| **page 8192** | 0.51-0.53s | 0.18-0.56s |
+
+The effect follows the **page size** cleanly and the pool depth not at all.
+
+**So what is established is a set of exclusions, and the mechanism is open.** It is the send page, at a
+step between 4096 and 8192; it is TLS-only (plaintext RIO at the same page does 12.58MB in 0.15s) and
+RIO-only (IOCP+TLS at page 4096 does it in 0.24s); it is **not** pool depth in either direction, **not**
+the TLS record size, **not** the receive buffer (worth 2.6x on its own against the page's ~25x), and
+**not** a busy or over-kicking loop. Anyone picking this up starts from a much smaller search space than
+"it is slow", and should not start from the paragraph below.
+
+*The original write-up follows, for the negative results and the method.*
+
+#### SUPERSEDED: the send page must hold a whole ENCRYPTED RECORD, and 4KB does not
 
 Added `SS_RIO_STATS=1` - RIO was the only backend with no instrumentation at all (io_uring has
 `SS_URING_STATS`, IOCP now has `SS_IOCP_STATS`). Four things fell out, in order.

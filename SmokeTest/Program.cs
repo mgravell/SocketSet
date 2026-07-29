@@ -17,6 +17,7 @@ int window = 1; // client send window: 1 = ping/pong, N = bounded pipeline, int.
 bool poke = false; // server echoes out-of-band via Connection.Send from a background thread
 bool adopt = false; // bind+listen a socket ourselves, then hand its handle to ListenHandle (socket-activation style)
 int verify = 0;    // >0: run the out-of-band Send content-verification harness with this payload size
+int verifySeg = 7000; // --verify's multi-segment chunk size (straddles a 4096 page boundary by default)
 long verifyEcho = 0; // >0: run the bidirectional echo content-verification harness, round-tripping this many bytes
 int closeAfter = 0; // >0: each client sends this many messages then closes (graceful-drain test)
 int loops = 1;      // drain test: repeat this many connect→drain cycles (0 = forever, until Ctrl+C)
@@ -160,6 +161,15 @@ for (int i = 0; i < args.Length; i++)
         case "--adopt":
             adopt = true;
             break;
+        // Segment size for --verify's multi-segment leg. Exposed 2026-07-29 to confirm item 0d's model:
+        // the RIO+TLS stall is predicted to be "one encrypted record does not fit one send page", and the
+        // record is sized by what the APPLICATION writes per call - so the page at which the cliff
+        // disappears should track this value, not a fixed protocol maximum. Hard-coded at 7000 before,
+        // which is why the model could be inferred from one step but not confirmed.
+        case "--verify-seg" when i + 1 < args.Length && int.TryParse(args[i + 1], out var vs):
+            verifySeg = vs;
+            break;
+
         case "--verify" when i + 1 < args.Length && int.TryParse(args[i + 1], out var vp):
             verify = Math.Max(1, vp);
             break;
@@ -298,7 +308,7 @@ if (args.Contains("--ktls-spike"))
 
 if (verify > 0)
 {
-    RunVerify(options, verify, port);
+    RunVerify(options, verify, port, verifySeg);
     return;
 }
 
@@ -329,9 +339,10 @@ static void RunRespPing(SocketSetOptions opts, string host, int port, string? tl
     Console.WriteLine($"resp-ping: reply=\"{reply}\" => {(completed && set.Ok ? "PASS" : "FAIL")}");
 }
 
-static void RunVerify(SocketSetOptions opts, int payloadLen, int port)
+static void RunVerify(SocketSetOptions opts, int payloadLen, int port, int seg)
 {
-    const int seg = 7000; // multi-segment chunk size for the sequence send (straddles page boundaries)
+    // seg: multi-segment chunk size for the sequence send. 7000 by default, which straddles a 4096 page
+    // boundary on purpose; --verify-seg varies it (see item 0d).
     using var set = new SendVerify(opts, payloadLen, seg);
     var ep = new IPEndPoint(IPAddress.Loopback, port);
     set.Listen(ep);
@@ -388,6 +399,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("                    the pipe instead of OnReceive (caller-supplied-buffer path)");
     Console.WriteLine("  --adopt           bind the listener here and hand its handle to ListenHandle (socket-activation style)");
     Console.WriteLine("  --verify N        run the out-of-band Send correctness harness with an N-byte payload");
+    Console.WriteLine("  --verify-seg N    --verify's multi-segment chunk size (default 7000). Under TLS this");
+    Console.WriteLine("                    sets the RECORD size, which is what the send page must exceed");
     Console.WriteLine("  --verify-echo N   round-trip N bytes of a known pattern through the echo path and");
     Console.WriteLine("                    byte-verify both legs (-z sets chunk size, --window the pipe depth)");
     Console.WriteLine("  --close-after N   each client sends N messages then closes (graceful-drain lifecycle test)");
