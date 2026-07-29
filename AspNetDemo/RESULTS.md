@@ -39,7 +39,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 | `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
-| BYO zero-copy **send** | **yes** | impossible (registered ids) | **yes** | no | no | ***yes - sends from the pipe*** |
+| BYO zero-copy **send** | **yes** (<=256 segs) | impossible (registered ids) | **yes** (<=1024 iov) | no | no | ***yes - sends from the pipe*** |
 | BYO zero-copy **receive** | no | no | no | no | no | ***yes - into `GetMemory()`*** |
 | internal zero-copy echo | no | no | **yes** (borrowed read buffers) | no | no | *n/a* |
 | pipe mode (`UsePipe`) | yes | yes | yes | yes | yes | *it **is** pipes* |
@@ -248,11 +248,13 @@ above does not cover.
    offload - kTLS's whole point - cannot appear at any size.
 6. **RIO is starved, not slow.** At its shipped page it is the worst leg in any table; at a 64KB page with
    a 4KB receive buffer it is the fastest thing measured on Windows.
-7. **Zero-copy send changes the 256KB picture completely, on the backend that can actually do it.**
+7. **Zero-copy send changes the 256KB picture completely, on both backends that can do it.**
    io_uring with `--byo` does **11,536.1** at 256KB against 7,950.2 classic (**+45.1%**), cutting the gap
-   to vanilla Kestrel from 36% to **7.3%**. IOCP has the same feature and gains nothing at that payload
-   because its 64-segment cap declines a 65-segment response - measured, not inferred. See the zero-copy
-   section below.
+   to vanilla Kestrel from 36% to **7.3%**. IOCP looked like an exception until 2026-07-29, when the
+   reason turned out to be a 64-segment cap declining a 65-segment response - measured, not inferred.
+   With that fixed IOCP does **11,136.2** against 4,918.2 classic and lands **-2.4% from a same-session
+   vanilla Kestrel**, from -56.9%. **On both backends the large-payload story is the same one**: not
+   fewer copies, but no copying path at all.
 
 ### The best-measured configuration on Linux today (2026-07-29)
 
@@ -270,8 +272,12 @@ recommendation. 512B and 64KB are unmoved by both.
 
 ### Known gaps in this picture
 
-- **Nothing on Windows has been re-measured since the 2026-07-28 page-chaining fix** (the bench host is
-  Linux). IOCP is the backend most likely to benefit and is untested.
+- ~~Nothing on Windows has been re-measured since the 2026-07-28 page-chaining fix~~ **CLOSED
+  2026-07-29** - Windows is re-measured, and IOCP's zero-copy send turned out to be the large one
+  (+117.3% with `--pipe-segment`, +61.1% without after the cap split). **What remains open there:** which
+  of the six commits between the 2026-07-27 and 2026-07-29 baselines owns the +17.6% on the classic
+  bridged leg (it is not `dd8cdce` - that A/B is flat), and `--pipe-segment`'s memory bill on Windows,
+  which is 2.7x RSS at 2048 connections on Linux and has never been measured here.
 - **The managed fallback appears in none of these tables**, despite being what actually runs wherever
   io_uring is unavailable (Docker's default seccomp profile blocks it).
 - **`ReceiveBufferSize` does not reach the managed backend** (`ManagedSocketShard` reads `BufferPageSize`).
