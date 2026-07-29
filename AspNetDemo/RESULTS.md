@@ -14,6 +14,138 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > for the findings and the method, not as a baseline. **Never compare a number across the two.** Where an
 > older section's conclusion has been re-tested, that is stated inline.
 
+## WHERE THINGS STAND (2026-07-29) — the consolidated view
+
+Everything below this section is a dated investigation; this is the summary they add up to. Cells are
+linked to the section that measured them. **Do not compare Linux and Windows rows** - same silicon, but
+different OS and different dates.
+
+### Feature / backend matrix
+
+Verified by inspection 2026-07-29, not recalled. This table has been wrong twice (it claimed
+`ReceiveBufferSize` reached only Windows, and that neither Linux backend had a per-socket receive slab), so
+each row names what it is asserting.
+
+The last column is **vanilla Kestrel's own socket transport** - the control every benchmark here is run
+against. It is included because several of our "no" cells are things Kestrel already has, and because it
+is the reason the comparison at 256KB goes the way it does. That column describes the framework's design
+rather than code in this repo, so it is marked as such and should be re-checked before being quoted.
+
+| feature | IOCP | RIO | io_uring | epoll | managed | *Kestrel (sockets)* |
+|---|---|---|---|---|---|---|
+| TLS in-transport | SChannel | SChannel | OpenSSL | OpenSSL | yes (per-conn gate) | *no - `SslStream` layered above* |
+| ALPN | yes | yes | yes | yes | yes | *yes (via `SslStream`)* |
+| kTLS | - | - | **yes, TX only** | **no code at all** | - | *no* |
+| `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
+| multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
+| chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
+| BYO zero-copy **send** | **yes** | impossible (registered ids) | no | no | no | ***yes - sends from the pipe*** |
+| BYO zero-copy **receive** | no | no | no | no | no | ***yes - into `GetMemory()`*** |
+| internal zero-copy echo | no | no | **yes** (borrowed read buffers) | no | no | *n/a* |
+| pipe mode (`UsePipe`) | yes | yes | yes | yes | yes | *it **is** pipes* |
+| write-pool exhaustion | stage + retry | stage + retry | pinned-heap fallback | n/a (`ArrayPool` staging) | n/a | *n/a* |
+| read depth > 1 | no | no (capped) | **yes, multishot** | n/a (level-triggered) | no | *no* |
+| AF_UNIX | yes | **no** (TCP/UDP) | yes | yes | yes | *yes* |
+| reuse-port multi-bind | no | no | **yes** (IP) | **yes** (IP) | no | *no* |
+| loop thread per shard | yes | yes | yes | yes | **no** | *no - thread pool + IO queues* |
+
+**The two cells that explain the 256KB result.** Kestrel is zero-copy in *both* directions **and pays no
+bridge at all** - its transport contract already *is* a pair of pipes, so there is nothing to adapt. Every
+SocketSet leg in the ASP.NET tables pays an adapter that Kestrel-on-sockets does not have, plus at least
+one copy that Kestrel does not make. That is the structural statement behind "the bridge costs 24-42% at
+256KB", and it is why the honest end-state for the ASP.NET path is fewer pipes and hops rather than fewer
+copies.
+
+Note also what SocketSet has that Kestrel does not, since the matrix cuts both ways: TLS terminated inside
+the transport (worth +22% at small messages against `SslStream`), kTLS, multishot receive, reuse-port
+multi-bind, and a loop thread per shard.
+
+**Copies on the outbound pipe path, which is what "BYO" is about.** `Connection.Send(in
+ReadOnlySequence)` is not overridden anywhere, so every backend except IOCP copies the caller's pipe
+segments into its own writer:
+
+| backend | pipe -> our buffer | our buffer -> socket | total userspace copies |
+|---|---|---|---:|
+| *Kestrel (sockets)* | *none - there is no "our buffer"* | *none - SAEA sends the pipe segments* | ***0*** |
+| IOCP (`TrySendZeroCopy`) | **none** - `WSABUF`s point at pipe memory | - | **0** |
+| managed | `WriteAll` into `_wbuf` (ArrayPool) | none - SAEA `SetBuffer(_wbuf)` sends it | 1 |
+| io_uring | `WriteAll` into pooled pages | none - writev over those pages | 1 |
+| epoll | `WriteAll` into `OutboundConnection` | `Flush` rents + copies the snapshot | 2 |
+| RIO | `WriteAll` into a registered write page | none - `RIOSend` from the page | 1 (permanent) |
+
+**The managed backend is one step from BYO, and it is the cheapest step available.** It already sends
+directly from the buffer it accumulated into - no staging copy, unlike epoll - so the only thing between
+it and zero-copy is that `WriteAll` accumulation. `SocketAsyncEventArgs` takes a `BufferList` of
+`ArraySegment`s, which is exactly the shape of a `ReadOnlySequence`, and needs **no pinning** because the
+SAEA handles that. That is the same mechanism Kestrel's own transport uses. Untested and unbuilt.
+
+### Headline numbers, Linux (bare metal, Ryzen 9 7900X, Pop!_OS 24.04, kernel 7.0.11)
+
+**Small messages** - `bench/run-matrix.sh`, `-c 128`, 2-byte responses, median rps, 3 scored passes:
+
+| leg | best rps | vs Kestrel |
+|---|---:|---:|
+| **iouring** (s8) | **823,328** | **+5.6%** |
+| epoll (s12) | 797,725 | +2.4% |
+| kestrel | 779,303 | - |
+| **iouring+tls** (s12) | **702,829** | **+22%** |
+| epoll+tls (s12) | 689,190 | +20% |
+| iouring+ktls (s12) | 597,486 | +3.7% |
+| kestrel+tls | 576,069 | - |
+
+**Payload sweep through the ASP.NET bridge** - goodput MiB/s, 12 shards, `-c 64`. Rows marked \* are the
+six-pass re-measurement of 2026-07-28; the rest are three-pass from the sweep earlier that day, whose
+64KB/256KB cells reproduce within ~2%, which is what licenses quoting its smaller payloads:
+
+| payload | kestrel | kestrel+tls | epoll | iouring | epoll+tls | iouring+tls | iouring+ktls |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 512 B | 346.6 | 255.6 | 338.9 | 332.0 | 290.2 | 285.4 | 249.9 |
+| 4 KB | 2,422.6 | 1,676.2 | 2,385.8 | 2,339.2 | 2,032.1 | 1,914.6 | 1,753.1 |
+| 16 KB | 7,351.3 | 4,448.6 | 7,122.3 | 7,053.9 | 5,722.7 | 5,333.2 | 4,315.0 |
+| 64 KB\* | 10,018.3 | 6,682.8 | **10,532.0** | **10,568.0** | 9,201.3 | 8,531.7 | 7,396.6 |
+| 256 KB\* | **12,515.8** | 8,030.4 | 6,655.5 | 7,817.6 | 4,342.9 | 3,934.4 | 5,600.1 |
+
+**Bare transport, no bridge**, same 12 shards and load - the control that localises the 256KB collapse:
+
+| payload | io_uring | epoll |
+|---|---:|---:|
+| 64 KB | 10,832.8 | 10,744.8 |
+| 256 KB | 10,349.4 | **11,437.3** |
+
+### Headline numbers, Windows (2026-07-27, same silicon, NOT comparable with the above)
+
+| leg | 16 KB | 256 KB |
+|---|---:|---:|
+| kestrel (bridged) | 4,007.7 | 11,488.9 |
+| iocp (bridged) | 3,741.1 | 4,483.4 |
+| rio (bridged, default 4KB page) | 1,521.1 | 2,051.6 |
+| **rio, bare, tuned** (64KB page + 4KB recv) | 4,365.8 | **11,030.2** |
+
+### How to read all of it
+
+1. **SocketSet beats stock Kestrel at small messages on Linux** - +5.6% plaintext, +22% TLS, disjoint
+   ranges. The TLS margin is the more interesting one: our in-transport OpenSSL against `SslStream`.
+2. **The TLS lead holds to 64KB and the plaintext legs are level with Kestrel there**, then everything
+   inverts at 256KB.
+3. **That inversion is the BRIDGE, not the transport.** The bare transport does not collapse - epoll
+   *rises* to 11,437 at 256KB. The bridge costs 2.0-2.4% at 64KB and 24.5-41.8% at 256KB, and charges a
+   *variable* amount (9-17% spread bridged against 2.7-3.0% bare).
+4. **512 B is ceiling-bound** and is not a transport comparison; all seven legs sit inside ~30%.
+5. **kTLS trails everywhere**, which is expected rather than damning: loopback has no NIC, so inline
+   offload - kTLS's whole point - cannot appear at any size.
+6. **RIO is starved, not slow.** At its shipped page it is the worst leg in any table; at a 64KB page with
+   a 4KB receive buffer it is the fastest thing measured on Windows.
+
+### Known gaps in this picture
+
+- **Nothing on Windows has been re-measured since the 2026-07-28 page-chaining fix** (the bench host is
+  Linux). IOCP is the backend most likely to benefit and is untested.
+- **The managed fallback appears in none of these tables**, despite being what actually runs wherever
+  io_uring is unavailable (Docker's default seccomp profile blocks it).
+- **`ReceiveBufferSize` does not reach the managed backend** (`ManagedSocketShard` reads `BufferPageSize`).
+- **Linux bridged legs below 64KB have not been re-run at six passes.** The fix cannot affect them (see
+  item 1), but they are three-pass numbers.
+
 ## Environment (current baseline, 2026-07-27)
 
 | | |
