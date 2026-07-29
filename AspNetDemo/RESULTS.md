@@ -117,16 +117,48 @@ controls rather than a cross-day comparison:
 across 98 cells. At 64KB epoll is unchanged (10,485.8 against 10,532.0), which is the right shape: the
 bridge costs only ~2% there, so there is nothing for a copy to be a large fraction *of*.
 
-**What this settles, and what it does not.** Pre-registered was "≈15 points, the io_uring-epoll gap";
-measured +16.3%. So **per-byte copying does cost, at large payloads** - and the standing conclusion
+**What this settles.** **Per-byte copying does cost at large payloads.** The standing conclusion
 "allocation and per-operation cost dominate; per-byte copying does not" needs its scope narrowed rather
-than reversed. That conclusion came from `fa97dd4` (+27% at 256KB for removing an *allocation*), from page
-size moving RIO 4.68x without changing bytes copied, and from IOCP zero-copy buying +3.5% *at 16KB*. None
-of those measured a copy removed at 256KB with everything else held still. This does. **Copies are cheap
-relative to allocations and syscalls, and they are not free at a quarter-megabyte per response.**
+than reversed: it came from `fa97dd4` (+27% at 256KB for removing an *allocation*), from page size moving
+RIO 4.68x without changing bytes copied, and from IOCP zero-copy buying +3.5% *at 16KB*. None of those
+removed a copy at 256KB with everything else held still. This does. **Copies are cheap next to allocations
+and syscalls, and they are not free at a quarter-megabyte per response.**
 
-It does NOT say the bridge is mostly copies: epoll had two and now has one, and the remaining gap to
-Kestrel at 256KB is still large. It says the copy term is real and worth about 16 points on this path.
+#### But the reason the test was run is REFUTED: this did not move the bridge's share at all
+
+The prediction had two halves and only one survived. The throughput half was right to within a point. The
+*causal* half - that the bridge costs epoll more than io_uring **because** epoll made an extra copy, so
+removing it should drop epoll's bridge cost by ~15 points - is wrong.
+
+The bare responder flushes through `OutboundConnection` too, so it got the same win
+(`bench/run-bare-vs-bridged.sh`, re-run on the fixed build, io_uring untouched as a control):
+
+| backend | bare, before | bare, after | change |
+|---|---:|---:|---:|
+| epoll @ 256KB | 11,437.3 | **12,971.1** | **+13.4%** |
+| io_uring @ 256KB *(control)* | 10,349.4 | 10,352.0 | +0.03% |
+| epoll @ 64KB | 10,744.8 | 10,759.4 | +0.1% |
+| io_uring @ 64KB *(control)* | 10,832.8 | 10,606.2 | -2.1% |
+
+Both sides of the subtraction rose, so the ratio is almost unchanged:
+
+| backend @ 256KB | bare | bridged | bridge cost | was |
+|---|---:|---:|---:|---:|
+| epoll | 12,971.1 | 7,739.1 | **40.3%** | 41.8% |
+| io_uring | 10,352.0 | 7,882.6 | **23.9%** | 24.5% |
+
+**epoll and io_uring now make the same number of outbound copies (one each) and the bridge still costs
+epoll 40.3% against io_uring's 23.9%.** So copy count does not explain the difference between them, and
+the correlation recorded above - io_uring 1 copy/24.5%, epoll 2 copies/41.8% - was coincidence as far as
+the *bridge* is concerned. It was flagged as "three points and a plausible mechanism, the shape of
+argument this file has twice had to retract"; it has now been retracted by its own test, which is the
+outcome that framing was there to make possible.
+
+**What is still unexplained, and is now the sharper question:** why does the same bridge cost epoll 40%
+and io_uring 24%, at equal copy counts, when epoll is the *faster* backend bare (12,971 vs 10,352)? Both
+run the same `PipeIoBridge`, the same two `Pipe`s and the same Kestrel. The remaining candidates are the
+per-flush marshalling shape (epoll's `SubmitFlush` enqueues a byte[] and pokes an eventfd; io_uring
+enqueues an `OutChain` and pokes an eventfd) and the wake/scheduling cost per flush - not the copies.
 
 **The managed backend is one step from BYO, and it is the cheapest step available.** It already sends
 directly from the buffer it accumulated into - no staging copy, unlike epoll - so the only thing between
@@ -165,12 +197,17 @@ two epoll cells at 256KB are +16.3% and +11.2% on what this table held the day b
 leg is a within-session control that did not move. The pre-copy-removal values are kept in the test
 section below rather than here, so this table always shows current behaviour.
 
-**Bare transport, no bridge**, same 12 shards and load - the control that localises the 256KB collapse:
+**Bare transport, no bridge**, same 12 shards and load - the control that localises the 256KB collapse.
+Re-measured 2026-07-29 after the `OutboundConnection` copy removal, which lifted bare epoll too:
 
 | payload | io_uring | epoll |
 |---|---:|---:|
-| 64 KB | 10,832.8 | 10,744.8 |
-| 256 KB | 10,349.4 | **11,437.3** |
+| 64 KB | 10,606.2 | 10,759.4 |
+| 256 KB | 10,352.0 | **12,971.1** |
+
+Bridge cost at 256KB is therefore **23.9% on io_uring and 40.3% on epoll** - essentially unchanged by the
+copy removal, because both sides of the subtraction rose. Copy count does NOT explain why the same bridge
+costs epoll nearly twice what it costs io_uring; see the refutation below.
 
 ### Headline numbers, Windows (2026-07-27, same silicon, NOT comparable with the above)
 
