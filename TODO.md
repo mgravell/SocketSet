@@ -78,7 +78,11 @@ Reading of that table:
   io_uring ~15%.
 - **kTLS is TX-only even on io_uring**, now confirmed against the kernel's own counters rather than
   inferred from the code: `TlsTxSw` moves, `TlsRxSw` stays at zero. Every kTLS number on file measures a
-  half-offloaded path. That is what item 4 is about, and it now has direct evidence.
+  half-offloaded path. That is what item 4 is about, and it now has direct evidence. **And per item 4b
+  (2026-07-29) this is the ROOT of the "kTLS costs us multishot receive" story, not a side-effect of it:**
+  multishot is unusable because RX is not offloaded, so OpenSSL must still see ciphertext and owns the
+  reads. Turn RX on and multishot `IORING_OP_RECV` over the provided-buffer ring should return plaintext
+  directly.
 - **`ReceiveBufferSize` and stage-and-retry are Windows-only**, and both hypotheses about them have now
   been CHECKED rather than left as guesses (2026-07-28, by inspection):
   - *`ReceiveBufferSize`*: **epoll needs it, io_uring does not** — epoll's receive slab is per-SOCKET,
@@ -1345,6 +1349,62 @@ already recorded twice (TLS written twice, epoll's send path a third copy).
 **Toggle:** ship it behind the existing `--ktls` selection path plus a capability check, and keep the
 `bench/README.md` rule that `/config` must report what was actually negotiated - `tls_stat` verification
 against the kernel counters is what caught "kTLS is TX-only" and must gate any epoll+ktls leg too.
+
+### 4b. "kTLS costs us multishot RX" — the PREMISE IS WRONG, and the real blocker is that RX was never offloaded (2026-07-29)
+
+Raised from an external, **unverified** claim: *io_uring can keep multishot RX with kTLS provided you use
+TLS 1.3, because the kernel decrypts in place and plaintext lands in the provided-buffer ring; TLS 1.2
+breaks it because the crypto layer's cmsg/header trick conflicts with `recvmsg_multishot`'s packed
+layout.* Worth chasing, but the framing does not match what this codebase actually does, and the
+correction matters more than the claim.
+
+**What is verified here, not recalled:**
+
+- We drive kTLS receive as io_uring `POLL` + `SSL_read` - one syscall per message, no multishot, no
+  provided buffers (`IoUringShard.KtlsRead`).
+- **That is not a sacrifice made FOR kTLS. It is forced because kTLS RX is not on.** `/proc/net/tls_stat`
+  on this host reads `TlsTxSw = 3,612`, **`TlsRxSw = 0`** cumulative across every kTLS run ever made here.
+  TX is offloaded; **receive has never been offloaded at all**, so OpenSSL still decrypts in userspace,
+  still needs the ciphertext, and owns the fd (`SSL_set_fd`) - which is exactly why reads must go through
+  `SSL_read` rather than through our own multishot recv.
+- We never call `setsockopt(SOL_TLS)` ourselves. We set `SSL_OP_ENABLE_KTLS` and let OpenSSL decide, so
+  whether RX engages is OpenSSL's choice, not ours.
+
+**So the causal chain is the other way round from the claim.** Multishot is not lost *because* kTLS is on;
+it is lost because kTLS RX is *off*, leaving userspace decryption in the path. **If RX offload were
+active, plain `recv` returns plaintext, and `IORING_OP_RECV` + `IORING_RECV_MULTISHOT` over a provided
+buffer ring should work unmodified** - that part of the external claim is mechanically sound, and it is
+the prize.
+
+**The claim's TLS-1.2/1.3 direction is suspect, and our evidence points the opposite way.** OpenSSL here is
+**3.0.13**, and 3.0.x is understood to decline KTLS *receive* for TLS 1.3 (post-handshake KeyUpdate is the
+usual reason given), while supporting it for TLS 1.2. If that is what is happening, then negotiating TLS
+1.3 - which we almost certainly do by default - is precisely *why* `TlsRxSw` is stuck at zero, and the
+advice "enforce TLS 1.3" would keep RX offload permanently off rather than enable it. **Not asserted:
+this is a hypothesis that fits the one number we have.**
+
+**Cheapest decisive test, and it is small:** add a max-protocol-version knob, force TLS 1.2 on a kTLS leg,
+and watch `TlsRxSw`. If it moves off zero, OpenSSL's TLS-1.3 RX restriction is the blocker and the
+external advice is inverted for this OpenSSL version. If it stays at zero, something else declines RX and
+the version is a red herring. Note we cannot currently even see what was negotiated - "negotiated cipher
+suite is not reported" is already on the smaller-items list, and this is a second reason to fix it.
+
+**If RX offload can be turned on, the follow-on work is small and the payoff is item 4's whole point:**
+
+- Receive becomes `IORING_OP_RECV` multishot over the provided-buffer ring, returning plaintext - i.e. the
+  same fast path as plaintext io_uring, which is the thing kTLS currently forfeits.
+- **The one real complication is control records.** With kTLS RX, a non-`application_data` record (alert,
+  KeyUpdate, close_notify) cannot be delivered through plain `recv`; the kernel fails the read and the
+  record type is only retrievable via `recvmsg` + the `TLS_GET_RECORD_TYPE` cmsg. So the shape is:
+  multishot `RECV` as the fast path, and on that specific failure fall back to a one-shot `RECVMSG` +
+  cmsg, handle the record, and re-arm. `TlsContentType` already exists for exactly these values.
+- The external note's `recvmsg_multishot` objection then does not apply, because the fast path is `RECV`
+  multishot (no `io_uring_recvmsg_out` header), not `RECVMSG` multishot.
+
+**Why it is worth doing:** kTLS currently trails userspace TLS on every leg (`iouring+ktls` 597,486 rps
+against `iouring+tls` 702,829, -15%), and the standing explanation is precisely this forfeiture. This
+would test that explanation rather than assume it - and item 3c predicts the same thing from the other
+end, since epoll has no multishot to lose and should therefore not pay the penalty at all.
 
 ### 4. kTLS: implement the RECVMSG + cmsg receive arm
 
