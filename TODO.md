@@ -71,7 +71,29 @@ Only if the flag route works is the code change (raise `MaxSendPages`, or send a
 - io_uring-only, so not a Windows concern but they explain the numbers: page chaining
   (`GetWriteSpan`), zero-copy send, the `zero-copy=` stat counter.
 
-### 5. Windows-specific traps that have already bitten
+### 5. While you are there — and what NOT to spend Windows time on
+
+**Worth doing on Windows, because it is Windows-shaped:** the page-size default (item 0). RIO wants a
+64KB page badly (**4.68x at 256KB**, monotonic, no penalty at 512B) and IOCP is indifferent; the decision
+has been blocked on *mechanism* rather than evidence for days — `BufferPageSize` is one global with a real
+default of 4096, so there is no way to distinguish "user asked for 4096" from "user said nothing". Needs a
+sentinel (0 = backend chooses) or a factory-supplied default, and that changes public option semantics.
+Also unswept: anything **above** 64KB, where RIO was still improving at the top of the range.
+
+**Do NOT spend Windows time on:**
+- **kTLS / OpenSSL anything.** Windows uses SChannel; the entire kTLS thread (items 4, 4b, 3c) is
+  Linux-only and does not apply.
+- **Managed BYO send** (item 2e) — assessed and deliberately not built, for reasons that do not change
+  by switching OS.
+- **Re-deriving the Linux numbers.** They are in `AspNetDemo/RESULTS.md` with their caveats, and the two
+  hosts/OSes must never be subtracted from each other.
+
+**If you would rather stay on Linux instead of switching:** the honest alternative is zero-copy RECEIVE +
+receive parking (order-of-work item 7) — the last structural term against vanilla Kestrel, which is
+zero-copy in *both* directions while we still copy inbound. Much bigger job, and it does not retire the
+correctness risk in §1.
+
+### 6. Windows-specific traps that have already bitten
 
 `bench/README.md` has the full list; the two that cost the most time were the **ephemeral-port gate**
 (`Wait-Ports` in `Run-Matrix.ps1` — any harness opening thousands of connections per cell needs it, and

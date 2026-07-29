@@ -20,6 +20,13 @@ goes faster where the platform lets it.
 Supported frameworks: `net10.0` and `net472`. (The native backends are .NET-only; .NET Framework
 gets the managed fallback.)
 
+## Working on SocketSet?
+
+Start with [`AGENTS.md`](AGENTS.md) — it points at the backlog ([`TODO.md`](TODO.md)), the measurements of
+record ([`AspNetDemo/RESULTS.md`](AspNetDemo/RESULTS.md)) and the benchmarking rules
+([`bench/README.md`](bench/README.md)), and lists the house rules for producing a number anyone should
+believe. **If you are picking this up on Windows, `TODO.md` opens with a section written for you.**
+
 ## Installation
 
 ```
