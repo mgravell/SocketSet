@@ -70,8 +70,11 @@ segments into its own writer:
 | IOCP with `--byo` (`TrySendZeroCopy`) | none - `WSABUF`s point straight at pipe memory | **0** |
 | io_uring | `WriteAll` into pooled pages; writev sends those pages | 1 |
 | managed | `WriteAll` into `_wbuf`; SAEA `SetBuffer(_wbuf)` sends it | 1 |
-| epoll | `WriteAll` into the accumulator, then `Flush` rents + copies a snapshot | 2 |
-| IOCP classic / RIO | accumulator -> `Flush` snapshot -> `StageOutbound` pooled staging -> drain into write pages | **3-4** |
+| epoll | `WriteAll` into the accumulator; `Flush` **hands that buffer over** (was: rent + copy) | 1 *(was 2)* |
+| IOCP classic / RIO | accumulator -> `StageOutbound` pooled staging -> drain into write pages (the `Flush` snapshot copy is gone) | **2-3** *(was 3-4)* |
+
+The epoll and Windows rows dropped by one on 2026-07-29 - see the test below, which is what removed it.
+**Windows is untested from this host**, so IOCP/RIO have the change but not the measurement.
 
 `IoUringConnection` derives from `Connection` and owns its `OutChain` writer, which is why it escapes the
 `Flush` snapshot; `EpollConnection` and `WindowsConnection` both derive from `OutboundConnection` and pay
@@ -91,6 +94,39 @@ That test is much cheaper than BYO and it gates it: this is the same question IO
 (+3.5% at 16KB, nothing at 256KB) was supposed to answer but could not, because IOCP caps at 64 `WSABUF`s
 and a 256KB response through Kestrel's 4KB blocks is ~64 segments - so it plausibly declined and fell back
 to copying at exactly the payload of interest.
+
+### TESTED 2026-07-29: the copy DID cost, +16.3% at 256KB, and the prediction was right to within a point
+
+`OutboundConnection.Flush` no longer rents a snapshot and copies into it; it hands over the accumulator's
+own pooled buffer (`PooledBufferWriter.TakeArray`) and lets the writer re-rent on next use. One copy
+removed from every out-of-band flush on epoll, IOCP and RIO. Re-measured with the full 7-leg sweep, 12
+shards, `-c 64`, 7 passes with the first discarded - so the four untouched legs are within-session
+controls rather than a cross-day comparison:
+
+| leg | before | after | change |
+|---|---:|---:|---:|
+| **epoll** | 6,655.5 [6083-6700] | **7,739.1** [7557-7861] | **+16.3%** |
+| **epoll+tls** | 4,342.9 [4306-4359] | **4,830.6** [4620-4851] | **+11.2%** |
+| iouring *(control)* | 7,817.6 | 7,882.6 | +0.8% |
+| iouring+tls *(control)* | 3,934.4 | 3,943.8 | +0.2% |
+| iouring+ktls *(control)* | 5,600.1 | 5,486.7 | -2.0% |
+| kestrel *(control)* | 12,515.8 | 12,450.5 | -0.5% |
+| kestrel+tls *(control)* | 8,030.4 | 8,026.5 | -0.1% |
+
+**Both epoll ranges are fully disjoint from their previous ones; every control is inside 2%.** Zero errors
+across 98 cells. At 64KB epoll is unchanged (10,485.8 against 10,532.0), which is the right shape: the
+bridge costs only ~2% there, so there is nothing for a copy to be a large fraction *of*.
+
+**What this settles, and what it does not.** Pre-registered was "≈15 points, the io_uring-epoll gap";
+measured +16.3%. So **per-byte copying does cost, at large payloads** - and the standing conclusion
+"allocation and per-operation cost dominate; per-byte copying does not" needs its scope narrowed rather
+than reversed. That conclusion came from `fa97dd4` (+27% at 256KB for removing an *allocation*), from page
+size moving RIO 4.68x without changing bytes copied, and from IOCP zero-copy buying +3.5% *at 16KB*. None
+of those measured a copy removed at 256KB with everything else held still. This does. **Copies are cheap
+relative to allocations and syscalls, and they are not free at a quarter-megabyte per response.**
+
+It does NOT say the bridge is mostly copies: epoll had two and now has one, and the remaining gap to
+Kestrel at 256KB is still large. It says the copy term is real and worth about 16 points on this path.
 
 **The managed backend is one step from BYO, and it is the cheapest step available.** It already sends
 directly from the buffer it accumulated into - no staging copy, unlike epoll - so the only thing between
@@ -121,8 +157,13 @@ six-pass re-measurement of 2026-07-28; the rest are three-pass from the sweep ea
 | 512 B | 346.6 | 255.6 | 338.9 | 332.0 | 290.2 | 285.4 | 249.9 |
 | 4 KB | 2,422.6 | 1,676.2 | 2,385.8 | 2,339.2 | 2,032.1 | 1,914.6 | 1,753.1 |
 | 16 KB | 7,351.3 | 4,448.6 | 7,122.3 | 7,053.9 | 5,722.7 | 5,333.2 | 4,315.0 |
-| 64 KB\* | 10,018.3 | 6,682.8 | **10,532.0** | **10,568.0** | 9,201.3 | 8,531.7 | 7,396.6 |
-| 256 KB\* | **12,515.8** | 8,030.4 | 6,655.5 | 7,817.6 | 4,342.9 | 3,934.4 | 5,600.1 |
+| 64 KB\* | 10,060.9 | 6,631.4 | **10,485.8** | **10,495.8** | 9,148.8 | 8,495.0 | 7,279.0 |
+| 256 KB\* | **12,450.5** | 8,026.5 | **7,739.1** | 7,882.6 | **4,830.6** | 3,943.8 | 5,486.7 |
+
+The 64KB and 256KB rows are the 2026-07-29 sweep, *after* the `OutboundConnection` copy removal - so the
+two epoll cells at 256KB are +16.3% and +11.2% on what this table held the day before, and every other
+leg is a within-session control that did not move. The pre-copy-removal values are kept in the test
+section below rather than here, so this table always shows current behaviour.
 
 **Bare transport, no bridge**, same 12 shards and load - the control that localises the 256KB collapse:
 
