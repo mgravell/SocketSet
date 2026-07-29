@@ -324,15 +324,56 @@ What it is instead, measured on the same host in one session:
 | rio, page 4096 *(control)* | 0.08s | so it is TLS-specific |
 | iocp+tls, page 4096 *(control)* | 0.22s | so it is RIO-specific |
 
-The candidate mechanism is the documented one: `WindowsRioShard.IssueSend` posts `RIOSend(conn.Rq, &buf,
-1, ...)` - **one write page per send**, because Windows caps `maxSendDataBuffers` at 1 - so page size is
-the only lever RIO has, exactly as in the 4.68x bridged result. **What that does NOT explain is the
-60x gap between rio and rio+tls at the same page size**, and this is recorded as measured-but-undiagnosed
-rather than folded into the existing story. A ~5ms-per-send implied latency is too slow to be syscall
-cost and suggests something is waiting, not working.
+#### DIAGNOSED later the same day: the send page must hold a whole ENCRYPTED RECORD, and 4KB does not
 
-Practical reading: this is a third independent argument for the page-size default (TODO item 0), and the
-first one that is a **correctness-gate failure** rather than a throughput number.
+Added `SS_RIO_STATS=1` - RIO was the only backend with no instrumentation at all (io_uring has
+`SS_URING_STATS`, IOCP now has `SS_IOCP_STATS`). Four things fell out, in order.
+
+**1. The loop is not busy; it is waiting.** 12.58MB through `rio+tls` at a 4KB page: 1,683 `RIOSend`s at
+4,086 B/send, `commits 1.00/send`, **`notify-rearms 0.17/send`, `port-wakes 0.17/send`**, 2.0 completions
+per send. A loop that was spinning or over-kicking would not look like that, and ~8ms per send is far too
+slow to be syscall cost.
+
+**2. Not pool depth.** `--write-buffers 4096`, `--oob-write-buffers 4096`, and both: 2.73-3.60s against a
+2.68-5.20s baseline. Stage-and-retry is not what is waiting. Hypothesis refuted.
+
+**3. `--page` moves two things at once, and the note above did not separate them.** The receive buffer
+follows `--page` unless `--recv-buffer` overrides it. Split (3MB out-of-band verify, 3 reps):
+
+| send page | recv buffer | time |
+|---:|---:|---|
+| 4096 | 4096 *(shipped)* | 3.03, 4.58, 6.15s |
+| 4096 | 65536 | 1.15, 1.78, 1.77s |
+| **65536** | **4096** | **0.18, 0.18, 0.18s** |
+| 65536 | 65536 | 0.21, 0.20, 0.23s |
+
+**The send page is the dominant term (~25x); the receive buffer is worth ~2.6x on its own.** The original
+attribution was right and the confound was real but secondary.
+
+**4. The cliff is a RECORD boundary, not a smooth quantisation.** Send-page sweep, `--recv-buffer` pinned
+at 4096 throughout:
+
+| send page | 4096 | 8192 | 16384 | 32768 | 65536 |
+|---|---|---|---|---|---|
+| time | 3.01-4.87s | 0.18-0.53s | 0.18-0.19s | 0.18-0.20s | 0.18s |
+
+**One doubling does almost all of it and it is flat thereafter** - a step, not a slope, which is what
+names the mechanism. `--verify` writes 7,000-byte segments; those encrypt to a **~7,029-byte record**.
+That does not fit a 4KB page, so it goes as two sends - and **the receiver cannot decrypt a partial
+record**, so it stalls until the second arrives. With one send in flight per connection that is a stall
+per record. It does fit an 8KB page. Plaintext never pays it, because a partial buffer is immediately
+usable by the receiver.
+
+*Pre-registered and only partly right:* the guess was that the step would land at 16384, SChannel's
+maximum record size. It lands at **8192**, which says the size that matters is **the caller's write size
+plus overhead**, not the protocol maximum. Varying the application write size and watching the step move
+with it is the confirming test, and is not yet done.
+
+**The rule:** on RIO with TLS the send page must exceed one encrypted record, and the record is sized by
+what the application writes per call. Scatter-gather would dissolve it, and RIO cannot have scatter-gather
+(`maxSendDataBuffers` capped at 1). This is a far stronger argument for the page-size default (TODO item
+0) than the throughput numbers were, and it is the **only one that is a correctness-gate failure** rather
+than a tuning result.
 
 ### The IOCP zero-copy probe, and the 65-segment decline confirmed on Windows
 

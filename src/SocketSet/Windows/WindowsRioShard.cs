@@ -34,6 +34,45 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     private static readonly nuint WakeKey = unchecked((nuint)(-1)); // PQCS wake
     private static readonly nuint RioKey = unchecked((nuint)(-2));  // RIONotify → "drain the CQ"
 
+    // ---- SS_RIO_STATS=1 -----------------------------------------------------------------------------
+    //
+    // Added 2026-07-29 for item 0d: RIO+TLS out-of-band send runs at ~0.6-1.1 MiB/s where plaintext RIO
+    // at the SAME page size runs ~37x faster, and reading the code does not explain it. What IS
+    // established is that the cost is per-SEND rather than per-encrypt: encryption count is independent
+    // of page size, and page size moves this 15-25x. So the question is what a RIOSend waits for when
+    // TLS is on, and that needs the loop's own accounting rather than another guess.
+    //
+    // The decisive ratios this is here to expose: sends-per-loop-wake (batching lost?), commits-per-send
+    // (a kick per send instead of per drain?) and notify-rearms-per-send (a full arm/block/wake round
+    // trip per page?). RIO is the only backend with no instrumentation at all; io_uring has
+    // SS_URING_STATS and IOCP now has SS_IOCP_STATS.
+    private static readonly bool ReportStats =
+        Environment.GetEnvironmentVariable("SS_RIO_STATS") == "1";
+
+    private static long s_sends, s_sendBytes, s_commitSend, s_commitRecv, s_notify, s_portWakes, s_cqDrains, s_completions, s_pumpFlush, s_stagedBytes;
+
+    private static void DumpStats(string tag)
+    {
+        long snd = Interlocked.Read(ref s_sends);
+        if (snd == 0) return;
+        double per(long x) => snd > 0 ? (double)x / snd : 0;
+        Console.Error.WriteLine($"[rio-stats:{tag}] RIOSends={snd:n0} ({Interlocked.Read(ref s_sendBytes) / (double)(1 << 20):n1} MiB, " +
+            $"{Interlocked.Read(ref s_sendBytes) / (double)snd:n0} B/send) " +
+            $"commits: send={Interlocked.Read(ref s_commitSend):n0} ({per(Interlocked.Read(ref s_commitSend)):n2}/send) " +
+            $"recv={Interlocked.Read(ref s_commitRecv):n0} | " +
+            $"notify-rearms={Interlocked.Read(ref s_notify):n0} ({per(Interlocked.Read(ref s_notify)):n2}/send) " +
+            $"port-wakes={Interlocked.Read(ref s_portWakes):n0} ({per(Interlocked.Read(ref s_portWakes)):n2}/send) " +
+            $"cq-drains={Interlocked.Read(ref s_cqDrains):n0} completions={Interlocked.Read(ref s_completions):n0} | " +
+            $"out-of-band flushes={Interlocked.Read(ref s_pumpFlush):n0} staged={Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB");
+    }
+
+    // Periodic as well as at shutdown: a rig kills the server, and item 0c's lesson is that a measurement
+    // readable only from a clean shutdown vanishes exactly under the load that matters.
+    // MUST be declared after ReportStats - static initializers run in declaration order.
+    private static readonly Timer? StatsTimer = ReportStats
+        ? new Timer(static _ => DumpStats("periodic"), null, 2000, 2000)
+        : null;
+
     private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
     private const uint ReqSend = 2; // NULL context being treated as "no completion")
 
@@ -191,6 +230,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             uint removed = 0;
             bool ok = Win32.GetQueuedCompletionStatusExBlocking(_port, _entries, EntryBatch, &removed, Win32.INFINITE, alertable: false);
             if (!ok) continue; // port closed at shutdown → IsActive ends the loop
+            if (ReportStats) Interlocked.Increment(ref s_portWakes);
 
             for (uint i = 0; i < removed; i++)
             {
@@ -231,6 +271,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             {
                 // CQ empty: re-arm race-free (arm, then one more drain to catch the gap).
                 Win32.RIONotify(_cq);
+                if (ReportStats) Interlocked.Increment(ref s_notify);
                 if (DrainRioOnce() == 0) return; // nothing slipped into the gap → done
                 FlushCommits();                   // flush anything the gap-drain deferred
                 continue;                         // something arrived; keep going (subject to budget)
@@ -240,6 +281,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             {
                 // Busy: re-arm and hand the loop back so accept/connect (port) completions get serviced.
                 Win32.RIONotify(_cq);
+                if (ReportStats) Interlocked.Increment(ref s_notify);
                 return;
             }
         }
@@ -274,8 +316,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
                 // strands the recv under a deep pipeline (dropped message → hang). So never rely on it:
                 // `if`/`if`, not `else if`. Cost is at most two commit calls per RQ per flush, still
                 // amortized over a whole drain chunk (DEFER's batching win is intact).
-                if (send) Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
-                if (recv) Win32.RIOReceive(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null);
+                if (send) { Win32.RIOSend(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null); if (ReportStats) Interlocked.Increment(ref s_commitSend); }
+                if (recv) { Win32.RIOReceive(conn.Rq, null, 0, Win32.RIO_MSG_COMMIT_ONLY, null); if (ReportStats) Interlocked.Increment(ref s_commitRecv); }
             }
         }
         _toCommit.Clear();
@@ -286,6 +328,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         uint n = Win32.RIODequeueCompletion(_cq, _rioResults, RioBatch);
         if (n == Win32.RIO_CORRUPT_CQ)
             throw new InvalidOperationException("RIODequeueCompletion reported a corrupt completion queue.");
+        if (ReportStats) { Interlocked.Increment(ref s_cqDrains); Interlocked.Add(ref s_completions, n); }
         for (uint i = 0; i < n; i++)
         {
             ref Win32.RIORESULT r = ref _rioResults[i];
@@ -301,6 +344,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     protected override void OnShutdown()
     {
+        if (ReportStats) DumpStats("shutdown");
         _portReady = false;
 
         lock (_acceptGate)
@@ -350,7 +394,12 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     internal void EnqueueInbound(nint socket, object? token) { _incoming.Enqueue((socket, token)); Poke(); }
     public override void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
-    public override void SubmitFlush(uint slot, uint generation, byte[] data, int length) { _flush.Enqueue((slot, generation, data, length)); Poke(); }
+    public override void SubmitFlush(uint slot, uint generation, byte[] data, int length)
+    {
+        if (ReportStats) { Interlocked.Increment(ref s_pumpFlush); Interlocked.Add(ref s_stagedBytes, length); }
+        _flush.Enqueue((slot, generation, data, length));
+        Poke();
+    }
 
     private void DrainCrossThread()
     {
@@ -742,6 +791,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         buf.Length = (uint)len;
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
         if (Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend) == 0) { FailSend(conn, slot); return; }
+        if (ReportStats) { Interlocked.Increment(ref s_sends); Interlocked.Add(ref s_sendBytes, len); }
         conn.CommitSend = true;
         QueueCommit(conn);
     }
