@@ -1353,6 +1353,36 @@ The backend now says which it got, once per process - `[ktls] openssl=3.0.13 tx=
 offloaded...` - because a silent half-offload is what made every kTLS figure in this file mean something
 other than it appeared to, for months. See TODO item 4b.
 
+### kTLS is still ~20% behind userspace TLS even with BOTH directions offloaded (2026-07-29)
+
+The standing explanation for kTLS trailing was "it forfeits multishot receive and provided buffers, so it
+pays one syscall per message". Now that kTLS RX can actually be enabled (OpenSSL 3.2+; see the correction
+above), that can be half-tested - and the half that could be tested says offload is not the missing piece.
+
+Same OpenSSL (self-built 3.5.7), same box, back-to-back, io_uring, 12 shards, 4 scored passes:
+
+| payload | `iouring+tls` (userspace crypto) | `iouring+ktls` (**TX and RX in kernel**) | kTLS vs TLS |
+|---|---:|---:|---:|
+| 512 B | 602,794 [600707-618626] | 505,905 [503951-518677] | **-16.1%** |
+| 16 KB | 349,724 [344650-354893] | 275,927 [275118-286061] | **-21.1%** |
+
+Ranges disjoint at both sizes; `TlsRxSw` climbed throughout, so the offload was genuinely on.
+
+**So full offload does not close the gap - it is roughly the same ~20% that TX-only showed.** And moving
+RX into the kernel on its own made things slightly *worse* (-4.3% at 512B against the TX-only build,
+ranges disjoint, though that comparison changes the whole library so it is not attributable to RX alone).
+
+**Why that is consistent rather than surprising, and what it leaves.** Our receive path did not change:
+`KtlsRead` still drives `POLL` + `SSL_read` per message. With RX offloaded, `SSL_read` returns plaintext
+the kernel decrypted instead of decrypting it itself - so the *crypto* moved but the *syscall per message*
+did not. Offload was never the lever; it is what makes the lever reachable.
+
+**This does not test the multishot hypothesis - it clears the way to test it.** The only remaining
+explanation for the ~20% is the receive architecture, and the work is now unblocked: with kTLS RX active,
+plain `recv` returns plaintext, so `IORING_OP_RECV` + `IORING_RECV_MULTISHOT` over the provided-buffer
+ring becomes possible (proven in `KtlsProbe`'s plain-send/plain-recv round-trip). That is TODO item 4, and
+it now has a number to beat: **~20%, twice measured, at two payload sizes.**
+
 ### What would move this forward
 
 Not more passes in a container. A real Linux host, ideally two machines, and a message size large enough
