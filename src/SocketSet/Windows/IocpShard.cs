@@ -302,6 +302,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
     protected override void OnShutdown()
     {
+        if (ReportStats) DumpStats("shutdown");
         _portReady = false;
 
         // Close listeners + outstanding accept sockets and free their native state (loop stopped → no race).
@@ -359,6 +360,60 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // calling thread (Memory.Pin is thread-agnostic) so the loop only has to build WSABUFs and post.
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _zeroCopy = [];
 
+    // ---- SS_IOCP_STATS=1: did the fast path RUN, or did it decline? ----------------------------------
+    //
+    // Added 2026-07-29, and the reason is a measurement that could not be interpreted without it. IOCP's
+    // zero-copy send measured +3.5% at 16KB and nothing at 256KB, which was read as "the copy was never
+    // the cost". io_uring then measured +45.1% at 256KB for the same change, and its zero-copy= segment
+    // counter showed why: a 256KB response through Kestrel's default ~4KB pipe blocks is 65.00 segments,
+    // against MaxSendPages = 64 here. A path that silently declines measures exactly like one that ran
+    // and did not pay - bench/README.md rule 2 - and IOCP had no way to tell those apart.
+    //
+    // So the decline is counted BY CAUSE, and the fragmentation case additionally records the true
+    // segment count (the accept loop early-exits at 65, so the real count needs a second walk - taken
+    // only when stats are on, which is why the whole block is gated rather than merely reported).
+    private static readonly bool ReportStats =
+        Environment.GetEnvironmentVariable("SS_IOCP_STATS") == "1";
+
+    private static long s_zcTaken, s_zcSegs;                       // accepted zero-copy sends, and their segments
+    private static long s_zcDeclineTls, s_zcDeclineClosed, s_zcDeclineEmpty, s_zcDeclineSegs;
+    private static long s_zcDeclineSegSum, s_zcDeclineSegMax;      // true segment count at a fragmentation decline
+    private static long s_sendPages, s_sendPageBufs;               // the COPYING path: WSASends, and their WSABUFs
+
+    private static void DumpStats(string tag)
+    {
+        long zc = Interlocked.Read(ref s_zcTaken), classic = Interlocked.Read(ref s_sendPages);
+        if (zc + classic == 0) return;
+        long dseg = Interlocked.Read(ref s_zcDeclineSegs), dsum = Interlocked.Read(ref s_zcDeclineSegSum);
+        Console.Error.WriteLine($"[iocp-stats:{tag}] zero-copy sends={zc:n0} segments={Interlocked.Read(ref s_zcSegs):n0} " +
+            $"| declined: tls={Interlocked.Read(ref s_zcDeclineTls):n0} closed={Interlocked.Read(ref s_zcDeclineClosed):n0} " +
+            $"empty={Interlocked.Read(ref s_zcDeclineEmpty):n0} too-fragmented={dseg:n0} " +
+            $"(cap={IocpConnection.MaxSendPages} mean-segs={(dseg > 0 ? (double)dsum / dseg : 0):n2} " +
+            $"max-segs={Interlocked.Read(ref s_zcDeclineSegMax):n0}) " +
+            $"| copying path: WSASends={classic:n0} WSABUFs={Interlocked.Read(ref s_sendPageBufs):n0}");
+    }
+
+    // Periodic as well as at shutdown, for the reason io_uring's is: a rig kills the server, and a
+    // measurement that can only be read from a clean shutdown vanishes precisely under load.
+    // MUST be declared after ReportStats - static initializers run in declaration order.
+    private static readonly Timer? StatsTimer = ReportStats
+        ? new Timer(static _ => DumpStats("periodic"), null, 2000, 2000)
+        : null;
+
+    /// <summary>A zero-copy send was refused because the sequence has more segments than one WSASend can
+    /// carry. Records what the count actually WAS, which is the number the 64-segment cap is judged
+    /// against - "it declined" and "it declined at 65" are different findings.</summary>
+    private static void RecordFragmentDecline(in ReadOnlySequence<byte> data)
+    {
+        Interlocked.Increment(ref s_zcDeclineSegs);
+        int total = 0;
+        foreach (var _ in data) total++;
+        Interlocked.Add(ref s_zcDeclineSegSum, total);
+        long seen;
+        while (total > (seen = Interlocked.Read(ref s_zcDeclineSegMax)))
+            if (Interlocked.CompareExchange(ref s_zcDeclineSegMax, total, seen) == seen) break;
+    }
+
     /// <summary>
     /// Accept a zero-copy send, or decline it so the caller copies instead. Called on the outbound pump
     /// thread, not the loop.
@@ -374,14 +429,21 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
                                  out ValueTask<bool> completion)
     {
         completion = default;
-        if (conn.Tls is not null) return false;                       // must encrypt: see above
-        if (Volatile.Read(ref conn.Socket) == 0) return false;
-        if (data.IsEmpty) return false;
+        if (conn.Tls is not null) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineTls); return false; } // must encrypt: see above
+        if (Volatile.Read(ref conn.Socket) == 0) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineClosed); return false; }
+        if (data.IsEmpty) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineEmpty); return false; }
 
         // Count first: pinning half a sequence and then discovering it is too fragmented would mean
         // unwinding pins for nothing.
         int n = 0;
-        foreach (var _ in data) if (++n > IocpConnection.MaxSendPages) return false;
+        foreach (var _ in data)
+        {
+            if (++n > IocpConnection.MaxSendPages)
+            {
+                if (ReportStats) RecordFragmentDecline(in data);
+                return false;
+            }
+        }
 
         var handles = pinned ? null : new System.Buffers.MemoryHandle[n];
         int i = 0;
@@ -407,6 +469,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
         conn.ZcHandles = handles;
         conn.ZcCount = i;
+        if (ReportStats) { Interlocked.Increment(ref s_zcTaken); Interlocked.Add(ref s_zcSegs, i); }
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         conn.ZcCompletion = tcs;
         completion = new ValueTask<bool>(tcs.Task);
@@ -1027,6 +1090,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             skip = 0;
         }
         if (n == 0) { CompleteWrite(conn, slot); return; } // nothing left outstanding
+        if (ReportStats) { Interlocked.Increment(ref s_sendPages); Interlocked.Add(ref s_sendPageBufs, n); }
 
         uint sent = 0;
         int rc = Win32.WSASend(conn.Socket, bufs, (uint)n, &sent, 0, &op->Overlapped, null);

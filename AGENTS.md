@@ -53,3 +53,6 @@ These are not style preferences; each one was learned by getting a wrong answer 
 - **No unit tests.** `SmokeTest` is the correctness gate: `--verify-echo` (byte-exact round-trip),
   `--verify`, `--churn`, `--poke`, across backends, plaintext and TLS, callback and `--pipe`. Run it on
   every backend you touched — this is the hottest code in the repo and the only safety net.
+  On Windows that is one command: **`bench/Run-SmokeMatrix.ps1`** (48 cells, ~3 minutes, one PASS/FAIL
+  line each). It exists because the gate was previously run by hand and so was skipped between OSes.
+  There is no `.sh` equivalent yet — on Linux it is still by hand.

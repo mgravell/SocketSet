@@ -4,11 +4,41 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## READ FIRST IF YOU ARE ON WINDOWS (written 2026-07-29 for a cold start after an OS switch)
+## WINDOWS CATCH-UP: DONE 2026-07-29 (this section was the plan; this header is the result)
 
-**Windows has not run anything since 2026-07-27, and shared code changed underneath it.** Everything
-below was developed and measured on Linux. Two of the changes touch code IOCP and RIO execute, and neither
-has ever been run on Windows. **Correctness first, measurement second.**
+**All three jobs below were carried out on 2026-07-29 and the section is kept for its reasoning.** What
+happened, in one paragraph each:
+
+1. **The `Flush` hand-off risk (§1) is retired.** New `bench/Run-SmokeMatrix.ps1` runs the correctness
+   gate as a script for the first time: IOCP / RIO / managed x plaintext / SChannel TLS x out-of-band
+   verify at 64KB/1MB/4MB, echo-verify on the callback and pipe paths, poke, churn. **47/48 PASS with
+   zero mismatches anywhere.** Run it on every backend you touch; it takes about three minutes.
+2. **The one FAIL is a NEW finding and is not this change.** `rio+tls/verify-oob-4m` under-delivers, and
+   bisecting to `dd8cdce^` in a worktree shows the same failure there, with a 5-pass interleaved A/B whose
+   ranges overlap completely (pre 2.68-5.18s, post 2.68-5.20s). It is **RIO+TLS out-of-band send starved
+   at the default 4KB page**: `--page 65536` gives 0.21-0.22s against 2.68-5.20s, fully disjoint, 15-25x.
+   See the new item 0d below - it is a correctness-gate failure, not just a throughput number.
+3. **The IOCP 65-segment experiment (§3) is ANSWERED, and the pre-registered prediction under-called it.**
+   `SS_IOCP_STATS=1` (new, mirrors `SS_URING_STATS`) confirms the cap story on Windows directly: 40/40
+   256KB responses declined at **mean 65.00 / max 65 segments against `MaxSendPages` = 64**. With
+   `--pipe-segment 65536`, declines go to zero and IOCP gains **+117.3% at 256KB** (6 scored passes,
+   disjoint ranges, `bench/Run-Byo.ps1`). The prediction asked for "something like io_uring's +45.1%".
+   **And the control matters as much as the result:** pipe block size *alone* moves nothing on Windows
+   (overlapping ranges), where on Linux it was independently worth +7.5% - so on IOCP the flag is purely
+   the enabler that gets a response under the cap, and none of the +117% belongs to the block size.
+
+**What that leaves open**, and it is now the top of the Windows list rather than the bottom:
+
+- **The mechanism decision from §3 is now forced.** The flag route worked, so "raise `MaxSendPages`, or
+  send a PREFIX and have `TrySendZeroCopy` report bytes instead of a bool" is no longer speculative work -
+  it is what converts a 117% flag into a default. See item 2f (new).
+- **`--pipe-segment`'s memory bill is unmeasured on Windows.** On Linux it costs **2.7x RSS at 2048
+  connections**, which is why it is a flag there. Nobody has measured that here, and a 117% result will
+  tempt someone to default it. Measure before defaulting.
+- **The Windows baseline re-measurement (§2) and where any of this sits against vanilla Kestrel** - see
+  the results file; do not quote a Kestrel gap from a cross-day table.
+
+*The original cold-start plan follows, unchanged.*
 
 ### 1. The one real risk: `OutboundConnection.Flush` changed, and IOCP/RIO inherit it
 
@@ -124,9 +154,12 @@ above this one first; item 3 below is what you are here to do.**
    **+7.5% at 256KB / +6.3% at 16KB** on io_uring (65.00 -> 5.00 iovec segments per response); pinning
    adds +0.7%, not separable. Costs **2.7x RSS at 2048 connections**, so both stay flags rather than
    defaults. `--pipe-segment` / `--pipe-pinned`, `bench/run-pipe-opts.sh`.
-6. **Windows validation + the IOCP 65-segment experiment.** THE NEXT THING. See the Windows section at the
-   top of this file: a shared-code change (`OutboundConnection.Flush`) has never run there, and the IOCP
-   zero-copy null result now has a measured explanation with a flag-only first test.
+6. ~~Windows validation + the IOCP 65-segment experiment~~ **DONE 2026-07-29, and it is the largest win
+   on this list: +117.3% at 256KB on IOCP.** The `Flush` hand-off is correctness-clean (47/48 cells), the
+   65.00-segment decline is confirmed on Windows directly, and pipe block size alone is *not* the cause
+   (overlapping ranges) - unlike Linux. **What it spawned, and both are now ahead of item 7:** item 2f
+   (make zero-copy survive a fragmented sequence, so this is a default rather than a demo flag) and item
+   0d (RIO+TLS out-of-band starvation, the one failing correctness cell).
 7. **Zero-copy RECEIVE + receive parking.** The last structural term against vanilla Kestrel, which is
    zero-copy in *both* directions while we still copy inbound (and copy a *second* time into `_staged`
    under backpressure). Parking is also the only thing that makes inbound backpressure real rather than
@@ -1031,6 +1064,40 @@ much stronger than when this entry was written**, and what is left is mechanism,
   no way to distinguish "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend
   chooses) or a factory-supplied default; that changes public option semantics and wants its own commit.
 
+### 0d. RIO + TLS out-of-band send is starved at the default page — a CORRECTNESS-GATE failure (2026-07-29)
+
+**Status: measured, mechanism partly identified, not fixed. The only red cell in the Windows smoke
+matrix.**
+
+`bench/Run-SmokeMatrix.ps1` cell `rio+tls/verify-oob-4m` fails: 7,815,168 of 12,582,912 bytes inside the
+harness's 15s deadline, **zero mismatches**. A rate problem, not a corruption one - but it fails a
+correctness gate, which no other throughput finding on this list does.
+
+**It is not the `Flush` hand-off.** Bisected to `dd8cdce^` in a worktree, which fails the same way
+(11,747,328/12,582,912). Interleaved 5-pass A/B of the 1MB cell: pre 2.68-5.18s, post 2.68-5.20s -
+**ranges overlap completely, so there is no delta to quote in either direction.**
+
+**It is the page size.** One session, same host:
+
+| leg | 3MB out-of-band verify | |
+|---|---:|---|
+| rio+tls, page 4096 (shipped) | 2.68-5.20s (5 passes) | ~0.6-1.1 MiB/s |
+| **rio+tls, page 65536** | **0.21-0.22s** (3 passes) | disjoint, **15-25x** |
+| rio, page 4096 *(control)* | 0.08s | TLS-specific |
+| iocp+tls, page 4096 *(control)* | 0.22s | RIO-specific |
+
+**What is explained and what is not.** `WindowsRioShard.IssueSend` posts `RIOSend(conn.Rq, &buf, 1, ...)`
+- one write page per send, because Windows caps `maxSendDataBuffers` at 1 - so page size is RIO's only
+lever, which is the documented 4.68x story. **That does not explain the ~60x gap between `rio` and
+`rio+tls` at the same page size.** The implied ~5ms per send is far too slow to be syscall cost and
+suggests something is *waiting* rather than working; RIO's deferred commit (`RIO_MSG_DEFER` +
+`RIO_MSG_COMMIT_ONLY`) is the first place to look. **Do not fold this into the existing page-size story
+until that is understood** - it is recorded as measured-but-undiagnosed on purpose.
+
+**Why it matters to item 0:** this is a third independent argument for a backend-chosen page default, and
+the first that is a failed correctness cell rather than a throughput number. RIO wanting 64KB is no
+longer only a tuning preference.
+
 ### 0b. Write-pool exhaustion closes the connection instead of applying backpressure
 
 **Status: DONE 2026-07-28. The justification I gave for it was wrong; the change is right anyway.**
@@ -1292,6 +1359,11 @@ now a number. io_uring's `IovMax` is 1024 and never hits it.
 send-a-PREFIX fix `2b-result` sketched (`TrySendZeroCopy` reporting bytes instead of a bool), and IOCP
 should show a large-payload gain of the same shape. If it does not, the cap was not the explanation.
 
+**RUN 2026-07-29, AND THE CAP WAS THE EXPLANATION — see item 2f.** The flag route (`--pipe-segment
+65536`, no code change) was tried first and is worth **+117.3% at 256KB** on IOCP, with
+`SS_IOCP_STATS=1` confirming the 65.00-segment decline on Windows directly rather than by inference from
+this counter. So this entry's prediction is confirmed, and by 2.6x more than "the same shape" implied.
+
 **Consequences for the rest of this file:**
 
 - **"Per-byte copying is not the constraint" is now bounded, not general.** It held for allocations
@@ -1306,6 +1378,38 @@ should show a large-payload gain of the same shape. If it does not, the cap was 
   and it does not - which is the zero-copy-receive/receive-parking work that has never been started.
 - **The pin cost did not bite.** 65 `GCHandle` pins + disposes per response and it still won by 45%, so a
   pinned-block pool (item 2d) is upside on top, not a precondition.
+
+### 2f. Make IOCP's zero-copy send survive a fragmented sequence (raised 2026-07-29, and now the top IOCP item)
+
+**Status: specified, not started. This is what converts a +117.3% flag into a default.**
+
+`--pipe-segment 65536` buys +117.3% at 256KB on IOCP purely by getting the response under
+`IocpConnection.MaxSendPages` = 64 (measured: the shipped configuration declines at **65.00** segments -
+off by one). That is a *demo* flag configuring *Kestrel's* pipes. A library caller with its own pipes,
+or any caller whose sequence happens to be fragmented, still silently falls back to copying and pays the
+same 2.2x. The transport should not be one segment away from a cliff it cannot see.
+
+Three options, in increasing order of how much they actually fix:
+
+1. **Raise the cap.** One constant. `WSASend` accepts far more than 64 `WSABUF`s, and the arrays are
+   per-connection (`ZcPtrs`/`ZcLens`/`SendPages`/`SendLens`, four arrays x `MaxSendPages` x connections),
+   so the cost is memory per connection and a bigger `stackalloc` per send. Cheapest, and it moves the
+   cliff rather than removing it.
+2. **Send a PREFIX** - `TrySendZeroCopy` reports bytes accepted instead of a bool, sends the first 64
+   segments zero-copy and lets the caller advance and re-offer the rest. Removes the cliff entirely and
+   is the shape `2b-result` originally sketched. It changes the `PipeIoBridge` contract, because
+   `AdvanceTo` must then consume a partial buffer.
+3. **Coalesce small trailing segments** into one pooled page and send a mixed vector. Best of both and
+   the most code.
+
+**Do 1 first and measure**, because it is a one-line change against a now-instrumented path: with
+`SS_IOCP_STATS=1` the decline count *is* the experiment, and it should reach zero without touching the
+demo's pipe configuration. **Pre-registered:** if raising the cap to (say) 256 reproduces the +117%
+without `--pipe-segment`, option 2's contract change is not worth making yet.
+
+**Do not skip the memory question.** `--pipe-segment 65536` costs **2.7x resident memory at 2048
+connections on Linux** and that has never been measured on Windows. A 117% result is exactly the kind
+that gets defaulted without its bill being read.
 
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 

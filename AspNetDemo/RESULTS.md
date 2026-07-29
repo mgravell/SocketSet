@@ -75,7 +75,9 @@ segments into its own writer:
 | IOCP classic / RIO | accumulator -> `StageOutbound` pooled staging -> drain into write pages (the `Flush` snapshot copy is gone) | **2-3** *(was 3-4)* |
 
 The epoll and Windows rows dropped by one on 2026-07-29 - see the test below, which is what removed it.
-**Windows is untested from this host**, so IOCP/RIO have the change but not the measurement.
+**Windows now has the change CHECKED but not attributed**: the smoke matrix passes on IOCP/RIO/managed
+(see "Windows validation after the OS switch"), and an interleaved A/B on the out-of-band path gives
+overlapping ranges, so there is no Windows throughput delta to credit the copy removal with either way.
 
 `IoUringConnection` derives from `Connection` and owns its `OutChain` writer, which is why it escapes the
 `Flush` snapshot; `EpollConnection` and `WindowsConnection` both derive from `OutboundConnection` and pay
@@ -262,6 +264,119 @@ recommendation. 512B and 64KB are unmoved by both.
 - **`ReceiveBufferSize` does not reach the managed backend** (`ManagedSocketShard` reads `BufferPageSize`).
 - **Linux bridged legs below 64KB have not been re-run at six passes.** The fix cannot affect them (see
   item 1), but they are three-pass numbers.
+
+## Windows validation after the OS switch (2026-07-29)
+
+Windows had run nothing since 2026-07-27 while shared code changed underneath it on Linux. This is the
+catch-up: correctness first, then the one experiment that had a measured explanation waiting for it.
+
+### The `OutboundConnection.Flush` hand-off is correctness-clean on Windows
+
+`dd8cdce` stopped `Flush` renting a snapshot and copying into it; it hands over the accumulator's own
+pooled array (`PooledBufferWriter.TakeArray`). `EpollConnection` **and `WindowsConnection`** both derive
+from `OutboundConnection`, so IOCP and RIO inherited that change on Linux and had never executed it. The
+hazard was specific: the handed-over array can be **much larger than the `length` argument** (it grows by
+doubling) where the old snapshot was `Rent(length)`, so any consumer inferring payload size from
+`data.Length` would over-send.
+
+`bench/Run-SmokeMatrix.ps1` (new, and the first scripted form of the correctness gate AGENTS.md has
+always asked for by hand): IOCP / RIO / managed x plaintext / SChannel TLS x out-of-band verify at
+64KB/1MB/4MB, echo-verify on the callback and pipe paths, poke, and churn. **47 of 48 cells PASS,
+mismatches zero everywhere.** The 4MB out-of-band cell is the sharpest one - it is the `Flush` path, at a
+payload where the handed-over array is substantially larger than `length`.
+
+The one failure is **not** this change; see below.
+
+### The one FAIL: RIO+TLS out-of-band send is starved at the default page, and it pre-dates the change
+
+`rio+tls/verify-oob-4m` delivered 7,815,168 of 12,582,912 bytes inside the harness's 15s deadline, with
+**zero mismatches** - a rate problem, not a corruption one.
+
+Bisected against `dd8cdce^` in a worktree, which **also fails** (11,747,328/12,582,912). Interleaved A/B
+of the 1MB cell, 5 passes each: pre 2.68-5.18s, post 2.68-5.20s. **Ranges overlap completely, so there is
+no quotable delta** - the hand-off neither caused nor measurably moved this.
+
+What it is instead, measured on the same host in one session:
+
+| leg | 3MB out-of-band verify | note |
+|---|---:|---|
+| rio+tls, page 4096 (shipped) | 2.68-5.20s (5 passes) | ~0.6-1.1 MiB/s |
+| **rio+tls, page 65536** | **0.21-0.22s** (3 passes) | ranges fully disjoint, **15-25x** |
+| rio, page 4096 *(control)* | 0.08s | so it is TLS-specific |
+| iocp+tls, page 4096 *(control)* | 0.22s | so it is RIO-specific |
+
+The candidate mechanism is the documented one: `WindowsRioShard.IssueSend` posts `RIOSend(conn.Rq, &buf,
+1, ...)` - **one write page per send**, because Windows caps `maxSendDataBuffers` at 1 - so page size is
+the only lever RIO has, exactly as in the 4.68x bridged result. **What that does NOT explain is the
+60x gap between rio and rio+tls at the same page size**, and this is recorded as measured-but-undiagnosed
+rather than folded into the existing story. A ~5ms-per-send implied latency is too slow to be syscall
+cost and suggests something is waiting, not working.
+
+Practical reading: this is a third independent argument for the page-size default (TODO item 0), and the
+first one that is a **correctness-gate failure** rather than a throughput number.
+
+### The IOCP zero-copy probe, and the 65-segment decline confirmed on Windows
+
+IOCP had no equivalent of io_uring's `zero-copy=` counter, so the experiment below could not have been
+interpreted: a fast path that silently declines measures identically to one that ran and did not pay
+(`bench/README.md` rule 2). Added `SS_IOCP_STATS=1` to `IocpShard`, mirroring `SS_URING_STATS` - gated on
+a `static readonly bool` so the default build pays a never-taken branch, dumped on a 2s timer as well as
+at shutdown because rigs kill the server.
+
+40 x 256KB responses, `--iocp --byo`, 12 shards:
+
+| leg | zero-copy sends | declined too-fragmented | mean segs | max segs | copying-path WSASends |
+|---|---:|---:|---:|---:|---:|
+| `--byo` (default ~4KB pipe blocks) | 2 | **40** | **65.00** | **65** | 80 (2,600 WSABUFs) |
+| `--byo --pipe-segment 65536` | 42 | **0** | - | - | **0** |
+| classic, no `--byo` *(control)* | 0 | 0 | - | - | 82 |
+
+**Every 256KB response declined, at exactly 65 segments against a cap of 64.** Off by one. This was
+inferred from io_uring's segment counter on 2026-07-29; it is now measured on Windows directly, and the
+64KB pipe block takes the decline count to zero and silences the copying path entirely.
+
+### THE EXPERIMENT: IOCP zero-copy is worth +117.3% at 256KB once it can actually run
+
+`bench/Run-Byo.ps1` (new), IOCP, 12 shards, `-c 64`, 7 passes with the first discarded, legs reshuffled
+each pass, zero errors across the sweep. Goodput MiB/s, median of 6 scored passes:
+
+| payload | classic *(shipped)* | byo | **byo-seg64k** | classic-seg64k *(control)* |
+|---|---:|---:|---:|---:|
+| 64 KB | 8,264.0 [8173-8379] | 8,298.4 [7817-8474] | **9,042.4** [8851-9188] | 8,299.1 [8095-8446] |
+| 256 KB | 5,177.4 [5092-5268] | 5,243.6 [5055-5507] | **11,393.3** [10878-11564] | 5,269.5 [5021-6004] |
+
+| comparison | 64 KB | 256 KB |
+|---|---:|---:|
+| **byo-seg64k vs byo** | +9.0% | **+117.3%** |
+| **byo-seg64k vs classic-seg64k** (zero-copy alone, block size held equal) | +9.0% | **+116.2%** |
+| classic-seg64k vs classic (**pipe block size alone**) | *ranges overlap* | *ranges overlap* |
+| byo-seg64k vs classic (both changes vs shipped) | +9.4% | **+120.1%** |
+
+**The pre-registered prediction was right, and by more than it asked for.** It expected "something like
+io_uring's +45.1%" if the cap was the explanation. It is 117%, and the counter column proves the
+mechanism rather than inferring it: the `byo` leg declined 194,804 responses at mean 65.00 segments while
+`byo-seg64k` took 425,734 zero-copy sends and declined none.
+
+**The control is the important half, and it separates Windows from Linux.** Pipe block size *on its own*
+moves nothing here at either payload - overlapping ranges, and 18.6% spread on `classic-seg64k` at 256KB.
+On Linux the same flag was worth **+7.5% at 256KB** independently of zero-copy. So the two platforms want
+`--pipe-segment` for different reasons: on io_uring it is a genuine second effect, on IOCP it is *purely*
+the enabler that gets the response under the 64-segment cap. Without this leg the +117% would have been
+apportioned wrongly between two changes.
+
+**At 64KB both byo legs already take the fast path** (0 declines either way - a 64KB response is ~17
+segments, well under the cap), so the +9.0% there is *not* engaging-vs-declining. It is fewer, larger
+segments per send: ~17 pins and 17 `WSABUF`s become ~2. Smaller effect, different mechanism, same flag.
+
+**What this does NOT yet establish**: where the tuned configuration sits against vanilla Kestrel. The
+2026-07-27 Windows table has kestrel at 11,488.9 MiB/s at 256KB, which is tantalisingly close to 11,393.3
+- but that is a **cross-day comparison** and this file has produced confident nonsense from those before.
+`Run-Byo.ps1` has since gained a `kestrel` leg so the control runs in the same reshuffled passes; until
+that has run, no gap against Kestrel should be quoted from this table.
+
+**And 2b-result's reading is now retracted for IOCP.** "Zero-copy send removed one copy and bought +3.5%,
+so copies are not the cost" was measured on a path that declined at the payload of interest. Both halves
+of that sentence were true and the conclusion did not follow.
 
 ## Environment (current baseline, 2026-07-27)
 
