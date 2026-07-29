@@ -72,7 +72,10 @@ what is worth doing:
 Reading of that table:
 
 - **epoll has no kTLS path whatsoever** — this is a missing feature, not a missing harness leg. Do not
-  add an `epoll+ktls` leg expecting it to work.
+  add an `epoll+ktls` leg expecting it to work. **Scoped as item 3c (2026-07-29): the OpenSSL/kernel half
+  is already shared, only the ~150-line readiness→`SSL_read` pump is missing, and epoll is the backend
+  where kTLS should look best** — it has no multishot receive to forfeit, which is what makes kTLS cost
+  io_uring ~15%.
 - **kTLS is TX-only even on io_uring**, now confirmed against the kernel's own counters rather than
   inferred from the code: `TlsTxSw` moves, `TlsRxSw` stays at zero. Every kTLS number on file measures a
   half-offloaded path. That is what item 4 is about, and it now has direct evidence.
@@ -1069,6 +1072,57 @@ If neither moves it, the honest conclusion is that the bridge cost is structural
 and the way to recover it is to not have a bridge, i.e. for Kestrel to talk to the transport directly,
 which is out of scope here.
 
+### 2d. The bridge's pipes are OURS, and they are almost entirely unconfigured (raised 2026-07-29)
+
+**Status: proposed, not started. Cheap levers first, custom pipe second.** This is aimed at the term the
+evidence actually blames — the bare-vs-bridged isolation puts the bridge at 24.5-41.8% at 256KB with the
+transport not declining at all, and `2b-result` reached the same place from the other side (zero-copy send
+removed a copy for +3.5%). If the cost is pipes and thread hops, the pipes are the thing to attack.
+
+`AspNetDemo/SocketSetConnection.cs:58-61` constructs both pipes with:
+
+```
+readerScheduler: PipeScheduler.ThreadPool, writerScheduler: PipeScheduler.ThreadPool,
+useSynchronizationContext: false, pauseWriterThreshold: 1MB, resumeWriterThreshold: 512KB
+```
+
+Everything else is default. Three knobs are sitting untouched, and none needs new abstractions:
+
+1. **`PipeScheduler`.** ThreadPool on *both* ends of *both* pipes means a hop per direction per exchange.
+   That is the "thread hops" term, named and unmeasured. **Do not naively set `Inline` on both** — an
+   inline *reader* scheduler runs Kestrel's request pipeline on the transport's loop thread, which blocks
+   the IO loop for every backend that has one (all but managed). Kestrel runs its own IO queues for exactly
+   this reason. The safe experiment is one side at a time, with the loop-thread hazard in mind.
+2. **`minimumSegmentSize`** (default 4096). This is why a 256KB response is ~64 segments — which is what
+   `2b-result` suspects silently defeated IOCP's zero-copy send (it caps at 64 `WSABUF`s), and it is 64
+   iterations of `WriteAll` per response on every other backend. A 64KB segment makes that 4.
+3. **`MemoryPool`** (default, unpinned). `ctx.UsePipe(pipe, pinned: true)` exists and is *recorded and
+   unused*; a pinned-block pool is what would make it mean something, and io_uring needs exactly "a stable
+   address" (see 2b).
+
+**Do these before writing a custom pipe** — they are configuration, they are individually A/B-able against
+the `--byo` leg, and one of them (segment size) plausibly explains an existing null result rather than just
+adding speed.
+
+**Then the custom `IDuplexPipe` itself**, which is the part worth exploring rather than assuming.
+`System.IO.Pipelines`' `Pipe` is general-purpose: it locks, it schedules, it manages its own segment
+lifetime, and it is written to let arbitrary producers and consumers meet. Our half is neither arbitrary
+nor general — one producer, one consumer, a known owner thread, and a transport that already owns pooled
+(often pinned) memory. A purpose-built duplex pipe could:
+
+- hand the app **the transport's own buffers** rather than copying into pipe segments — which is BYO in
+  the direction we currently cannot do at all (there is no receive-side zero-copy on any backend), and
+  which is the same mechanism that would make inbound backpressure real rather than advisory;
+- drop the locking for an SPSC ring, since the producer/consumer identities are fixed;
+- decide scheduling per direction instead of taking `PipeScheduler`'s general answer.
+
+**The obvious risk, stated up front:** Kestrel's transport contract is `IDuplexPipe`, and anything we hand
+it must behave exactly like a `Pipe` under every access pattern Kestrel uses (`ReadAsync`/`AdvanceTo`
+combinations, examined-vs-consumed, cancellation, completion with exceptions). That is a correctness
+surface much larger than it looks, and `SmokeTest --pipe` is the only harness that would catch a mistake.
+Weigh that against the measured prize: the whole bridge is 24-42% at 256KB and ~2% at 64KB, so this is a
+large-payload play, not a general one.
+
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 
 **Status: designed, not started. Now the highest-value item on this list, with a measured target.**
@@ -1210,6 +1264,47 @@ that bridge, not the transport or the cipher, is what is being measured.
 
 If plaintext kestrel also lands near 8 GB/s, the bridge is costing 2-4x on big responses - which matters
 more to the "ASP.NET Core over SocketSet" story than any transport difference measured so far.
+
+### 3c. epoll + kTLS behind a toggle (raised 2026-07-29) — and epoll is where kTLS should look BEST
+
+**Status: proposed, not started. The estimate "85% of the work is already done" was checked and holds.**
+
+Already shared, i.e. nothing to write: `OpenSslTlsProvider.CreateKernelSsl` (the `SSL*` bound to the fd
+with kernel offload), `KtlsProbe` (capability detection), the `NativeOpenSsl` bindings
+(`SSL_do_handshake`/`SSL_read`/`SSL_write`/`SSL_shutdown`/`SSL_get_error`), and
+`OpenSslTlsFilter.GetAlpnSelected`. None of that is io_uring-specific.
+
+What is io_uring-specific, and is what epoll needs (~150 lines, `IoUringShard.cs:1066-1180`):
+`StartKtls` → `KtlsPump` (drive the handshake) → `KtlsComplete` → `KtlsRead`/`KtlsRespond`, plus teardown
+(`SSL_shutdown` while idle, `SSL_free` in finalize) and a per-connection plaintext receive buffer.
+
+**And the mapping is EASIER on epoll, not harder.** io_uring drives kTLS receive as `POLL` + `SSL_read` -
+it has to synthesise readiness, because its native model is completion. epoll *is* readiness, so
+"`EPOLLIN` → `SSL_read`" is the backend's own idiom rather than an adaptation. TX needs nothing at all: it
+is a plaintext `send()` that the kernel encrypts, and epoll already sends plaintext directly from its
+buffer.
+
+**The non-obvious reason to want it, beyond parity.** Every kTLS number on file is io_uring's, and
+io_uring pays a structural penalty for kTLS that epoll does not: kTLS forfeits `IORING_RECV_MULTISHOT` and
+provided buffers, dropping io_uring to one syscall per message (that is what item 4 is about). **epoll has
+no multishot to give up** - it is one `recv` per readiness event either way - so kTLS should cost epoll
+nothing structurally. If that holds, `epoll+ktls` is the configuration where kTLS finally competes on this
+codebase, and it is measurable on loopback because it is a comparison against `epoll+tls` on the same
+backend rather than a claim about NIC offload.
+
+*Pre-registered:* `epoll+ktls` should land at or above `epoll+tls` at small messages, where
+`iouring+ktls` trails `iouring+tls` by ~15% (597,486 vs 702,829 rps). If it trails on epoll too, the
+"multishot forfeiture" explanation is wrong and the cost is in the kTLS record path itself.
+
+**Factoring, since two backends will then want the same pump.** The Ktls\* methods are parameterised by
+only two backend concerns - "tell me when the fd is readable" and "send these plaintext bytes" - so the
+handshake drive and the read/respond loop can move to a shared helper with those as callbacks. Worth doing
+as part of this rather than leaving a third copy of the send machinery, which is the mistake this file has
+already recorded twice (TLS written twice, epoll's send path a third copy).
+
+**Toggle:** ship it behind the existing `--ktls` selection path plus a capability check, and keep the
+`bench/README.md` rule that `/config` must report what was actually negotiated - `tls_stat` verification
+against the kernel counters is what caught "kTLS is TX-only" and must gate any epoll+ktls leg too.
 
 ### 4. kTLS: implement the RECVMSG + cmsg receive arm
 

@@ -20,13 +20,26 @@ namespace SocketSets.Managed;
 /// </summary>
 internal sealed unsafe class ManagedSocketShard : SocketSetShard
 {
-    private int _bufferSize;
+    private int _bufferSize;    // SEND scratch handed to OnAccept/OnConnect/OnWrite
+    // RECEIVE buffer, one per connection for its lifetime - so this multiplies by connection count, not by
+    // a pool depth, which is why SocketSetOptions.ReceiveBufferSize exists. The managed backend was the
+    // last one still ignoring it (IOCP/RIO always honoured it; epoll and io_uring gained it 2026-07-28).
+    private int _recvBufSize;
     private readonly List<Socket> _listeners = [];
     private readonly ConcurrentDictionary<ManagedConnection, byte> _connections = [];
 
-    public ManagedSocketShard(SocketSetOptions options) => _bufferSize = options.BufferPageSize;
+    public ManagedSocketShard(SocketSetOptions options)
+    {
+        _bufferSize = options.BufferPageSize;
+        _recvBufSize = options.ReceiveBufferSize > 0 ? options.ReceiveBufferSize : options.BufferPageSize;
+    }
 
-    protected override void OnInitialize() => _bufferSize = Parent.Options.BufferPageSize;
+    protected override void OnInitialize()
+    {
+        _bufferSize = Parent.Options.BufferPageSize;
+        _recvBufSize = Parent.Options.ReceiveBufferSize > 0
+            ? Parent.Options.ReceiveBufferSize : Parent.Options.BufferPageSize;
+    }
 
     // Managed has no fixed slot table (connections are heap objects in a ConcurrentDictionary), so it is
     // never "full" — placement always succeeds here without touching the reservation counter.
@@ -191,7 +204,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             {
                 // SetBuffer is inside the guard too: a concurrent Close can dispose the
                 // socket between iterations, and touching it must fail gracefully, not throw.
-                conn.RecvArgs.SetBuffer(conn.RecvBuffer, 0, _bufferSize);
+                conn.RecvArgs.SetBuffer(conn.RecvBuffer, 0, _recvBufSize);
                 pending = conn.Socket.ReceiveAsync(conn.RecvArgs);
             }
             catch (ObjectDisposedException) { return; } // connection closed under us
@@ -217,7 +230,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         int response;
         fixed (byte* buf = conn.RecvBuffer)
         {
-            var ctx = new SocketSet.ReceiveContext(conn, buf, _bufferSize, n);
+            // Capacity is the RECEIVE buffer's: an in-place response is written back into the buffer the
+            // bytes arrived in, so it is bounded by that, not by the send scratch.
+            var ctx = new SocketSet.ReceiveContext(conn, buf, _recvBufSize, n);
             Parent.DispatchReceive(ref ctx);
             response = ctx.ResponseBytes;
         }
@@ -560,7 +575,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
     private ManagedConnection Register(Socket socket, object? token)
     {
-        var conn = new ManagedConnection(this, socket, _bufferSize) { UserToken = token };
+        var conn = new ManagedConnection(this, socket, _bufferSize, _recvBufSize) { UserToken = token };
         _connections[conn] = 0;
         return conn;
     }
@@ -748,12 +763,12 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         private int _wpos;
         private ManagedWriteMemoryManager? _wmgr; // backs GetMemory; invalidated when _wbuf is recycled
 
-        public ManagedConnection(ManagedSocketShard shard, Socket socket, int bufferSize)
+        public ManagedConnection(ManagedSocketShard shard, Socket socket, int sendSize, int recvSize)
         {
             Shard = shard;
             Socket = socket;
-            RecvBuffer = new byte[bufferSize];
-            SendBuffer = new byte[bufferSize];
+            RecvBuffer = new byte[recvSize];
+            SendBuffer = new byte[sendSize];
             RecvArgs = new ConnArgs(shard) { Conn = this };
             SendArgs = new ConnArgs(shard) { Conn = this };
         }

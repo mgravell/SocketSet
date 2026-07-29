@@ -80,6 +80,42 @@ internal unsafe struct WriteVState
     public OutChain Chain;    // segments backing the iovecs (to release on completion)
     public bool AppData;      // TLS: this send carried encrypted APPLICATION data → fire OnWrite on completion
                               // (handshake records / control replies / plaintext OOB flushes leave it false)
+    public ZcJob? Zc;         // non-null => the iovecs point at CALLER memory, not our chain (see ZcJob)
+}
+
+/// <summary>
+/// A zero-copy send: iovecs pointing straight at a caller's <see cref="ReadOnlySequence{T}"/> segments
+/// (pipe memory), rather than at buffers we copied into. Built on the CALLER's thread by
+/// <c>TrySendZeroCopy</c> (pinning is thread-agnostic and the sequence is only read), then handed to the
+/// loop thread, which owns it from that point.
+///
+/// OWNERSHIP: the socket reads this memory directly, so the caller must not release it - Kestrel's pump
+/// must not <c>AdvanceTo</c> - until <see cref="Completion"/> fires. Every exit path (success, send error,
+/// teardown, a slot that went away before the request was drained) must complete it exactly once, or the
+/// pump deadlocks holding a <c>ReadResult</c> forever.
+/// </summary>
+internal sealed unsafe class ZcJob
+{
+    public LibC.iovec* Iov;           // native iovec array (Count entries), freed by the loop thread
+    public int Count;
+    public long Total;
+    public MemoryHandle[]? Handles;   // pins to dispose; null when the caller asserted already-pinned memory
+    public TaskCompletionSource<bool>? Completion;
+
+    /// <summary>Release everything and signal the waiting pump. Idempotent; safe on any thread that owns
+    /// the job (the caller before hand-off, the loop thread after).</summary>
+    public void Finish(bool ok)
+    {
+        if (Iov != null) { NativeMemory.Free(Iov); Iov = null; }
+        if (Handles is { } hs)
+        {
+            for (int i = 0; i < Count; i++) hs[i].Dispose();
+            Handles = null;
+        }
+        var tcs = Completion;
+        Completion = null;
+        tcs?.TrySetResult(ok);
+    }
 }
 
 /// <summary>
@@ -189,6 +225,21 @@ internal sealed unsafe class IoUringConnection : Connection
     // once per response. Measured: 4KB page, 16KB body, 200k requests - 1.000 pinned allocs/response
     // before, 0.000 after (5 pooled segments instead), and goodput 4,363.7 -> 8,578.0 MiB/s.
     private protected override Span<byte> GetWriteSpan(int sizeHint) => GetSpan();
+
+    /// <summary>
+    /// Zero-copy send: point the writev's iovecs straight at the caller's sequence instead of copying it
+    /// into pooled pages. io_uring is the natural second driver after IOCP because its send is ALREADY a
+    /// vector of segments, and because it needs only a stable address - unlike RIO, which addresses
+    /// registered buffer ids and can never take foreign memory.
+    ///
+    /// It is also the backend that can TEST the thing IOCP's result could not. IOCP measured +3.5% at 16KB
+    /// and nothing at 256KB, but it caps at 64 `WSABUF`s and a 256KB response through Kestrel's 4KB pipe
+    /// blocks is ~64 segments - so it plausibly declined and fell back to copying at exactly the payload
+    /// where the bridge costs 24.5%. `IovMax` is 1024, so that ceiling is not in play here.
+    /// </summary>
+    internal override bool TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned,
+                                           out ValueTask<bool> completion)
+        => Shard.TrySendZeroCopy(this, in data, pinned, out completion);
 
     public override bool Flush()
     {
@@ -337,5 +388,8 @@ internal struct PendingJob
     public ArraySegment<byte> Seg;
     public OutChain Chain; // Count > 0 => this is a flushed chain; otherwise Seg is the echo response
     public bool AppData;   // TLS: chain carries encrypted application data → fire OnWrite when it completes
+    public ZcJob? Zc;      // non-null => a zero-copy send queued behind an in-flight one; takes precedence
+                           // over Seg/Chain. Queued here rather than in a side-slot so a connection that
+                           // mixes pipe writes with direct sends keeps ONE FIFO order for its byte stream.
 }
 #endif

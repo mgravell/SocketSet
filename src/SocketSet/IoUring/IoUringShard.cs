@@ -121,7 +121,7 @@ internal sealed class IoUringShard : SocketSetShard
     // Send accounting, to answer "how many completion round trips does ONE response cost?" - the quantity
     // behind the page-size cliff. s_sendSubmit counts every send SQE; the rest decompose it by cause.
     private static long s_opSend, s_opWriteV, s_pendEnqueue, s_pendDrain, s_partialResubmit;
-    private static long s_segPooled, s_segManaged;
+    private static long s_segPooled, s_segManaged, s_segZeroCopy;
     private static long s_iovSegs; // total iovec segments across all writevs: segments/response is the
                                    // real independent variable, since sends/response is constant at 1.
     private static int s_statsReported;
@@ -135,7 +135,8 @@ internal sealed class IoUringShard : SocketSetShard
             $"queued-behind-inflight={Interlocked.Read(ref s_pendEnqueue):n0} " +
             $"drained={Interlocked.Read(ref s_pendDrain):n0} " +
             $"partial-write-resubmits={Interlocked.Read(ref s_partialResubmit):n0}) " +
-            $"segs: pooled-page={Interlocked.Read(ref s_segPooled):n0} pinned-managed={Interlocked.Read(ref s_segManaged):n0}");
+            $"segs: pooled-page={Interlocked.Read(ref s_segPooled):n0} pinned-managed={Interlocked.Read(ref s_segManaged):n0} " +
+            $"zero-copy={Interlocked.Read(ref s_segZeroCopy):n0}");
     }
     private static readonly bool ReportStats =
         Environment.GetEnvironmentVariable("SS_URING_STATS") == "1";
@@ -275,7 +276,10 @@ internal sealed class IoUringShard : SocketSetShard
             while (pending.Count > 0)
             {
                 var job = pending.Dequeue();
-                if (job.Chain.Count > 0) ReleaseChainBuffers(job.Chain);
+                // A queued zero-copy send never reached the socket: fail it, so the pump stops waiting and
+                // releases the caller's memory. Missing this deadlocks the pipe pump holding a ReadResult.
+                if (job.Zc is { } zc) zc.Finish(false);
+                else if (job.Chain.Count > 0) ReleaseChainBuffers(job.Chain);
                 else if (job.Seg.Array is not null) ArrayPool<byte>.Shared.Return(job.Seg.Array); // pooled echo staging
             }
         }
@@ -706,17 +710,147 @@ internal sealed class IoUringShard : SocketSetShard
 
     // Release an in-flight writev's resources on completion: free the iovec array and return the pool
     // pages (POH overflow segments are just dropped for GC).
-    private unsafe void ReleaseWriteV(IoUringConnection conn)
+    private unsafe void ReleaseWriteV(IoUringConnection conn) => ReleaseWriteV(conn, ok: false);
+
+    /// <summary>Release the in-flight send's resources. <paramref name="ok"/> is the result reported to a
+    /// zero-copy caller: true only when the send actually completed, since the pump uses it to decide
+    /// whether to advance its reader.</summary>
+    private unsafe void ReleaseWriteV(IoUringConnection conn, bool ok)
     {
         ref var ws = ref conn.WriteV;
+        if (ws.Zc is { } zc)
+        {
+            // Zero-copy: the iovecs point at the CALLER's memory, so there is no chain to release and the
+            // iovec array belongs to the job. Finish() frees it, drops the pins, and releases the pump.
+            zc.Finish(ok);
+            conn.WriteV = default;
+            return;
+        }
         if (ws.Iov != null) NativeMemory.Free(ws.Iov);
         ReleaseChainBuffers(ws.Chain);
         conn.WriteV = default;
     }
 
+    // =====================================================================
+    // Zero-copy send (BYO buffers; see Connection.TrySendZeroCopy)
+    // =====================================================================
+
+    /// <summary>Zero-copy requests marshaled in from the pipe pump. The job is fully built by the caller
+    /// (pinning and iovec construction are thread-agnostic); the loop thread only issues it.</summary>
+    private readonly ConcurrentQueue<(uint Slot, uint Generation, ZcJob Job)> _zeroCopy = [];
+
+    internal unsafe bool TrySendZeroCopy(IoUringConnection conn, in ReadOnlySequence<byte> data, bool pinned,
+                                         out ValueTask<bool> completion)
+    {
+        completion = default;
+        // TLS must encrypt, so the bytes on the wire are never the caller's bytes. Refusing (rather than
+        // silently copying) keeps the fallback the obvious path - the caller then uses Send().
+        if (conn.Tls is not null || conn.KtlsSsl != 0) return false;
+        if (Volatile.Read(ref conn.Fd) == 0) return false;
+        if (data.IsEmpty) return false;
+
+        // Count first: pinning half a sequence and then discovering it is too fragmented would mean
+        // unwinding pins for nothing. IovMax is 1024, so this refuses far later than IOCP's 64.
+        int n = 0;
+        foreach (var _ in data) if (++n > IovMax) return false;
+
+        // THE PIN COST IS THE THING TO WATCH, and it is why `pinned` is not a micro-optimisation. With an
+        // ordinary MemoryPool this takes one GCHandle pin per SEGMENT, and Kestrel's default 4KB blocks
+        // make a 256KB response ~64 pins + 64 disposes - plausibly dearer than the single copy being
+        // removed. A null or negative result here is therefore ambiguous until the pool is pinned
+        // (`ctx.UsePipe(pipe, pinned: true)` over a pinned-block pool), at which point this whole branch
+        // disappears. See TODO 2d.
+        var job = new ZcJob { Handles = pinned ? null : new MemoryHandle[n] };
+        var iov = (LibC.iovec*)NativeMemory.Alloc((nuint)n * (nuint)sizeof(LibC.iovec));
+        job.Iov = iov;
+        int i = 0;
+        long total = 0;
+        foreach (var seg in data)
+        {
+            if (seg.IsEmpty) continue;
+            byte* p;
+            if (job.Handles is null)
+            {
+                // Caller asserts the memory is already pinned (a pinned-block pool), so its address is
+                // stable without a handle and we skip the per-segment pin entirely.
+                p = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(seg.Span));
+            }
+            else
+            {
+                var h = seg.Pin();
+                job.Handles[i] = h;
+                p = (byte*)h.Pointer;
+            }
+            iov[i].iov_base = p;
+            iov[i].iov_len = (nuint)seg.Length;
+            total += seg.Length;
+            i++;
+        }
+        if (i == 0) { job.Count = 0; job.Finish(false); return false; }
+
+        job.Count = i;
+        job.Total = total;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        job.Completion = tcs;
+        completion = new ValueTask<bool>(tcs.Task);
+
+        _zeroCopy.Enqueue((conn.Slot, Volatile.Read(ref conn.Generation), job));
+        Poke();
+        return true;
+    }
+
+    /// <summary>Loop thread: issue a zero-copy job, or queue it behind an in-flight send.</summary>
+    private unsafe void PumpZeroCopy(uint slot, uint generation, ZcJob job)
+    {
+        var conn = _conns[slot - 1];
+        // Slot reused, closing, or send-closed since the request was queued: fail it rather than write
+        // into a re-tenanted socket. Finish(false) is what stops the pump waiting forever.
+        if (conn.Generation != generation || conn.Fd == 0 || conn.Closing
+            || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
+        {
+            job.Finish(false);
+            return;
+        }
+
+        if (conn.SendBusy)
+        {
+            if (ReportStats) Interlocked.Increment(ref s_pendEnqueue);
+            (conn.Pending ??= new()).Enqueue(new PendingJob { Zc = job });
+            return;
+        }
+
+        conn.SendBusy = true;
+        SubmitZc(conn, conn.Fd, job);
+    }
+
+    /// <summary>Issue a zero-copy job as one writev over the caller's segments. Assumes SendBusy is held.
+    /// Partial writes need no special handling: HandleWriteV advances the same cursor it does for our own
+    /// chains, and the caller's memory stays put until Finish().</summary>
+    private unsafe void SubmitZc(IoUringConnection conn, int fd, ZcJob job)
+    {
+        // NB: s_opWriteV is counted centrally in Submit() by opcode, so it must NOT be incremented here -
+        // that funnel exists precisely so no send path can be missed or double-counted.
+        if (ReportStats)
+        {
+            Interlocked.Add(ref s_iovSegs, job.Count);
+            Interlocked.Add(ref s_segZeroCopy, job.Count);
+        }
+        conn.WriteV = new WriteVState
+        {
+            Iov = job.Iov, TotalIov = job.Count, Cursor = 0, Sent = 0, Total = job.Total, Zc = job,
+        };
+        SubmitWriteV(conn.Slot, fd, job.Iov, job.Count);
+    }
+
     // Submit a queued job (leasing fresh IO-pool buffers for a segment). SendBusy stays set.
     private unsafe void SubmitPendingJob(IoUringConnection conn, uint slot, int fd, in PendingJob job)
     {
+        if (job.Zc is { } zc)
+        {
+            SubmitZc(conn, fd, zc);
+            return;
+        }
+
         if (job.Chain.Count > 0)
         {
             SubmitChain(conn, fd, job.Chain, job.AppData);
@@ -1085,6 +1219,9 @@ internal sealed class IoUringShard : SocketSetShard
     private unsafe void Cleanup()
     {
         _ringReady = false;
+        // Any zero-copy request that arrived but never reached a connection must still be completed, or
+        // whichever pump is awaiting it never returns.
+        while (_zeroCopy.TryDequeue(out var z)) z.Job.Finish(false);
         foreach (var fd in _listeners.Keys) LibC.close(fd);
         _listeners.Clear();
 
@@ -1137,6 +1274,10 @@ internal sealed class IoUringShard : SocketSetShard
             // Issue any out-of-band writes flushed in from other threads.
             while (_flush.TryDequeue(out var f))
                 PumpFlush(f.Slot, f.Generation, f.Chain);
+
+            // Issue any zero-copy sends handed in by a pipe pump.
+            while (_zeroCopy.TryDequeue(out var z))
+                PumpZeroCopy(z.Slot, z.Generation, z.Job);
 
             // Honour any close requests marshaled in from other threads.
             while (_closes.TryDequeue(out var c))
@@ -1722,9 +1863,10 @@ internal sealed class IoUringShard : SocketSetShard
             return;
         }
 
-        // Full payload sent.
+        // Full payload sent. ok: true is what releases a zero-copy caller to AdvanceTo its reader - the
+        // socket has finished reading its memory only now.
         bool appData = conn.WriteV.AppData;
-        ReleaseWriteV(conn);
+        ReleaseWriteV(conn, ok: true);
         // TLS: an encrypted application send just completed → fire OnWrite so the app can pipeline the
         // next message (handshake records / control replies / plaintext OOB flushes leave AppData false).
         if (appData && conn.Tls is not null && !conn.Closing && conn.Fd != 0)
