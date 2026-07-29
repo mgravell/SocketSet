@@ -53,9 +53,20 @@ internal sealed class IocpConnection : WindowsConnection
     public bool SendZeroCopy;
 
     /// <summary>Pins held for the duration of a zero-copy send; disposed when it completes or fails.
-    /// Null entries beyond <see cref="ZcCount"/>. Only populated when the caller did NOT assert pinned
-    /// memory — an already-pinned pool needs no handle.</summary>
+    /// Live entries are [0, <see cref="ZcHandleCount"/>). Only populated when the caller did NOT assert
+    /// pinned memory — an already-pinned pool needs no handle.
+    ///
+    /// POOLED per connection, like <see cref="ZcPtrs"/>. It used to be a fresh array per SEND, which is a
+    /// per-RESPONSE allocation on the pump thread: 65 segments x 24 bytes is ~1.5KB of garbage per 256KB
+    /// response, and at the rates this path now runs that is tens of MB/s of Gen0 pressure. Not an LOH
+    /// allocation like the one `fa97dd4` removed for +27%, so a smaller effect is expected - but it is on
+    /// the hot path and costs one lazily-allocated array to remove.</summary>
     public System.Buffers.MemoryHandle[]? ZcHandles;
+
+    /// <summary>How many of <see cref="ZcHandles"/> are live. Zero when the caller asserted pinned memory,
+    /// which is why it is tracked separately from <see cref="ZcCount"/>: the pooled array outlives a
+    /// pinned send that never used it.</summary>
+    public int ZcHandleCount;
 
     /// <summary>
     /// Segment cap for a ZERO-COPY send. Deliberately larger than <see cref="MaxSendPages"/>, and it has
@@ -86,11 +97,14 @@ internal sealed class IocpConnection : WindowsConnection
     public int[]? ZcLens;
     public int ZcCount;
 
-    /// <summary>Materialise the zero-copy segment arrays. Pump thread, before any segment is recorded.</summary>
-    public void EnsureZcArrays()
+    /// <summary>Materialise the zero-copy segment arrays. Pump thread, before any segment is recorded.
+    /// <paramref name="needHandles"/> is false when the caller asserted pinned memory, so a pinned-pool
+    /// connection never allocates the handle array at all.</summary>
+    public void EnsureZcArrays(bool needHandles)
     {
         ZcPtrs ??= new nint[MaxZeroCopySegments];
         ZcLens ??= new int[MaxZeroCopySegments];
+        if (needHandles) ZcHandles ??= new System.Buffers.MemoryHandle[MaxZeroCopySegments];
     }
 
     /// <summary>Signals the outbound pump that the send completed (true) or the connection went away

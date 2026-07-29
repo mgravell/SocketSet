@@ -52,7 +52,11 @@ param(
     # on the bare path and exactly nothing on the bridged one (see TODO item 1).
     [switch]$Bridged,
     [ValidateSet("iocp", "rio")]
-    [string]$Backend = "iocp"
+    [string]$Backend = "iocp",
+    # Extra demo/responder flags applied to BOTH sides, e.g. --byo, --pipe-segment 65536. Without this a
+    # change that only affects an opt-in path (zero-copy send is reached only via --byo) measures as
+    # exactly nothing, and the null result looks like a property of the change rather than of the leg.
+    [string[]]$ExtraArgs = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -108,8 +112,8 @@ function New-Side([string]$name, [string]$commit) {
 # One measurement of one side at one payload. Split out of Measure-Side so the two sides can be
 # INTERLEAVED (see below) rather than run as two blocks.
 function Measure-One([string]$exe, [int]$port, [int]$sz) {
-    $argList = if ($Bridged) { @("--$Backend", "--shards", "$Shards", "--port", "$port") }
-               else { @("--http", "--$Backend", "-n", "$Shards", "-z", "$sz", "--port", "$port") }
+    $argList = if ($Bridged) { @("--$Backend", "--shards", "$Shards", "--port", "$port") + $ExtraArgs }
+               else { @("--http", "--$Backend", "-n", "$Shards", "-z", "$sz", "--port", "$port") + $ExtraArgs }
     $proc = Start-Process $exe -ArgumentList $argList `
         -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ab.out" -RedirectStandardError "$env:TEMP\ab.err"
     try { $proc.ProcessorAffinity = [IntPtr]$serverMask } catch { }

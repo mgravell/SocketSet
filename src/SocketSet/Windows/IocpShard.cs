@@ -447,10 +447,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             }
         }
 
-        conn.EnsureZcArrays();
+        conn.EnsureZcArrays(needHandles: !pinned);
         nint[] ptrs = conn.ZcPtrs!;
         int[] lens = conn.ZcLens!;
-        var handles = pinned ? null : new System.Buffers.MemoryHandle[n];
+        var handles = pinned ? null : conn.ZcHandles;
         int i = 0;
         foreach (var seg in data)
         {
@@ -472,7 +472,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         }
         if (i == 0) { DisposeZc(handles, i); return false; }
 
-        conn.ZcHandles = handles;
+        // The handle array is now POOLED, so "how many pins are live" can no longer be read off the
+        // array being null: a pinned-memory send leaves a previous send's array in place, unused.
+        conn.ZcHandleCount = handles is null ? 0 : i;
         conn.ZcCount = i;
         if (ReportStats) { Interlocked.Increment(ref s_zcTaken); Interlocked.Add(ref s_zcSegs, i); }
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -493,8 +495,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     /// <summary>Release a finished/abandoned zero-copy send and signal the pump. Loop thread.</summary>
     private void FinishZeroCopy(IocpConnection conn, bool ok)
     {
-        DisposeZc(conn.ZcHandles, conn.ZcCount);
-        conn.ZcHandles = null;
+        // Dispose the pins but KEEP the array - it is pooled per connection now. ZcHandleCount, not
+        // ZcCount, is the live count: a pinned-memory send has ZcCount > 0 and no pins at all.
+        DisposeZc(conn.ZcHandles, conn.ZcHandleCount);
+        conn.ZcHandleCount = 0;
         conn.ZcCount = 0;
         conn.SendZeroCopy = false;
         conn.ZcPending = false;

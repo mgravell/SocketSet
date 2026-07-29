@@ -1,7 +1,7 @@
 # bench — harnesses, and how to not fool yourself
 
-Four harnesses live here. The scripts carry their own detailed headers; this file is the part that is not
-in any one of them: **how to get a number you can trust on this kind of machine.**
+The scripts carry their own detailed headers; this file is the part that is not in any one of them:
+**how to get a number you can trust on this kind of machine.**
 
 Read this before adding a harness or believing a result. It is written from a session in which eight
 separate confounders each produced clean-looking, plausible, wrong numbers — none of them announced
@@ -11,7 +11,9 @@ itself as an error.
 
 | script | question it answers |
 |---|---|
-| `Compare-Commits.ps1` | *"Did this change help?"* Two commits, isolated worktrees, back to back. **Use this for any before/after claim.** |
+| **`Run-SmokeMatrix.ps1`** | *"Is it still correct?"* **Windows: the correctness gate, and the first thing to run.** 48 cells (IOCP/RIO/managed × plaintext/TLS × out-of-band verify, echo callback + pipe, poke, churn), ~3 min, one PASS/FAIL line each. No `.sh` equivalent yet. |
+| `Compare-Commits.ps1` | *"Did this change help?"* Two commits, isolated worktrees, **interleaved**. **Use this for any before/after claim.** `-Bridged` measures through Kestrel rather than the bare responder; `-ExtraArgs` passes demo flags (a change on an opt-in path such as `--byo` measures as nothing without it). |
+| `Run-Byo.ps1` | Windows counterpart of `run-byo.sh`, plus the legs that keep it honest: a `classic-seg64k` control separating pipe block size from zero-copy, and a same-session `kestrel` control. Gates every leg on the `SS_IOCP_STATS` counter, not just `/config`. |
 | `Run-TlsSizes.ps1` | Windows: how transports/TLS scale with payload size (and shard count). |
 | `Run-Matrix.ps1` | Windows: fixed-size transport × TLS matrix. |
 | `run-matrix.sh`, `run-tls-sizes.sh` | Linux equivalents of the two above. Both take `SHARDS="4 8 12"`. |
@@ -24,11 +26,28 @@ itself as an error.
 
 The five `run-*.sh` rigs added on 2026-07-28/29 are Linux-only as written (they use `taskset` and the
 Linux `/proc` interfaces). Their *headers* carry the pre-registered predictions and what would falsify
-them, which is the part worth reading before re-running one.
+them, which is the part worth reading before re-running one — and in at least three cases the
+falsification was the finding.
 
-**If you are picking this up on Windows after the Linux work:** read the section at the top of
-`../TODO.md` first. A shared-code change (`OutboundConnection.Flush`) has never been executed on Windows,
-so the smoke matrix comes before any measurement.
+**A rig is not neutral about what it can see.** Two of the day's results came from adding a leg rather
+than running one: `Run-Byo.ps1`'s `classic-seg64k` control is the only reason +117% could be attributed
+to zero-copy rather than split with the pipe block size, and `Compare-Commits.ps1` measured the bare
+responder only, so a bridged-path question could not have been asked of it at all. When a result matters,
+check what the harness is *unable* to distinguish before trusting it.
+
+**Every backend now has a counter, and all three are off by default (a `static readonly bool` read once,
+so the default build pays a never-taken branch). They exist because rule 2 below cannot be satisfied by
+reading code:**
+
+| variable | backend | what it settles |
+|---|---|---|
+| `SS_URING_STATS=1` | io_uring | send SQEs by kind, iovec segments, pooled/pinned/zero-copy segment counts |
+| `SS_IOCP_STATS=1` | IOCP | zero-copy sends **taken vs declined by cause**, and the true segment count at a fragmentation decline. This is what turned "zero-copy buys nothing at 256KB" into "it declined every 256KB response at 65 segments against a cap of 64". |
+| `SS_RIO_STATS=1` | RIO | sends and bytes/send, per-direction commits, notify re-arms, port wakes, CQ drains, out-of-band flushes. Added for item 0d; its first job was proving the loop was **idle**, which killed several candidates at once. |
+
+**If you are picking this up on Windows after the Linux work:** the catch-up was done on 2026-07-29 —
+read the top of `../TODO.md` for what it found. Run `Run-SmokeMatrix.ps1` before believing anything; it
+currently reports 47/48, and the one red cell is item 0d rather than a regression.
 
 All of them fetch `bombardier` into `.tools/` on first run. Linux scripts need `jq curl taskset shuf`
 (`gawk` for the nicer pivot, `lscpu` for the CPU split — without it the split falls back and warns).
