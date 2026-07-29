@@ -14,6 +14,7 @@ itself as an error.
 | **`Run-SmokeMatrix.ps1`** | *"Is it still correct?"* **Windows: the correctness gate, and the first thing to run.** 48 cells (IOCP/RIO/managed × plaintext/TLS × out-of-band verify, echo callback + pipe, poke, churn), ~3 min, one PASS/FAIL line each. No `.sh` equivalent yet. |
 | `Compare-Commits.ps1` | *"Did this change help?"* Two commits, isolated worktrees, **interleaved**. **Use this for any before/after claim.** `-Bridged` measures through Kestrel rather than the bare responder; `-ExtraArgs` passes demo flags (a change on an opt-in path such as `--byo` measures as nothing without it). |
 | `Run-Byo.ps1` | Windows counterpart of `run-byo.sh`, plus the legs that keep it honest: a `classic-seg64k` control separating pipe block size from zero-copy, and a same-session `kestrel` control. Gates every leg on the `SS_IOCP_STATS` counter, not just `/config`. |
+| `Measure-PipeMemory.ps1` | *"What does the pipe block size COST?"* Windows: peak working set vs connection count for the bridge's pipe pool. Run it at **2048** connections — the effect is connections × block, so 64 measures nothing and reads as free. |
 | `Run-TlsSizes.ps1` | Windows: how transports/TLS scale with payload size (and shard count). |
 | `Run-Matrix.ps1` | Windows: fixed-size transport × TLS matrix. |
 | `run-matrix.sh`, `run-tls-sizes.sh` | Linux equivalents of the two above. Both take `SHARDS="4 8 12"`. |

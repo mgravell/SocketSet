@@ -528,6 +528,44 @@ recommending. Do not read +61.1% as "the flag is now unnecessary".
 **1,025**, so both still decline at a 256 cap. That is why this is written as a cap and not a contract;
 removing the cliff entirely needs the send-a-PREFIX design in item 2f, not a bigger number.
 
+### The memory bill for `--pipe-segment`, on Windows — and `--pipe-pinned` is not optional after all
+
+`bench/Measure-PipeMemory.ps1` (new; the Windows counterpart of the RSS half of the Linux rigs). Peak
+working set under load, 12 shards, 4KB payload, `--iocp`. **Two independent runs at 2048 connections**,
+because a claim this consequential should not rest on one:
+
+| leg | 64 conns | 512 conns | **2048 conns** | rps @ 2048 |
+|---|---:|---:|---:|---:|
+| classic | 228 MB | 258 MB | 404 / 386 MB | 208k / 206k |
+| byo | 224 MB | 231 MB | 659 / 453 MB | 225k / 219k |
+| **byo-seg64k** | 222 MB | 438 MB | **1,282 / 1,285 MB** | **181k / 175k** |
+| **byo-seg64k-pin** | 213 MB | 250 MB | **388 / 346 MB** | 227k / 216k |
+
+**Three things, and the third was not expected.**
+
+**1. The bill is real and it is Windows' too.** `--pipe-segment 65536` takes peak RSS to ~1.28 GB at 2048
+connections against ~0.39 GB for the shipped bridge - **~3.2x** - and the 1,282/1,285 MB pair is the most
+reproducible number in this file. Quoted against `byo` rather than `classic` it is 1.95x and 2.84x on the
+two runs; the `byo` leg itself swings 453-659 MB, so **quote it against `classic` or in absolutes**, not
+as a byo-ratio. Linux's figure was 2.7x, so the two platforms agree on the shape.
+
+**2. At 64 connections it is invisible** (0.99x), which is the same trap the receive-slab table fell into
+on 2026-07-28: resident cost scales with **connections x block**, so a small-connection run measures
+nothing and reads as "free". Any memory claim here needs 2048.
+
+**3. `--pipe-pinned` removes the bill AND the throughput penalty, which reverses the Linux reading.** On
+Linux pinning measured +0.7% and "not separable", so it was filed as a nice-to-have. On Windows the
+pinned pool lands at **346-388 MB - at or below `classic`** - and restores throughput to 216-227k against
+the unpinned pool's 175-181k. So at 2048 connections the unpinned 64KB block pool is **both the most
+expensive and the slowest leg measured**, and pinning is not a refinement of `--pipe-segment`, it is its
+**required companion**.
+
+**What this settles for item 2f:** `--pipe-segment 65536` must not be defaulted on its own. The
+configuration that is actually defensible is `--byo --pipe-segment 65536 --pipe-pinned`, which is the one
+combining -2.4% against vanilla Kestrel at 256KB with memory at or below the shipped bridge. The
+throughput half of that pairing has been measured at `-c 64` and the memory half at `-c 2048`; **the two
+have not been measured in the same run**, which is the gap before anything is defaulted.
+
 **And 2b-result's reading is now retracted for IOCP.** "Zero-copy send removed one copy and bought +3.5%,
 so copies are not the cost" was measured on a path that declined at the payload of interest. Both halves
 of that sentence were true and the conclusion did not follow.

@@ -1503,9 +1503,26 @@ Three options, in increasing order of how much they actually fix:
 demo's pipe configuration. **Pre-registered:** if raising the cap to (say) 256 reproduces the +117%
 without `--pipe-segment`, option 2's contract change is not worth making yet.
 
-**Do not skip the memory question.** `--pipe-segment 65536` costs **2.7x resident memory at 2048
-connections on Linux** and that has never been measured on Windows. A 117% result is exactly the kind
-that gets defaulted without its bill being read.
+**The memory question is now MEASURED on Windows (2026-07-29), and it changed the recommendation.**
+`bench/Measure-PipeMemory.ps1`, two independent runs at 2048 connections:
+
+| leg @ 2048 conns | peak RSS | rps |
+|---|---:|---:|
+| classic | 404 / 386 MB | 208k / 206k |
+| **byo + `--pipe-segment 65536`** | **1,282 / 1,285 MB** | **181k / 175k** |
+| **the same + `--pipe-pinned`** | **388 / 346 MB** | 227k / 216k |
+
+**`--pipe-segment 65536` on its own is the most expensive AND the slowest leg at 2048 connections** -
+~3.2x the shipped bridge's memory and ~15% less throughput. **`--pipe-pinned` removes both**, landing at
+or below `classic`. That reverses the Linux reading, where pinning measured +0.7%, "not separable", and
+was filed as optional: on Windows it is `--pipe-segment`'s **required companion**, not a refinement.
+
+At 64 connections the whole effect is invisible (0.99x) - the same connections-x-block trap the
+receive-slab table fell into on 2026-07-28. Any memory claim here needs 2048.
+
+**So the defensible configuration is `--byo --pipe-segment 65536 --pipe-pinned`, not `--pipe-segment`
+alone.** Remaining gap before anything is defaulted: the throughput half was measured at `-c 64` and the
+memory half at `-c 2048`, and **the two have never been measured in the same run**.
 
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 
