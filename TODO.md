@@ -1077,6 +1077,29 @@ If neither moves it, the honest conclusion is that the bridge cost is structural
 and the way to recover it is to not have a bridge, i.e. for Kestrel to talk to the transport directly,
 which is out of scope here.
 
+### 2e. Managed backend BYO send — ASSESSED 2026-07-29 and deliberately NOT built
+
+The managed backend is the closest of any to zero-copy and the furthest from being worth the risk today.
+Recording the decision so it is a choice rather than an omission.
+
+**Why it looks attractive.** It is already one copy, not two: `ManagedConnection` accumulates into an
+`ArrayPool` buffer and `Flush` hands *that array* to `SendAsync` via `SetBuffer` - no staging copy. Only
+the `WriteAll` accumulation stands between it and BYO, `SocketAsyncEventArgs.BufferList` takes
+`ArraySegment`s (the shape of a `ReadOnlySequence`), and **no pinning is needed** - the SAEA handles it.
+That is the same mechanism vanilla Kestrel's own transport uses.
+
+**Why it was not built.** The send path is a state machine over one `byte[]` plus `SendOffset` /
+`CurrentLength`, and `PumpSend` re-issues `SetBuffer(data, offset, remaining)` on every partial send.
+`BufferList` cannot coexist with `SetBuffer`, so supporting it means a *second*, parallel representation
+with its own partial-send cursor across segments - inside a lock-based path, in the backend that is the
+portable fallback (i.e. what runs wherever io_uring is unavailable, including Docker's default seccomp
+profile), and which appears in **no** benchmark in this repo. New concurrency-adjacent code with no
+measurement to catch a regression is the wrong trade while larger, measured wins are open.
+
+**What would change the decision:** a managed leg in the rigs (so a regression would be visible at all),
+or evidence that the managed path is on someone's hot path. The io_uring result (+45.1% at 256KB) says the
+mechanism pays where it can be measured, so this is a sequencing call, not a doubt about the idea.
+
 ### 2d. The bridge's pipes are OURS, and they are almost entirely unconfigured (raised 2026-07-29)
 
 **Status: proposed, not started. Cheap levers first, custom pipe second.** This is aimed at the term the
