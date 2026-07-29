@@ -224,8 +224,9 @@ above, which are a different OS.
 |---|---:|---:|
 | kestrel (bridged) | 3,991.9 | 11,620.0 |
 | iocp (bridged) | 3,745.2 | 5,273.3 |
-| **iocp, bridged, `--byo --pipe-segment 65536`** | **9,042.4**\* | **11,136.2**\* (**-2.4%** vs a same-session kestrel) |
-| iocp, bridged, `--byo` (no flag, after the cap split) | - | 8,447.9\* |
+| **iocp, bridged, `--byo --pipe-segment 65536 --pipe-pinned`** | - | **11,557.7**\* (**level** with a same-session kestrel; 346-388 MB at 2048 conns) |
+| iocp, bridged, `--byo --pipe-segment 65536` | 9,042.4\* | 11,394.6\* (same throughput, **1.28 GB** at 2048 conns) |
+| iocp, bridged, `--byo` (no flag, after the cap split) | - | 8,756.9\* |
 | rio (bridged, default 4KB page) | 1,530.9 | 2,108.2 |
 | *rio, bare, tuned* (64KB page + 4KB recv, 2026-07-27) | *4,365.8* | *11,030.2* |
 
@@ -561,10 +562,32 @@ expensive and the slowest leg measured**, and pinning is not a refinement of `--
 **required companion**.
 
 **What this settles for item 2f:** `--pipe-segment 65536` must not be defaulted on its own. The
-configuration that is actually defensible is `--byo --pipe-segment 65536 --pipe-pinned`, which is the one
-combining -2.4% against vanilla Kestrel at 256KB with memory at or below the shipped bridge. The
-throughput half of that pairing has been measured at `-c 64` and the memory half at `-c 2048`; **the two
-have not been measured in the same run**, which is the gap before anything is defaulted.
+configuration that is actually defensible is `--byo --pipe-segment 65536 --pipe-pinned`.
+
+#### And the pinned configuration costs nothing at 256KB — it is level with vanilla Kestrel
+
+The gap this file named a paragraph ago (throughput measured at `-c 64`, memory at `-c 2048`, never the
+pinned leg at a large payload) is now closed. `Run-Byo.ps1` gained a `byo-seg64k-pin` leg; 6 scored
+passes, 256KB, 12 shards, same session, zero errors:
+
+| leg | goodput MiB/s | vs kestrel |
+|---|---:|---|
+| kestrel *(control)* | 11,715.7 [10592-11828] | - |
+| **byo-seg64k-pin** | **11,557.7** [11328-11777] | **ranges overlap: no difference** |
+| byo-seg64k | 11,394.6 [11274-11818] | ranges overlap |
+| byo | 8,756.9 [8509-8887] | -25.3% |
+| classic-seg64k | 5,323.5 [5219-5702] | -54.6% |
+| classic *(shipped)* | 5,276.1 [5161-5467] | **-55.0%** |
+
+**Pinning is free on throughput and worth 3.2x on memory**, so there is no trade to weigh:
+`byo-seg64k-pin` and `byo-seg64k` overlap at 256KB (11,558 vs 11,395), and only one of them is 346-388MB
+at 2048 connections.
+
+*On the Kestrel comparison, stated precisely:* this run puts the tuned configuration **level** with
+vanilla Kestrel (overlapping ranges); the earlier run put the unpinned variant at -2.4% (disjoint). The
+difference is the **control**, not us - Kestrel's own leg spread 0.8% in that run and 10.5% in this one.
+The defensible claim is *parity at 256KB*, not a signed percentage, and the shipped bridge's -55.0% is
+the number that actually moved.
 
 **And 2b-result's reading is now retracted for IOCP.** "Zero-copy send removed one copy and bought +3.5%,
 so copies are not the cost" was measured on a path that declined at the payload of interest. Both halves

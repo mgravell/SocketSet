@@ -1521,8 +1521,16 @@ At 64 connections the whole effect is invisible (0.99x) - the same connections-x
 receive-slab table fell into on 2026-07-28. Any memory claim here needs 2048.
 
 **So the defensible configuration is `--byo --pipe-segment 65536 --pipe-pinned`, not `--pipe-segment`
-alone.** Remaining gap before anything is defaulted: the throughput half was measured at `-c 64` and the
-memory half at `-c 2048`, and **the two have never been measured in the same run**.
+alone** - and that gap is now closed too. `Run-Byo.ps1` gained a `byo-seg64k-pin` leg: at 256KB, 6 scored
+passes, it measures **11,557.7 [11328-11777]** against `byo-seg64k`'s 11,394.6 [11274-11818] (overlapping
+- **pinning costs nothing on throughput**) and against a same-session vanilla Kestrel of 11,715.7
+(**also overlapping - parity**). Shipped `classic` is -55.0%.
+
+**So there is no trade left to weigh on this pairing**: same throughput, parity with Kestrel, and
+346-388MB instead of 1.28GB at 2048 connections. What remains before defaulting is a decision about
+public behaviour, not another measurement - and note the memory figures were taken at a 4KB payload
+while the throughput ones are at 256KB, so a single run covering both axes at once would still be the
+most honest evidence to default on.
 
 ### 2b. BYO-buffer, phase 2: per-backend zero-copy, IOCP first
 

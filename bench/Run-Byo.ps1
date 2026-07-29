@@ -112,6 +112,11 @@ $legs = @(
     @{ Name = "byo";            Args = @("--byo");                              Want = "byo=pipe";      Deny = "pipeseg" }
     @{ Name = "byo-seg64k";     Args = @("--byo", "--pipe-segment", "65536");   Want = "pipeseg=65536"; Deny = "" }
     @{ Name = "classic-seg64k"; Args = @("--pipe-segment", "65536");            Want = "pipeseg=65536"; Deny = "byo=pipe" }
+    # The pinned pool is here because Measure-PipeMemory.ps1 (2026-07-29) found that at 2048 connections
+    # --pipe-segment WITHOUT it is both the most expensive leg (3.2x classic's RSS) and the slowest. So
+    # this is the configuration actually worth recommending, and it had never been throughput-tested at
+    # 256KB - the memory result was measured at a 4KB payload and the throughput result at -c 64.
+    @{ Name = "byo-seg64k-pin"; Args = @("--byo", "--pipe-segment", "65536", "--pipe-pinned"); Want = "pipepinned=1"; Deny = "" }
     @{ Name = "kestrel";        Args = @("--kestrel");                          Want = "transport=kestrel-sockets"; Deny = "byo=pipe"; NoShards = $true }
 ) | Where-Object { $_.Name -like $Filter }
 
