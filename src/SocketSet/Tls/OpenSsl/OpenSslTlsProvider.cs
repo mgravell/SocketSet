@@ -50,7 +50,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
 
         _clientCtx = SSL_CTX_new(TLS_method());
         if (_clientCtx == 0) throw Err("SSL_CTX_new(client)");
-        if (kernelOffload) SSL_CTX_set_options(_clientCtx, SSL_OP_ENABLE_KTLS);
+        if (kernelOffload) { SSL_CTX_set_options(_clientCtx, SSL_OP_ENABLE_KTLS); ApplyKtlsRxOverride(_clientCtx); }
         if (trustCertPem is not null)
         {
             // Trust exactly this certificate (self-signed test setup): add it to the client's store.
@@ -69,7 +69,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
             if (serverKeyPem is null) throw new ArgumentNullException(nameof(serverKeyPem), "A server certificate needs its private key.");
             _serverCtx = SSL_CTX_new(TLS_method());
             if (_serverCtx == 0) throw Err("SSL_CTX_new(server)");
-            if (kernelOffload) SSL_CTX_set_options(_serverCtx, SSL_OP_ENABLE_KTLS);
+            if (kernelOffload) { SSL_CTX_set_options(_serverCtx, SSL_OP_ENABLE_KTLS); ApplyKtlsRxOverride(_serverCtx); }
             nint cert = LoadX509(serverCertPem);
             try
             {
@@ -239,6 +239,24 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
         if (rbio == 0 || wbio == 0) { SSL_free(ssl); throw Err("BIO_new"); }
         SSL_set_bio(ssl, rbio, wbio);
         return (ssl, rbio, wbio);
+    }
+
+    /// <summary>
+    /// Diagnostic control over kTLS RECEIVE offload: <c>SS_KTLS_NO_RX=1</c> sets
+    /// <c>SSL_MODE_NO_KTLS_RX</c>, leaving TX offloaded and RX in userspace.
+    ///
+    /// It exists to make the RX question answerable WITHOUT changing OpenSSL versions. Measured
+    /// 2026-07-29, turning RX on (by moving from system 3.0.13 to a self-built 3.5.7, since 3.0.x declines
+    /// kTLS RX for TLS 1.3) cost -4.3% at 512B - but that comparison changes the whole library, so it
+    /// cannot attribute the loss to RX offload. With this knob the same binary can be run both ways.
+    /// </summary>
+    private static void ApplyKtlsRxOverride(nint ctx)
+    {
+        if (Environment.GetEnvironmentVariable("SS_KTLS_NO_RX") != "1") return;
+        long before = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MODE, 0, IntPtr.Zero); // op=0 returns the mode unchanged
+        long after = SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MODE, SSL_MODE_NO_KTLS_RX, IntPtr.Zero);
+        Console.Error.WriteLine($"[ktls] SS_KTLS_NO_RX: mode 0x{before:x} -> 0x{after:x} " +
+                                $"(NO_KTLS_RX=0x{SSL_MODE_NO_KTLS_RX:x} set={(after & SSL_MODE_NO_KTLS_RX) != 0})");
     }
 
     private static nint LoadX509(string pem)
