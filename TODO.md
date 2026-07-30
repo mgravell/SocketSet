@@ -1149,15 +1149,32 @@ why it reproduces as often as it does.
 **Verification:** 4 configs x 25 reps = 100 runs, 0 crashes, against a pre-fix rate of ~4-5/8 per config
 (so ~50 expected). Plus the full smoke matrix with churn cells repeated.
 
-**WHAT DOES NOT ADD UP, and it is why this is not marked closed.** The bisection says the crash needs a
-TIGHT SLOT TABLE: `--sockets 4096` is 0/8 while the baseline is 4/8, and that variant does not reduce
+**WHAT DID NOT ADD UP, and what a soak then said about it.** The bisection says the crash needs a TIGHT
+SLOT TABLE: `--sockets 4096` is 0/8 while the baseline is 4/8, and that variant does not reduce
 concurrency at all — same clients, same churn rate — it only stops slots being recycled. A stale-`Rq`
-window should not care whether the freed slot is immediately re-tenanted. So either slot reuse merely
-shortens the window enough to matter, or **there is a second lifetime bug here that this fix has masked
-rather than removed**. The honest reading of 100 clean runs is "this fault is gone"; it is not
-"the churn path is now correct".
+window should not care whether the freed slot is immediately re-tenanted, so the worry was a **second
+lifetime bug masked rather than removed**.
 
-**If it ever returns, start here:** completions carry only the slot (`r.SocketContext`), *not* a
+`bench/Soak-Churn.ps1` (new) went looking for it — 60s per case, watching all three faces a lifetime bug
+can wear (crash, wedge, quiet accounting imbalance), including a case with the slot table at exactly
+100% capacity (SmokeTest runs both ends in one process, so `-c 128` against `--sockets 64` x 4 shards is
+full):
+
+| case | connections churned | |
+|---|---:|---|
+| **rio+tls, table FULL** | **51,845** | clean |
+| rio+tls, tight | 36,463 | clean |
+| rio plaintext, tight | 244,992 | clean |
+| iocp+tls, table full *(control)* | 49,779 | clean |
+| iocp+tls, tight *(control)* | 37,751 | clean |
+
+**~51,000 connections through the exact configuration that used to fault inside one second**, at maximum
+reuse pressure. That is the strongest available evidence that slot reuse was shortening the stale-`Rq`
+window rather than exposing a separate bug — but it is evidence, not proof: **0e was a ~1-in-2 fault and
+still hid for months** behind a suite that ran its cell once. Treat "there is no second bug" as unproven.
+
+**The structural hazard remains real regardless**, and would be the thing to harden if this area ever
+misbehaves again: completions carry only the slot (`r.SocketContext`), *not* a
 generation, so a stale completion landing on a re-tenanted slot is structurally possible; the
 defer-recycle rule (`TryFinalize` refusing to free while `RecvArmed || SendBusy`) is the only thing
 preventing it. Any path that clears those flags without the completion having drained reopens it.
