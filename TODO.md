@@ -1135,19 +1135,28 @@ a managed exception - the process dies. `### UNHANDLED ###` never prints, so a m
 it: this is a fault in unsafe/native-interop code, which on this path means the RIO submission or
 completion machinery.
 
-**Frequency, pristine build at `e104568` (before any of 2026-07-29's work), 6 reps per cell:**
+**Frequency — RE-MEASURED 2026-07-30 with a stuck Windows Firewall dialog cleared.** The first table
+here was taken while one was pending against the binary under test, which is a documented 2.8x
+confounder, and it **understated the rate roughly threefold**. Both builds, 8 reps per cell:
 
-| page | write-buffers | pass | access violation |
-|---:|---:|---:|---:|
-| **4096** | **1024** *(the SHIPPED default)* | 5 | **1** |
-| 4096 | 512 | 3 | **3** |
-| 4096 | 128 | 6 | 0 |
-| 65536 | 512 | 2 | **4** |
-| 65536 | 256 | 3 | **3** |
-| 65536 | 128 | 3 | **3** |
+| page | write-buffers | pristine `e104568` | today's HEAD |
+|---:|---:|---|---|
+| **4096** | **1024** *(the SHIPPED default)* | **5/8 crash** | **4/8 crash** |
+| 4096 | 512 | 4/8 crash | 4/8 crash |
+| 4096 | 128 | - | 2/8 crash |
+| 4096 | 64 | - | **0 crash, 8/8 WEDGE** |
+| 65536 | 512 | 3/8 crash | 3/8 crash |
+| 65536 | 256 | 3/8 crash | 6/8 crash |
 
-**Read that first row again: it happens on the configuration the library ships.** It is not caused by the
-64KB page and not by a shallow pool; both of those change the *rate*, not the existence.
+**Read the first row again: roughly one run in two, on the configuration the library ships.** And the
+pristine build crashes at least as often as today's, which is what makes "this predates 2026-07-29"
+solid rather than inferred.
+
+**A correction to this entry's own earlier advice.** It previously said a 4KB page with 128 write buffers
+showed 0/6, and drew from that "depth moves the rate, so a lower rate will look like a fix". The 0/6 was
+the confounder plus luck: **128 crashes too** (2/8). The honest version is stronger and simpler - *every*
+depth tested crashes, except the one shallow enough to wedge first (64 wedges 8/8 and never gets far
+enough to crash, which is masking, not avoiding). Do not tune depth and call it fixed.
 
 **Why it was never seen before**, and this is the transferable part: it is intermittent at roughly 1-in-6
 on the defaults, and `rio+tls/churn` is ONE cell that had only ever been run a handful of times. Four

@@ -292,18 +292,22 @@ process dies with **0xC0000005**, intermittently, usually inside one second, und
 `--rio --tls-schannel` connection churn. No managed exception: `### UNHANDLED ###` never prints, so this
 is a fault in unsafe/native-interop code.
 
-Pristine build at `e104568` — i.e. before anything measured on 2026-07-29 — 6 reps per cell:
+**Re-measured 2026-07-30 with a stuck Firewall dialog cleared** — the first version of this table was
+taken with one pending against the binary under test (a documented 2.8x confounder) and understated the
+rate about threefold. 8 reps per cell, both builds:
 
-| page | write-buffers | pass | access violation |
-|---:|---:|---:|---:|
-| **4096** | **1024** *(the SHIPPED default)* | 5 | **1** |
-| 4096 | 512 | 3 | **3** |
-| 4096 | 128 | 6 | 0 |
-| 65536 | 512 | 2 | **4** |
-| 65536 | 256 | 3 | **3** |
+| page | write-buffers | pristine `e104568` | today's HEAD |
+|---:|---:|---|---|
+| **4096** | **1024** *(the SHIPPED default)* | **5/8 crash** | **4/8 crash** |
+| 4096 | 512 | 4/8 crash | 4/8 crash |
+| 4096 | 128 | - | 2/8 crash |
+| 4096 | 64 | - | 0 crash, **8/8 wedge** |
+| 65536 | 512 | 3/8 crash | 3/8 crash |
+| 65536 | 256 | 3/8 crash | 6/8 crash |
 
-**It happens on the configuration the library ships**, and neither the page size nor the pool depth
-causes it - they move the *rate*. Full analysis, what is excluded, and where to start: TODO item 0e.
+**Roughly one run in two, on the configuration the library ships** - and the pristine build crashes at
+least as often as the current one, which is what makes "predates 2026-07-29" solid rather than inferred.
+Neither page size nor pool depth causes it. Full analysis and where to start: TODO item 0e.
 `bench/Repro-RioChurnCrash.ps1` reproduces it with nothing but an exit code.
 
 **Why no benchmark in this file ever caught it**, which is the transferable part: every rig here holds
@@ -312,6 +316,34 @@ that opens and closes sockets in anger is the smoke matrix's `churn` cell, which
 against an ~1-in-6 fault. An intermittent crash under a suite you run once is indistinguishable from a
 flaky harness - and that is exactly how it first read ("no churn result line"). `Run-SmokeMatrix.ps1` now
 names crash exit codes instead of letting them fall through as missing output.
+
+### Firewall-confounder audit of everything above (2026-07-30)
+
+A stuck Windows Firewall dialog was cleared on 2026-07-30, and nobody knew how long it had been pending.
+That is a documented 2.8x confounder here, so rather than assume, this is what was at risk and how each
+part was cleared. **The exposure is path-shaped**: the dialog fires for binaries at paths Windows has not
+seen before, so the question for any result is "did it run from a fresh path?"
+
+| result | ran from | verdict |
+|---|---|---|
+| item 0e crash rates | `%TEMP%\av-check\pristine` (**new**) | **AFFECTED — re-measured**, rate was understated ~3x |
+| the three `dd8cdce` A/Bs | `%TEMP%\ss-ab\*` (**new**) | cleared by level agreement, below |
+| the pin-handle A/Bs | `%TEMP%\ss-ab\*` (**new**) | cleared by level agreement, below |
+| smoke matrices | repo `Release` (in use all day) | not at risk — a blocked socket fails cells, it cannot fake a PASS |
+| `Run-TlsSizes`, `Run-Byo`, `Measure-PipeMemory` | repo `Release` | cleared by control agreement, below |
+
+**The repo-path runs are cleared by their own controls.** `Run-TlsSizes`' vanilla-Kestrel legs reproduced
+the 2026-07-27 figures within ~1% (3,991.9 vs 4,007.7; 11,620.0 vs 11,488.9). A 2.8x throttle cannot hide
+inside a 1% agreement with a two-day-old number.
+
+**The worktree A/Bs are cleared by level agreement with a repo-path run.** They measured the classic
+bridged IOCP leg at 256KB at 5,083 / 5,249 / 5,145 MiB/s across three runs; `Run-TlsSizes` measured the
+same leg at **5,273.3** from the allow-listed path on the same day. Same number, different paths, so the
+worktree binaries were not being throttled - and all three A/Bs agreed with each other anyway. The
+"copy removal is worth nothing on Windows" conclusion stands.
+
+**What the confounder did change** is only the item 0e frequency table, which is corrected above - and it
+made the bug *worse* than recorded, not better.
 
 ## Windows validation after the OS switch (2026-07-29)
 

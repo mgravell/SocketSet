@@ -8,15 +8,16 @@
     - this is a fault in unsafe/native-interop code. The whole signal is the exit code, so this rig needs
     no debugger and no symbols: it runs the churn cell N times and counts how many die.
 
-    WHY A DEDICATED RIG. The fault is intermittent - roughly 1 in 6 on the defaults - and the smoke matrix
-    runs that cell ONCE. At that rate four consecutive clean runs are likely, which is precisely how this
-    went unnoticed: an intermittent crash in a suite you run once per change is indistinguishable from a
-    flaky harness. Anything claiming to fix it must be judged over many reps, not one.
+    WHY A DEDICATED RIG. The fault is intermittent - roughly ONE RUN IN TWO on the shipped defaults - and
+    the smoke matrix runs that cell ONCE. Even at that rate a couple of clean runs in a row are ordinary,
+    which is how it went unnoticed: an intermittent crash in a suite you run once per change is
+    indistinguishable from a flaky harness. Judge anything claiming to fix it over many reps, not one.
 
-    AND DO NOT JUDGE A FIX BY POOL DEPTH. Depth moves the frequency (a 4KB page with 128 write buffers
-    showed 0/6, the shipped 4KB/1024 shows ~1/6, a 64KB page with 512 shows ~4/6) without removing the
-    fault. A change that lowers the rate looks exactly like a fix and is a mask. Several depths are swept
-    here for that reason: a real fix is 0 crashes across ALL of them.
+    AND DO NOT JUDGE A FIX BY POOL DEPTH. Every depth tested crashes, except one shallow enough to WEDGE
+    before it gets far enough to crash (a 4KB page with 64 write buffers wedges 8/8 and never faults -
+    masking, not avoiding). An earlier version of this header claimed 128 was clean at 0/6; that was a
+    pending Firewall dialog plus luck, and 128 crashes 2/8 once measured properly. Several depths are
+    swept here for exactly that reason: a real fix is 0 crashes across ALL of them.
 
 .PARAMETER Exe
     SmokeTest.exe to test. Defaults to the repo's Release build; point it at a worktree build to check
