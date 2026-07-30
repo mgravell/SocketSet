@@ -47,9 +47,18 @@ reading code:**
 | `SS_IOCP_STATS=1` | IOCP | zero-copy sends **taken vs declined by cause**, and the true segment count at a fragmentation decline. This is what turned "zero-copy buys nothing at 256KB" into "it declined every 256KB response at 65 segments against a cap of 64". |
 | `SS_RIO_STATS=1` | RIO | sends and bytes/send, per-direction commits, notify re-arms, port wakes, CQ drains, out-of-band flushes. Added for item 0d; its first job was proving the loop was **idle**, which killed several candidates at once. |
 
-**If you are picking this up on Windows after the Linux work:** the catch-up was done on 2026-07-29 —
-read the top of `../TODO.md` for what it found. Run `Run-SmokeMatrix.ps1` before believing anything; it
-currently reports 47/48, and the one red cell is item 0d rather than a regression.
+**If you are picking this up on Windows after the Linux work:** the catch-up was done on 2026-07-29/30 —
+read the top of `../TODO.md` for what it found. Run `Run-SmokeMatrix.ps1` before believing anything.
+
+**A confounder the other nine did not cover: a harness bug that makes every cell AGREE.** The first run
+of `Bisect-RioChurnCrash.ps1` reported all eight variants identical — including two controls that were
+known to behave differently. That is not a finding, it is a broken rig, and it happened because a
+function parameter was named `$args`, a PowerShell automatic variable, so every variant launched with an
+empty argument list and printed usage. It produced a clean, symmetric, entirely wrong table.
+
+The general rule this earns: **put a control in the matrix whose answer you already know, and read it
+FIRST.** Uniformity across cells that should differ is a harness failure until proven otherwise. That rig
+now throws outright if a run exits cleanly without ever entering the scenario, rather than scoring it.
 
 All of them fetch `bombardier` into `.tools/` on first run. Linux scripts need `jq curl taskset shuf`
 (`gawk` for the nicer pivot, `lscpu` for the CPU split — without it the split falls back and warns).

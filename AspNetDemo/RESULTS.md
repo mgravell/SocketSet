@@ -285,6 +285,37 @@ recommendation. 512B and 64KB are unmoved by both.
 - **Linux bridged legs below 64KB have not been re-run at six passes.** The fix cannot affect them (see
   item 1), but they are three-pass numbers.
 
+## FIXED 2026-07-30: the access violation was a stale RIO request-queue handle
+
+`closesocket` destroys the RIO request queue, but `conn.Rq` was only cleared in `TryFinalize` — which
+early-returns whenever an op is still in flight, i.e. the normal case under churn. `FlushCommits` guards
+on `Socket != 0 && Rq != 0`, and `Socket` is deliberately held non-zero as the claimed marker until
+finalize, so both guards passed while the queue was already gone and it posted `RIO_MSG_COMMIT_ONLY`
+against a dead handle. Zeroing `Rq` where the socket actually closes fixes it; `ArmReceive`/`IssueSend`
+gained the same guard because a post-close completion can still reach them.
+
+**100 runs (4 configs x 25), zero crashes, against ~50 expected at the pre-fix rate.**
+
+**The bisection that found it is the transferable part** — no debugger, no symbols, just removing one
+variable at a time from the churn cell and re-measuring the rate (`bench/Bisect-RioChurnCrash.ps1`):
+
+| variant | crash rate | what it ruled in or out |
+|---|---:|---|
+| baseline | 4/8 | - |
+| **`--sockets 4096`** | **0/8** | needs slot REUSE - and it does not reduce concurrency, so this is a lifetime signal, not a load one |
+| graceful close (no RST) | 4/8 | does NOT need the abortive path |
+| `-n 1` (one shard) | 0/8 | needs multiple shards |
+| `--close-after 64` | 0/8 | scales with CLOSES, not traffic |
+| `-c 8` | 0/8 | needs many concurrent racers |
+| rio plaintext *(control)* | 0/8 | TLS-only confirmed |
+| iocp+tls *(control)* | 0/8 | RIO-only confirmed |
+
+**And one signal still does not fit**, which is recorded rather than smoothed over: the tight-table
+dependence should not matter to a stale-`Rq` window. Either slot reuse merely shortens the window, or a
+second lifetime bug is being masked. See TODO item 0e.
+
+*The pre-fix investigation follows.*
+
 ## An ACCESS VIOLATION in RIO+TLS under churn, on the shipped defaults (2026-07-29)
 
 **Found while validating an unrelated change, and it is the most serious thing in this file.** The

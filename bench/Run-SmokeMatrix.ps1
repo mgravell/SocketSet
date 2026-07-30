@@ -34,6 +34,11 @@ param(
     [int]$FirstPort = 10500,
     # Per-cell wall-clock ceiling. A wedge is a failure mode this gate must report rather than hang on.
     [int]$TimeoutSec = 120,
+    # How many times to run each CHURN cell. Not a paranoia knob: item 0e is an access violation that
+    # strikes roughly one run in two, and this suite ran that cell ONCE - so the gate could not have
+    # disproved a fix, and a real fault read as a flaky harness. Everything else here is deterministic
+    # and runs once.
+    [int]$ChurnReps = 5,
     [switch]$KeepLogs
 )
 
@@ -148,44 +153,55 @@ Write-Host ""
 $port = $FirstPort
 $results = @()
 foreach ($cell in $cells) {
-    $port++
-    $argList = @($cell.Args) + @("--port", "$port")
-    $safe = $cell.Name -replace '[\\/:*?"<>|+]', '-'
-    $out = Join-Path $logDir "$safe.log"
-    $err = Join-Path $logDir "$safe.err"
+    # Churn cells run N times and report the WORST outcome: an intermittent fault that a single run
+    # would have called PASS is the whole reason item 0e survived this long.
+    $reps = if ($cell.Test -eq "churn") { $ChurnReps } else { 1 }
+    $ok = $true; $detail = ""; $worstSecs = 0.0; $failed = 0
 
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow `
-        -RedirectStandardOutput $out -RedirectStandardError $err
-    $exited = $p.WaitForExit($TimeoutSec * 1000)
-    if (-not $exited) {
-        try { $p.Kill() } catch { }
-        try { $p.WaitForExit(5000) | Out-Null } catch { }
-    }
-    $sw.Stop()
+    foreach ($rep in 1..$reps) {
+        $port++
+        $argList = @($cell.Args) + @("--port", "$port")
+        $safe = $cell.Name -replace '[\\/:*?"<>|+]', '-'
+        $out = Join-Path $logDir "$safe.r$rep.log"
+        $err = Join-Path $logDir "$safe.r$rep.err"
 
-    $text = ((Get-Content $out -Raw -ErrorAction SilentlyContinue) + "`n" +
-             (Get-Content $err -Raw -ErrorAction SilentlyContinue))
-    if (-not $exited) {
-        $ok = $false; $detail = "TIMEOUT after ${TimeoutSec}s (wedged)"
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $p = Start-Process -FilePath $exe -ArgumentList $argList -PassThru -NoNewWindow `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+        $exited = $p.WaitForExit($TimeoutSec * 1000)
+        if (-not $exited) {
+            try { $p.Kill() } catch { }
+            try { $p.WaitForExit(5000) | Out-Null } catch { }
+        }
+        $sw.Stop()
+        if ($sw.Elapsed.TotalSeconds -gt $worstSecs) { $worstSecs = $sw.Elapsed.TotalSeconds }
+
+        $text = ((Get-Content $out -Raw -ErrorAction SilentlyContinue) + "`n" +
+                 (Get-Content $err -Raw -ErrorAction SilentlyContinue))
+        if (-not $exited) { $repOk = $false; $repDetail = "TIMEOUT after ${TimeoutSec}s (wedged)" }
+        else {
+            $judged = Test-CellOutput $cell.Test $text $p.ExitCode
+            $repOk = $judged[0]; $repDetail = $judged[1]
+        }
+        if (-not $repOk) { $failed++; if ($ok) { $detail = $repDetail } ; $ok = $false }
+        elseif ($reps -eq 1) { $detail = $repDetail }
+        if (-not $KeepLogs -and $repOk) { Remove-Item $out, $err -ErrorAction SilentlyContinue }
     }
-    else {
-        $judged = Test-CellOutput $cell.Test $text $p.ExitCode
-        $ok = $judged[0]; $detail = $judged[1]
+    if ($reps -gt 1) {
+        $detail = if ($ok) { "$reps/$reps clean" } else { "$failed/$reps FAILED - $detail" }
     }
+    $sw = [pscustomobject]@{ Elapsed = [timespan]::FromSeconds($worstSecs) }
 
     $results += [pscustomobject]@{
         Cell = $cell.Name; Result = $(if ($ok) { "PASS" } else { "FAIL" })
-        Detail = $detail; Secs = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+        Detail = $detail; Secs = [math]::Round($worstSecs, 1)
     }
     $colour = if ($ok) { "Green" } else { "Red" }
-    Write-Host ("  {0,-26} {1,-4} {2,6:n1}s  {3}" -f $cell.Name, $(if ($ok) { "PASS" } else { "FAIL" }), $sw.Elapsed.TotalSeconds, $detail) -ForegroundColor $colour
-    if (-not $ok -and $VerbosePreference -ne "SilentlyContinue") { Write-Host $text -ForegroundColor DarkGray }
+    Write-Host ("  {0,-26} {1,-4} {2,6:n1}s  {3}" -f $cell.Name, $(if ($ok) { "PASS" } else { "FAIL" }), $worstSecs, $detail) -ForegroundColor $colour
 
     # Ports go into TIME_WAIT even with --reset-close on the accepted side; each cell gets a fresh one,
     # but give teardown a moment so a wedge is attributable to the cell that caused it.
     Start-Sleep -Milliseconds 300
-    if (-not $KeepLogs -and $ok) { Remove-Item $out, $err -ErrorAction SilentlyContinue }
 }
 
 Write-Host ""

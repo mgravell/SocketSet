@@ -482,6 +482,16 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             Win32.shutdown(conn.Socket, Win32.SD_BOTH);
         }
         Win32.closesocket(conn.Socket);
+
+        // The request queue is destroyed WITH the socket, so its handle dies HERE - not in TryFinalize,
+        // which early-returns whenever an op is still in flight (RecvArmed/SendBusy), i.e. the normal
+        // case under churn. Leaving Rq set while Socket is deliberately held non-zero as the claimed
+        // marker let FlushCommits satisfy BOTH of its guards and post RIO_MSG_COMMIT_ONLY against a
+        // destroyed queue. That is item 0e's access violation, and it is a SEQUENCING bug on one thread
+        // rather than a race: close and FlushCommits both run on the loop.
+        conn.Rq = 0;
+        conn.CommitPending = conn.CommitRecv = conn.CommitSend = false;
+
         TryFinalize(conn, slot);
     }
 
@@ -765,6 +775,9 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     private void ArmReceive(RioConnection conn)
     {
+        // The queue died with the socket (see CloseClient). A completion arriving after close can still
+        // reach here, and RIOReceive against a zero RQ is not a clean failure - it faults.
+        if (conn.Rq == 0) return;
         Win32.RIO_BUF buf;
         buf.BufferId = _recvBufferId;
         buf.Offset = (uint)(conn.RecvBuf * _recvBufSize);
@@ -789,6 +802,9 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         buf.BufferId = _writeBufferId;
         buf.Offset = (uint)(wi * _writeBufSize + off);
         buf.Length = (uint)len;
+        // Same as ArmReceive: after close the queue is gone, and a send completion can still drive us
+        // back here through the pending-send machinery.
+        if (conn.Rq == 0) { FailSend(conn, slot); return; }
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
         if (Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend) == 0) { FailSend(conn, slot); return; }
         if (ReportStats) { Interlocked.Increment(ref s_sends); Interlocked.Add(ref s_sendBytes, len); }

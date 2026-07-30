@@ -1126,8 +1126,43 @@ much stronger than when this entry was written**, and what is left is mechanism,
 
 ### 0e. ACCESS VIOLATION in RIO+TLS under connection churn — ON THE SHIPPED DEFAULTS (2026-07-29)
 
-**Status: reproduced, not diagnosed. This is the most serious defect on this list and it outranks
-everything else on it. It predates 2026-07-29 entirely.**
+**Status: FIXED 2026-07-30 (a stale RIO request-queue handle), verified over 100 runs where ~50 crashes
+were expected. The causal story is only PARTLY consistent with the bisection — read "what does not add
+up" below before treating this as closed.**
+
+**The bug.** `CloseClient` calls `closesocket`, which destroys the connection's RIO request queue. But
+`conn.Rq` was only zeroed in `TryFinalize`, which **early-returns whenever an op is still in flight**
+(`RecvArmed || SendBusy`) — the normal case under churn. `FlushCommits` guards on
+`conn.Socket != 0 && conn.Rq != 0`, and `Socket` is *deliberately* held non-zero as the claimed marker
+until finalize, so **both guards pass while the queue is already destroyed** and it posts
+`RIO_MSG_COMMIT_ONLY` against a dead handle. The `Socket != 0` guard was clearly meant to prevent exactly
+this and structurally cannot.
+
+Not a data race — close and `FlushCommits` both run on the loop thread. A **sequencing** bug, which is
+why it reproduces as often as it does.
+
+**The fix** (`WindowsRioShard`): zero `conn.Rq` and the commit flags in `CloseClient`, immediately after
+`closesocket`, because that is when the queue actually dies. `ArmReceive` and `IssueSend` gained
+`Rq == 0` guards, since a completion arriving after close can still drive either of them and
+`RIOReceive`/`RIOSend` against a zero handle faults rather than failing cleanly.
+
+**Verification:** 4 configs x 25 reps = 100 runs, 0 crashes, against a pre-fix rate of ~4-5/8 per config
+(so ~50 expected). Plus the full smoke matrix with churn cells repeated.
+
+**WHAT DOES NOT ADD UP, and it is why this is not marked closed.** The bisection says the crash needs a
+TIGHT SLOT TABLE: `--sockets 4096` is 0/8 while the baseline is 4/8, and that variant does not reduce
+concurrency at all — same clients, same churn rate — it only stops slots being recycled. A stale-`Rq`
+window should not care whether the freed slot is immediately re-tenanted. So either slot reuse merely
+shortens the window enough to matter, or **there is a second lifetime bug here that this fix has masked
+rather than removed**. The honest reading of 100 clean runs is "this fault is gone"; it is not
+"the churn path is now correct".
+
+**If it ever returns, start here:** completions carry only the slot (`r.SocketContext`), *not* a
+generation, so a stale completion landing on a re-tenanted slot is structurally possible; the
+defer-recycle rule (`TryFinalize` refusing to free while `RecvArmed || SendBusy`) is the only thing
+preventing it. Any path that clears those flags without the completion having drained reopens it.
+
+*The original entry follows, including the pre-fix reproduction data.*
 
 `SmokeTest --rio --tls-schannel -s -c 64 --churn 10 --close-after 4 --sockets 128 --reset-close` exits
 with **0xC0000005 (access violation)**, intermittently, usually within the first second. Not a wedge, not
