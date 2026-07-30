@@ -168,32 +168,44 @@ internal sealed class PipeIoBridge
                 var result = await input.ReadAsync().ConfigureAwait(false);
                 var buffer = result.Buffer;
 
+                // How much of `buffer` we may hand back to the pipe. Not always buffer.End: a backend may
+                // accept only a PREFIX (see Connection.TrySendZeroCopy), in which case the remainder stays
+                // unconsumed and the next ReadAsync returns it immediately.
+                var consumed = buffer.Start;
+                bool drained = buffer.IsEmpty;
+
                 if (!buffer.IsEmpty)
                 {
                     // Prefer zero-copy: the backend sends straight out of the pipe's own segments. It
-                    // declines when it cannot (RIO, managed, or a sequence too fragmented for one call),
-                    // and then we take the copying path, which is always correct.
+                    // returns 0 when it cannot at all (RIO, managed, TLS), and then we take the copying
+                    // path, which is always correct.
                     //
                     // Note the ordering rule this creates: with zero-copy the socket is reading the pipe's
                     // memory, so AdvanceTo must wait for the send to COMPLETE, not merely to be submitted.
                     // That is the whole reason this awaits before advancing.
-                    if (_conn.TrySendZeroCopy(in buffer, Pinned, out var sent))
+                    long accepted = _conn.TrySendZeroCopy(in buffer, Pinned, out var sent);
+                    if (accepted > 0)
                     {
                         if (!await sent.ConfigureAwait(false))
                         {
                             input.AdvanceTo(buffer.Start); // connection gone; do not consume what we could not send
                             break;
                         }
+                        consumed = buffer.GetPosition(accepted);
+                        drained = accepted == buffer.Length;
                     }
                     else if (!_conn.Send(in buffer))
                     {
                         input.AdvanceTo(buffer.Start); // connection gone; do not consume what we cannot send
                         break;
                     }
+                    else { consumed = buffer.End; drained = true; }
                 }
 
-                input.AdvanceTo(buffer.End);
-                if (result.IsCompleted || result.IsCanceled) break;
+                input.AdvanceTo(consumed);
+                // Only stop on completion once everything really has gone out: with a partial accept there
+                // is still a remainder, and IsCompleted stays set for the next read that returns it.
+                if ((result.IsCompleted || result.IsCanceled) && drained) break;
             }
         }
         catch (Exception ex)

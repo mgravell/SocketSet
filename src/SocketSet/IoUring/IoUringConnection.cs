@@ -237,9 +237,17 @@ internal sealed unsafe class IoUringConnection : Connection
     /// blocks is ~64 segments - so it plausibly declined and fell back to copying at exactly the payload
     /// where the bridge costs 24.5%. `IovMax` is 1024, so that ceiling is not in play here.
     /// </summary>
-    internal override bool TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned,
+    /// <remarks>
+    /// The base contract became "bytes accepted, possibly a prefix" on 2026-07-30, so IOCP could stop
+    /// falling off a cliff at its <c>WSABUF</c> cap. io_uring keeps ALL-OR-NOTHING behaviour here -
+    /// either the whole sequence or 0 - which is exactly what it did before, so nothing about this
+    /// backend changes. Its cap is <c>IovMax</c> = 1024 against IOCP's 256, so the cliff is far away
+    /// rather than absent; adopting prefix sends here is a follow-up, and it wants measuring on Linux
+    /// rather than assuming (see TODO item 2f).
+    /// </remarks>
+    internal override long TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned,
                                            out ValueTask<bool> completion)
-        => Shard.TrySendZeroCopy(this, in data, pinned, out completion);
+        => Shard.TrySendZeroCopy(this, in data, pinned, out completion) ? data.Length : 0;
 
     public override bool Flush()
     {

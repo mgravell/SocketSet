@@ -616,9 +616,36 @@ table. The honest reading is that the cap raise removes a **silent cliff** - a c
 the line lost 2.2x with no way to see it - and that large pipe blocks remain the configuration worth
 recommending. Do not read +61.1% as "the flag is now unnecessary".
 
-**Still a cliff, just moved:** measured directly, a 1MB response is **257** segments and a 4MB response
-**1,025**, so both still decline at a 256 cap. That is why this is written as a cap and not a contract;
-removing the cliff entirely needs the send-a-PREFIX design in item 2f, not a bigger number.
+**~~Still a cliff, just moved~~ — REMOVED 2026-07-30, see below.** Measured directly, a 1MB response is
+**257** segments and a 4MB response **1,025**, so both still declined at a 256 cap. That is what the
+send-a-PREFIX design fixed.
+
+### The segment cliff is GONE: zero-copy send now reports bytes accepted (+80.6% at 1MB)
+
+`Connection.TrySendZeroCopy` returns **bytes accepted** rather than a bool. IOCP sends the first
+`MaxZeroCopySegments` segments and says how many bytes that was; `PipeIoBridge` advances its reader by
+exactly that much and re-offers the remainder. A cap that used to make a whole response fall back to
+copying now just costs an extra send. io_uring keeps all-or-nothing behaviour, unchanged.
+
+Isolated worktrees, interleaved, 6 scored passes, `--byo`, 12 shards:
+
+| payload | before | after | |
+|---|---:|---:|---|
+| 256 KB | 7,346.8 [7168-7743] | 7,329.0 [7035-7545] | **-0.2%, overlapping** — no cost where the cap already fit |
+| **1 MB** | **2,422.0** [2399-2503] | **4,374.1** [4365-4449] | **+80.6%, fully disjoint** |
+
+That is the shape the change was predicted to have: nothing where the sequence already fitted, a large
+gain where it did not. The counter shows why, at the shipped ~4KB pipe blocks:
+
+| payload | segments/response | before | after |
+|---|---:|---|---|
+| 256 KB | 65 | zero-copy | zero-copy, 0 prefixes |
+| 1 MB | 257 | **declined → 200 WSASends copying** | 80 zero-copy sends, 40 prefixes, **copying path silent** |
+| 4 MB | 1,025 | **declined → 680 WSASends copying** | 200 zero-copy sends, 160 prefixes, **copying path silent** |
+
+**The copying path is now unused on the pipe path at every size measured.** And `--pipe-segment 65536`
+is no longer what makes zero-copy *engage* — it is only a tuning knob for how many segments each send
+carries. Its memory bill is unchanged, so where it is used, `--pipe-pinned` is still required.
 
 ### The memory bill for `--pipe-segment`, on Windows — and `--pipe-pinned` is not optional after all
 

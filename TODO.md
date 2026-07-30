@@ -1580,6 +1580,37 @@ this counter. So this entry's prediction is confirmed, and by 2.6x more than "th
 
 ### 2f. Make IOCP's zero-copy send survive a fragmented sequence (raised 2026-07-29)
 
+**Status: OPTIONS 1 AND 2 DONE. The cliff is gone rather than moved — a fragmented sequence of ANY size
+now goes out zero-copy. Option 3 (coalescing small trailing segments) remains, and is now optional.**
+
+**Option 2, done 2026-07-30.** `Connection.TrySendZeroCopy` returns **bytes accepted** instead of a
+bool; IOCP sends the first `MaxZeroCopySegments` segments and reports how many bytes that was, and
+`PipeIoBridge` advances its reader by exactly that much and re-offers the remainder on the next read.
+io_uring keeps all-or-nothing (returns `data.Length` or 0), so **nothing about that backend changes** —
+its cap is `IovMax` 1024 against IOCP's 256, so its cliff is far away rather than absent. Adopting
+prefix sends there is a follow-up that wants measuring on Linux, not assuming.
+
+*Measured, isolated worktrees, interleaved, 6 scored passes, `--byo`:*
+
+| payload | before | after | |
+|---|---:|---:|---|
+| 256 KB | 7,346.8 [7168-7743] | 7,329.0 [7035-7545] | **-0.2%, ranges overlap** — no cost where the cap already fit |
+| **1 MB** | **2,422.0** [2399-2503] | **4,374.1** [4365-4449] | **+80.6%, fully disjoint** |
+
+*And the counter proves the mechanism rather than inferring it* — at the shipped ~4KB pipe blocks:
+
+| payload | segments/response | before | after |
+|---|---:|---|---|
+| 256 KB | 65 | zero-copy | zero-copy, 0 prefixes |
+| 1 MB | 257 | **declined, 200 WSASends copying** | 80 zero-copy sends, 40 prefixes, **copying path silent** |
+| 4 MB | 1,025 | **declined, 680 WSASends copying** | 200 zero-copy sends, 160 prefixes, **copying path silent** |
+
+**What this retires:** `--pipe-segment 65536` is no longer needed to get zero-copy to engage at all — it
+is now purely a tuning knob for segments-per-send. The memory finding still stands, so if it IS used,
+`--pipe-pinned` remains its required companion.
+
+*Original entry (option 1) follows.*
+
 **Status: OPTION 1 DONE 2026-07-29 (+61.1% with no flag, and a p99 bill). Options 2 and 3 still open,
 and the p99 result is the argument for doing one of them.**
 

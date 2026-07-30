@@ -376,6 +376,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         Environment.GetEnvironmentVariable("SS_IOCP_STATS") == "1";
 
     private static long s_zcTaken, s_zcSegs;                       // accepted zero-copy sends, and their segments
+    private static long s_zcPrefix;                                // ...of which sent a PREFIX and left a remainder
     private static long s_zcDeclineTls, s_zcDeclineClosed, s_zcDeclineEmpty, s_zcDeclineSegs;
     private static long s_zcDeclineSegSum, s_zcDeclineSegMax;      // true segment count at a fragmentation decline
     private static long s_sendPages, s_sendPageBufs;               // the COPYING path: WSASends, and their WSABUFs
@@ -386,6 +387,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         if (zc + classic == 0) return;
         long dseg = Interlocked.Read(ref s_zcDeclineSegs), dsum = Interlocked.Read(ref s_zcDeclineSegSum);
         Console.Error.WriteLine($"[iocp-stats:{tag}] zero-copy sends={zc:n0} segments={Interlocked.Read(ref s_zcSegs):n0} " +
+            $"prefix-sends={Interlocked.Read(ref s_zcPrefix):n0} " +
             $"| declined: tls={Interlocked.Read(ref s_zcDeclineTls):n0} closed={Interlocked.Read(ref s_zcDeclineClosed):n0} " +
             $"empty={Interlocked.Read(ref s_zcDeclineEmpty):n0} too-fragmented={dseg:n0} " +
             // The ZERO-COPY cap, not MaxSendPages. Printing the wrong one here would be the exact failure
@@ -424,37 +426,33 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     ///  - TLS. The bytes must be ENCRYPTED before they reach the wire, so handing the socket the
     ///    application's plaintext would put plaintext on the network. This is not a performance
     ///    limitation, it is a correctness one.
-    ///  - More segments than one WSASend can carry (<see cref="IocpConnection.MaxSendPages"/>).
     ///  - Connection closing, or a zero-copy send already outstanding.
+    ///
+    /// A sequence with more segments than one <c>WSASend</c> can carry is NOT a decline: the first
+    /// <see cref="IocpConnection.MaxZeroCopySegments"/> segments are sent and the byte count is
+    /// returned, so the caller advances by that much and offers the rest. See the base declaration for
+    /// why the cliff had to become a slope.
     /// </summary>
-    internal bool TrySendZeroCopy(IocpConnection conn, in ReadOnlySequence<byte> data, bool pinned,
+    /// <returns>Bytes accepted — possibly a prefix of <paramref name="data"/>; 0 = declined.</returns>
+    internal long TrySendZeroCopy(IocpConnection conn, in ReadOnlySequence<byte> data, bool pinned,
                                  out ValueTask<bool> completion)
     {
         completion = default;
-        if (conn.Tls is not null) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineTls); return false; } // must encrypt: see above
-        if (Volatile.Read(ref conn.Socket) == 0) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineClosed); return false; }
-        if (data.IsEmpty) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineEmpty); return false; }
-
-        // Count first: pinning half a sequence and then discovering it is too fragmented would mean
-        // unwinding pins for nothing.
-        int n = 0;
-        foreach (var _ in data)
-        {
-            if (++n > IocpConnection.MaxZeroCopySegments)
-            {
-                if (ReportStats) RecordFragmentDecline(in data);
-                return false;
-            }
-        }
+        if (conn.Tls is not null) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineTls); return 0; } // must encrypt: see above
+        if (Volatile.Read(ref conn.Socket) == 0) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineClosed); return 0; }
+        if (data.IsEmpty) { if (ReportStats) Interlocked.Increment(ref s_zcDeclineEmpty); return 0; }
 
         conn.EnsureZcArrays(needHandles: !pinned);
         nint[] ptrs = conn.ZcPtrs!;
         int[] lens = conn.ZcLens!;
         var handles = pinned ? null : conn.ZcHandles;
         int i = 0;
+        long accepted = 0;
+        bool truncated = false;
         foreach (var seg in data)
         {
             if (seg.IsEmpty) continue;
+            if (i == IocpConnection.MaxZeroCopySegments) { truncated = true; break; } // send a PREFIX
             if (handles is null)
             {
                 // Caller asserts the memory is already pinned, so its address is stable without a handle.
@@ -468,22 +466,28 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
                 ptrs[i] = (nint)h.Pointer;
             }
             lens[i] = seg.Length;
+            accepted += seg.Length;
             i++;
         }
-        if (i == 0) { DisposeZc(handles, i); return false; }
+        if (i == 0) { DisposeZc(handles, i); return 0; }
 
         // The handle array is now POOLED, so "how many pins are live" can no longer be read off the
         // array being null: a pinned-memory send leaves a previous send's array in place, unused.
         conn.ZcHandleCount = handles is null ? 0 : i;
         conn.ZcCount = i;
-        if (ReportStats) { Interlocked.Increment(ref s_zcTaken); Interlocked.Add(ref s_zcSegs, i); }
+        if (ReportStats)
+        {
+            Interlocked.Increment(ref s_zcTaken);
+            Interlocked.Add(ref s_zcSegs, i);
+            if (truncated) Interlocked.Increment(ref s_zcPrefix);
+        }
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         conn.ZcCompletion = tcs;
         completion = new ValueTask<bool>(tcs.Task);
 
         _zeroCopy.Enqueue((conn.Slot, Volatile.Read(ref conn.Generation)));
         Poke();
-        return true;
+        return accepted;
     }
 
     private static void DisposeZc(System.Buffers.MemoryHandle[]? handles, int count)

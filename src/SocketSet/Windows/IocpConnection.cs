@@ -121,7 +121,7 @@ internal sealed class IocpConnection : WindowsConnection
         Shard = shard;
     }
 
-    internal override bool TrySendZeroCopy(in System.Buffers.ReadOnlySequence<byte> data, bool pinned,
+    internal override long TrySendZeroCopy(in System.Buffers.ReadOnlySequence<byte> data, bool pinned,
                                            out ValueTask<bool> completion)
         => Shard.TrySendZeroCopy(this, in data, pinned, out completion);
 }

@@ -120,21 +120,29 @@ public abstract class Connection : IBufferWriter<byte>
     /// buffers. Used by pipe mode (<c>ctx.UsePipe</c>) so a response can go out straight from the
     /// application's pipe segments.
     ///
-    /// Returns false when this backend cannot do it — RIO addresses registered buffer ids rather than raw
-    /// addresses, the managed backend has no such path, and even IOCP declines a sequence with more
-    /// segments than one WSASend can carry. The caller must then fall back to
+    /// Returns the number of BYTES ACCEPTED, which may be a PREFIX of <paramref name="data"/>; 0 means
+    /// the backend declined entirely and the caller must fall back to
     /// <see cref="Send(in System.Buffers.ReadOnlySequence{byte})"/>, which copies. Refusing rather than
     /// silently copying is deliberate: the fallback has to stay the obvious, always-correct path.
     ///
-    /// OWNERSHIP: on true, <paramref name="data"/> must stay valid and unmodified until
-    /// <paramref name="completion"/> completes — the socket is reading it directly. The caller must not
-    /// <c>AdvanceTo</c> its pipe reader before then. <paramref name="pinned"/> says the memory is already
-    /// pinned (a pinned-object-heap pool), letting the backend skip per-operation pinning.
+    /// WHY BYTES RATHER THAN A BOOL, since this was a bool until 2026-07-30. Every backend caps how
+    /// fragmented a sequence it can take in one operation (IOCP: <c>WSABUF</c>s per <c>WSASend</c>;
+    /// io_uring: iovecs per writev), and all-or-nothing turns that cap into a CLIFF - one segment over
+    /// the line and the whole response silently falls back to copying. That was worth 2.2x on IOCP at a
+    /// 256KB response, because Kestrel's ~4KB pipe blocks made it 65 segments against a cap of 64.
+    /// Reporting a prefix converts the cliff into a slope: the backend sends what it can, the caller
+    /// advances by that much and offers the rest.
+    ///
+    /// OWNERSHIP: on a non-zero return, the first <c>accepted</c> bytes of <paramref name="data"/> must
+    /// stay valid and unmodified until <paramref name="completion"/> completes — the socket is reading
+    /// them directly. The caller must not <c>AdvanceTo</c> past that point before then.
+    /// <paramref name="pinned"/> says the memory is already pinned (a pinned-object-heap pool), letting
+    /// the backend skip per-operation pinning.
     /// </summary>
-    internal virtual bool TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned, out ValueTask<bool> completion)
+    internal virtual long TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned, out ValueTask<bool> completion)
     {
         completion = default;
-        return false;
+        return 0;
     }
 #endif
 
