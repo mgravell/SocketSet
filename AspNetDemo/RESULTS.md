@@ -14,11 +14,28 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > for the findings and the method, not as a baseline. **Never compare a number across the two.** Where an
 > older section's conclusion has been re-tested, that is stated inline.
 
-## WHERE THINGS STAND (2026-07-29) — the consolidated view
+## WHERE THINGS STAND (2026-07-30) — the consolidated view
 
 Everything below this section is a dated investigation; this is the summary they add up to. Cells are
 linked to the section that measured them. **Do not compare Linux and Windows rows** - same silicon, but
 different OS and different dates.
+
+### What changed on 2026-07-30, because it moves several conclusions in this file
+
+- **An ACCESS VIOLATION in RIO+TLS under churn was found and fixed** (item 0e). It was present on the
+  shipped defaults at roughly **one run in two**, and had been for months. Found while validating an
+  unrelated change; the reason it survived is that **no benchmark in this repo churns connections** -
+  every one holds keep-alive and measures steady state. There is now a soak rig that does.
+- **The zero-copy segment cliff is gone** (item 2f option 2). `TrySendZeroCopy` reports bytes accepted
+  rather than a bool, so a cap costs an extra send instead of falling back to copying an entire
+  response: **+80.6% at 1MB**, and the copying path is now unused on the pipe path at every size
+  measured. `--pipe-segment 65536` is no longer needed to make zero-copy *engage* - it is only a
+  segments-per-send tuning knob now.
+- **Backends choose their own buffer geometry** (item 0), which fixed item 0d - RIO's `verify-oob-4m`
+  cell went from a 15.2s failure to passing in 0.2s. **Unverified on Linux**; epoll and io_uring are
+  unchanged by construction, not by test.
+
+Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
 ### Feature / backend matrix
 
@@ -39,7 +56,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 | `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
-| BYO zero-copy **send** | **yes** (<=256 segs) | impossible (registered ids) | **yes** (<=1024 iov) | no | no | ***yes - sends from the pipe*** |
+| BYO zero-copy **send** | **yes** - any length (256 segs/send, then a PREFIX) | impossible (registered ids) | **yes** (all-or-nothing, <=1024 iov) | no | no | ***yes - sends from the pipe*** |
 | BYO zero-copy **receive** | no | no | no | no | no | ***yes - into `GetMemory()`*** |
 | internal zero-copy echo | no | no | **yes** (borrowed read buffers) | no | no | *n/a* |
 | pipe mode (`UsePipe`) | yes | yes | yes | yes | yes | *it **is** pipes* |
@@ -214,7 +231,46 @@ Bridge cost at 256KB is therefore **23.9% on io_uring and 40.3% on epoll** - ess
 copy removal, because both sides of the subtraction rose. Copy count does NOT explain why the same bridge
 costs epoll nearly twice what it costs io_uring; see the refutation below.
 
-### Headline numbers, Windows (2026-07-29, same silicon, NOT comparable with the above)
+### Headline numbers, Windows — the current picture (2026-07-30, IOCP, 12 shards, `-c 64`)
+
+**One session, all legs reshuffled into the same passes, 6 scored passes, zero errors** — so every
+comparison in this table is within-session and the vanilla-Kestrel control is a real control rather than
+a remembered number. Goodput MiB/s, median [min-max]:
+
+| payload | classic *(shipped)* | `--byo` | **`--byo --pipe-segment 65536`** | *kestrel (control)* |
+|---|---:|---:|---:|---:|
+| 512 B | 113.2 | 112.3 | 112.4 | 126.6 |
+| 16 KB | 3,317.4 | 3,197.4 | 3,442.2 | 3,558.6 |
+| 256 KB | 4,052.8 | 7,422.2 | **10,238.8** | 10,199.4 |
+| 1 MB | 2,341.9 | 4,422.0 | **5,640.6** | 4,938.4 |
+
+Against the same-session Kestrel control, ranges disjoint unless stated:
+
+| payload | shipped bridge | best configuration |
+|---|---:|---|
+| 512 B | *overlapping* | *overlapping* — ceiling-bound, and every leg spreads 10-18% here |
+| 16 KB | **-6.8%** | *overlapping* — parity |
+| 256 KB | **-60.3%** | *overlapping* — **parity** |
+| 1 MB | **-52.6%** | **+14.2% — SocketSet is FASTER** |
+
+**This is the first time anything in this repo has beaten vanilla Kestrel at a large payload**, and it is
+the combined effect of the day's work: the segment cap became a prefix (so zero-copy engages at any
+size), the cap itself was split from `MaxSendPages`, and the geometry mechanism let RIO stop being
+misconfigured. At 256KB the shipped bridge is still **-60.3%**, which is the number that matters for
+anyone not opting in.
+
+**Two honest caveats.** The 512B and 16KB rows are noisy here (10-18% per-leg spread against 4-6% at the
+large payloads), which is why almost everything overlaps there — they are not evidence of parity so much
+as absence of evidence. And these absolute values sit below the previous section's (10,238 vs 11,394 at
+256KB) because that was a different session; **both the SocketSet legs and the Kestrel control moved
+together**, which is exactly why only within-session comparisons are quoted.
+
+*And note `--pipe-segment` still earns its keep at 1MB* — `byo-seg64k` beats plain `byo` by **+27.6%**
+there and **+37.9%** at 256KB. It is no longer what makes zero-copy *engage*, but fewer, larger segments
+per send is a real second effect. Its 3.2x memory bill is unchanged, so `--pipe-pinned` remains its
+companion (and costs nothing: the pinned leg is inside the unpinned leg's range at every size here).
+
+### Headline numbers, Windows (2026-07-29, superseded by the table above)
 
 Re-measured 2026-07-29 at 12 shards, 6 scored passes. Both Kestrel controls reproduce the 2026-07-27
 figures within ~1%, so the two Windows tables *are* comparable with each other - unlike the Linux rows

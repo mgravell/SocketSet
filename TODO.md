@@ -1626,6 +1626,17 @@ prefix sends there is a follow-up that wants measuring on Linux, not assuming.
 is now purely a tuning knob for segments-per-send. The memory finding still stands, so if it IS used,
 `--pipe-pinned` remains its required companion.
 
+**AND THE COMBINED EFFECT, measured in one session across four payloads with a same-session Kestrel
+control (2026-07-30):** the tuned configuration is now **+14.2% FASTER than vanilla Kestrel at 1MB**
+(5,640.6 against 4,938.4, disjoint) and at **parity at 256KB**. That is the first time anything here has
+beaten Kestrel at a large payload. `--pipe-segment` still earns +27.6% at 1MB and +37.9% at 256KB over
+plain `--byo`, so segments-per-send remains a real second effect even with the cliff gone.
+
+**The number that matters for anyone NOT opting in is unchanged and bad:** the shipped `classic` bridge
+is **-60.3% against Kestrel at 256KB** and -52.6% at 1MB. Everything above is behind `--byo`. Making the
+BYO bridge the default — or getting the classic path closer — is the obvious next question, and it has
+never been asked directly.
+
 *Original entry (option 1) follows.*
 
 **Status: OPTION 1 DONE 2026-07-29 (+61.1% with no flag, and a p99 bill). Options 2 and 3 still open,
