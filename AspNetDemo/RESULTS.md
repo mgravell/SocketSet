@@ -49,6 +49,24 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### Concurrency: we lead at c64 but degrade MORE than Kestrel above it (2026-08-01, 256 KB plaintext, 3 passes, ranges)
+
+| c | kestrel | io_uring | epoll |
+|---|---:|---:|---:|
+| 64 | 12,416-12,569 | 12,487-12,888 | 12,653-12,822 |
+| 128 | 9,941-10,111 | 9,511-9,686 | 9,684-9,798 |
+| 256 | 7,440-7,506 | 7,212-7,277 | 7,355-7,413 |
+
+At **c64 we lead** (epoll disjoint above Kestrel, io_uring ≈ parity/ahead). By **c128 Kestrel pulls ahead
+of both, DISJOINT (+2-6%)**, and holds a narrower disjoint lead at c256. So the crossover is between c64
+and c128, and the gap is real, not noise. Sub-finding: **epoll degrades LESS than io_uring under
+concurrency** (epoll ≥ io_uring at both c128 and c256, disjoint) — plausibly io_uring's single-issuer ring
+contends worse than epoll's readiness loop when many connections' sends pile up. This is the concrete
+motivation for the "two half-pipes" work (`TODO.md`): the leading suspect is the per-connection `Task.Run`
+pump contending on the ThreadPool as connections multiply. Everyone still drops sharply c64→c256 because
+loopback itself saturates — so c64 is the sweet spot and these higher-c numbers are about *relative*
+scaling, not peak throughput.
+
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 
 - **An ACCESS VIOLATION in RIO+TLS under churn was found and fixed** (item 0e). It was present on the

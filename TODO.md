@@ -812,9 +812,11 @@ reader/writer machinery.
 
 **What it targets (mapped to measured facts, not hope):**
 1. **Eliminates the per-connection pump `Task`** — the leading suspect for the one thing measured but
-   unexplained this session: we degrade MORE than Kestrel as concurrency rises (io_uring 92%→80% of
-   Kestrel c64→c128). N ThreadPool pump tasks contending is a plausible cause; removing them is the clean
-   test. **Strongest bet.**
+   unexplained this session, now firmed up with a 3-pass ranged sweep (2026-08-01, RESULTS "Concurrency"):
+   at c64 we LEAD (epoll disjoint above Kestrel), but by c128 Kestrel pulls ahead of both DISJOINT (+2-6%)
+   and holds it at c256 — we degrade more under load. And **epoll degrades LESS than io_uring** (io_uring's
+   single-issuer ring plausibly contends worse when many sends pile up). N ThreadPool pump tasks contending
+   is the plausible cause; removing them is the clean test. **Strongest bet.**
 2. **Real backpressure** — the custom inbound `PipeReader` lets the loop PARK `EPOLLIN` (stop reading the
    socket) when Kestrel falls behind, closing the "inbound backpressure is only advisory" correctness gap
    and removing the staged second copy (the one-flush constraint).
