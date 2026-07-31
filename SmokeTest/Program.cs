@@ -617,7 +617,8 @@ if (closeAfter > 0 && churn > 0)
         $"churn: done — connected={connected:n0} in {churnSecs:0.0}s = {rate:n0} conn/s " +
         $"(≈{rate * 2:n0} sockets/s open+close) closed={set.Closed:n0} live={liveEnd} " +
         $"(client={set.LiveClient} server={set.LiveServer}) open-fds={openFds} " +
-        $"round-trips={set.RoundTripBytes:n0} => {(ok ? "PASS" : "FAIL (wedged)")}");
+        $"round-trips={set.RoundTripBytes:n0} capacity-drops={set.PlacementFailures:n0} " +
+        $"=> {(ok ? "PASS" : "FAIL (wedged)")}");
     return;
 }
 
@@ -704,6 +705,11 @@ if (clientCount > 0)
 {
     Console.WriteLine($"done: {set.RoundTripBytes:n0} round-trip bytes over {sw.Elapsed.TotalSeconds:0.0}s across {set.Connected} connection(s)");
     Console.WriteLine($"recv: {set.RecvOps:n0} completions, {set.RecvBytes:n0} bytes, avg {set.AvgRecvSize:n0} bytes/recv");
+    // Non-zero means connections were REFUSED for lack of slots. Printed unconditionally because the
+    // accept path used to drop them silently - a full table looked exactly like a healthy server.
+    if (set.PlacementFailures > 0)
+        Console.WriteLine($"capacity: {set.PlacementFailures:n0} connection(s) DROPPED - every shard's slot table was full " +
+            $"(raise --sockets or --shards; this is the quantity dynamic shard growth would remove)");
     if (alpn is not null)
     {
         // Both ends must land on the same id — a one-sided result means the extension went out but the

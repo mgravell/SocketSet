@@ -143,8 +143,24 @@ public abstract partial class SocketSet : IDisposable
             var shard = arr[(start + k) % (uint)arr.Length];
             if (shard.TryReserve()) return shard;
         }
+        Interlocked.Increment(ref _placementFailures);
         return null; // every shard full (we may grow here later; for now the caller drops/throws)
     }
+
+    private long _placementFailures;
+
+    /// <summary>
+    /// Connections that could not be placed because every shard's slot table was full.
+    ///
+    /// Counted because the two callers fail DIFFERENTLY and one of them failed silently: <c>Connect</c>
+    /// throws <see cref="InvalidOperationException"/>, but an ACCEPT just closes the socket, so a server
+    /// at capacity was indistinguishable from a healthy one — no callback, no log, no counter. Measured
+    /// 2026-07-31: with the table full, accepts vanish and connects take down an unguarded caller.
+    ///
+    /// This is the quantity dynamic shard growth would drive: growth is worth building exactly when this
+    /// is non-zero under a load you care about, and pointless while it stays at zero.
+    /// </summary>
+    public long PlacementFailures => Interlocked.Read(ref _placementFailures);
 
     /// <summary>
     /// Reject an endpoint this platform cannot express, BEFORE any socket is created. Validation lives

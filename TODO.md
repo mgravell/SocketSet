@@ -467,7 +467,28 @@ stepping stone.
 
 ## Dynamic shard growth (MinShards -> MaxShards)
 
-**Status: proposed, not started. Intended behaviour from the outset; architecture surveyed 2026-07-27.**
+**Status: proposed, not started. Architecture surveyed 2026-07-27; the CURRENT failure behaviour finally
+measured 2026-07-31, and it is two different failures rather than one.**
+
+### What a full slot table does today (measured, not recalled)
+
+The two callers of `TryPlace` fail differently, and one of them failed silently:
+
+| path | behaviour when every shard is full |
+|---|---|
+| **Connect** | throws `InvalidOperationException`. Intended, but it killed an unguarded caller outright — `SmokeTest` filling its own table exits `0xE0434352`. |
+| **Accept** | `closesocket` and **drop, with no callback, no log and no counter**. A server at capacity was indistinguishable from a healthy one. |
+
+`SocketSet.PlacementFailures` now counts both, and SmokeTest prints it (including in the churn summary),
+so the condition is at least visible: a tight table under churn reports **1,751 drops out of 10,570
+connections**, where a roomy one reports 0. That number was previously invisible.
+
+**This is the quantity growth would remove**, and the reason to build it is that it is non-zero under a
+load you care about — not the architecture argument. It is still worth doing for the memory reason in the
+next paragraph, but the trigger is now measurable rather than assumed.
+
+*Original entry follows.*
+
 
 Today `Options.Shards` is a fixed count materialised in the `SocketSet` constructor and never changed.
 The intent is for it to become **MinShards**: start at a reasonable count, and when a connection cannot be
