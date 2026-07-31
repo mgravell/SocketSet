@@ -56,6 +56,31 @@ different OS and different dates.
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
+### Linux flat-check: the shared changes are throughput-neutral, and the one thing that moved was a default flip (2026-07-31)
+
+Handover §2 step 4 — re-run `bench/run-tls-sizes.sh` (7 legs x 5 sizes, 3 scored passes, same rig and
+same-session Kestrel controls) and compare against the payload-sweep table above, which should be flat.
+It is: **every cell reproduces within ~3% except one**, and the Kestrel plaintext control lands at
+12,450.9 against a recorded 12,450.5 (0.0%), so the session is sound and the host is the same instrument.
+
+**The one mover is io_uring plaintext at 256KB: 7,882.6 → 11,586.6 MiB/s (+47.0%), three passes within
+0.1%.** It is NOT a transport change and NOT noise — it is commit `29da643` making the BYO bridge the
+default. The recorded baseline measured the classic copy path (BYO was opt-in then); the leg now measures
+zero-copy. Attribution nailed down three ways rather than inferred across runs:
+
+1. **Path taken, not just enabled** (rule 2): `SS_URING_STATS=1` at 256KB reports
+   `pooled-page=0 pinned-managed=0 zero-copy=2,602` — every segment goes zero-copy.
+2. **Same-session A/B** (rule 6): io_uring 256KB plaintext, zero-copy vs `--classic`, interleaved 3 passes:
+   **6,270 vs 3,660 MiB/s = +71%** (2 shards, so lower absolutes than the 12-shard sweep; the ratio is the
+   point). The zero-copy path is where io_uring's large-payload plaintext performance lives.
+3. **epoll is unchanged** (7,739.1 → 7,744.3): it has no zero-copy send, so the default flip cannot touch
+   it — which is exactly why only the io_uring cell moved.
+
+So the shared PipeIoBridge/Flush changes did not move the Linux throughput baseline; the transport is
+neutral, and the visible delta is a demo default now pointing at the faster path. Under TLS the win does
+not appear (iouring+tls 256KB flat at ~3,963) because the payload is encrypted into a separate buffer, so
+there is no pipe memory to send from zero-copy.
+
 ### Feature / backend matrix
 
 Verified by inspection 2026-07-29, not recalled. This table has been wrong twice (it claimed
@@ -237,6 +262,14 @@ The 64KB and 256KB rows are the 2026-07-29 sweep, *after* the `OutboundConnectio
 two epoll cells at 256KB are +16.3% and +11.2% on what this table held the day before, and every other
 leg is a within-session control that did not move. The pre-copy-removal values are kept in the test
 section below rather than here, so this table always shows current behaviour.
+
+> **STALE for io_uring as of 2026-07-31, and the reason is instructive.** These io_uring cells were
+> measured while `--byo` was OPT-IN, so `run-tls-sizes.sh`'s `--io-uring` leg (which passes no `--byo`)
+> measured the CLASSIC copy bridge. Commit `29da643` then made BYO the default, so the same command now
+> measures the zero-copy path. Re-measured 2026-07-31 (see "Linux flat-check" below): io_uring 256KB goes
+> **7,882.6 → 11,586.6 (+47.0%)**, small payloads drift **-2 to -5%** (byo pipe overhead where there is no
+> large copy to save). epoll and every non-io_uring cell are unchanged. Do not quote the io_uring row here
+> as current.
 
 **Bare transport, no bridge**, same 12 shards and load - the control that localises the 256KB collapse.
 Re-measured 2026-07-29 after the `OutboundConnection` copy removal, which lifted bare epoll too:

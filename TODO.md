@@ -40,9 +40,15 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
    out-of-band send starves at the default 4KB page (a ~7000-byte encrypted record cannot make progress
    through a 4096 send page). `--page 65536` fixes it in 0.2s, exactly as it fixed RIO's 0d. This is
    correctness evidence for the `DefaultGeometry` decision (§3 item 2), not a bug in the new code.
-4. **A size sweep against the recorded numbers**, which should be flat. Anything that moves is one of the
-   shared changes above, since nothing else about those backends was touched. **STILL TO DO** —
-   `bench/run-tls-sizes.sh`, compare against `AspNetDemo/RESULTS.md`'s "Linux baseline on bare metal".
+4. ~~**A size sweep against the recorded numbers**, which should be flat.~~ **DONE 2026-07-31 — flat, and
+   the one mover was a default flip, not a shared-code regression.** `bench/run-tls-sizes.sh` reproduces
+   the payload-sweep table within ~3% everywhere (Kestrel control 12,450.9 vs recorded 12,450.5 = 0.0%)
+   EXCEPT io_uring plaintext 256KB: **7,882.6 → 11,586.6 (+47%)**. That is `29da643` making the BYO bridge
+   the default — the recorded row was the classic copy path (BYO was opt-in), the leg now measures
+   zero-copy (confirmed taken: `zero-copy=2,602` segments, 0 pooled/managed; same-session A/B byo vs
+   `--classic` = +71%). epoll is unchanged (no zero-copy send), which is why only io_uring moved. So the
+   shared PipeIoBridge/Flush changes are throughput-neutral on Linux. Full write-up in
+   `AspNetDemo/RESULTS.md` "Linux flat-check".
 
 ### 3. Then the Linux-only work, in priority order
 
