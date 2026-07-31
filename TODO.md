@@ -4,37 +4,60 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## READ FIRST IF YOU ARE ON LINUX (written 2026-07-29, after a Windows session)
+## READ FIRST IF YOU ARE ON LINUX (rewritten 2026-07-31, after three days of Windows work)
 
-Two things landed on Windows that you need to know about, in this order.
+Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
+measurement second — the same discipline the Windows switch needed, for the same reason.
 
-### 1. There is an ACCESS VIOLATION in RIO+TLS under churn, on the default configuration — item 0e
+### 1. What changed in SHARED code, i.e. what can actually affect epoll and io_uring
 
-It is Windows-only (RIO), so it does not affect you directly, but it is the highest-priority item in this
-file and it is **not fixed**. If you are picking work, that is the work.
+Ordered by how likely it is to bite. Everything here is unverified on Linux.
 
-### 2. `BufferPageSize` and three pool depths are now `0` = "backend chooses" — and Linux is UNVERIFIED
+| change | risk to Linux |
+|---|---|
+| **`PipeIoBridge` outbound pump rewritten** for prefix sends — it no longer assumes `AdvanceTo(buffer.End)`, and no longer exits on `IsCompleted` until the buffer is drained | **HIGHEST.** This is the shared bridge; epoll and io_uring both run it. A bug here is a stall or a lost tail on the pipe path. |
+| **`Connection.TrySendZeroCopy` returns `long` (bytes accepted)**, not `bool` | io_uring was updated to all-or-nothing (`data.Length` or 0), so its behaviour should be **identical**. Verify, do not assume. |
+| **`BufferPageSize` + 3 pool depths are `0` = "backend chooses"**, resolved once via `SocketSetFactory.DefaultGeometry` | epoll/io_uring inherit `BufferGeometry.Default` = the old hard-coded values, so nothing should move. |
+| **`SocketSet.Listen`/`Connect` validate the endpoint** and reject `@abstract` names off-Linux | On Linux the guard must NOT fire — abstract sockets are a real Linux feature and io_uring maps a leading `@`. **Check an `@name` still works.** |
+| **Dynamic shard growth** (`Options.MaxShards`, default 0 = off) | Off by default, so no behaviour change — but see the gap in §3. |
+| `SocketSet.PlacementFailures`, `SS_BRIDGE_STATS`, stale-completion detectors | Additive counters. IOCP/RIO only for the detectors. |
 
-`SocketSetFactory.DefaultGeometry` supplies whatever the caller left unset, resolved once in the
-`SocketSet` constructor (`SocketSetOptions.ResolvedFor`). **epoll and io_uring are unchanged BY
-CONSTRUCTION** — they inherit `BufferGeometry.Default`, whose values are exactly the old hard-coded
-defaults (page 4096, recv 4096, pools 1024/256/256). No Linux behaviour should move.
+### 2. What to check, in order
 
-"By construction" is not "verified", and it has never been run on Linux. **What to check, in order:**
-
-1. **The banner, not the flag.** `SmokeTest --http` and AspNetDemo's `/config` now print the RESOLVED
+1. **Build both targets.** `net10.0` and `net472` — the netfx build broke twice this week on things like
+   `OperatingSystem.IsLinux()`.
+2. **The banner, not the flag.** `SmokeTest --http` and AspNetDemo's `/config` print the RESOLVED
    geometry (`/config` gained a `geometry` field). Confirm epoll and io_uring report
-   `page=4096 recvbuf=4096 writebufs=1024 oobwritebufs=256 readpages=256`. If any reads `0`, a read site
-   was missed and it is measuring something nobody chose.
-2. **The smoke matrix on both backends**, which is by hand there — there is no `.sh` equivalent of
-   `Run-SmokeMatrix.ps1` yet, and writing one is worth more than one run of it.
-3. **Then a size sweep against the last recorded numbers**, which should be flat. Anything that moves is
-   this change, since nothing else about those backends was touched.
+   `page=4096 recvbuf=4096 writebufs=1024 oobwritebufs=256 readpages=256`. **A `0` means a read site was
+   missed** and something is running a geometry nobody chose.
+3. **The smoke matrix, by hand** — there is still no `.sh` equivalent of `Run-SmokeMatrix.ps1`, and
+   **writing one is worth more than one run of it**. Cover `--verify-echo` (callback AND `--pipe`, since
+   the pipe path is what changed), `--verify`, `--churn`, `--poke`, plaintext and TLS, on epoll and
+   io_uring. Include an `@abstract` UDS case: it must still work here.
+4. **A size sweep against the recorded numbers**, which should be flat. Anything that moves is one of the
+   shared changes above, since nothing else about those backends was touched.
 
-If Linux wants a different geometry — io_uring's read pool is per-SHARD, so it can afford a big page
-where epoll's per-SOCKET slab cannot — the mechanism is now there to say so: override `DefaultGeometry`
-on the factory, with a measurement attached. **Do not override it without one**; RIO's has a 4.68x
-throughput result and a correctness-gate failure behind it.
+### 3. Then the Linux-only work, in priority order
+
+1. **Multi-bind listener replay for shard growth.** Growth is implemented and measured on the
+   single-listener path (Windows) but a grown shard gets **no accepts** on the reuse-port path, which is
+   io_uring and epoll over IP. The set must remember what it was asked to listen on and replay it. This
+   is the only genuinely unfinished piece of that feature.
+2. **Decide whether Linux wants a different `DefaultGeometry`.** The mechanism now exists to say so per
+   backend. io_uring's read pool is per-SHARD so it can afford a big page where epoll's per-SOCKET slab
+   cannot. **Do not override without a measurement** — RIO's override has a 4.68x result and a
+   correctness-gate failure behind it.
+3. **Prefix sends on io_uring.** It keeps all-or-nothing; its cap is `IovMax` 1024 against IOCP's 256, so
+   the cliff is far away rather than absent. Worth measuring before building.
+4. **kTLS / epoll+kTLS (items 4, 4b, 3c)** — unchanged, and still Linux-only.
+
+### 4. What NOT to spend Linux time on
+
+- **Anything RIO or IOCP.** Windows-only backends.
+- **Item 1c (read depth)** — the premise was measured on Windows and the case for it may have the sign
+  backwards; see that entry before touching the io_uring side.
+- **Item 7 (zero-copy receive / receive parking)** — deprioritised on measurement, not opinion: the
+  inbound gap to Kestrel is ≤5% and the second copy it removes is 0.011% of bytes.
 
 ---
 
