@@ -36,7 +36,13 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > epoll `writev` zero-copy send — **bridged epoll 256KB 7,732 → 10,894 MiB/s (+41%)**, now level with
 > io_uring. What remains of the bridge (the pump thread-hop + loop-thread marshal vs vanilla Kestrel's
 > tighter integration) is the structural part; io_uring's bridged 256KB is already within ~7% of Kestrel.
-> The original handover text follows.
+>
+> **Zero-copy RECEIVE (item 7) was then built on epoll as a springboard and RESOLVED by measurement:** it
+> engages 100% and is byte-exact, but a same-session A/B (`SS_NO_ZC_RECV`) shows NO throughput win across
+> three workloads — Kestrel `/drain` upload, bare symmetric pipe echo, and a pure receive-flood
+> (`SmokeTest --sink`, receiver ≫ sender). `recv()`'s kernel→user copy is unavoidable and dominates; the
+> transport copy isn't the constraint. **So io_uring's much-harder zero-copy receive is not worth
+> building.** The original handover text follows.
 
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
@@ -406,7 +412,7 @@ what is worth doing:
 | `ReceiveBufferSize` (send/recv split) | yes | yes | **yes** (2026-07-28) | **yes** (2026-07-28) |
 | write-pool exhaustion: stage and retry | yes | yes | no | no |
 | BYO-buffer zero-copy SEND | yes | n/a by design | **yes** (2026-07-30/31, prefix) | **yes** (2026-07-31, `writev`, prefix) |
-| BYO-buffer zero-copy RECEIVE | **no** | **no** | **no** | **no** |
+| BYO-buffer zero-copy RECEIVE | **no** | **no** | **no** | **yes** (2026-07-31; measured to buy nothing — see item 7) |
 
 Reading of that table:
 
