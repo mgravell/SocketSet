@@ -14,7 +14,26 @@ public class SocketSetOptions
     /// <summary>Server-handshake config used when <see cref="Tls"/> is set and this set accepts.</summary>
     public TlsServerOptions TlsServer { get; set; } = new();
 
+    /// <summary>Shards created up front. With <see cref="MaxShards"/> set this is the MINIMUM: the set
+    /// starts here and grows on demand.</summary>
     public int Shards { get; set; } = 4;
+
+    /// <summary>
+    /// Upper bound for on-demand shard growth. <c>0</c> (the default) means <b>no growth</b> — the set is
+    /// fixed at <see cref="Shards"/>, exactly as before.
+    ///
+    /// Growth triggers when a connection cannot be placed because every shard's slot table is full, which
+    /// is the condition <see cref="SocketSet.PlacementFailures"/> counts. Per-shard memory is
+    /// <see cref="SocketsPerShard"/> x the buffer sizes, pre-allocated and pinned, so growth is how you
+    /// get a small <see cref="SocketsPerShard"/> (cheap shards) without a hard ceiling on connections.
+    ///
+    /// DELIBERATELY NOT <see cref="SocketSetFactory.MaxShards"/>, which is a backend CAPABILITY cap (the
+    /// managed backend wants exactly 1) rather than a growth policy. Both apply; the effective ceiling is
+    /// the lower of the two.
+    ///
+    /// Shrink is not implemented: reclaiming a shard means draining its connections first.
+    /// </summary>
+    public int MaxShards { get; set; }
     public int SocketsPerShard { get; set; } = 4096;
     public bool PinWorkerThreads { get; set; } = true;
     public SocketSetFactory Factory { get; set; } = SocketSetFactory.Default;

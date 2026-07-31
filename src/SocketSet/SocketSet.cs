@@ -18,7 +18,14 @@ public abstract partial class SocketSet : IDisposable
     // (worker-thread-bound) initialization, recording any failure. The constructor
     // blocks on the gate so it can fail fast rather than return a set with silently
     // dead shards that would swallow the work routed to them.
-    private readonly CountdownEvent? _startupGate;
+    // Not readonly: shard GROWTH reuses this to wait for the one new shard, under _growLock, which
+    // serialises growth and cannot overlap construction (construction has returned before any connection
+    // exists to trigger growth).
+    private CountdownEvent? _startupGate;
+
+    // Serialises growth. Readers never take it: TryPlace/RoundRobin snapshot _shards into a local, so a
+    // longer array published with Volatile.Write is observed atomically or not at all.
+    private readonly object _growLock = new();
     private readonly ConcurrentBag<Exception> _startupFaults = [];
 
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(30);
@@ -143,9 +150,90 @@ public abstract partial class SocketSet : IDisposable
             var shard = arr[(start + k) % (uint)arr.Length];
             if (shard.TryReserve()) return shard;
         }
+        // Every shard is full. Grow if allowed, then re-walk ONLY the shards that did not exist a moment
+        // ago - re-walking the old ones would just fail again.
+        if (TryGrow(arr.Length))
+        {
+            var grown = _shards;
+            for (uint k = (uint)arr.Length; k < (uint)grown.Length; k++)
+            {
+                if (grown[k].TryReserve()) return grown[k];
+            }
+        }
+
         Interlocked.Increment(ref _placementFailures);
-        return null; // every shard full (we may grow here later; for now the caller drops/throws)
+        return null; // every shard full and growth is off or exhausted; the caller drops/throws
     }
+
+    /// <summary>
+    /// Add one shard, if <see cref="SocketSetOptions.MaxShards"/> allows. Returns true when the set is
+    /// longer than <paramref name="observedLength"/> afterwards — including when another thread grew it
+    /// first, since the caller only wants to know whether re-walking is worthwhile.
+    ///
+    /// Growth is deliberately ONE shard per failed placement rather than doubling: each shard
+    /// pre-allocates and pins <c>SocketsPerShard</c> x the buffer sizes, so an over-eager step is
+    /// expensive and irreversible (there is no shrink).
+    /// </summary>
+    private bool TryGrow(int observedLength)
+    {
+        var factory = Options.Factory;
+        int ceiling = Math.Min(Options.MaxShards, factory.MaxShards);
+        if (ceiling <= observedLength) return false; // growth off, or already at the cap
+
+        lock (_growLock)
+        {
+            var current = _shards;
+            if (current.Length > observedLength) return true;   // someone else grew; just re-walk
+            if (current.Length >= ceiling) return false;
+
+            SocketSetShard shard;
+            try
+            {
+                shard = factory.CreateShard(Options);
+                shard.Init(this, current.Length);
+            }
+            catch (Exception ex) { OnWorkerFaulted(ex); return false; }
+
+            // Start it the same way the constructor does, but gated on this ONE shard. A grown shard that
+            // never finishes initialising must not be published: it would silently swallow every
+            // connection routed to it, which is worse than the drop that growth exists to prevent.
+            if (factory.UsesWorkerThreads)
+            {
+                _startupGate = new CountdownEvent(1);
+                var thread = new Thread(static state => ((SocketSetShard)state!).Run())
+                {
+                    IsBackground = true,
+                    Priority = ThreadPriority.AboveNormal,
+                    Name = $"{Name} worker {current.Length}",
+                };
+                thread.Start(shard);
+                bool ready = _startupGate.Wait(StartupTimeout);
+                _startupGate = null;
+                if (!ready) { shard.Stop(); return false; }
+            }
+            else
+            {
+                try { shard.InitializeInline(); }
+                catch (Exception ex) { OnWorkerFaulted(ex); shard.Stop(); return false; }
+            }
+
+            // Copy-on-write publish. Readers snapshot into a local, so they see either the old array or
+            // the new one, never a torn view - and a reader holding the old snapshot simply misses the
+            // new shard until its next call, which is harmless.
+            var next = new SocketSetShard[current.Length + 1];
+            Array.Copy(current, next, current.Length);
+            next[current.Length] = shard;
+            Volatile.Write(ref _shards, next);
+            Interlocked.Increment(ref _shardsGrown);
+            return true;
+        }
+    }
+
+    private long _shardsGrown;
+
+    /// <summary>Shards added on demand since construction. <see cref="Options"/>.<c>Shards</c> plus this
+    /// is the current count.</summary>
+    public long ShardsGrown => Interlocked.Read(ref _shardsGrown);
 
     private long _placementFailures;
 

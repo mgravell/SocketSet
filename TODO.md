@@ -467,6 +467,44 @@ stepping stone.
 
 ## Dynamic shard growth (MinShards -> MaxShards)
 
+**IMPLEMENTED 2026-07-31 for the single-listener path (Windows IOCP/RIO, `ListenHandle`, AF_UNIX) and the
+managed backend. Multi-bind / reuse-port (io_uring, epoll on IP) is NOT covered — see the gap below.
+Default OFF: `MaxShards` 0 keeps a fixed shard count and the old behaviour exactly.**
+
+`SocketSetOptions.MaxShards` is the growth cap, deliberately separate from `SocketSetFactory.MaxShards`
+(a backend CAPABILITY cap — the managed backend wants exactly 1); both apply and the lower wins, verified
+by the managed backend refusing to grow with `--max-shards 16`.
+
+**Measured**, same tight table (`--sockets 8`, 4 shards) under 6s of churn on IOCP:
+
+| | connections | capacity drops | shards grown |
+|---|---:|---:|---:|
+| growth off | 10,538 | **1,704** | 0 |
+| growth on (cap 16) | **18,361** | **0** | 8 |
+
+It moved **74% more connections** simply by not refusing them.
+
+**Two things the survey got right and one it over-estimated.** `_shards` was already non-readonly and both
+hot readers (`TryPlace`, `RoundRobin`) already snapshot it into a local — the copy-on-write-safe pattern —
+so step 1 was nearly free rather than the work it was billed as. Teardown (step 4) also came free:
+`Dispose` iterates the current array, so grown shards are stopped. Growth adds ONE shard per failed
+placement rather than doubling, because each shard pins `SocketsPerShard` x the buffer sizes and there is
+no shrink.
+
+**Gaps, all deliberate:**
+
+- **Multi-bind listeners are not replayed** onto a grown shard, so on io_uring/epoll over IP a new shard
+  gets no accepts. That is survey step 3 and the only genuinely unfinished piece. It needs the set to
+  remember what it was asked to listen on. **Untestable here — the Linux box is where it matters.**
+- **Growth blocks the placing thread** while the new shard's startup gate is waited on (up to the 30s
+  startup timeout). Acceptable for the accept path, which is already off the hot loop, but it is a
+  serialisation point under a burst.
+- **A shard being created concurrently with `Dispose`** can be missed, as the survey noted.
+- **No shrink**, by design.
+
+*Original entry follows.*
+
+
 **Status: proposed, not started. Architecture surveyed 2026-07-27; the CURRENT failure behaviour finally
 measured 2026-07-31, and it is two different failures rather than one.**
 

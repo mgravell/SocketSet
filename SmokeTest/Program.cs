@@ -62,6 +62,10 @@ for (int i = 0; i < args.Length; i++)
         case ("-n" or "--shards") when i + 1 < args.Length && int.TryParse(args[i + 1], out var sh):
             options.Shards = sh;
             break;
+        // Growth cap. 0 (default) = fixed shard count, exactly as before.
+        case "--max-shards" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ms):
+            options.MaxShards = ms;
+            break;
         case ("-p" or "--pin") when i + 1 < args.Length && bool.TryParse(args[i + 1], out var pin):
             options.PinWorkerThreads = pin;
             break;
@@ -405,6 +409,7 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -u / --uds name   use a Unix domain socket (e.g. @foo for abstract) instead of TCP");
     Console.WriteLine("  -z / --size N     ping-pong message size in bytes (default 512)");
     Console.WriteLine("  -n / --shards N   number of shards / worker threads (default 4)");
+    Console.WriteLine("  --max-shards N    grow up to N shards on demand when every slot table is full");
     Console.WriteLine("  -p / --pin B      pin worker threads to CPUs, true|false (default true)");
     Console.WriteLine("  -e / --entries N  io_uring SQ entries per shard (default 4096; lower if RLIMIT_MEMLOCK is tight)");
     Console.WriteLine("  -m / --managed    force the portable managed-socket fallback (default auto-detects)");
@@ -618,6 +623,7 @@ if (closeAfter > 0 && churn > 0)
         $"(≈{rate * 2:n0} sockets/s open+close) closed={set.Closed:n0} live={liveEnd} " +
         $"(client={set.LiveClient} server={set.LiveServer}) open-fds={openFds} " +
         $"round-trips={set.RoundTripBytes:n0} capacity-drops={set.PlacementFailures:n0} " +
+        $"shards-grown={set.ShardsGrown:n0} " +
         $"=> {(ok ? "PASS" : "FAIL (wedged)")}");
     return;
 }
@@ -707,6 +713,8 @@ if (clientCount > 0)
     Console.WriteLine($"recv: {set.RecvOps:n0} completions, {set.RecvBytes:n0} bytes, avg {set.AvgRecvSize:n0} bytes/recv");
     // Non-zero means connections were REFUSED for lack of slots. Printed unconditionally because the
     // accept path used to drop them silently - a full table looked exactly like a healthy server.
+    if (set.ShardsGrown > 0)
+        Console.WriteLine($"capacity: grew {set.ShardsGrown:n0} shard(s) on demand (started at {options.Shards})");
     if (set.PlacementFailures > 0)
         Console.WriteLine($"capacity: {set.PlacementFailures:n0} connection(s) DROPPED - every shard's slot table was full " +
             $"(raise --sockets or --shards; this is the quantity dynamic shard growth would remove)");
