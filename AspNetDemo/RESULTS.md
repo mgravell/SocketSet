@@ -66,6 +66,12 @@ different OS and different dates.
   can't scatter-gather, so page size is its only large-send lever and worth 4.68x), io_uring dispatches one
   writev over a segment chain, so page size is not a throughput lever. With the writev-cap bug fixed, there
   is no correctness reason for a bigger page either. Verdict: leave io_uring on `BufferGeometry.Default`.
+- **epoll gained a real kTLS path (item 3c).** `--epoll --ktls` now runs kernel TLS — epoll was the last
+  backend with no kTLS code at all. TX is kernel-offloaded (plaintext `send()`, reusing the normal send
+  path), RX is `EPOLLIN → SSL_read` (userspace decrypt on this box's OpenSSL 3.0.13: `[ktls/epoll]
+  tx=True rx=False`). Correctness-clean: smoke matrix 58/58 with new `+ktls` cells, ALPN over the kernel
+  path. The throughput question it was built to answer — does epoll+ktls reach epoll+tls, where
+  io_uring+ktls trails by ~15%? — is being measured; see the item 3c entry in `TODO.md`.
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 

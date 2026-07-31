@@ -6,6 +6,17 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ## READ FIRST IF YOU ARE ON LINUX (rewritten 2026-07-31, after three days of Windows work)
 
+> **THIS CATCH-UP IS DONE (end of 2026-07-31 Linux session). What follows is kept for its reasoning; the
+> per-item status is inline.** In one paragraph: the shared changes are correctness-clean on Linux (new
+> `bench/run-smoke-matrix.sh`, **58/58** including kTLS cells), the size-sweep flat-check found the
+> transport throughput-neutral (the one mover was the BYO-default flip, not a regression), reuse-port shard
+> growth now works on io_uring + epoll (two gaps, not the one named), the io_uring TLS out-of-band stall
+> was a writev/IOV_MAX bug (fixed, NOT a geometry problem — so io_uring keeps `BufferGeometry.Default`),
+> and **epoll gained a real kTLS path (item 3c)**. All committed and pushed to `main`. What is genuinely
+> still open on Linux: prefix sends on io_uring (§3 item 3), the epoll+ktls *throughput* comparison (item
+> 3c's point — measurement, not code), the TLS-renegotiation audit, and kTLS multishot (items 4/4b, which
+> need OpenSSL 3.2+ and real hardware). The original handover text follows.
+
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
 
@@ -24,7 +35,7 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
 
 ### 2. What to check, in order
 
-**STEPS 1-3 DONE 2026-07-31; step 4 (the size sweep) still outstanding.** Results inline below.
+**ALL FOUR STEPS DONE 2026-07-31.** Results inline below.
 
 1. ~~**Build both targets.**~~ **DONE** — `net10.0` and `net472` both build clean, 0 errors (7 pre-existing
    XML-doc warnings only).
@@ -33,8 +44,9 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
    anywhere; no read site missed. io_uring confirmed as the auto-detected default (`IoUringFactory`).
 3. ~~**The smoke matrix, by hand**~~ **DONE, and the `.sh` runner is now written**: `bench/run-smoke-matrix.sh`
    (io_uring / epoll / managed x plaintext / `--tls-ssl` x verify / echo-cb / echo-pipe / poke / churn,
-   plus `@abstract` UDS echo-pipe on the two native backends). Started at **51/52**, now **52/52** after a
-   bug fix. The pipe path is clean (every echo-pipe cell passes), the abstract-UDS guard correctly does NOT
+   plus `@abstract` UDS echo-pipe on the two native backends, plus `+ktls` verify/echo cells on io_uring
+   and epoll). Started at **51/52**, now **58/58** after a bug fix and the epoll+kTLS work. The pipe path is
+   clean (every echo-pipe cell passes), the abstract-UDS guard correctly does NOT
    fire. The one initial FAIL (`iouring+tls/verify-oob-4m`) LOOKED like item 0d but was NOT a geometry
    problem — it was an **unbounded writev** (IOV_MAX), now fixed. See §3 item 2 for the full diagnosis; the
    short version is the TLS out-of-band send issued a single `writev` of ~1024 page-segments for a 4MB
@@ -76,8 +88,14 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
 
    Net: RIO needed 64KB for both reasons; io_uring needs it for neither. Leave the default alone.
 3. **Prefix sends on io_uring.** It keeps all-or-nothing; its cap is `IovMax` 1024 against IOCP's 256, so
-   the cliff is far away rather than absent. Worth measuring before building.
-4. **kTLS / epoll+kTLS (items 4, 4b, 3c)** — unchanged, and still Linux-only.
+   the cliff is far away rather than absent. Worth measuring before building. **STILL OPEN — the highest
+   remaining Linux code item.** (Note: the zero-copy SEND path still DECLINES at >`IovMax` segments; the
+   2026-07-31 writev fix capped the TLS out-of-band CHAIN at `IovMax` but did not add a prefix to the
+   zero-copy path — that is this item.)
+4. **kTLS / epoll+kTLS.** ~~item 3c (epoll+kTLS pump)~~ **DONE 2026-07-31 — epoll runs real kTLS**, smoke
+   matrix has `+ktls` cells (58/58). Its throughput comparison is the open follow-up (see item 3c below).
+   **items 4 / 4b (kTLS multishot receive)** remain open and need OpenSSL 3.2+ (RX offload) and real
+   hardware to be worth it — deliberately deprioritised, see "START HERE".
 
 ### 4. What NOT to spend Linux time on
 
@@ -256,9 +274,12 @@ above this one first; item 3 below is what you are here to do.**
    chooses", filled from `SocketSetFactory.DefaultGeometry` once in the `SocketSet` constructor. Every
    backend keeps its exact previous geometry except **RIO**, which now asks for a 64KB page with a 4KB
    receive buffer — and that **fixes item 0d**: `rio+tls/verify-oob-4m` went from a 15.2s failure to
-   passing in 0.2s. **UNVERIFIED ON LINUX** — epoll and io_uring are unchanged by construction (they take
-   `BufferGeometry.Default`, which is the old values), but nobody has run them. See the handover note
-   at the top of this file.
+   passing in 0.2s. ~~**UNVERIFIED ON LINUX**~~ **VERIFIED ON LINUX 2026-07-31** — the geometry banner
+   reads `page=4096 recvbuf=4096 writebufs=1024 oobwritebufs=256 readpages=256` on io_uring, epoll and
+   managed (no `0`s, so no read site missed), and the smoke matrix passes; epoll/io_uring were indeed
+   unchanged by the geometry mechanism, as constructed. (Separately, io_uring was CONSIDERED for a 64KB
+   default like RIO's and DECLINED — see §3 item 2: its 0d-lookalike stall was a writev bug, not a page
+   problem, and it is page-insensitive for throughput.)
 4. ~~Item 1, the 64KB->256KB collapse~~ **ANSWERED: it is the bridge**, 2.0-2.4% at 64KB and 24.5-41.8% at
    256KB, with the instability the bridge's too. See item 1 for the isolation.
 5. ~~The bridge's pipes are unconfigured (item 2d)~~ **MEASURED 2026-07-29.** Block size is worth
