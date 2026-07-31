@@ -85,7 +85,9 @@ different OS and different dates.
   handled), but TLS 1.2 is reachable and advertised "Secure Renegotiation IS supported" — the CVE-2011-1473
   DoS shape. The SERVER now sets `SSL_OP_NO_RENEGOTIATION` (refuses client-initiated renegotiation, survives
   cleanly); the CLIENT deliberately does not (would break legit server-initiated reneg from peers we dial).
-  Follow-up in progress: a `TlsOptions.MinProtocol` defaulting to TLS 1.3 to make 1.2 opt-in entirely.
+  And **the default TLS floor is now TLS 1.3** (`OpenSslTlsProvider(minProtocol:)`, default `Tls13`) — a
+  TLS-1.2-only client is rejected outright, retiring the whole 1.2 surface (renegotiation included) on the
+  default path; 1.2 is opt-in (`--tls-min12`). Smoke matrix stays green (all cells negotiate 1.3).
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 

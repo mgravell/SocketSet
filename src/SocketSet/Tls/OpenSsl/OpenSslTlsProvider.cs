@@ -43,13 +43,18 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
     /// via the fd-bound path hand their keys to the kernel at handshake completion; see
     /// <see cref="SupportsKernelOffload"/>.</param>
     public OpenSslTlsProvider(string? serverCertPem = null, string? serverKeyPem = null,
-        string? trustCertPem = null, bool verifyServer = true, bool kernelOffload = false)
+        string? trustCertPem = null, bool verifyServer = true, bool kernelOffload = false,
+        TlsProtocol minProtocol = TlsProtocol.Tls13)
     {
         _verifyServer = verifyServer;
         _kernelOffload = kernelOffload;
+        // Minimum negotiated version. Default TLS 1.3, which retires the entire TLS 1.2 surface
+        // (renegotiation, CBC/RSA-kex ciphers, downgrade) rather than patching it piecemeal; 1.2 is opt-in.
+        long minVer = minProtocol == TlsProtocol.Tls13 ? TLS1_3_VERSION : TLS1_2_VERSION;
 
         _clientCtx = SSL_CTX_new(TLS_method());
         if (_clientCtx == 0) throw Err("SSL_CTX_new(client)");
+        SSL_CTX_ctrl(_clientCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, minVer, IntPtr.Zero);
         // NOTE the asymmetry with the server context below: SSL_OP_NO_RENEGOTIATION is deliberately NOT set
         // on the CLIENT. Setting it here would make us REFUSE server-initiated renegotiation from servers we
         // dial — a legitimate (if legacy) TLS 1.2 pattern (on-demand client-cert auth), so refusing it is an
@@ -74,6 +79,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
             if (serverKeyPem is null) throw new ArgumentNullException(nameof(serverKeyPem), "A server certificate needs its private key.");
             _serverCtx = SSL_CTX_new(TLS_method());
             if (_serverCtx == 0) throw Err("SSL_CTX_new(server)");
+            SSL_CTX_ctrl(_serverCtx, SSL_CTRL_SET_MIN_PROTO_VERSION, minVer, IntPtr.Zero);
             // Reject CLIENT-initiated renegotiation: the CVE-2011-1473 DoS shape (a client forcing repeated
             // expensive server handshakes). TLS 1.2 is reachable (no min-version pin) and the server
             // otherwise advertises "Secure Renegotiation IS supported", so the vector is real. No effect on
@@ -319,7 +325,8 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
     /// client trust exactly that certificate with full verification (so the real verify + hostname path is
     /// exercised, not bypassed). NOT for production — the key lives only in this process.
     /// </summary>
-    public static OpenSslTlsProvider CreateSelfSignedLoopback(string host = "localhost", bool kernelOffload = false)
+    public static OpenSslTlsProvider CreateSelfSignedLoopback(string host = "localhost", bool kernelOffload = false,
+        TlsProtocol minProtocol = TlsProtocol.Tls13)
     {
         using var rsa = RSA.Create(2048);
         var req = new CertificateRequest($"CN={host}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
@@ -330,7 +337,8 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
         using var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1));
         string certPem = cert.ExportCertificatePem();
         string keyPem = rsa.ExportPkcs8PrivateKeyPem();
-        return new OpenSslTlsProvider(certPem, keyPem, trustCertPem: certPem, verifyServer: true, kernelOffload: kernelOffload);
+        return new OpenSslTlsProvider(certPem, keyPem, trustCertPem: certPem, verifyServer: true,
+            kernelOffload: kernelOffload, minProtocol: minProtocol);
     }
 }
 #endif

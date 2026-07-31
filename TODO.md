@@ -22,7 +22,12 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > active KeyUpdate injection test. **Deferred (environment-gated):** kTLS multishot with RX offload (items
 > 4/4b — need OpenSSL 3.2+ and real hardware), SChannel renegotiation parity (Windows), and the
 > real-hardware session (item 5 — the only place kTLS NIC offload is visible). The largest remaining
-> Linux code lever is the Kestrel-bridge cost (24-42% at 256KB). The original handover text follows.
+> Linux code lever is the Kestrel-bridge cost (24-42% at 256KB).
+>
+> **UPDATE (later 2026-07-31):** `TlsOptions`/`OpenSslTlsProvider` now take a `minProtocol` floor,
+> **defaulting to TLS 1.3** (1.2 is opt-in via `--tls-min12`) — this retires the whole 1.2 surface on the
+> default path, so the renegotiation flag is now belt-and-suspenders. Next: the active KeyUpdate injection
+> test, then the Kestrel-bridge investigation. The original handover text follows.
 
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
@@ -717,15 +722,21 @@ completes a second handshake and the server survives cleanly (no crash, no hang)
 handshakes + data are unaffected (full smoke matrix green, incl. TLS echo/verify on io_uring + epoll). The
 flag does not touch TLS 1.3 KeyUpdate.
 
+**DONE since the audit:**
+- **Min-version floor, default TLS 1.3 (2026-07-31).** `OpenSslTlsProvider` gained a `minProtocol`
+  parameter (`TlsProtocol.Tls13` by default; `CreateSelfSignedLoopback` too), setting
+  `SSL_CTX_set_min_proto_version` on both contexts. This retires the whole TLS 1.2 surface on the default
+  path — a TLS-1.2-only `s_client` is now rejected (`New, (NONE)`), TLS 1.3 works, echo byte-exact. 1.2 is
+  opt-in (`SmokeTest --tls-min12`, verified to reconnect a 1.2 client). So the renegotiation flag is now
+  belt-and-suspenders for the opt-in-1.2 case rather than load-bearing.
+
 **Still open (smaller):**
 - **SChannel (IOCP/RIO)** was NOT re-audited here (Windows box). It has an explicit `SEC_I_RENEGOTIATE`
   path (`SChannelTlsFilter.cs:328`) that handles both TLS 1.2 renegotiation and TLS 1.3 KeyUpdate — so it
-  *accepts* renegotiation rather than refusing it. Decide on Windows whether to match the OpenSSL refusal
-  (schannel has `SCH_CRED_NO_...`/ disable-reconnect knobs) for parity.
-- **A min-version option** (pin TLS 1.3) would remove the 1.2 surface entirely; not added (1.2 interop kept
-  deliberately, pre-alpha). A `TlsOptions.MinProtocol` is the clean way if wanted.
+  *accepts* renegotiation rather than refusing it, and has no min-version floor. Decide on Windows whether
+  to match the OpenSSL refusal + 1.3 floor for parity.
 - **An active KeyUpdate injection test** (client calls `SSL_key_update` mid-stream and both sides keep
-  exchanging) is not yet in `SmokeTest`; KeyUpdate handling is code-verified, not test-verified.
+  exchanging) is not yet in `SmokeTest`; KeyUpdate handling is code-verified, not test-verified. NEXT UP.
 
 ## Factor the shared IOCP/RIO data path
 

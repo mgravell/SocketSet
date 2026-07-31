@@ -54,7 +54,9 @@ internal static unsafe partial class NativeOpenSsl
     // a mode bit suppressing RX, and OpenSSL < 3.2 declining RX offload for TLS 1.3.
     public const int SSL_CTRL_SET_MODE = 33;
     public const int SSL_CTRL_CLEAR_MODE = 78;
+    public const int SSL_CTRL_SET_MIN_PROTO_VERSION = 123; // SSL_CTX_set_min_proto_version(ctx, ver) macro
     public const int SSL_CTRL_SET_MAX_PROTO_VERSION = 124;
+    // (TLS1_2_VERSION / TLS1_3_VERSION wire values are defined below as `long` — the ctrl `larg` type.)
     // NB the RX bit is 0x800, NOT 0x400 - 0x400 is SSL_MODE_DTLS_SCTP_LABEL_LENGTH_BUG. Getting this
     // wrong once already produced a false "clearing the mode changes nothing" result (2026-07-29): the
     // toggle silently did nothing, which is indistinguishable from a toggle that did nothing useful.

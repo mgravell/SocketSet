@@ -107,7 +107,9 @@ for (int i = 0; i < args.Length; i++)
         case "--tls-ssl":
             // Real OpenSSL TLS: a throwaway self-signed cert for "localhost", server configured with it,
             // client trusts exactly it with full verification (SNI + hostname). Loopback self-test only.
-            options.Tls = SocketSets.Tls.OpenSsl.OpenSslTlsProvider.CreateSelfSignedLoopback("localhost");
+            // Default min version is TLS 1.3; --tls-min12 opts the floor down to 1.2 (legacy-interop path).
+            options.Tls = SocketSets.Tls.OpenSsl.OpenSslTlsProvider.CreateSelfSignedLoopback("localhost",
+                minProtocol: args.Contains("--tls-min12") ? SocketSets.Tls.TlsProtocol.Tls12 : SocketSets.Tls.TlsProtocol.Tls13);
             options.TlsClient.TargetHost = "localhost";
             break;
 

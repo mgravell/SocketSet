@@ -1,6 +1,20 @@
 namespace SocketSets.Tls;
 
 /// <summary>
+/// Minimum TLS protocol version a provider will negotiate. The default is <see cref="Tls13"/>: TLS 1.3 is
+/// universal on modern peers, has no renegotiation, and mandates forward secrecy, so the whole TLS 1.2
+/// surface (renegotiation DoS, CBC/RSA-kex ciphers, downgrade) is opt-in rather than opt-out here. Set
+/// <see cref="Tls12"/> to interoperate with a peer that cannot do 1.3.
+/// </summary>
+public enum TlsProtocol
+{
+    /// <summary>Allow TLS 1.2 and 1.3 (1.2 floor). For legacy interop only.</summary>
+    Tls12,
+    /// <summary>TLS 1.3 only (the default). Rejects any peer that cannot do 1.3.</summary>
+    Tls13,
+}
+
+/// <summary>
 /// Per-connection configuration for an outbound (client) TLS handshake. Kept deliberately small for now;
 /// the fields that exist are the ones with correctness/security weight, and the TODOs mark the knobs a
 /// real implementation will need.
@@ -32,7 +46,8 @@ public sealed class TlsClientOptions
     public IReadOnlyList<string>? AlpnProtocols { get; set; }
 
     // TODO: CA trust source (system store vs explicit roots), client certificate for mutual TLS,
-    // min/max protocol version, session-resumption/ticket cache.
+    // session-resumption/ticket cache. (Min protocol version is set on the provider — see
+    // OpenSslTlsProvider's minProtocol parameter, TlsProtocol.Tls13 by default.)
 }
 
 /// <summary>
@@ -58,5 +73,6 @@ public sealed class TlsServerOptions
     public IReadOnlyList<string>? AlpnProtocols { get; set; }
 
     // TODO: server certificate + private key (the one non-optional piece for a real server), SNI-based
-    // certificate selection, optional client-certificate request (mutual TLS), version floor/ceiling.
+    // certificate selection, optional client-certificate request (mutual TLS). (Version floor is set on the
+    // provider — see OpenSslTlsProvider's minProtocol parameter, TlsProtocol.Tls13 by default.)
 }
