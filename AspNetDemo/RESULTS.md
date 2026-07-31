@@ -70,8 +70,12 @@ different OS and different dates.
   backend with no kTLS code at all. TX is kernel-offloaded (plaintext `send()`, reusing the normal send
   path), RX is `EPOLLIN → SSL_read` (userspace decrypt on this box's OpenSSL 3.0.13: `[ktls/epoll]
   tx=True rx=False`). Correctness-clean: smoke matrix 58/58 with new `+ktls` cells, ALPN over the kernel
-  path. The throughput question it was built to answer — does epoll+ktls reach epoll+tls, where
-  io_uring+ktls trails by ~15%? — is being measured; see the item 3c entry in `TODO.md`.
+  path. **The throughput question it was built to answer is measured, and the pre-registered prediction is
+  FALSIFIED:** epoll+ktls does NOT reach epoll+tls — same-session, 4 scored passes, disjoint, it trails
+  **−9.3% at 512 B** (~537k vs ~592k rps) and −12.3% at 4 KB, comparable to io_uring+ktls's −11.7% / −7.3%.
+  Since epoll forfeits no multishot receive, most of the kTLS small-message penalty is the **record path
+  itself** (per-message RX `SSL_read`), not multishot forfeiture. TX-only offload here (RX userspace <
+  OpenSSL 3.2); the RX-offloaded picture is still unmeasured. Full write-up: item 3c in `TODO.md`.
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 

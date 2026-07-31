@@ -12,10 +12,11 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > transport throughput-neutral (the one mover was the BYO-default flip, not a regression), reuse-port shard
 > growth now works on io_uring + epoll (two gaps, not the one named), the io_uring TLS out-of-band stall
 > was a writev/IOV_MAX bug (fixed, NOT a geometry problem — so io_uring keeps `BufferGeometry.Default`),
-> and **epoll gained a real kTLS path (item 3c)**. All committed and pushed to `main`. What is genuinely
-> still open on Linux: prefix sends on io_uring (§3 item 3), the epoll+ktls *throughput* comparison (item
-> 3c's point — measurement, not code), the TLS-renegotiation audit, and kTLS multishot (items 4/4b, which
-> need OpenSSL 3.2+ and real hardware). The original handover text follows.
+> and **epoll gained a real kTLS path (item 3c)** — whose pre-registered throughput prediction then
+> FALSIFIED itself (epoll+ktls trails epoll+tls ~9%, so the kTLS small-message penalty is the record path,
+> not multishot forfeiture). All committed and pushed to `main`. What is genuinely still open on Linux:
+> prefix sends on io_uring (§3 item 3), the TLS-renegotiation audit, and kTLS multishot with RX offload
+> (items 4/4b, which need OpenSSL 3.2+ and real hardware). The original handover text follows.
 
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
@@ -93,7 +94,9 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
    2026-07-31 writev fix capped the TLS out-of-band CHAIN at `IovMax` but did not add a prefix to the
    zero-copy path — that is this item.)
 4. **kTLS / epoll+kTLS.** ~~item 3c (epoll+kTLS pump)~~ **DONE 2026-07-31 — epoll runs real kTLS**, smoke
-   matrix has `+ktls` cells (58/58). Its throughput comparison is the open follow-up (see item 3c below).
+   matrix has `+ktls` cells (58/58). Its throughput comparison is DONE too and falsified the pre-registered
+   prediction (epoll+ktls trails epoll+tls ~9%, so the kTLS penalty is the record path, not multishot
+   forfeiture — see item 3c below).
    **items 4 / 4b (kTLS multishot receive)** remain open and need OpenSSL 3.2+ (RX offload) and real
    hardware to be worth it — deliberately deprioritised, see "START HERE".
 
@@ -2131,10 +2134,29 @@ nothing (plaintext `send()`, kernel encrypts, reusing `SendBytes`) and RX is the
 callback echo, pipe echo, out-of-band verify at 4MB, and ALPN (h2). New `*+ktls` cells in
 `run-smoke-matrix.sh` cover io_uring and epoll.**
 
-**STILL OPEN: the measurement.** The pre-registered throughput comparison below (does `epoll+ktls` reach
-`epoll+tls`, where `iouring+ktls` trails `iouring+tls` by ~15%?) is NOT yet run. That is the point of the
-feature and the next step for it — a `bench/run-tls-sizes.sh` leg. NIC offload stays invisible on loopback
-regardless; this measures only the multishot-forfeiture hypothesis.
+**MEASURED 2026-07-31, and the pre-registered prediction (below) is FALSIFIED.** Same-session
+`bench/run-tls-sizes.sh` (SHARDS=12, `-c 64`, 4 scored passes, disjoint ranges), small-message rps:
+
+| leg | 512 B | 4 KB |
+|---|---:|---:|
+| epoll+tls | ~592,000 | 2,034.7 MiB/s |
+| **epoll+ktls** | **~537,000 (−9.3%)** | **1,785.2 MiB/s (−12.3%)** |
+| iouring+tls (control) | ~585,000 | 1,900.8 MiB/s |
+| iouring+ktls (control) | ~516,000 (−11.7%) | 1,761.7 MiB/s (−7.3%) |
+
+**epoll+ktls does NOT reach epoll+tls — it trails by ~9-12%, comparable to io_uring's ~8-12%, ranges
+disjoint (not noise).** The prediction said epoll should reach parity because it has no multishot receive
+to forfeit; it did not, so **most of the kTLS small-message penalty is the kTLS record path itself, not
+multishot forfeiture** — epoll pays ~9% while forfeiting nothing multishot-related. What differs between
+the two epoll legs: kTLS moves TX encryption into the kernel (worth ~nothing at 512 B, where crypto is
+rounding error) but RX still goes through `SSL_read` on a kTLS-enabled socket, whose per-read overhead is
+what shows up. Any multishot-forfeiture cost is at most the small residual between io_uring's gap and
+epoll's, and that residual is inside the cross-backend noise here.
+
+**Scope caveat:** this is TX-only offload (RX userspace on OpenSSL 3.0.13, `[ktls/epoll] rx=False`). With
+RX offloaded (OpenSSL 3.2+, item 4b) the RX `SSL_read` cost could change and io_uring could regain
+multishot over provided buffers — so this falsification is about TX-only kTLS on loopback, and the
+RX-offloaded picture is still unmeasured. NIC offload stays structurally invisible on loopback regardless.
 
 *Original entry follows.*
 
@@ -2166,6 +2188,10 @@ backend rather than a claim about NIC offload.
 *Pre-registered:* `epoll+ktls` should land at or above `epoll+tls` at small messages, where
 `iouring+ktls` trails `iouring+tls` by ~15% (597,486 vs 702,829 rps). If it trails on epoll too, the
 "multishot forfeiture" explanation is wrong and the cost is in the kTLS record path itself.
+
+**→ RESULT (2026-07-31): it TRAILS on epoll too (−9.3% at 512 B, disjoint), so the second branch is the
+one that fired — the cost is the kTLS record path, not multishot forfeiture. Full numbers at the top of
+this item.**
 
 **Factoring, since two backends will then want the same pump.** The Ktls\* methods are parameterised by
 only two backend concerns - "tell me when the fd is readable" and "send these plaintext bytes" - so the
