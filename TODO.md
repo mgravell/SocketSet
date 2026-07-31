@@ -26,8 +26,10 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 >
 > **UPDATE (later 2026-07-31):** `TlsOptions`/`OpenSslTlsProvider` now take a `minProtocol` floor,
 > **defaulting to TLS 1.3** (1.2 is opt-in via `--tls-min12`) — this retires the whole 1.2 surface on the
-> default path, so the renegotiation flag is now belt-and-suspenders. Next: the active KeyUpdate injection
-> test, then the Kestrel-bridge investigation. The original handover text follows.
+> default path, so the renegotiation flag is now belt-and-suspenders. KeyUpdate is now test-verified too
+> (`bench/verify-tls-keyupdate.sh`, both backends). **The Linux TLS backlog is now empty** — the only
+> remaining TLS item is SChannel renegotiation/floor parity, which is Windows-only. Next Linux code lever:
+> the Kestrel-bridge investigation (24-42% at 256KB). The original handover text follows.
 
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
@@ -730,13 +732,18 @@ flag does not touch TLS 1.3 KeyUpdate.
   opt-in (`SmokeTest --tls-min12`, verified to reconnect a 1.2 client). So the renegotiation flag is now
   belt-and-suspenders for the opt-in-1.2 case rather than load-bearing.
 
+- **KeyUpdate is now TEST-verified (2026-07-31).** `bench/verify-tls-keyupdate.sh` drives a TLS 1.3
+  KeyUpdate in BOTH directions mid-stream (`openssl s_client` `K` then `k`) against our echo server and
+  confirms the echo keeps round-tripping byte-exact across the rekey, server clean — PASS on io_uring and
+  epoll. (Not a SmokeTest matrix cell: it needs the external `openssl` binary. kTLS is out of scope — the
+  kernel owns TX keys, so it can't do a userspace TX KeyUpdate.)
+
 **Still open (smaller):**
 - **SChannel (IOCP/RIO)** was NOT re-audited here (Windows box). It has an explicit `SEC_I_RENEGOTIATE`
   path (`SChannelTlsFilter.cs:328`) that handles both TLS 1.2 renegotiation and TLS 1.3 KeyUpdate — so it
   *accepts* renegotiation rather than refusing it, and has no min-version floor. Decide on Windows whether
-  to match the OpenSSL refusal + 1.3 floor for parity.
-- **An active KeyUpdate injection test** (client calls `SSL_key_update` mid-stream and both sides keep
-  exchanging) is not yet in `SmokeTest`; KeyUpdate handling is code-verified, not test-verified. NEXT UP.
+  to match the OpenSSL refusal + 1.3 floor for parity. **This is the one remaining TLS backlog item, and
+  it is Windows-only.**
 
 ## Factor the shared IOCP/RIO data path
 
