@@ -10,7 +10,7 @@ namespace SocketSets.AspNet;
 ///   transport — Kestrel's own sockets ("vanilla", the control) vs the SocketSet transport, and within
 ///               that which backend (auto-detected, or forced to managed / IOCP / RIO / io_uring).
 ///   TLS       — off, terminated in the transport (SChannel on Windows, OpenSSL on Linux), or terminated
-///               with kernel offload (kTLS: Linux + io_uring only). Vanilla Kestrel does its own HTTPS
+///               with kernel offload (kTLS: Linux, io_uring or epoll). Vanilla Kestrel does its own HTTPS
 ///               via SslStream, which is exactly the comparison worth having.
 ///
 /// Every configuration is pinned to HTTP/1.1 so the legs stay comparable; see Program.cs.
@@ -160,8 +160,8 @@ internal sealed class DemoConfig
 
         if (Ktls && !OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("--ktls needs Linux (kernel TLS); Windows has no kTLS equivalent.");
-        if (Ktls && Which is not (Backend.Auto or Backend.IoUring))
-            throw new ArgumentException("--ktls is only implemented on the io_uring backend; drop the backend override.");
+        if (Ktls && Which is not (Backend.Auto or Backend.IoUring or Backend.Epoll))
+            throw new ArgumentException("--ktls is implemented on the io_uring and epoll backends only; drop the backend override.");
         if (Ktls && VanillaKestrel)
             throw new ArgumentException("--ktls applies to the SocketSet transport; it cannot combine with --kestrel.");
         if (Which is Backend.Iocp or Backend.Rio && !OperatingSystem.IsWindows())

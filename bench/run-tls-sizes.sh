@@ -84,6 +84,7 @@ BASE_LEGS=(
   "iouring+tls|--io-uring --tls|socketset/io_uring|openssl|1"
   "iouring+ktls|--ktls|socketset/auto(iouring)|ktls (openssl + kernel offload)|1"
   "epoll+tls|--epoll --tls|socketset/epoll|openssl|1"
+  "epoll+ktls|--epoll --ktls|socketset/epoll|ktls (openssl + kernel offload)|1"
   "kestrel+tls|--kestrel --tls|kestrel-sockets|kestrel/sslstream|0"
 )
 
