@@ -49,6 +49,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     private static readonly bool ReportStats =
         Environment.GetEnvironmentVariable("SS_RIO_STATS") == "1";
 
+    private static long s_staleCompletions;   // MUST stay 0 - a completion from a previous tenant
     private static long s_sends, s_sendBytes, s_commitSend, s_commitRecv, s_notify, s_portWakes, s_cqDrains, s_completions, s_pumpFlush, s_stagedBytes;
 
     private static void DumpStats(string tag)
@@ -63,6 +64,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             $"notify-rearms={Interlocked.Read(ref s_notify):n0} ({per(Interlocked.Read(ref s_notify)):n2}/send) " +
             $"port-wakes={Interlocked.Read(ref s_portWakes):n0} ({per(Interlocked.Read(ref s_portWakes)):n2}/send) " +
             $"cq-drains={Interlocked.Read(ref s_cqDrains):n0} completions={Interlocked.Read(ref s_completions):n0} | " +
+            $"STALE COMPLETIONS={Interlocked.Read(ref s_staleCompletions):n0} (must be 0) " +
             $"out-of-band flushes={Interlocked.Read(ref s_pumpFlush):n0} staged={Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB");
     }
 
@@ -75,6 +77,20 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     private const uint ReqRecv = 1; // RIORESULT.RequestContext discriminator (both non-zero: rule out a
     private const uint ReqSend = 2; // NULL context being treated as "no completion")
+
+    // RequestContext is a ULONGLONG and the discriminator needs 2 bits of it, so the connection
+    // GENERATION rides in the top half. A completion otherwise carries only a slot (SocketContext), and
+    // nothing in it distinguishes "my connection" from "whoever holds this slot now" - the defer-recycle
+    // rule is the only thing making that safe. Item 0e was a lifetime bug on exactly this backend, so
+    // this is where the detector is worth most.
+    //
+    // Guarded on a 64-bit pointer: the value is passed through `(void*)(nuint)`, which would truncate the
+    // generation away on a 32-bit build and make EVERY completion look stale. There, packing is skipped
+    // and behaviour is exactly as before.
+    private static readonly bool PackGeneration = IntPtr.Size == 8;
+
+    private static ulong ReqCtx(uint kind, uint generation)
+        => PackGeneration ? ((ulong)generation << 32) | kind : kind;
 
 
     internal enum OpKind : int { Accept = 0, Connect = 1 }
@@ -334,7 +350,16 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             ref Win32.RIORESULT r = ref _rioResults[i];
             uint slot = (uint)r.SocketContext;
             bool failed = r.Status != 0;
-            if (r.RequestContext == ReqRecv) HandleRecv(slot, r.BytesTransferred, failed);
+            uint kind = (uint)(r.RequestContext & 0xFFFFFFFF);
+            // Drop a completion armed for a previous tenant of this slot rather than applying it to the
+            // current one: if defer-recycle ever leaks, a dropped completion may strand a slot, but an
+            // applied one corrupts a live connection. Must always be 0 - see SS_RIO_STATS.
+            if (PackGeneration && (uint)(r.RequestContext >> 32) != _conns[slot - 1].Generation)
+            {
+                Interlocked.Increment(ref s_staleCompletions);
+                continue;
+            }
+            if (kind == ReqRecv) HandleRecv(slot, r.BytesTransferred, failed);
             else HandleSend(slot, r.BytesTransferred, failed);
         }
         return n;
@@ -784,7 +809,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         buf.Length = (uint)_recvBufSize;
         conn.RecvArmed = true;
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
-        if (Win32.RIOReceive(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqRecv) == 0)
+        if (Win32.RIOReceive(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqCtx(ReqRecv, conn.Generation)) == 0)
         {
             conn.RecvArmed = false;
             CloseClient(conn.Slot);
@@ -806,7 +831,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         // back here through the pending-send machinery.
         if (conn.Rq == 0) { FailSend(conn, slot); return; }
         // DEFER: queue into the RQ ring without a kernel kick; committed in a batch (see FlushCommits).
-        if (Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqSend) == 0) { FailSend(conn, slot); return; }
+        if (Win32.RIOSend(conn.Rq, &buf, 1, Win32.RIO_MSG_DEFER, (void*)(nuint)ReqCtx(ReqSend, conn.Generation)) == 0) { FailSend(conn, slot); return; }
         if (ReportStats) { Interlocked.Increment(ref s_sends); Interlocked.Add(ref s_sendBytes, len); }
         conn.CommitSend = true;
         QueueCommit(conn);

@@ -1232,9 +1232,11 @@ does not match the slot's current tenant, counting it as `STALE COMPLETIONS` in 
 should always read 0 — and does, through TCP and TLS churn — because the invariant below is what makes a
 slot-only completion safe in the first place. The point is that if the invariant ever breaks, it now
 announces itself instead of silently applying a dead connection's completion to whoever holds the slot,
-which is how a lifetime bug becomes corruption rather than a log line. **RIO has no equivalent yet**: its
-`RequestContext` currently carries only the op kind, and packing a generation alongside it is the obvious
-follow-up given 0e lived on that backend.
+which is how a lifetime bug becomes corruption rather than a log line. **RIO has the same detector**, and
+it is the backend that most wanted one since 0e lived here: `RIORESULT.RequestContext` is a `ULONGLONG`
+and the op-kind discriminator needs two bits of it, so the generation rides in the top half. Guarded on a
+64-bit pointer, because the value is passed through `(void*)(nuint)` and a 32-bit build would truncate
+the generation away and make **every** completion look stale.
 
 The underlying hazard is unchanged: completions carry only the slot (`r.SocketContext`), *not* a
 generation, so a stale completion landing on a re-tenanted slot is structurally possible; the
