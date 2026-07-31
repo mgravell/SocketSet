@@ -96,6 +96,11 @@ internal sealed class PipeIoBridge
     private static readonly bool ReportStats =
         Environment.GetEnvironmentVariable("SS_BRIDGE_STATS") == "1";
 
+    // A/B control: SS_NO_ZC_RECV=1 forces the copying receive path even where zero-copy receive is
+    // possible, to measure what reading straight into pipe memory is actually worth. Read once.
+    private static readonly bool NoZeroCopyRecv =
+        Environment.GetEnvironmentVariable("SS_NO_ZC_RECV") == "1";
+
     private static long s_recv, s_recvBytes;        // inbound callbacks and their bytes (copy #1, always paid)
     private static long s_flushSync, s_flushAsync;  // flushes that completed inline vs went async
     private static long s_staged, s_stagedBytes;    // copy #2: only paid when a flush was outstanding
@@ -106,7 +111,9 @@ internal sealed class PipeIoBridge
         if (recv == 0) return;
         long staged = Interlocked.Read(ref s_staged);
         long async_ = Interlocked.Read(ref s_flushAsync);
+        long zc = Interlocked.Read(ref s_recvZeroCopy);
         Console.Error.WriteLine($"[bridge-stats:{tag}] receives={recv:n0} ({Interlocked.Read(ref s_recvBytes) / (double)(1 << 20):n1} MiB) " +
+            $"zero-copy-recv={zc:n0} ({(recv > 0 ? 100.0 * zc / recv : 0):n1}% of receives) | " +
             $"flush: sync={Interlocked.Read(ref s_flushSync):n0} async={async_:n0} ({(recv > 0 ? 100.0 * async_ / recv : 0):n1}% of receives) | " +
             $"STAGED (second copy)={staged:n0} ({(recv > 0 ? 100.0 * staged / recv : 0):n1}% of receives, " +
             $"{Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB)");
@@ -115,6 +122,60 @@ internal sealed class PipeIoBridge
     private static readonly Timer? StatsTimer = ReportStats
         ? new Timer(static _ => DumpStats("periodic"), null, 2000, 2000)
         : null;
+
+    private static long s_recvZeroCopy; // receives read straight into pipe memory (no transport-side copy)
+
+    /// <summary>
+    /// ZERO-COPY RECEIVE, for a readiness backend that reads on demand (epoll). Hand out a slice of the
+    /// pipe's OWN output memory to <c>recv()</c> into, so inbound bytes land in the pipe with NO
+    /// transport-side copy — paired 1:1 with <see cref="CommitReceive"/>. Returns false when the writer
+    /// cannot be touched right now (a flush is outstanding, or the bridge is torn down); the caller then
+    /// falls back to its copying path (<see cref="OnReceived"/>).
+    ///
+    /// WHY ONLY A READINESS BACKEND. A completion backend (io_uring) must arm a receive with a buffer
+    /// BEFORE the data arrives, so it would have to reserve pipe memory speculatively; epoll asks for the
+    /// buffer only once EPOLLIN says data is waiting, so it can read straight into the pipe with no
+    /// inversion. See TODO item 7. Loop-thread only (the same thread that calls OnReceived).
+    /// </summary>
+    internal bool TryBeginReceive(int sizeHint, out Memory<byte> buffer)
+    {
+        buffer = default;
+        if (NoZeroCopyRecv) return false; // A/B: force the copy path
+        lock (_inGate)
+        {
+            // A flush in flight means the writer is off-limits (concurrent-write throw); fall back to the
+            // copy+stage path, which is the ~0.1%-of-receives case (SS_BRIDGE_STATS).
+            if (Volatile.Read(ref _completed) != 0 || _flushPending) return false;
+            buffer = _pipe.Output.GetMemory(sizeHint);
+            return true;
+        }
+    }
+
+    /// <summary>Commit <paramref name="bytes"/> that were <c>recv()</c>'d into the buffer from
+    /// <see cref="TryBeginReceive"/>: advance the writer and flush. If the flush goes async, subsequent
+    /// receives stage behind it exactly as <see cref="OnReceived"/> does, until it drains.</summary>
+    internal void CommitReceive(int bytes)
+    {
+        if (bytes <= 0) return;
+        if (ReportStats) { Interlocked.Increment(ref s_recv); Interlocked.Add(ref s_recvBytes, bytes); Interlocked.Increment(ref s_recvZeroCopy); }
+
+        ValueTask<FlushResult> flush;
+        lock (_inGate)
+        {
+            _pipe.Output.Advance(bytes);
+            flush = _pipe.Output.FlushAsync();
+            if (flush.IsCompletedSuccessfully)
+            {
+                if (ReportStats) Interlocked.Increment(ref s_flushSync);
+                var r = flush.Result;
+                if (r.IsCompleted || r.IsCanceled) _conn.Close();
+                return;
+            }
+            if (ReportStats) Interlocked.Increment(ref s_flushAsync);
+            _flushPending = true;
+        }
+        _ = DrainFlushesAsync(flush);
+    }
 
     /// <summary>Inbound data, on the loop thread, in place of <c>OnReceive</c>.</summary>
     internal void OnReceived(ReadOnlySpan<byte> data)

@@ -331,6 +331,17 @@ above this one first; item 3 below is what you are here to do.**
    **So neither half is a throughput item.** Zero-copy receive is chasing ≤5%, of which the copy is only
    a part; parking is chasing 0.011%. The ONLY surviving argument for parking is that inbound
    backpressure is **advisory** rather than real — a correctness gap, which should be scheduled as one.
+
+   **CONFIRMED EMPIRICALLY 2026-07-31 by building the epoll springboard.** epoll is the cheap backend to
+   test this on (readiness reads into pipe `GetMemory()` with no arm-ahead inversion). Built it
+   (`PipeIoBridge.TryBeginReceive`/`CommitReceive`, epoll `PumpReceive`, new `/drain` endpoint,
+   `SS_NO_ZC_RECV` A/B knob): it engages 100% (`zero-copy-recv=100.0%`, staged=0), byte-exact — **and a
+   same-session ON-vs-OFF A/B at 256KB uploads shows NO difference** (~54.7k vs ~56.3k req/s, ranges fully
+   overlapping). The inbound copy is rounding error against recv + pipe + Kestrel, exactly as estimated.
+   **So io_uring's much-harder zero-copy receive is NOT worth building** — the win it would chase does not
+   exist here. (Kept the epoll implementation as it advances the both-directions-zero-copy goal and removes
+   a real copy whose memory-bandwidth value is a real-NIC question; the backpressure/parking correctness
+   gap is untouched — the MVP falls back to the copy path under a pending flush rather than parking.)
 8. **Dynamic shard growth.** Specified, untouched. Now the largest *unstarted* item.
 
 **Deliberately deprioritised: kTLS multishot (items 4 / 4b), and a 2026-07-31 measurement weakened the
@@ -412,7 +423,9 @@ Reading of that table:
   - *Stage-and-retry*: **confirmed not needed on io_uring.** `IoUringConnection.EnsureRoom` falls back to a
     pinned-heap page when the pool is dry (`IoUringConnection.cs:226`) rather than closing, so pool depth
     costs allocation there, never connections. The Windows hazard genuinely does not exist on this path.
-- **Zero-copy RECEIVE does not exist on any backend, and the reason is the API shape, not the backlog.**
+- **Zero-copy RECEIVE** (as of this 2026-07-28 note it existed on no backend; **epoll gained it 2026-07-31**
+  — see item 7 — and measuring it confirmed the copy is not the constraint) **— the reason it was hard is
+  the API shape, not the backlog.**
   `Connection` has a `TrySendZeroCopy` and no receive counterpart. Inbound always lands in the transport's
   own slab and `PipeIoBridge.OnReceived(ReadOnlySpan<byte>)` copies it into `pipe.Output.Write(data)` —
   on IOCP exactly as on epoll. Under backpressure it is worse than one copy: a `PipeWriter` permits only

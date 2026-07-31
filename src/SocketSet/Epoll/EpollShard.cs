@@ -631,19 +631,44 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
     private void PumpReceive(EpollConnection conn)
     {
+        // Zero-copy receive is available only for a NON-TLS pipe-mode connection: TLS inbound is ciphertext
+        // that must land in the recv slab to be decrypted before any plaintext reaches the pipe, and the
+        // callback path has no pipe to read into. (kTLS never reaches here — it routes to KtlsRead.)
+        var bridge = conn.Tls is null ? conn.PipeIo : null;
         byte* buf = _recvBuffer.Address(conn.RecvBuf);
         for (int i = 0; i < ReadBurst; i++)
         {
-            nint n = LibC.recv(conn.Fd, buf, (nuint)_recvBufSize, 0);
-            if (n > 0)
+            nint n;
+            // Read straight into the pipe's own memory when the writer is free (no flush pending). GetMemory
+            // hands out at least _recvBufSize; recv fills up to that. The pin is held only across the
+            // syscall — pooled memory could otherwise move under GC.
+            if (bridge is not null && bridge.TryBeginReceive(_recvBufSize, out var mem))
             {
-                if (!Deliver(conn, buf, (int)n)) return;
-                if (conn.Fd < 0 || conn.Closing) return;
-                if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
-                // A short read means the socket buffer is drained; skip the extra syscall that would
-                // only return EAGAIN. Safe under level-triggering: if more arrives we get another wake.
-                if (n < _recvBufSize) return;
-                continue;
+                using (var h = mem.Pin()) n = LibC.recv(conn.Fd, (byte*)h.Pointer, (nuint)mem.Length, 0);
+                if (n > 0)
+                {
+                    bridge.CommitReceive((int)n);           // advance + flush; no transport-side copy
+                    if (conn.Fd < 0 || conn.Closing) return;
+                    if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+                    if (n < mem.Length) return;             // socket drained (short read)
+                    continue;
+                }
+                // n <= 0: fall through to the shared error/EOF handling below. GetMemory without Advance is
+                // harmless — the next receive reuses the same pipe memory.
+            }
+            else
+            {
+                n = LibC.recv(conn.Fd, buf, (nuint)_recvBufSize, 0);
+                if (n > 0)
+                {
+                    if (!Deliver(conn, buf, (int)n)) return;
+                    if (conn.Fd < 0 || conn.Closing) return;
+                    if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+                    // A short read means the socket buffer is drained; skip the extra syscall that would
+                    // only return EAGAIN. Safe under level-triggering: if more arrives we get another wake.
+                    if (n < _recvBufSize) return;
+                    continue;
+                }
             }
             if (n == 0) { CloseClient(conn.Slot); return; } // orderly EOF from the peer
 

@@ -70,6 +70,14 @@ app.MapPost("/echo", async (HttpRequest req) =>
     return Results.Text($"echoed {ms.Length} bytes\n");
 });
 
+// Inbound-only: read (and discard) the whole request body, then a tiny response. Isolates the RECEIVE
+// path (the transport's inbound copy, or its absence with zero-copy receive) from any outbound cost.
+app.MapPost("/drain", async (HttpRequest req) =>
+{
+    await req.Body.CopyToAsync(Stream.Null);
+    return Results.Text("ok\n");
+});
+
 // Exercise multi-segment outbound (a response bigger than one buffer/chunk).
 app.MapGet("/big", (int n = 100_000) => Results.Text(new string('x', n)));
 

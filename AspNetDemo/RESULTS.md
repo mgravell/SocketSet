@@ -99,6 +99,19 @@ different OS and different dates.
   partial-write drain holding the pins, IovMax prefix like io_uring): bridged epoll 256KB **7,732 →
   10,894 MiB/s (+41%)**, three passes tight, now level with io_uring bridged (11,586) and near Kestrel
   (12,470). Byte-exact on the smoke matrix incl. the 8MB deep-window prefix cell.
+- **epoll got BYO zero-copy RECEIVE too — and measuring it RESOLVED item 7 (the copy is not the
+  constraint).** epoll's readiness model makes this the cheap backend for it: `EPOLLIN` says data is
+  waiting, so it reads straight into the pipe's `GetMemory()` — no speculative arm-ahead, which is what
+  makes the io_uring version hard. Implemented as the springboard item 7 asked for (a new
+  `PipeIoBridge.TryBeginReceive`/`CommitReceive`, used by epoll's `PumpReceive` for non-TLS pipe
+  connections; falls back to the copy path when a flush is pending — ~0.1% of receives). It engages 100%
+  (`SS_BRIDGE_STATS`: `zero-copy-recv=100.0% of receives`, staged=0) and is byte-exact. **But the A/B says
+  it buys nothing: 256KB uploads to a `/drain` endpoint, zero-copy receive ON vs OFF (`SS_NO_ZC_RECV`),
+  interleaved — ~54.7k vs ~56.3k req/s, ranges fully overlapping (~14,000 MiB/s inbound either way).** So
+  the inbound copy is rounding error against the recv syscall + pipe + Kestrel — confirming item 7's
+  estimate empirically. **Conclusion: do NOT speculatively build io_uring's much-harder zero-copy receive;
+  the win it chases does not exist on this box.** (Real-NIC memory-bandwidth effects stay untested here,
+  the usual loopback caveat.)
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
@@ -147,7 +160,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
 | BYO zero-copy **send** | **yes** - any length (256 segs/send, then a PREFIX) | impossible (registered ids) | **yes** - any length (1024 iov/send, then a PREFIX) | **yes** - `writev` <=1024 iov, then a PREFIX | no | ***yes - sends from the pipe*** |
-| BYO zero-copy **receive** | no | no | no | no | no | ***yes - into `GetMemory()`*** |
+| BYO zero-copy **receive** | no | no | no (needs receive-parking) | **yes** (readiness reads into `GetMemory()`) | no | ***yes - into `GetMemory()`*** |
 | internal zero-copy echo | no | no | **yes** (borrowed read buffers) | no | no | *n/a* |
 | pipe mode (`UsePipe`) | yes | yes | yes | yes | yes | *it **is** pipes* |
 | write-pool exhaustion | stage + retry | stage + retry | pinned-heap fallback | n/a (`ArrayPool` staging) | n/a | *n/a* |
