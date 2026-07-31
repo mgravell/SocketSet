@@ -146,6 +146,11 @@ scaling, not peak throughput.
   partial-write drain holding the pins, IovMax prefix like io_uring): bridged epoll 256KB **7,732 →
   10,894 MiB/s (+41%)**, three passes tight, now level with io_uring bridged (11,586) and near Kestrel
   (12,470). Byte-exact on the smoke matrix incl. the 8MB deep-window prefix cell.
+  **CLEAN SAME-SESSION A/B (2026-08-01, closing the cross-run gap): `--classic` (copy bridge) vs the
+  default zero-copy BYO at 256KB, 3 passes, disjoint — epoll 6,786 → 12,468 MiB/s (+84%), io_uring 7,452 →
+  12,708 (+71%), both zero-copy legs ≥ Kestrel (12,069-12,602).** The clean number is LARGER than the
+  +41% above because that compared classic against the UNPINNED zero-copy path; classic → PINNED zero-copy
+  is the full win (the copy removal composed with the pinning fix). This retires the cross-run caveat.
 - **epoll got BYO zero-copy RECEIVE too — and measuring it RESOLVED item 7 (the copy is not the
   constraint).** epoll's readiness model makes this the cheap backend for it: `EPOLLIN` says data is
   waiting, so it reads straight into the pipe's `GetMemory()` — no speculative arm-ahead, which is what
