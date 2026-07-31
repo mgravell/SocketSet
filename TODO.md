@@ -43,6 +43,10 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > (pinned) pools, io_uring AND epoll reach parity/edge ahead at 256KB (~12,650 vs Kestrel ~12,535). Fixed
 > by making the demo's pipe pool pinned by DEFAULT (`--pipe-unpinned` opts out). So with a fair pool we are
 > ≥ Kestrel across the plaintext size range; the bridge's structural pump-hop is NOT the 256KB bottleneck.
+> The one plaintext mystery left — we degrade MORE than Kestrel as concurrency rises (92%→80% c64→c128) —
+> and the one correctness gap (advisory inbound backpressure) are both targeted by the **"two half-pipes"**
+> proposal (see its section below): expose real reader/writer to Kestrel, drain directly on the loop side,
+> kill the per-connection pump task. That is the most promising forward item for the ASP.NET path.
 >
 > **Zero-copy RECEIVE (item 7) was then built on epoll as a springboard and RESOLVED by measurement:** it
 > engages 100% and is byte-exact, but a same-session A/B (`SS_NO_ZC_RECV`) shows NO throughput win across
@@ -784,6 +788,63 @@ flag does not touch TLS 1.3 KeyUpdate.
   *accepts* renegotiation rather than refusing it, and has no min-version floor. Decide on Windows whether
   to match the OpenSSL refusal + 1.3 floor for parity. **This is the one remaining TLS backlog item, and
   it is Windows-only.**
+
+## Two half-pipes: replace the Kestrel bridge's two full `Pipe`s (proposed 2026-07-31)
+
+**Status: proposed, not started. The most promising forward perf/correctness idea for the ASP.NET path,
+and the concrete form of "integrate the drain into the loop thread."**
+
+Today `SocketSetConnection` builds TWO full `System.IO.Pipelines.Pipe`s (`_inbound`, `_outbound`), each
+with the complete reader+writer state machine, scheduler-dispatched continuations, and the
+one-outstanding-flush constraint. Kestrel only ever touches ONE half of each; OUR side pays for the other
+half it doesn't need. The idea: expose the REAL half Kestrel requires and go DIRECT on our side, because
+our side is a loop thread that is already running — it can peek/push the shared buffer without the async
+reader/writer machinery.
+
+- **Outbound (app→socket):** Kestrel is the producer → expose a real `PipeWriter`. We are the consumer →
+  the loop thread drains the buffer directly. **No `PipeReader`, and no per-connection `Task.Run` pump.**
+- **Inbound (socket→app):** Kestrel is the consumer → expose a real `PipeReader`. We are the producer →
+  the loop `recv`s straight into the buffer and publishes. No `PipeWriter`.
+
+**What it targets (mapped to measured facts, not hope):**
+1. **Eliminates the per-connection pump `Task`** — the leading suspect for the one thing measured but
+   unexplained this session: we degrade MORE than Kestrel as concurrency rises (io_uring 92%→80% of
+   Kestrel c64→c128). N ThreadPool pump tasks contending is a plausible cause; removing them is the clean
+   test. **Strongest bet.**
+2. **Real backpressure** — the custom inbound `PipeReader` lets the loop PARK `EPOLLIN` (stop reading the
+   socket) when Kestrel falls behind, closing the "inbound backpressure is only advisory" correctness gap
+   and removing the staged second copy (the one-flush constraint).
+3. **Native zero-copy both ways** — loop `recv`s into the reader's buffer, sends from the writer's buffer;
+   deletes the `TryBeginReceive`/`CommitReceive` dance + fallback.
+4. **Less machinery / allocation** — one shared buffer + a poke per half vs two full `Pipe` state machines;
+   should show on the small-message / GC / RSS axes (the regimes NOT stressed yet).
+
+**Calibrate the expectation.** Do NOT expect it to move 256KB / c64 — we are already ≥ Kestrel there once
+pools match, and the pump-hop was PROVEN not to be the bottleneck at that point (per-segment pinning was,
+now fixed). Note the `SS_PIPE_SCHED=inline` result (−28% on io_uring) is NOT a refutation: inline ran the
+pump CONTINUATION on Kestrel's thread and still marshaled; the half-pipe REMOVES the pump so the
+already-running loop thread drains on its own timeline — a different mechanism. Bank the wins at
+**concurrency / small-message / allocation-RSS / backpressure-correctness**, not the headline.
+
+**The real cost is CORRECTNESS, not throughput.** Hand-rolling `PipeReader`/`PipeWriter` is the fiddly,
+hot-path-dangerous part — `AdvanceTo`'s consumed-vs-examined, backpressure thresholds, `Complete` /
+`CancelPendingRead`, the `FlushResult.IsCompleted/IsCanceled` edges. The current code uses stock `Pipe`
+precisely to dodge all of that. **De-risk by doing the OUTBOUND half first** (a custom `PipeWriter` whose
+`FlushAsync` just pokes the loop — no async reader on our side, the simpler half), prove the
+pump-elimination + high-concurrency hypothesis, THEN do the inbound `PipeReader` (harder, but where real
+backpressure lives).
+
+**Evaluation, pre-registered** (against the current two-full-`Pipe` baseline, rigs already exist —
+`SmokeTest --sink`, the demo, the concurrency sweep, `SS_BRIDGE_STATS`): (a) high-concurrency rps
+(c128/c256) closes toward Kestrel; (b) small-message rps up; (c) GC gen-0 / allocations down; (d)
+backpressure becomes real (staged-copy counter stays 0 AND recv parks under a slow reader). **If c256 does
+NOT improve, the pump-task-contention hypothesis was wrong — and that is itself the finding.**
+
+**Possible backing store:** the author has the core of a "ROS chunk allocator" — a `Pipe`-like
+producer/consumer buffer with better semantics (multiple in-flight / real backpressure / pinned chunks
+without the pinned-pool's ~2.7x RSS). Not on hand yet. The half-pipe is the natural place to slot it: our
+direct side can use its native interface while the Kestrel side still sees a standard reader/writer. Worth
+A/B-ing the allocator against stock `Pipe` on the same four axes when it lands.
 
 ## Factor the shared IOCP/RIO data path
 
