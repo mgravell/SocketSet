@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SocketSets.IoUring;
 using SocketSets.Native;
@@ -90,6 +91,9 @@ internal sealed unsafe class EpollShard : SocketSetShard
     private readonly ConcurrentQueue<(int Slot, uint Generation, byte[] Data, int Len)> _flush = [];
     private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token)> _connects = [];
     private readonly ConcurrentQueue<(int Fd, object? Token)> _newListeners = [];
+    private readonly ConcurrentQueue<(int Slot, uint Generation, EpollZcSend Zc)> _zeroCopy = [];
+
+    private const int IovMax = 1024; // UIO_MAXIOV: writev rejects iovcnt above this with -EINVAL
 
     public EpollShard(SocketSetOptions options)
     {
@@ -180,6 +184,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
             var tls = _conns[i].Tls;
             if (tls is not null) { _conns[i].Tls = null; tls.Dispose(); }
             if (_conns[i].KtlsSsl != 0) { SSL_free(_conns[i].KtlsSsl); _conns[i].KtlsSsl = 0; }
+            if (_conns[i].Zc is { } zc) { _conns[i].Zc = null; zc.Finish(false); }
         }
 
         if (_events != null) { NativeMemory.Free(_events); _events = null; }
@@ -266,6 +271,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
             try { PumpFlush(f.Slot, f.Generation, f.Data, f.Len); }
             finally { ArrayPool<byte>.Shared.Return(f.Data); }
         }
+        while (_zeroCopy.TryDequeue(out var z)) StartZc(z.Slot, z.Generation, z.Zc);
         while (_closes.TryDequeue(out var x)) RequestClose(x.Slot, x.Generation);
     }
 
@@ -289,6 +295,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.Pending?.Clear();
         conn.Tls = null;
         conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
+        conn.Zc = null;         // ditto — any in-flight zero-copy send was finished in CloseClient
         conn.IsClient = false;
         // Bump the generation before publishing Fd: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
@@ -347,6 +354,8 @@ internal sealed unsafe class EpollShard : SocketSetShard
             while (pending.Count > 0) ArrayPool<byte>.Shared.Return(pending.Dequeue().Array!);
         conn.SendOffset = 0;
         conn.WantWrite = false;
+        // Fail any in-flight zero-copy send: release its pins and unblock the pump (which then stops).
+        if (conn.Zc is { } zc) { conn.Zc = null; zc.Finish(false); }
         if (conn.Tls is { } tls) { conn.Tls = null; tls.Dispose(); }
         // kTLS: free the SSL (the fd it was bound to is already closed above; BIO_NOCLOSE, so SSL_free does
         // not touch it). The reusable KtlsRecv buffer is kept for the next tenant. No SSL_shutdown: the fd
@@ -612,7 +621,8 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
         if ((events & LibC.EPOLLOUT) != 0)
         {
-            PumpSend(conn);
+            // A zero-copy send drains via writev from its own pinned iovecs, not the pooled Pending queue.
+            if (conn.Zc is not null) PumpZc(conn); else PumpSend(conn);
             if (conn.Fd < 0 || conn.Closing) return;
         }
 
@@ -905,6 +915,114 @@ internal sealed unsafe class EpollShard : SocketSetShard
     {
         if (cipher.IsEmpty || conn.Fd < 0 || conn.Closing) return;
         fixed (byte* p = cipher) SendBytes(conn, p, cipher.Length);
+    }
+
+    // =====================================================================
+    // Zero-copy send (BYO pipe path). writev straight out of the caller's pinned pipe memory — no copy and
+    // no buffer registration (unlike RIO, which is why RIO can't do this and epoll can). Mirrors io_uring's
+    // TrySendZeroCopy, but the send is a synchronous writev with an EPOLLOUT drain, not a ring completion.
+    // Measured 2026-07-31: without this, epoll's bridged 256KB goodput was ~41% below its bare transport,
+    // because the pipe path fell back to Connection.Send and copied the whole response.
+    // =====================================================================
+
+    // Pump thread: pin the (prefix of the) sequence, build the iovec array, marshal the send to the loop.
+    internal long TrySendZeroCopy(EpollConnection conn, in ReadOnlySequence<byte> data, bool pinned,
+                                  out ValueTask<bool> completion)
+    {
+        completion = default;
+        // TLS/kTLS: the wire bytes are not the caller's bytes, so decline and let the bridge copy via Send().
+        if (conn.Tls is not null || conn.KtlsSsl != 0) return 0;
+        if (Volatile.Read(ref conn.Fd) < 0) return 0;
+        if (data.IsEmpty) return 0;
+
+        // Count non-empty segments, capped at IovMax — beyond that we send a prefix and the caller
+        // re-presents the remainder (PipeIoBridge handles a partial accept).
+        int n = 0;
+        foreach (var seg in data) { if (seg.IsEmpty) continue; if (++n == IovMax) break; }
+        if (n == 0) return 0;
+
+        var zc = new EpollZcSend { Handles = pinned ? null : new MemoryHandle[n] };
+        var iov = (LibC.iovec*)NativeMemory.Alloc((nuint)n * (nuint)sizeof(LibC.iovec));
+        zc.Iov = iov;
+        int i = 0;
+        long total = 0;
+        foreach (var seg in data)
+        {
+            if (seg.IsEmpty) continue;
+            if (i == n) break; // filled the prefix; the rest is the caller's to re-present
+            byte* p;
+            if (zc.Handles is null)
+                p = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(seg.Span)); // caller asserts pinned
+            else { var h = seg.Pin(); zc.Handles[i] = h; p = (byte*)h.Pointer; }
+            iov[i].iov_base = p;
+            iov[i].iov_len = (nuint)seg.Length;
+            total += seg.Length;
+            i++;
+        }
+        if (i == 0) { zc.Count = 0; zc.Finish(false); return 0; }
+
+        zc.Count = i;
+        zc.Total = total;
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        zc.Completion = tcs;
+        completion = new ValueTask<bool>(tcs.Task);
+        _zeroCopy.Enqueue((conn.Slot, Volatile.Read(ref conn.Generation), zc));
+        Poke();
+        return total; // bytes accepted — the whole sequence, or an IovMax-segment prefix of it
+    }
+
+    // Loop thread: adopt a marshaled zero-copy send onto its connection, or fail it if the slot recycled.
+    private void StartZc(int slot, uint generation, EpollZcSend zc)
+    {
+        var conn = _conns[slot];
+        if (conn.Generation != generation || conn.Fd < 0 || conn.Closing
+            || (conn.Flags & SocketSet.SocketFlags.SendClosed) != 0)
+        {
+            zc.Finish(false);
+            return;
+        }
+        // In pipe mode the pump awaits each send before issuing the next, so there is never a second
+        // zero-copy send in flight; fail a lingering one rather than leak its pins.
+        if (conn.Zc is { } old) old.Finish(false);
+        conn.Zc = zc;
+        PumpZc(conn);
+    }
+
+    // Loop thread: writev from the cursor. Fully sent -> complete + release pins; EAGAIN/partial -> arm
+    // EPOLLOUT and resume on the next writable wake; error -> close.
+    private void PumpZc(EpollConnection conn)
+    {
+        var zc = conn.Zc!;
+        while (zc.Sent < zc.Total)
+        {
+            nint w = LibC.writev(conn.Fd, zc.Iov + zc.Cursor, zc.Count - zc.Cursor);
+            if (w > 0)
+            {
+                zc.Sent += w;
+                // Skip iovecs this write fully drained and trim the one it stopped inside.
+                long consume = w;
+                while (consume > 0 && zc.Cursor < zc.Count)
+                {
+                    long il = (long)zc.Iov[zc.Cursor].iov_len;
+                    if (il <= consume) { consume -= il; zc.Cursor++; }
+                    else
+                    {
+                        zc.Iov[zc.Cursor].iov_base = (byte*)zc.Iov[zc.Cursor].iov_base + consume;
+                        zc.Iov[zc.Cursor].iov_len = (nuint)(il - consume);
+                        consume = 0;
+                    }
+                }
+                continue;
+            }
+            int err = Marshal.GetLastPInvokeError();
+            if (err == LibC.EINTR) continue;
+            if (err == LibC.EAGAIN) { ArmWrite(conn); return; } // socket buffer full — resume on EPOLLOUT
+            conn.Zc = null; zc.Finish(false); CloseClient(conn.Slot); return; // fatal
+        }
+        // Everything has gone out.
+        if (conn.WantWrite) DisarmWrite(conn);
+        conn.Zc = null;
+        zc.Finish(true); // release the pins and unblock the pump to advance the pipe reader
     }
 
     // =====================================================================

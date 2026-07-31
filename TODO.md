@@ -28,8 +28,15 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > **defaulting to TLS 1.3** (1.2 is opt-in via `--tls-min12`) — this retires the whole 1.2 surface on the
 > default path, so the renegotiation flag is now belt-and-suspenders. KeyUpdate is now test-verified too
 > (`bench/verify-tls-keyupdate.sh`, both backends). **The Linux TLS backlog is now empty** — the only
-> remaining TLS item is SChannel renegotiation/floor parity, which is Windows-only. Next Linux code lever:
-> the Kestrel-bridge investigation (24-42% at 256KB). The original handover text follows.
+> remaining TLS item is SChannel renegotiation/floor parity, which is Windows-only.
+>
+> **The Kestrel-bridge investigation found a concrete win, not just structure:** a same-session
+> bare-vs-bridged isolation showed bridged EPOLL 41% below its (fastest-measured) bare transport at 256KB
+> because epoll lacked BYO zero-copy send and copied the whole response on the pipe path. Implemented
+> epoll `writev` zero-copy send — **bridged epoll 256KB 7,732 → 10,894 MiB/s (+41%)**, now level with
+> io_uring. What remains of the bridge (the pump thread-hop + loop-thread marshal vs vanilla Kestrel's
+> tighter integration) is the structural part; io_uring's bridged 256KB is already within ~7% of Kestrel.
+> The original handover text follows.
 
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
@@ -380,7 +387,7 @@ what is worth doing:
 | kTLS | - | - | **yes** | **yes** (2026-07-31; TX offloaded, RX userspace < OpenSSL 3.2) |
 | `ReceiveBufferSize` (send/recv split) | yes | yes | **yes** (2026-07-28) | **yes** (2026-07-28) |
 | write-pool exhaustion: stage and retry | yes | yes | no | no |
-| BYO-buffer zero-copy SEND | yes | n/a by design | no | no |
+| BYO-buffer zero-copy SEND | yes | n/a by design | **yes** (2026-07-30/31, prefix) | **yes** (2026-07-31, `writev`, prefix) |
 | BYO-buffer zero-copy RECEIVE | **no** | **no** | **no** | **no** |
 
 Reading of that table:

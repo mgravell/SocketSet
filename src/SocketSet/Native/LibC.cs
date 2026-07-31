@@ -233,6 +233,12 @@ internal static unsafe partial class LibC
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial nint send(int fd, void* buf, nuint len, int flags);
 
+    // Scatter-gather send: one syscall over an array of iovecs pointing at arbitrary (here: pinned pipe)
+    // memory — no buffer registration, unlike RIO. Used by epoll's zero-copy send. Returns bytes written,
+    // or -1 with errno (EAGAIN when the socket buffer is full → drain the rest on EPOLLOUT).
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial nint writev(int fd, iovec* iov, int iovcnt);
+
     /// <summary>Kernel sockaddr_in (16 bytes), IPv4.</summary>
     [StructLayout(LayoutKind.Sequential, Size = 16)]
     internal struct SockAddrIn

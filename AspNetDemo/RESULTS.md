@@ -89,6 +89,17 @@ different OS and different dates.
   TLS-1.2-only client is rejected outright, retiring the whole 1.2 surface (renegotiation included) on the
   default path; 1.2 is opt-in (`--tls-min12`). Smoke matrix stays green (all cells negotiate 1.3).
 
+- **epoll got BYO zero-copy send, worth +41% on the bridged 256KB path.** The Kestrel-bridge
+  investigation (measure-first) ran a same-session bare-vs-bridged isolation: bare epoll is the FASTEST
+  thing measured at 256KB (13,107 MiB/s, above io_uring and Kestrel), yet bridged epoll was the SLOWEST
+  (7,732) — a 41% bridge cost. The cause was concrete, not structural: epoll had no `TrySendZeroCopy`, so
+  the pipe path fell back to `Connection.Send` and COPIED the whole response, where io_uring sends
+  zero-copy. Unlike RIO (registered buffer ids only), epoll's `writev` takes arbitrary addresses, so it can
+  send straight from the pinned pipe segments. Implemented (a marshaled `writev` with an EPOLLOUT
+  partial-write drain holding the pins, IovMax prefix like io_uring): bridged epoll 256KB **7,732 →
+  10,894 MiB/s (+41%)**, three passes tight, now level with io_uring bridged (11,586) and near Kestrel
+  (12,470). Byte-exact on the smoke matrix incl. the 8MB deep-window prefix cell.
+
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
 ### Linux flat-check: the shared changes are throughput-neutral, and the one thing that moved was a default flip (2026-07-31)
@@ -135,7 +146,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 | `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
-| BYO zero-copy **send** | **yes** - any length (256 segs/send, then a PREFIX) | impossible (registered ids) | **yes** - any length (1024 iov/send, then a PREFIX) | no | no | ***yes - sends from the pipe*** |
+| BYO zero-copy **send** | **yes** - any length (256 segs/send, then a PREFIX) | impossible (registered ids) | **yes** - any length (1024 iov/send, then a PREFIX) | **yes** - `writev` <=1024 iov, then a PREFIX | no | ***yes - sends from the pipe*** |
 | BYO zero-copy **receive** | no | no | no | no | no | ***yes - into `GetMemory()`*** |
 | internal zero-copy echo | no | no | **yes** (borrowed read buffers) | no | no | *n/a* |
 | pipe mode (`UsePipe`) | yes | yes | yes | yes | yes | *it **is** pipes* |

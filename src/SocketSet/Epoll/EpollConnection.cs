@@ -1,5 +1,40 @@
 #if NET // Linux epoll backend; compiled out of the netfx fallback build.
+using System.Buffers;
+using System.Runtime.InteropServices;
+using SocketSets.Native;
+
 namespace SocketSets.Epoll;
+
+/// <summary>
+/// An in-flight zero-copy send: the socket is doing a <c>writev</c> straight out of the CALLER's (pinned
+/// pipe) memory, so nothing here is copied and the pins must be held until the whole thing has gone out —
+/// possibly across several EPOLLOUT-driven <c>writev</c>s if the socket buffer fills. Mirrors io_uring's
+/// <c>ZcJob</c>, but epoll's <c>writev</c> is synchronous with an EPOLLOUT drain rather than a completion.
+/// </summary>
+internal sealed unsafe class EpollZcSend
+{
+    public LibC.iovec* Iov;            // native iovec array (Count entries), freed by the loop thread
+    public int Count;
+    public int Cursor;                 // first not-fully-sent iovec — the partial-write resume point
+    public long Total;
+    public long Sent;
+    public MemoryHandle[]? Handles;    // pins to dispose; null when the caller asserted already-pinned memory
+    public TaskCompletionSource<bool>? Completion;
+
+    /// <summary>Release the iovec array + pins and signal the waiting pump. Idempotent.</summary>
+    public void Finish(bool ok)
+    {
+        if (Iov != null) { NativeMemory.Free(Iov); Iov = null; }
+        if (Handles is { } hs)
+        {
+            for (int i = 0; i < Count; i++) hs[i].Dispose();
+            Handles = null;
+        }
+        var tcs = Completion;
+        Completion = null;
+        tcs?.TrySetResult(ok);
+    }
+}
 
 /// <summary>
 /// Per-connection identity for the Linux epoll backend - the readiness-model analogue of
@@ -66,6 +101,10 @@ internal sealed class EpollConnection : OutboundConnection
     /// blocked, because a level-triggered EPOLLOUT on an idle socket would wake the loop continuously.</summary>
     public bool WantWrite;
 
+    /// <summary>The in-flight zero-copy send (BYO pipe path), or null. When set, EPOLLOUT drives its
+    /// <c>writev</c> drain rather than the pooled <see cref="Pending"/> queue. Loop thread only.</summary>
+    public EpollZcSend? Zc;
+
     public EpollConnection(EpollShard shard, int slot)
     {
         Shard = shard;
@@ -89,5 +128,14 @@ internal sealed class EpollConnection : OutboundConnection
         Shard.SubmitFlush(Slot, Volatile.Read(ref Generation), data, length);
         return true;
     }
+
+    /// <summary>Zero-copy send from the caller's (pinned pipe) memory via <c>writev</c>. Returns bytes
+    /// accepted — the whole sequence, or an <c>IovMax</c>-segment PREFIX of it, the caller re-presents the
+    /// rest — or 0 when zero-copy is not possible (TLS/kTLS: the wire bytes differ; closed; empty). Called
+    /// from the pipe pump (a foreign thread); the pinning + iovec build are thread-agnostic and the send
+    /// itself is marshaled to the loop.</summary>
+    internal override long TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned,
+                                           out ValueTask<bool> completion)
+        => Shard.TrySendZeroCopy(this, in data, pinned, out completion);
 }
 #endif
