@@ -312,13 +312,13 @@ if (args.Contains("--ktls-spike"))
 
 if (verify > 0)
 {
-    RunVerify(options, verify, port, verifySeg);
+    RunVerify(options, verify, port, verifySeg, uds);
     return;
 }
 
 if (verifyEcho > 0)
 {
-    RunEchoVerify(options, verifyEcho, size, window, port, pipeMode);
+    RunEchoVerify(options, verifyEcho, size, window, port, pipeMode, uds);
     return;
 }
 
@@ -343,15 +343,28 @@ static void RunRespPing(SocketSetOptions opts, string host, int port, string? tl
     Console.WriteLine($"resp-ping: reply=\"{reply}\" => {(completed && set.Ok ? "PASS" : "FAIL")}");
 }
 
-static void RunVerify(SocketSetOptions opts, int payloadLen, int port, int seg)
+// The endpoint the standalone harnesses bind AND dial. Split out because RunVerify/RunEchoVerify used to
+// build `new IPEndPoint(Loopback, port)` unconditionally and therefore SILENTLY IGNORED -u: every "UDS"
+// result from them was a TCP run. That is this repo's rule 1 - never trust a flag, trust the banner -
+// broken by the harness itself, and it invalidated the 2026-07-27 evidence that Windows UDS worked. The
+// banner now prints the endpoint so a run says which transport it actually used.
+static EndPoint HarnessEndpoint(string? uds, int port)
+{
+#if NET
+    if (uds is not null) return new UnixDomainSocketEndPoint(uds);
+#endif
+    return new IPEndPoint(IPAddress.Loopback, port);
+}
+
+static void RunVerify(SocketSetOptions opts, int payloadLen, int port, int seg, string? uds)
 {
     // seg: multi-segment chunk size for the sequence send. 7000 by default, which straddles a 4096 page
     // boundary on purpose; --verify-seg varies it (see item 0d).
     using var set = new SendVerify(opts, payloadLen, seg);
-    var ep = new IPEndPoint(IPAddress.Loopback, port);
+    var ep = HarnessEndpoint(uds, port);
     set.Listen(ep);
     set.Connect(ep);
-    Console.WriteLine($"verify: backend={opts.Factory.GetType().Name} payload={payloadLen} seg={seg} expected={set.Expected}");
+    Console.WriteLine($"verify: backend={opts.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} endpoint={ep} payload={payloadLen} seg={seg} expected={set.Expected}");
 
     var sw = Stopwatch.StartNew();
     while (set.ServerConn is null && sw.Elapsed < TimeSpan.FromSeconds(5)) Thread.Sleep(5);
@@ -365,13 +378,13 @@ static void RunVerify(SocketSetOptions opts, int payloadLen, int port, int seg)
     Console.WriteLine($"verify: received={set.Received}/{set.Expected} mismatches={set.Mismatches} => {(ok ? "PASS" : "FAIL")}");
 }
 
-static void RunEchoVerify(SocketSetOptions opts, long totalBytes, int chunk, int window, int port, bool pipeMode)
+static void RunEchoVerify(SocketSetOptions opts, long totalBytes, int chunk, int window, int port, bool pipeMode, string? uds)
 {
     using var set = new EchoVerify(opts, totalBytes, chunk, window) { PipeMode = pipeMode };
-    var ep = new IPEndPoint(IPAddress.Loopback, port);
+    var ep = HarnessEndpoint(uds, port);
     set.Listen(ep);
     set.Connect(ep);
-    Console.WriteLine($"verify-echo: backend={opts.Factory.GetType().Name} total={totalBytes} chunk={chunk} window={window} pipe={pipeMode}");
+    Console.WriteLine($"verify-echo: backend={opts.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} endpoint={ep} total={totalBytes} chunk={chunk} window={window} pipe={pipeMode}");
 
     var sw = Stopwatch.StartNew();
     while (set.RoundTripped < set.Expected && sw.Elapsed < TimeSpan.FromSeconds(30)) Thread.Sleep(10);

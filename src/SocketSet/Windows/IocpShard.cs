@@ -733,6 +733,23 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             any.sin_family = (ushort)Win32.AF_INET;
             Win32.bind(s, &any, 16);
         }
+        else
+        {
+            // ...and it requires that of AF_UNIX too, which this used to skip. ConnectEx on an unbound
+            // AF_UNIX socket fails with WSAEINVAL, StartConnect then closes it and frees the slot, and the
+            // connect silently never happens - so Windows UDS accepted nothing at all on this backend.
+            // Bind to the UNNAMED address (family only, no path): the client end needs an address, not a
+            // name, and a named bind would litter the filesystem with a file per outbound connection.
+            Win32.SockAddrUn unnamed = default;
+            unnamed.sun_family = Win32.AF_UNIX;
+            if (Win32.bind(s, &unnamed, sizeof(ushort)) != 0)
+            {
+                int err = Marshal.GetLastPInvokeError();
+                Win32.closesocket(s);
+                ReleaseReservation();
+                throw new Win32Exception(err, "bind(AF_UNIX, unnamed) failed; ConnectEx requires a bound socket");
+            }
+        }
 
         _pendingConnects.Enqueue((s, endpoint, userToken));
         Poke();
@@ -773,7 +790,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         else // UnixDomainSocketEndPoint (caller validated the type before marshaling)
         {
             var uds = (UnixDomainSocketEndPoint)endpoint;
-            addrLen = Win32.SockAddrUn.Init((Win32.SockAddrUn*)addrPtr, uds.ToString());
+            addrLen = Win32.SockAddrUn.Init((Win32.SockAddrUn*)addrPtr, UnixSocketFile.ValidatePath(uds.ToString()));
         }
 
         // Connect reuses the slot's recv op-ctx (no recv is armed yet); re-armed as a recv on completion.
@@ -819,9 +836,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             {
                 nint s = Win32.WSASocketW(Win32.AF_UNIX, Win32.SOCK_STREAM, 0, null, 0, Win32.WSA_FLAG_OVERLAPPED);
                 if (s == Win32.INVALID_SOCKET) throw new Win32Exception(Marshal.GetLastPInvokeError(), "WSASocketW(AF_UNIX) failed");
-                UnixSocketFile.PrepareForBind(uds.ToString()); // clear a stale socket file (Windows AF_UNIX is filesystem-only)
+                string udsPath = UnixSocketFile.ValidatePath(uds.ToString()); // '@abstract' is Linux-only
+                UnixSocketFile.PrepareForBind(udsPath); // clear a stale socket file (Windows AF_UNIX is filesystem-only)
                 Win32.SockAddrUn addr;
-                uint len = Win32.SockAddrUn.Init(&addr, uds.ToString());
+                uint len = Win32.SockAddrUn.Init(&addr, udsPath);
                 if (Win32.bind(s, &addr, (int)len) == Win32.SOCKET_ERROR)
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "UDS bind(AF_UNIX) failed");
                 if (Win32.listen(s, _listenBacklog) == Win32.SOCKET_ERROR)

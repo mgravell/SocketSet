@@ -2092,6 +2092,55 @@ standard that survives being read by an expert audience.
 
 ## Check UDS on Windows
 
+**Status: WAS BROKEN, FIXED 2026-07-31. And the 2026-07-27 "it WORKS" verdict below was an artifact of
+the harness ignoring the flag — the very failure that entry congratulates itself on guarding against.**
+
+### The verdict was wrong because the test never used UDS
+
+`RunVerify` and `RunEchoVerify` in `SmokeTest/Program.cs` built `new IPEndPoint(Loopback, port)`
+unconditionally. **They ignored `-u` entirely**, so every "UDS" result from them was a TCP run. The entry
+below says it was "Checked deliberately, because 'the test passed' is not evidence when the flag might
+have been ignored" — and the flag was being ignored, by the harness rather than by the transport. Rule 1
+of `bench/README.md`, broken from the inside.
+
+Fixed: both harnesses now take the endpoint, and their banner prints `transport=` and `endpoint=` so a
+run says which transport it actually used.
+
+### With `-u` honoured, UDS on IOCP did not work at all
+
+`verify-echo` over UDS: **`roundtripped=0/262144`**. `verify`: **`FAIL (no connection accepted)`**. The
+TCP control passed and — the decisive comparison — **the MANAGED backend over the same UDS path passed**,
+so AF_UNIX works on Windows; it was the IOCP backend that did not.
+
+**Cause:** `ConnectEx` requires an explicitly bound socket, and `IocpShard.Connect` bound only in the
+`if (af == AF_INET)` branch. AF_UNIX fell through unbound, `ConnectEx` failed, `StartConnect` closed the
+socket and freed the slot, and the connect silently never happened. The comment stating the requirement
+was three lines above the branch that skipped it.
+
+**Fix:** bind the AF_UNIX client socket to the UNNAMED address (family only, no path) before `ConnectEx`.
+Unnamed rather than a temp path on purpose: the client end needs an address, not a name, and a named bind
+would leave a file per outbound connection.
+
+**Now passing over UDS on IOCP:** echo-verify (plaintext and SChannel TLS), out-of-band `--verify`
+(plaintext and TLS), and churn. Stale socket files were already handled (`UnixSocketFile.PrepareForBind`
+unlinks at bind), and an over-long path already fails with a clear .NET message naming the 108-char limit.
+
+### `@abstract` names are now rejected before the socket layer is touched
+
+`-u @name` on Windows used to create a FILE literally called `@name` in the working directory and carry
+on. It now throws `PlatformNotSupportedException` from `SocketSet.Listen`/`Connect` — at the public API,
+**before any socket is created**, so nothing has to be unwound. Validation lives there rather than in a
+backend so every backend gets it: the managed path had the same hole.
+
+### STILL OPEN: a UDS-only connection leak under churn — item 0f
+
+Not the same bug, and not fixed. Same churn shape, 5 reps each: **TCP 0/5 leaked, UDS 3/5**, always
+exactly one server-side connection (`live=1 (client=0 server=1)`) after a 6s churn moving ~12,000
+connections. It is a slot leak rather than a crash or a wedge, but sustained churn would exhaust the
+table. The smoke matrix does not catch it because its churn cell is TCP.
+
+*The original entry follows, and its verdict should be read as retracted.*
+
 **Status: RAISED as suspected-broken, then TESTED and it WORKS (2026-07-27).**
 
 Evidence, IOCP backend, filesystem path under `%TEMP%`:

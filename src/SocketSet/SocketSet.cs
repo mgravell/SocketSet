@@ -146,8 +146,26 @@ public abstract partial class SocketSet : IDisposable
         return null; // every shard full (we may grow here later; for now the caller drops/throws)
     }
 
+    /// <summary>
+    /// Reject an endpoint this platform cannot express, BEFORE any socket is created. Validation lives
+    /// here rather than in a backend so it happens once, on every backend, and - the point - before the
+    /// socket layer is touched at all: a check further down has already created a socket (and, on the
+    /// connect path, claimed a slot) that then has to be unwound.
+    ///
+    /// Today that means Linux abstract-namespace names (<c>'@'</c> prefix) off Linux, where AF_UNIX is
+    /// filesystem-only and <c>@foo</c> would silently become a FILE called <c>@foo</c> in the working
+    /// directory. Measured 2026-07-31: it did exactly that.
+    /// </summary>
+    private static void ValidateEndpoint(EndPoint endpoint)
+    {
+#if NET
+        if (endpoint is UnixDomainSocketEndPoint uds) UnixSocketFile.ValidatePath(uds.ToString());
+#endif
+    }
+
     public void Listen(EndPoint endpoint, object? userToken = null)
     {
+        ValidateEndpoint(endpoint);
         if (Options.Factory.CanMultiBind(endpoint))
         {
             // Reuse-port: every shard binds its own listener and the kernel balances accepts (io_uring/IP).
@@ -167,6 +185,7 @@ public abstract partial class SocketSet : IDisposable
 
     public void Connect(EndPoint endpoint, object? userToken = null)
     {
+        ValidateEndpoint(endpoint);
         // Walk for a shard with a free slot rather than committing to one round-robin pick that might be
         // full while siblings have room. The chosen shard holds a reservation; its Connect consumes it by
         // claiming the slot, or releases it on a pre-claim failure.
