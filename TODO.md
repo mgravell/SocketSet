@@ -329,7 +329,7 @@ what is worth doing:
 
 | feature | IOCP | RIO | io_uring | epoll |
 |---|---|---|---|---|
-| kTLS | - | - | **yes** | **no references at all** |
+| kTLS | - | - | **yes** | **yes** (2026-07-31; TX offloaded, RX userspace < OpenSSL 3.2) |
 | `ReceiveBufferSize` (send/recv split) | yes | yes | **yes** (2026-07-28) | **yes** (2026-07-28) |
 | write-pool exhaustion: stage and retry | yes | yes | no | no |
 | BYO-buffer zero-copy SEND | yes | n/a by design | no | no |
@@ -337,11 +337,11 @@ what is worth doing:
 
 Reading of that table:
 
-- **epoll has no kTLS path whatsoever** — this is a missing feature, not a missing harness leg. Do not
-  add an `epoll+ktls` leg expecting it to work. **Scoped as item 3c (2026-07-29): the OpenSSL/kernel half
-  is already shared, only the ~150-line readiness→`SSL_read` pump is missing, and epoll is the backend
-  where kTLS should look best** — it has no multishot receive to forfeit, which is what makes kTLS cost
-  io_uring ~15%.
+- ~~**epoll has no kTLS path whatsoever**~~ **IMPLEMENTED 2026-07-31 (item 3c). `--epoll --ktls` now runs
+  real kTLS** (TX kernel-offloaded, RX userspace on OpenSSL < 3.2), correctness-clean on the smoke matrix.
+  The `~150-line readiness→SSL_read pump` estimate held (~130 lines). epoll being the backend where kTLS
+  should look best — no multishot receive to forfeit — is now testable; the throughput comparison is the
+  open follow-up (see item 3c).
 - **kTLS is TX-only on the SYSTEM OpenSSL (3.0.13), and that is OpenSSL's limit, not ours** — measured
   2026-07-29: a self-built 3.5.7 gives RX=True on TLS 1.3 and moves `TlsRxSw` off zero (0 -> 8). On 3.0.13
   `TlsTxSw` moves and `TlsRxSw` stays at zero. Every kTLS number on file measures a
@@ -2101,7 +2101,23 @@ more to the "ASP.NET Core over SocketSet" story than any transport difference me
 
 ### 3c. epoll + kTLS behind a toggle (raised 2026-07-29) — and epoll is where kTLS should look BEST
 
-**Status: proposed, not started. The estimate "85% of the work is already done" was checked and holds.**
+**Status: IMPLEMENTED 2026-07-31, correctness-clean. The "85% already done" estimate held — the new code
+is ~130 lines in `EpollShard.cs` (`StartKtls`/`KtlsPump`/`KtlsComplete`/`KtlsRead`/`ReportKtlsOnce` plus
+`FireOpen`/`HandleConnection`/teardown wiring and three `EpollConnection` fields). As predicted, TX needed
+nothing (plaintext `send()`, kernel encrypts, reusing `SendBytes`) and RX is the backend's own idiom
+(`EPOLLIN → SSL_read`). `--epoll --ktls` reports `[ktls/epoll] tx=True rx=False` on this box's OpenSSL
+3.0.13 (TX genuinely kernel-offloaded; RX userspace, as expected < 3.2) and passes the smoke matrix:
+callback echo, pipe echo, out-of-band verify at 4MB, and ALPN (h2). New `*+ktls` cells in
+`run-smoke-matrix.sh` cover io_uring and epoll.**
+
+**STILL OPEN: the measurement.** The pre-registered throughput comparison below (does `epoll+ktls` reach
+`epoll+tls`, where `iouring+ktls` trails `iouring+tls` by ~15%?) is NOT yet run. That is the point of the
+feature and the next step for it — a `bench/run-tls-sizes.sh` leg. NIC offload stays invisible on loopback
+regardless; this measures only the multishot-forfeiture hypothesis.
+
+*Original entry follows.*
+
+**The estimate "85% of the work is already done" was checked and holds.**
 
 Already shared, i.e. nothing to write: `OpenSslTlsProvider.CreateKernelSsl` (the `SSL*` bound to the fd
 with kernel offload), `KtlsProbe` (capability detection), the `NativeOpenSsl` bindings

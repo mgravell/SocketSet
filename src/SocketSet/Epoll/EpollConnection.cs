@@ -40,6 +40,18 @@ internal sealed class EpollConnection : OutboundConnection
     /// <summary>Index into the shard's recv-buffer pool; held for the connection's lifetime, -1 if none.</summary>
     public int RecvBuf = -1;
 
+    // --- kTLS (kernel TLS offload; OpenSSL owns the fd, kernel does the record crypto) ---
+    /// <summary>OpenSSL <c>SSL*</c> bound to the fd, or 0 when this is not a kTLS connection. Mutually
+    /// exclusive with <see cref="OutboundConnection.Tls"/> (the userspace filter): a connection is either
+    /// kernel-offloaded or userspace, never both.</summary>
+    public nint KtlsSsl;
+    /// <summary>Handshake done + keys pushed to the kernel → data phase. While false the readiness events
+    /// step <c>SSL_do_handshake</c> instead of reading application data.</summary>
+    public bool KtlsReady;
+    /// <summary>Plaintext <c>SSL_read</c> target, reused for the connection's lifetime; also the buffer an
+    /// inline response is written back into (like the plaintext recv buffer on the non-TLS path).</summary>
+    public byte[]? KtlsRecv;
+
     // --- send serialisation (loop thread only) ---
     // A stream socket must not have two writers racing, and a partial write must be resumed before any
     // later bytes go out. Everything outbound therefore funnels through Pending, in order.

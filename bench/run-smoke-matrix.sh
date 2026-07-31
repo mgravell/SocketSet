@@ -148,6 +148,18 @@ for bi in 0 1; do   # iouring, epoll
         add_cell "$name" "$args" "uds-echo-pipe"
     done
 done
+# kTLS (kernel TLS offload) — io_uring and epoll only; needs the `tls` kernel module (modprobe tls) and,
+# for RX offload, OpenSSL 3.2+ (TX-only on older, which the [ktls] banner reports). Managed/RIO/IOCP have no
+# kTLS path, so no cells for them. Covers the out-of-band Flush leg (verify) plus callback and pipe echo.
+if command -v modprobe >/dev/null && [ -d /proc/net ] && (lsmod 2>/dev/null | grep -q '^tls' || [ -e /proc/net/tls_stat ]); then
+    for bi in 0 1; do   # iouring, epoll
+        add_cell "${backend_names[$bi]}+ktls/verify-oob-4m" "${backend_args[$bi]} --ktls --verify 4194304" verify-oob-4m
+        add_cell "${backend_names[$bi]}+ktls/echo-cb-64k"   "${backend_args[$bi]} --ktls --verify-echo 1048576 -z 65536" echo-cb-64k
+        add_cell "${backend_names[$bi]}+ktls/echo-pipe-4k"  "${backend_args[$bi]} --ktls --verify-echo 1048576 -z 4096 --pipe" echo-pipe-4k
+    done
+else
+    echo "note: kTLS cells skipped — the 'tls' kernel module is not loaded (modprobe tls to enable)"
+fi
 
 # Filter (glob).
 sel_names=(); sel_args=(); sel_rules=()

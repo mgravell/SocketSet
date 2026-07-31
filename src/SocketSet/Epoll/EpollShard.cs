@@ -8,6 +8,8 @@ using System.Runtime.InteropServices;
 using SocketSets.IoUring;
 using SocketSets.Native;
 using SocketSets.Tls;
+using SocketSets.Tls.OpenSsl;
+using static SocketSets.Tls.OpenSsl.NativeOpenSsl;
 
 namespace SocketSets.Epoll;
 
@@ -177,6 +179,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
             if (fd >= 0) LibC.close(fd);
             var tls = _conns[i].Tls;
             if (tls is not null) { _conns[i].Tls = null; tls.Dispose(); }
+            if (_conns[i].KtlsSsl != 0) { SSL_free(_conns[i].KtlsSsl); _conns[i].KtlsSsl = 0; }
         }
 
         if (_events != null) { NativeMemory.Free(_events); _events = null; }
@@ -285,6 +288,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.SendOffset = 0;
         conn.Pending?.Clear();
         conn.Tls = null;
+        conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
         conn.IsClient = false;
         // Bump the generation before publishing Fd: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
@@ -344,6 +348,10 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.SendOffset = 0;
         conn.WantWrite = false;
         if (conn.Tls is { } tls) { conn.Tls = null; tls.Dispose(); }
+        // kTLS: free the SSL (the fd it was bound to is already closed above; BIO_NOCLOSE, so SSL_free does
+        // not touch it). The reusable KtlsRecv buffer is kept for the next tenant. No SSL_shutdown: the fd
+        // is gone, so a close_notify could not be written anyway, and the peer sees a TCP FIN.
+        if (conn.KtlsSsl != 0) { SSL_free(conn.KtlsSsl); conn.KtlsSsl = 0; conn.KtlsReady = false; }
         conn.UserToken = null;
         conn.Flags = 0;
         conn.Closing = false;
@@ -530,9 +538,22 @@ internal sealed unsafe class EpollShard : SocketSetShard
     {
         conn.IsClient = isClient;
 
-        // TLS: the app must not see this connection until the handshake completes, so the open is
-        // deferred to the DriveTlsHandshake -> FireOpen call that follows completion.
-        if (Parent.Options.Tls is not null && conn.Tls is null) { BeginTls(conn, isClient); return; }
+        // TLS: the app must not see this connection until the handshake completes, so the open is deferred.
+        // kTLS (kernel offload) and userspace TLS are the two shapes; pick per provider capability + option.
+        // A kTLS connection's open is deferred to KtlsComplete, a userspace one to DriveTlsHandshake's
+        // FireOpen re-entry — so both branches return here without firing OnAccept/OnConnect.
+        if (Parent.Options.Tls is not null && conn.Tls is null && conn.KtlsSsl == 0)
+        {
+            // TlsClient/TlsServer are distinct types (no common base), so read the flag per side.
+            bool allowKernel = isClient
+                ? Parent.Options.TlsClient.AllowKernelOffload
+                : Parent.Options.TlsServer.AllowKernelOffload;
+            if (allowKernel && Parent.Options.Tls is { SupportsKernelOffload: true } and OpenSslTlsProvider kop)
+                StartKtls(conn, isClient, kop);   // OpenSSL owns the fd; readiness-driven; kernel does crypto
+            else
+                BeginTls(conn, isClient);          // userspace TLS via memory BIOs
+            return;
+        }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         conn.Opened = true;
@@ -577,6 +598,17 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // EPOLLERR alone is fatal. EPOLLHUP/EPOLLRDHUP are NOT: there may still be buffered inbound data
         // to read, and discarding it on the hangup event would truncate the last response.
         if ((events & LibC.EPOLLERR) != 0) { CloseClient(slot); return; }
+
+        // kTLS: a distinct data path (SSL_read for RX / plaintext write for TX, kernel does the crypto), so
+        // route it before the userspace pumps. While handshaking, either readiness event just steps the
+        // handshake; once ready, EPOLLOUT drains blocked plaintext sends and EPOLLIN drives SSL_read.
+        if (conn.KtlsSsl != 0)
+        {
+            if (!conn.KtlsReady) { KtlsPump(conn); return; }
+            if ((events & LibC.EPOLLOUT) != 0) { PumpSend(conn); if (conn.Fd < 0 || conn.Closing) return; }
+            if ((events & (LibC.EPOLLIN | LibC.EPOLLRDHUP | LibC.EPOLLHUP)) != 0) KtlsRead(conn);
+            return;
+        }
 
         if ((events & LibC.EPOLLOUT) != 0)
         {
@@ -873,6 +905,126 @@ internal sealed unsafe class EpollShard : SocketSetShard
     {
         if (cipher.IsEmpty || conn.Fd < 0 || conn.Closing) return;
         fixed (byte* p = cipher) SendBytes(conn, p, cipher.Length);
+    }
+
+    // =====================================================================
+    // kTLS (kernel TLS offload). OpenSSL is bound to the fd (socket BIO, SSL_OP_ENABLE_KTLS); once the
+    // handshake completes the DATA path is plaintext: TX writes plaintext and the kernel encrypts (so the
+    // normal SendBytes machinery is reused unchanged), RX is SSL_read (kernel decrypts when RX offload is
+    // available, else OpenSSL decrypts in userspace — capability is discovered, never assumed). This is the
+    // readiness-native analogue of io_uring's POLL-driven kTLS: epoll's EPOLLIN/EPOLLOUT ARE the readiness
+    // io_uring has to synthesise, so there is no multishot receive to forfeit — the backend kTLS should
+    // suit best (TODO item 3c).
+    // =====================================================================
+
+    private static int s_ktlsReported; // TX/RX offload state reported once per process (see io_uring's twin)
+
+    // Stand up the kTLS engine at open. The fd is already non-blocking and already registered for EPOLLIN
+    // (ConnEventsRead), so the handshake is driven purely by readiness — no extra arming for WANT_READ.
+    private void StartKtls(EpollConnection conn, bool client, OpenSslTlsProvider prov)
+    {
+        conn.IsClient = client;
+        conn.KtlsRecv ??= new byte[_recvBufSize];
+        // Client supplies TargetHost (SNI/verify); ALPN comes from whichever side's options apply.
+        conn.KtlsSsl = prov.CreateKernelSsl(conn.Fd, client,
+            client ? Parent.Options.TlsClient.TargetHost : null,
+            client ? Parent.Options.TlsClient.AlpnProtocols : Parent.Options.TlsServer.AlpnProtocols);
+        KtlsPump(conn);
+    }
+
+    // One handshake step. WANT_WRITE arms EPOLLOUT; WANT_READ needs nothing (EPOLLIN is always armed) beyond
+    // dropping any stale write-interest. Runs on the loop thread against a non-blocking fd, so never blocks.
+    private void KtlsPump(EpollConnection conn)
+    {
+        int ret = SSL_do_handshake(conn.KtlsSsl);
+        if (ret == 1) { KtlsComplete(conn); return; }
+        int err = SSL_get_error(conn.KtlsSsl, ret);
+        if (err == SSL_ERROR_WANT_WRITE) ArmWrite(conn);
+        else if (err == SSL_ERROR_WANT_READ) { if (conn.WantWrite) DisarmWrite(conn); }
+        else CloseClient(conn.Slot); // bad cert, verify failure, protocol error, …
+    }
+
+    // Handshake done + keys in the kernel: fire the deferred open (greeting rides the NORMAL plaintext send
+    // path — the kernel encrypts it), then let EPOLLIN drive reads. POLLIN is already armed, so app data
+    // coalesced after the final handshake flight surfaces on the next wake.
+    private void KtlsComplete(EpollConnection conn)
+    {
+        if (conn.WantWrite) DisarmWrite(conn); // no write-interest until an actual send blocks
+        ReportKtlsOnce(conn.KtlsSsl);
+        conn.KtlsReady = true;
+        // No TlsFilter here, so publish the ALPN result straight off the SSL — NegotiatedProtocol reads it.
+        conn.KernelAlpn = OpenSslTlsFilter.GetAlpnSelected(conn.KtlsSsl);
+
+        bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
+        conn.Opened = true; // app now sees it open → pairs with OnClosed
+        int sb;
+        if (conn.IsClient)
+        {
+            var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _bufSize : 0);
+            Parent.OnConnect(ref ctx);
+            sb = ctx.SendBytes;
+        }
+        else
+        {
+            var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _bufSize : 0);
+            Parent.OnAccept(ref ctx);
+            sb = ctx.SendBytes;
+        }
+        if (leased)
+        {
+            // Greeting is plaintext in the write page; kTLS TX encrypts it in the kernel, so it goes out the
+            // normal path (NOT SendEncrypted, which is the userspace-filter path).
+            if (sb > 0 && !conn.Closing && conn.Fd >= 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
+                SendBytes(conn, wp, sb);
+            _writeBuffer.Release(wi);
+        }
+    }
+
+    // Socket readable: drain every whole record SSL_read can surface, delivering each to the app and sending
+    // any inline response via the plaintext path (kernel encrypts). Level-triggered EPOLLIN re-fires when
+    // more arrives, so WANT_READ just returns.
+    private void KtlsRead(EpollConnection conn)
+    {
+        fixed (byte* p = conn.KtlsRecv)
+        {
+            while (true)
+            {
+                int n = SSL_read(conn.KtlsSsl, p, conn.KtlsRecv!.Length);
+                if (n > 0)
+                {
+                    var ctx = new SocketSet.ReceiveContext(conn, p, conn.KtlsRecv.Length, n);
+                    Parent.DispatchReceive(ref ctx);
+                    int response = ctx.ResponseBytes;
+                    if (response > 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0
+                        && conn.Fd >= 0 && !conn.Closing)
+                        SendBytes(conn, p, response);
+                    if (conn.Closing || conn.Fd < 0) return; // a callback / response tore it down
+                    continue; // more records may be buffered in the engine
+                }
+
+                int err = SSL_get_error(conn.KtlsSsl, n);
+                if (err == SSL_ERROR_WANT_READ) return;             // drained; EPOLLIN re-fires on more
+                if (err == SSL_ERROR_WANT_WRITE) { ArmWrite(conn); return; } // e.g. a renegotiation write
+                CloseClient(conn.Slot);                             // ZERO_RETURN (close_notify) / fatal / syscall
+                return;
+            }
+        }
+    }
+
+    // Report what the kernel ACTUALLY took, once per process — a silent TX-only degradation (OpenSSL < 3.2
+    // declines kTLS RX for TLS 1.3) is what made a year of io_uring kTLS numbers mean something other than
+    // they appeared to. Capability is discovered (BIO_get_ktls_recv), so an old OpenSSL degrades to RX in
+    // userspace rather than breaking — but it now says so.
+    private static void ReportKtlsOnce(nint ssl)
+    {
+        if (Interlocked.Exchange(ref s_ktlsReported, 1) != 0) return;
+        bool ktx = BIO_get_ktls_send(SSL_get_wbio(ssl));
+        bool krx = BIO_get_ktls_recv(SSL_get_rbio(ssl));
+        Console.Error.WriteLine(
+            $"[ktls/epoll] openssl={OpenSslVersionString()} tx={ktx} rx={krx}" +
+            (krx ? "" : " -- RX NOT offloaded: OpenSSL decrypts in userspace (SSL_read). Unlike io_uring this "
+                      + "costs epoll nothing structural — it is readiness-driven anyway. OpenSSL 3.2+ is "
+                      + "required for kTLS RX on TLS 1.3; see TODO item 4b."));
     }
 }
 #endif

@@ -109,7 +109,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 |---|---|---|---|---|---|---|
 | TLS in-transport | SChannel | SChannel | OpenSSL | OpenSSL | yes (per-conn gate) | *no - `SslStream` layered above* |
 | ALPN | yes | yes | yes | yes | yes | *yes (via `SslStream`)* |
-| kTLS | - | - | **yes** (TX always; **RX needs OpenSSL 3.2+**) | **no code at all** | - | *no* |
+| kTLS | - | - | **yes** (TX always; **RX needs OpenSSL 3.2+**) | **yes** (TX always; RX needs 3.2+) | - | *no* |
 | `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
