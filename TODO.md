@@ -8,16 +8,21 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 > **THIS CATCH-UP IS DONE (end of 2026-07-31 Linux session). What follows is kept for its reasoning; the
 > per-item status is inline.** In one paragraph: the shared changes are correctness-clean on Linux (new
-> `bench/run-smoke-matrix.sh`, **58/58** including kTLS cells), the size-sweep flat-check found the
+> `bench/run-smoke-matrix.sh`, **60/60** including kTLS and prefix-send cells), the size-sweep flat-check found the
 > transport throughput-neutral (the one mover was the BYO-default flip, not a regression), reuse-port shard
 > growth now works on io_uring + epoll (two gaps, not the one named), the io_uring TLS out-of-band stall
 > was a writev/IOV_MAX bug (fixed, NOT a geometry problem — so io_uring keeps `BufferGeometry.Default`),
 > and **epoll gained a real kTLS path (item 3c)** — whose pre-registered throughput prediction then
 > FALSIFIED itself (epoll+ktls trails epoll+tls ~9%, so the kTLS small-message penalty is the record path,
-> not multishot forfeiture), and **io_uring got zero-copy prefix sends** (§3 item 3 — measured that an 8MB
-> response was 100% copy, fixed it to 100% zero-copy). All committed and pushed to `main`. What is
-> genuinely still open on Linux: the TLS-renegotiation audit, and kTLS multishot with RX offload (items
-> 4/4b, which need OpenSSL 3.2+ and real hardware). The original handover text follows.
+> not multishot forfeiture), **io_uring got zero-copy prefix sends** (§3 item 3 — measured that an 8MB
+> response was 100% copy, fixed it to 100% zero-copy), and the **TLS renegotiation audit** landed
+> (server refuses client-initiated renegotiation via `SSL_OP_NO_RENEGOTIATION`; client keeps allowing
+> server-initiated; TLS 1.3 KeyUpdate untouched). All committed and pushed to `main`. **Active TLS
+> follow-ups in progress:** a `TlsOptions.MinProtocol` defaulting to TLS 1.3 (make 1.2 opt-in), then an
+> active KeyUpdate injection test. **Deferred (environment-gated):** kTLS multishot with RX offload (items
+> 4/4b — need OpenSSL 3.2+ and real hardware), SChannel renegotiation parity (Windows), and the
+> real-hardware session (item 5 — the only place kTLS NIC offload is visible). The largest remaining
+> Linux code lever is the Kestrel-bridge cost (24-42% at 256KB). The original handover text follows.
 
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
@@ -47,7 +52,7 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
 3. ~~**The smoke matrix, by hand**~~ **DONE, and the `.sh` runner is now written**: `bench/run-smoke-matrix.sh`
    (io_uring / epoll / managed x plaintext / `--tls-ssl` x verify / echo-cb / echo-pipe / poke / churn,
    plus `@abstract` UDS echo-pipe on the two native backends, plus `+ktls` verify/echo cells on io_uring
-   and epoll). Started at **51/52**, now **58/58** after a bug fix and the epoll+kTLS work. The pipe path is
+   and epoll). Started at **51/52**, now **60/60** after a bug fix, the epoll+kTLS work, and prefix-send cells. The pipe path is
    clean (every echo-pipe cell passes), the abstract-UDS guard correctly does NOT
    fire. The one initial FAIL (`iouring+tls/verify-oob-4m`) LOOKED like item 0d but was NOT a geometry
    problem — it was an **unbounded writev** (IOV_MAX), now fixed. See §3 item 2 for the full diagnosis; the
@@ -101,7 +106,7 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
    downloads, all `x`, exact length) and a new `echo-pipe-8m-deep` smoke cell (8MB, window 2048) guards the
    prefix boundary math on io_uring and epoll.
 4. **kTLS / epoll+kTLS.** ~~item 3c (epoll+kTLS pump)~~ **DONE 2026-07-31 — epoll runs real kTLS**, smoke
-   matrix has `+ktls` cells (58/58). Its throughput comparison is DONE too and falsified the pre-registered
+   matrix has `+ktls` cells (60/60). Its throughput comparison is DONE too and falsified the pre-registered
    prediction (epoll+ktls trails epoll+tls ~9%, so the kTLS penalty is the record path, not multishot
    forfeiture — see item 3c below).
    **items 4 / 4b (kTLS multishot receive)** remain open and need OpenSSL 3.2+ (RX offload) and real

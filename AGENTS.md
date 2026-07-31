@@ -65,6 +65,6 @@ both have caused hesitation:
   `--verify`, `--churn`, `--poke`, across backends, plaintext and TLS, callback and `--pipe`. Run it on
   every backend you touched — this is the hottest code in the repo and the only safety net.
   It is one command per OS now: **`bench/Run-SmokeMatrix.ps1`** on Windows (48 cells: IOCP/RIO/managed),
-  and **`bench/run-smoke-matrix.sh`** on Linux (58 cells: io_uring/epoll/managed x plaintext/OpenSSL-TLS,
+  and **`bench/run-smoke-matrix.sh`** on Linux (60 cells: io_uring/epoll/managed x plaintext/OpenSSL-TLS,
   plus `@abstract`-UDS and `+ktls` cells). Each reduces to one PASS/FAIL line per cell in ~3-6 minutes.
   Both exist because the gate was previously run by hand and so was skipped between OSes.

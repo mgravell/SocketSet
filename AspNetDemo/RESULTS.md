@@ -69,13 +69,23 @@ different OS and different dates.
 - **epoll gained a real kTLS path (item 3c).** `--epoll --ktls` now runs kernel TLS — epoll was the last
   backend with no kTLS code at all. TX is kernel-offloaded (plaintext `send()`, reusing the normal send
   path), RX is `EPOLLIN → SSL_read` (userspace decrypt on this box's OpenSSL 3.0.13: `[ktls/epoll]
-  tx=True rx=False`). Correctness-clean: smoke matrix 58/58 with new `+ktls` cells, ALPN over the kernel
+  tx=True rx=False`). Correctness-clean: smoke matrix 60/60 (incl. later prefix cells) with new `+ktls` cells, ALPN over the kernel
   path. **The throughput question it was built to answer is measured, and the pre-registered prediction is
   FALSIFIED:** epoll+ktls does NOT reach epoll+tls — same-session, 4 scored passes, disjoint, it trails
   **−9.3% at 512 B** (~537k vs ~592k rps) and −12.3% at 4 KB, comparable to io_uring+ktls's −11.7% / −7.3%.
   Since epoll forfeits no multishot receive, most of the kTLS small-message penalty is the **record path
   itself** (per-message RX `SSL_read`), not multishot forfeiture. TX-only offload here (RX userspace <
   OpenSSL 3.2); the RX-offloaded picture is still unmeasured. Full write-up: item 3c in `TODO.md`.
+- **io_uring zero-copy prefix sends (§3 item 3).** Measured that the >IovMax (1024-segment) decline is a
+  hard cliff: at 256KB the pipe path is 100% zero-copy, but an 8MB response was **100% copy** (`zero-copy=2`
+  of ~61k segments, overflowing into per-response pinned allocations). Fixed: `TrySendZeroCopy` returns
+  bytes-accepted and caps iovecs at IovMax, streaming a large sequence as several zero-copy writevs. After:
+  8MB is **100% zero-copy**. Byte-exact under concurrency; new `echo-pipe-8m-deep` smoke cell.
+- **TLS renegotiation audited + hardened.** The default is TLS 1.3 (no renegotiation; KeyUpdate already
+  handled), but TLS 1.2 is reachable and advertised "Secure Renegotiation IS supported" — the CVE-2011-1473
+  DoS shape. The SERVER now sets `SSL_OP_NO_RENEGOTIATION` (refuses client-initiated renegotiation, survives
+  cleanly); the CLIENT deliberately does not (would break legit server-initiated reneg from peers we dial).
+  Follow-up in progress: a `TlsOptions.MinProtocol` defaulting to TLS 1.3 to make 1.2 opt-in entirely.
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
