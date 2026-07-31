@@ -704,8 +704,10 @@ What the audit found (OpenSSL backends, io_uring/epoll — probed with `openssl 
 - **kTLS** cannot renegotiate (keys are fixed in the kernel); it runs TLS 1.3 here anyway, so KeyUpdate is
   the only post-handshake event and OpenSSL services it.
 
-Decision + change: **reject client-initiated renegotiation** by setting `SSL_OP_NO_RENEGOTIATION` on both
-OpenSSL contexts (`OpenSslTlsProvider`). Verified: a TLS 1.2 `R` (renegotiate) from s_client no longer
+Decision + change: **reject client-initiated renegotiation on the SERVER** by setting `SSL_OP_NO_RENEGOTIATION`
+on the server OpenSSL context only (`OpenSslTlsProvider`). The CLIENT context deliberately does NOT set it:
+that would refuse legitimate server-initiated renegotiation from servers we dial (a legacy TLS 1.2 pattern)
+with no DoS upside for a client. Verified: a TLS 1.2 `R` (renegotiate) from s_client no longer
 completes a second handshake and the server survives cleanly (no crash, no hang); TLS 1.3 and 1.2
 handshakes + data are unaffected (full smoke matrix green, incl. TLS echo/verify on io_uring + epoll). The
 flag does not touch TLS 1.3 KeyUpdate.
