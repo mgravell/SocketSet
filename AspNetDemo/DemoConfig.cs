@@ -90,9 +90,13 @@ internal sealed class DemoConfig
     /// the zero-copy send path) the number of per-segment pins.</summary>
     public int PipeSegment { get; private set; }
 
-    /// <summary>Back the bridge's pipes with a pinned-block pool and assert `pinned: true` to the
-    /// transport, so a zero-copy send skips per-segment GCHandle pinning entirely.</summary>
-    public bool PipePinned { get; private set; }
+    /// <summary>Back the bridge's pipes with a pinned-block pool and assert `pinned: true` to the transport,
+    /// so a zero-copy send skips per-segment GCHandle pinning entirely. DEFAULT TRUE (2026-07-31): this
+    /// matches vanilla Kestrel, which uses a PinnedBlockMemoryPool by default — an UNPINNED default made our
+    /// zero-copy send pay ~64 GCHandle pins per 256KB response that Kestrel does not, which was the ENTIRE
+    /// "bridge trails Kestrel at 256KB" gap (measured: pinned reaches parity/ahead). `--pipe-unpinned` opts
+    /// out (it costs less pinned RSS but reintroduces the per-segment pin, so it is the unfair comparison).</summary>
+    public bool PipePinned { get; private set; } = true;
 
     public string Scheme => Tls ? "https" : "http";
 
@@ -140,6 +144,7 @@ internal sealed class DemoConfig
                 case "--pipe-segment" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ps):
                     cfg.PipeSegment = ps; i++; break;
                 case "--pipe-pinned": cfg.PipePinned = true; break;
+                case "--pipe-unpinned": cfg.PipePinned = false; break; // opt out of the (default) pinned pool
 
                 case "-h":
                 case "--help": cfg.Help = true; break;

@@ -34,8 +34,15 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > bare-vs-bridged isolation showed bridged EPOLL 41% below its (fastest-measured) bare transport at 256KB
 > because epoll lacked BYO zero-copy send and copied the whole response on the pipe path. Implemented
 > epoll `writev` zero-copy send — **bridged epoll 256KB 7,732 → 10,894 MiB/s (+41%)**, now level with
-> io_uring. What remains of the bridge (the pump thread-hop + loop-thread marshal vs vanilla Kestrel's
-> tighter integration) is the structural part; io_uring's bridged 256KB is already within ~7% of Kestrel.
+> io_uring.
+>
+> **CORRECTION: the residual "Kestrel wins at 256KB" gap was a POOL-DEFAULT confounder, not the thread
+> model.** An inline-scheduler experiment made io_uring WORSE (−28%), killing the pump-hop hypothesis; the
+> real cause was per-segment pinning — Kestrel's pipes use a `PinnedBlockMemoryPool` by default, ours used
+> `MemoryPool.Shared`, so our zero-copy send paid ~64 GCHandle pins per 256KB response. With matched
+> (pinned) pools, io_uring AND epoll reach parity/edge ahead at 256KB (~12,650 vs Kestrel ~12,535). Fixed
+> by making the demo's pipe pool pinned by DEFAULT (`--pipe-unpinned` opts out). So with a fair pool we are
+> ≥ Kestrel across the plaintext size range; the bridge's structural pump-hop is NOT the 256KB bottleneck.
 >
 > **Zero-copy RECEIVE (item 7) was then built on epoll as a springboard and RESOLVED by measurement:** it
 > engages 100% and is byte-exact, but a same-session A/B (`SS_NO_ZC_RECV`) shows NO throughput win across

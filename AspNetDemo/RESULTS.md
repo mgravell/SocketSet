@@ -121,6 +121,30 @@ different OS and different dates.
   memory-bandwidth saturation across many cores is invisible on loopback, and the callback path is already
   copy-free so this is moot for callback-based (Redis/RPC-style) transports anyway.
 
+- **CORRECTION — "Kestrel wins at 256KB" was a POOL-DEFAULT confounder in our own demo, not a transport
+  or thread-model deficit.** Chasing the residual bridge gap: an inline-pipe-scheduler experiment
+  (`SS_PIPE_SCHED=inline`, resume the pump on Kestrel's thread instead of the ThreadPool) made io_uring
+  *worse* (−28%), which killed the thread-hop hypothesis. The real cause was **per-segment pinning**:
+  vanilla Kestrel backs its pipes with a `PinnedBlockMemoryPool` by default, so its zero-copy send needs no
+  per-op pinning — but AspNetDemo defaulted to `MemoryPool.Shared`, so OUR zero-copy send pinned ~64
+  segments (`GCHandle` per 4KB block) on every 256KB response. Same-session, 256KB, matched pools:
+
+  | | MiB/s | vs Kestrel |
+  |---|---:|---:|
+  | kestrel (control) | ~12,535 | — |
+  | io_uring, default `MemoryPool.Shared` | ~10,500 | −16% |
+  | **io_uring, pinned pool** | ~12,650 | **+1%** |
+  | epoll, default `MemoryPool.Shared` | ~10,750 | −14% |
+  | **epoll, pinned pool** | ~12,660 | **+1%** |
+
+  With matched (pinned) pools BOTH backends reach parity / edge ahead at 256KB — and we already led at
+  64KB (+5%) and small messages (+5.6% plaintext, +22% TLS). **So with a fair pool we are ≥ Kestrel across
+  the plaintext size range.** Fixed by making the demo's pipe pool **pinned by default** (matches Kestrel;
+  `--pipe-unpinned` opts out). This reframes the older "the bridge costs 24-42% at 256KB / Kestrel pays no
+  bridge" narrative below: much of that was the unpinned-pool handicap, and the structural pump-hop is NOT
+  the 256KB bottleneck (the inline experiment proved it). Standing caveat: the pinned pool costs ~2.7x RSS
+  at 2048 connections (item 2d) — the same tradeoff Kestrel makes by default.
+
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
 ### Linux flat-check: the shared changes are throughput-neutral, and the one thing that moved was a default flip (2026-07-31)

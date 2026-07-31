@@ -130,6 +130,13 @@ doing more work. **Measure cost per request at saturation**, where there are no 
 - **Power state.** On a laptop, battery vs mains is a large and *variable* difference in sustained power
   limit, not a few percent - never compare across the two. The current host is a desktop on mains, so this
   no longer applies here, but the older figures in `AspNetDemo/RESULTS.md` were taken on a laptop.
+- **Mismatched memory pools (an APPLES-TO-ORANGES default).** Comparing our ASP.NET path against vanilla
+  Kestrel at 256KB looked like a clean −14 to −16% loss for weeks — but Kestrel backs its pipes with a
+  `PinnedBlockMemoryPool` by default while AspNetDemo defaulted to `MemoryPool.Shared`, so OUR zero-copy
+  send paid ~64 `GCHandle` pins per 256KB response that Kestrel does not. That WAS the whole gap: with
+  matched (pinned) pools both backends reach parity/edge ahead. Fixed by pinning the demo pool by default
+  (2026-07-31; `--pipe-unpinned` opts out). Lesson: when you benchmark against another stack, match its
+  buffer/pool strategy, or you are measuring your own default's handicap, not the transport.
 - **Firewall prompts.** A pending Windows Firewall dialog held every leg to ~95k rps (2.8x) with no errors
   and no other symptom - and was then misread as a generator ceiling, so it cost a wrong conclusion as
   well as a wrong number. Do not rely on spotting the dialog: allow-list the binaries **by path**, for all

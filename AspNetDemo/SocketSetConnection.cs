@@ -57,6 +57,12 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         _conn = conn;
         _byo = byo;
         var sched = PipeScheduler.ThreadPool;
+        // EXPERIMENT (SS_PIPE_SCHED=inline): resume the OUTBOUND reader (the SocketSet pump) INLINE on the
+        // thread that flushed — i.e. Kestrel's request thread — instead of hopping to the ThreadPool. This
+        // is safe for the outbound pipe because only Kestrel flushes it (never the loop thread), so no pump
+        // work lands on the loop thread. Tests how much of the bridge cost is the read-side thread hop.
+        var outReader = Environment.GetEnvironmentVariable("SS_PIPE_SCHED") == "inline"
+            ? PipeScheduler.Inline : sched;
         // minimumSegmentSize and the pool are the two levers behind the "65 segments per 256KB response"
         // measurement (see PinnedBlockMemoryPool). Both default to the framework's choices so an unflagged
         // run is byte-for-byte the old behaviour.
@@ -65,7 +71,7 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         _inbound = new Pipe(new PipeOptions(pool, readerScheduler: sched, writerScheduler: sched,
             useSynchronizationContext: false, pauseWriterThreshold: 1 << 20, resumeWriterThreshold: 1 << 19,
             minimumSegmentSize: seg));
-        _outbound = new Pipe(new PipeOptions(pool, readerScheduler: sched, writerScheduler: sched,
+        _outbound = new Pipe(new PipeOptions(pool, readerScheduler: outReader, writerScheduler: sched,
             useSynchronizationContext: false, minimumSegmentSize: seg));
 
         Transport = this;
