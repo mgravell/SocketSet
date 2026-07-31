@@ -21,6 +21,12 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
     /// OnReceive. Exercises the caller-supplied-IDuplexPipe path end to end.</summary>
     public bool PipeMode { get; set; }
 
+    /// <summary>Pipe mode, but DRAIN inbound (read + discard) instead of echoing — makes the accepted
+    /// connection a pure RECEIVER over the pipe. With a flooding client (`--pipeline`) this isolates the
+    /// inbound (zero-copy-receive) path with no send-work diluting it. Received bytes count into
+    /// <see cref="Echoed"/> so the throughput is observable.</summary>
+    public bool SinkMode { get; set; }
+
     private readonly BlockingCollection<(Connection Conn, byte[] Data)> _pokes = new();
     private int _pokeStarted;
 
@@ -124,10 +130,18 @@ public class EchoServer(SocketSetOptions options) : SocketSet(options)
                     var buffer = result.Buffer;
                     if (!buffer.IsEmpty)
                     {
-                        foreach (var seg in buffer) appOut.Write(seg.Span);
-                        Interlocked.Add(ref _echoed, (long)buffer.Length);
-                        var f = await appOut.FlushAsync().ConfigureAwait(false);
-                        if (f.IsCompleted || f.IsCanceled) { appIn.AdvanceTo(buffer.End); break; }
+                        if (SinkMode)
+                        {
+                            // Pure receiver: count the bytes and discard them, no echo.
+                            Interlocked.Add(ref _echoed, (long)buffer.Length);
+                        }
+                        else
+                        {
+                            foreach (var seg in buffer) appOut.Write(seg.Span);
+                            Interlocked.Add(ref _echoed, (long)buffer.Length);
+                            var f = await appOut.FlushAsync().ConfigureAwait(false);
+                            if (f.IsCompleted || f.IsCanceled) { appIn.AdvanceTo(buffer.End); break; }
+                        }
                     }
                     appIn.AdvanceTo(buffer.End);
                     if (result.IsCompleted || result.IsCanceled) break;

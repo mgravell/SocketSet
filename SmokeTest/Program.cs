@@ -26,6 +26,7 @@ string? cpus = null; // CPU affinity spec, e.g. "0-5" or "0,2,4" or "0-3,8"
 string host = "127.0.0.1"; // client connect target (server always binds Any)
 int port = 10000;
 bool pipeMode = false;   // --pipe: accepted connections use ctx.UsePipe(IDuplexPipe) instead of OnReceive
+bool sink = false;       // --sink: pipe server drains instead of echoing (pure receiver)
 bool resp = false;          // >0: run the dumb RESP PING client against --host/--port
 string? tlsTrust = null;    // path to a PEM cert the TLS client should trust (external-server test)
 string tlsHost = "localhost"; // TargetHost for SNI + hostname verification
@@ -160,6 +161,12 @@ for (int i = 0; i < args.Length; i++)
             break;
         case "--pipe":
             pipeMode = true;
+            break;
+        case "--sink":
+            // Pipe mode where the server DRAINS instead of echoing — a pure receiver. Pair with --pipeline
+            // (unbounded client send) to flood the inbound path and measure receive throughput in isolation.
+            pipeMode = true;
+            sink = true;
             break;
         case "--poke":
             poke = true;
@@ -516,7 +523,7 @@ if (uds is not null) Console.WriteLine("note: UDS not supported on this target f
 listenEp = new IPEndPoint(IPAddress.Any, port);
 connectEp = new IPEndPoint(IPAddress.Parse(host), port);
 #endif
-using var set = new EchoServer(options) { GreetingSize = size, Window = window, PokeMode = poke, PipeMode = pipeMode, CloseAfterMessages = closeAfter };
+using var set = new EchoServer(options) { GreetingSize = size, Window = window, PokeMode = poke, PipeMode = pipeMode, SinkMode = sink, CloseAfterMessages = closeAfter };
 string mode = window == 1 ? "ping/pong" : window == int.MaxValue ? "pipeline(unbounded)" : $"pipeline(window={window})";
 Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +

@@ -338,10 +338,17 @@ above this one first; item 3 below is what you are here to do.**
    `SS_NO_ZC_RECV` A/B knob): it engages 100% (`zero-copy-recv=100.0%`, staged=0), byte-exact — **and a
    same-session ON-vs-OFF A/B at 256KB uploads shows NO difference** (~54.7k vs ~56.3k req/s, ranges fully
    overlapping). The inbound copy is rounding error against recv + pipe + Kestrel, exactly as estimated.
-   **So io_uring's much-harder zero-copy receive is NOT worth building** — the win it would chase does not
-   exist here. (Kept the epoll implementation as it advances the both-directions-zero-copy goal and removes
-   a real copy whose memory-bandwidth value is a real-NIC question; the backpressure/parking correctness
-   gap is untouched — the MVP falls back to the copy path under a pending flush rather than parking.)
+   **Triangulated across three workloads** after a challenge (was HTTP asymmetry / Kestrel overhead hiding
+   it?): the Kestrel `/drain` upload, a BARE symmetric pipe echo (no Kestrel), and the discriminating PURE
+   receive-flood (new `SmokeTest --sink` = a drain-only pipe server, flooded by a `--pipeline` client, so
+   receiver ≫ sender and nothing dilutes the copy) — all three show ON/OFF overlapping (the flood at
+   ~4,700 MiB/s inbound). The `recv()` kernel→user copy is unavoidable and dominates; the zero-copy path's
+   own `GetMemory`+lock ~cancels the transport copy it removes. **So io_uring's much-harder zero-copy
+   receive is NOT worth building** — the win it would chase does not exist here. (Kept the epoll
+   implementation as it advances the both-directions-zero-copy goal; the backpressure/parking correctness
+   gap is untouched — the MVP falls back to the copy path under a pending flush rather than parking. Standing
+   caveats: real-NIC bandwidth saturation is invisible on loopback, and the callback path is already
+   copy-free so this is moot for callback-based transports.)
 8. **Dynamic shard growth.** Specified, untouched. Now the largest *unstarted* item.
 
 **Deliberately deprioritised: kTLS multishot (items 4 / 4b), and a 2026-07-31 measurement weakened the

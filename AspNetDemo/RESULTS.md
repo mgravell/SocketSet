@@ -109,9 +109,17 @@ different OS and different dates.
   it buys nothing: 256KB uploads to a `/drain` endpoint, zero-copy receive ON vs OFF (`SS_NO_ZC_RECV`),
   interleaved — ~54.7k vs ~56.3k req/s, ranges fully overlapping (~14,000 MiB/s inbound either way).** So
   the inbound copy is rounding error against the recv syscall + pipe + Kestrel — confirming item 7's
-  estimate empirically. **Conclusion: do NOT speculatively build io_uring's much-harder zero-copy receive;
-  the win it chases does not exist on this box.** (Real-NIC memory-bandwidth effects stay untested here,
-  the usual loopback caveat.)
+  estimate empirically. **The finding was then triangulated across THREE workloads after a good challenge
+  (was the HTTP asymmetry / Kestrel overhead hiding the win?):** (1) Kestrel `/drain` upload — no win;
+  (2) BARE symmetric pipe echo (no Kestrel) — no win (~13 GB/s round-trip, ON/OFF overlapping); (3) the
+  discriminating case, a PURE unidirectional receive-flood (epoll `--sink` pipe server, flooding
+  `--pipeline` client, receiver ≫ sender, so nothing dilutes the copy) — STILL no win (~4,700 MiB/s
+  inbound, ON/OFF overlapping at both 64KB and 256KB). Why it holds even there: `recv()`'s kernel→user copy
+  is unavoidable and dominates, and the zero-copy path's own `GetMemory` + lock roughly cancels the
+  transport copy it removes; the bottleneck is the syscall/pipe, not memcpy. **Conclusion: do NOT
+  speculatively build io_uring's much-harder zero-copy receive.** Remaining honest caveats: real-NIC
+  memory-bandwidth saturation across many cores is invisible on loopback, and the callback path is already
+  copy-free so this is moot for callback-based (Redis/RPC-style) transports anyway.
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
