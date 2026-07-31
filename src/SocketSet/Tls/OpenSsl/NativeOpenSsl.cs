@@ -40,6 +40,10 @@ internal static unsafe partial class NativeOpenSsl
 
     // --- kTLS ---
     public const ulong SSL_OP_ENABLE_KTLS = 1UL << 3; // SSL_OP_BIT(3): let OpenSSL push keys to the kernel
+    // 0x40000000 (SSL_OP_BIT(30)): reject CLIENT-initiated renegotiation, the CVE-2011-1473 DoS shape where
+    // a client forces repeated expensive server handshakes. Only meaningful on TLS <= 1.2 (TLS 1.3 has no
+    // renegotiation); it does NOT affect TLS 1.3 KeyUpdate, which stays allowed. Set unconditionally.
+    public const ulong SSL_OP_NO_RENEGOTIATION = 1UL << 30;
     public const int BIO_CTRL_GET_KTLS_SEND = 73;     // BIO_get_ktls_send: is kernel TX-offload active?
     public const int BIO_CTRL_GET_KTLS_RECV = 76;     // BIO_get_ktls_recv: is kernel RX-offload active?
 

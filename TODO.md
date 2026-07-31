@@ -314,11 +314,16 @@ above this one first; item 3 below is what you are here to do.**
    backpressure is **advisory** rather than real — a correctness gap, which should be scheduled as one.
 8. **Dynamic shard growth.** Specified, untouched. Now the largest *unstarted* item.
 
-**Deliberately deprioritised: kTLS multishot (item 4).** It is unblocked (OpenSSL 3.2+ enables kTLS RX for
-TLS 1.3 — validated 2026-07-29), but kTLS measures **16-21% SLOWER** than userspace TLS even with both
-directions offloaded, the work is substantial, the system OpenSSL here is 3.0.13, and kTLS's actual payoff
-(NIC offload) is *structurally invisible* on loopback. It belongs to the real-hardware session (item 5),
-not to the next one.
+**Deliberately deprioritised: kTLS multishot (items 4 / 4b), and a 2026-07-31 measurement weakened the
+case further.** It is unblocked in principle (OpenSSL 3.2+ enables kTLS RX for TLS 1.3 — validated
+2026-07-29), but: the system OpenSSL here is **3.0.13** (RX not offloaded, so multishot-over-plaintext
+cannot even be attempted without a self-built OpenSSL), the work is substantial, and kTLS's actual payoff
+(NIC offload) is *structurally invisible* on loopback. **AND the whole premise of items 4/4b — that
+io_uring's kTLS cost is forfeiting multishot receive — was undercut by the item 3c measurement (2026-07-31):
+epoll+ktls trails epoll+tls by ~9% while forfeiting NO multishot, so the kTLS small-message penalty is the
+record path itself, and multishot-RX would recover at most the ~3% residual between io_uring's gap and
+epoll's — inside the noise.** So items 4/4b now chase ~3%, need a self-built OpenSSL, and show nothing of
+their real (NIC) value on loopback. Firmly a real-hardware session (item 5), not this box.
 
 **Where the remaining performance is, on the evidence rather than on intuition.** Three independent
 results now agree that the Kestrel bridge — not the transport, not copies, not allocation — is what costs
@@ -684,22 +689,36 @@ IOCP/RIO factoring below means writing it N times too.
 
 ## TLS renegotiation requests
 
-**Status: proposed, not started (added 2026-07-31).** Verify what the four TLS paths actually do when a
-peer requests renegotiation — SChannel (IOCP/RIO), OpenSSL userspace (io_uring/epoll), the managed gate,
-and kTLS — and decide whether to implement it or to reject it cleanly.
+**AUDITED 2026-07-31, and the OpenSSL side is HARDENED. The decision was "reject, don't implement" for
+renegotiation proper; KeyUpdate was already handled.**
 
-Why it needs a look rather than an assumption:
-- **kTLS cannot renegotiate** — once keys are handed to the kernel the session is fixed, so a renegotiation
-  request on a kTLS connection has to be refused or force a fallback, not silently wedge.
-- The userspace filters drive the handshake once and then treat the connection as data-phase
-  (`HandshakeComplete`); a mid-stream `SSL_read`/`SSL_write` returning "want handshake" is a path that may
-  not be exercised anywhere. Renegotiation is also a known DoS vector (CVE-2011-1473 shape), so the safe
-  default may well be to reject — but that should be a decision with a test behind it, not an accident.
-- TLS 1.3 removes renegotiation entirely (it has post-handshake auth / KeyUpdate instead); so part of this
-  is deciding whether we even care below 1.3, and whether KeyUpdate is handled.
+What the audit found (OpenSSL backends, io_uring/epoll — probed with `openssl s_client` against a live
+`SmokeTest -s --tls-ssl` server):
+- **The default negotiates TLS 1.3** (`TLS_AES_256_GCM_SHA384`), which has NO renegotiation — its rekey
+  mechanism is KeyUpdate, and that is already driven by the filter's `SSL_read` loop (post-handshake
+  messages are pulled and any control-record reply is written back; see `OpenSslTlsFilter.ProcessInbound`).
+  So on the default there was never a renegotiation-DoS exposure, and KeyUpdate needs no new code.
+- **BUT TLS 1.2 is reachable** — there is no min-version pin, so a client offering only 1.2 negotiates
+  `ECDHE-RSA-AES256-GCM-SHA384`, and the server advertised *"Secure Renegotiation IS supported"*. That is
+  the live CVE-2011-1473 shape: a client forcing repeated expensive server handshakes.
+- **kTLS** cannot renegotiate (keys are fixed in the kernel); it runs TLS 1.3 here anyway, so KeyUpdate is
+  the only post-handshake event and OpenSSL services it.
 
-First step is a test (extend `SmokeTest` to request a renegotiation / KeyUpdate and observe each backend),
-then a decision: implement, or refuse with a defined error rather than a stall.
+Decision + change: **reject client-initiated renegotiation** by setting `SSL_OP_NO_RENEGOTIATION` on both
+OpenSSL contexts (`OpenSslTlsProvider`). Verified: a TLS 1.2 `R` (renegotiate) from s_client no longer
+completes a second handshake and the server survives cleanly (no crash, no hang); TLS 1.3 and 1.2
+handshakes + data are unaffected (full smoke matrix green, incl. TLS echo/verify on io_uring + epoll). The
+flag does not touch TLS 1.3 KeyUpdate.
+
+**Still open (smaller):**
+- **SChannel (IOCP/RIO)** was NOT re-audited here (Windows box). It has an explicit `SEC_I_RENEGOTIATE`
+  path (`SChannelTlsFilter.cs:328`) that handles both TLS 1.2 renegotiation and TLS 1.3 KeyUpdate — so it
+  *accepts* renegotiation rather than refusing it. Decide on Windows whether to match the OpenSSL refusal
+  (schannel has `SCH_CRED_NO_...`/ disable-reconnect knobs) for parity.
+- **A min-version option** (pin TLS 1.3) would remove the 1.2 surface entirely; not added (1.2 interop kept
+  deliberately, pre-alpha). A `TlsOptions.MinProtocol` is the clean way if wanted.
+- **An active KeyUpdate injection test** (client calls `SSL_key_update` mid-stream and both sides keep
+  exchanging) is not yet in `SmokeTest`; KeyUpdate handling is code-verified, not test-verified.
 
 ## Factor the shared IOCP/RIO data path
 

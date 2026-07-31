@@ -50,6 +50,10 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
 
         _clientCtx = SSL_CTX_new(TLS_method());
         if (_clientCtx == 0) throw Err("SSL_CTX_new(client)");
+        // Reject client-initiated renegotiation (TLS <= 1.2 DoS hardening; no effect on TLS 1.3 KeyUpdate).
+        // A TLS 1.2 client is reachable here (no min-version pin), and the server otherwise advertises
+        // "Secure Renegotiation IS supported", so the vector is real. Set on both roles for symmetry.
+        SSL_CTX_set_options(_clientCtx, SSL_OP_NO_RENEGOTIATION);
         if (kernelOffload) { SSL_CTX_set_options(_clientCtx, SSL_OP_ENABLE_KTLS); ApplyKtlsRxOverride(_clientCtx); }
         if (trustCertPem is not null)
         {
@@ -69,6 +73,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
             if (serverKeyPem is null) throw new ArgumentNullException(nameof(serverKeyPem), "A server certificate needs its private key.");
             _serverCtx = SSL_CTX_new(TLS_method());
             if (_serverCtx == 0) throw Err("SSL_CTX_new(server)");
+            SSL_CTX_set_options(_serverCtx, SSL_OP_NO_RENEGOTIATION); // reject client renegotiation (see client ctx)
             if (kernelOffload) { SSL_CTX_set_options(_serverCtx, SSL_OP_ENABLE_KTLS); ApplyKtlsRxOverride(_serverCtx); }
             nint cert = LoadX509(serverCertPem);
             try
