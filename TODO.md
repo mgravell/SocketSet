@@ -2132,12 +2132,29 @@ on. It now throws `PlatformNotSupportedException` from `SocketSet.Listen`/`Conne
 **before any socket is created**, so nothing has to be unwound. Validation lives there rather than in a
 backend so every backend gets it: the managed path had the same hole.
 
-### STILL OPEN: a UDS-only connection leak under churn — item 0f
+### OPEN but MUCH milder than first recorded: a rare UDS churn leak — item 0f
 
-Not the same bug, and not fixed. Same churn shape, 5 reps each: **TCP 0/5 leaked, UDS 3/5**, always
-exactly one server-side connection (`live=1 (client=0 server=1)`) after a 6s churn moving ~12,000
-connections. It is a slot leak rather than a crash or a wedge, but sustained churn would exhaust the
-table. The smoke matrix does not catch it because its churn cell is TCP.
+**First recorded as "TCP 0/5, UDS 3/5", which was an unstable estimate from too few samples.** Measured
+properly it is rare and, crucially, **it does not accumulate**:
+
+| run | connections moved | leaked |
+|---|---:|---:|
+| first two batches, 9 reps total | ~12,000 each | **5 runs leaked `live=1`** |
+| bisection baseline, 6 reps | ~12,000 each | 0 |
+| soak, 3 x 6s + 3 x **60s** | **370,000 total** | **0** |
+
+So: observed five times, always exactly one server-side connection, **never reproduced on demand since**,
+and three 60-second runs moving 123,000 connections apiece came back clean. A per-connection leak would
+have shown ~10x more at 10x the connections; it showed none. That makes it a rare teardown one-off
+rather than the slot-exhaustion risk the first write-up implied.
+
+Bisection (6 reps per variant) found the controls clean — **TCP 0/6 and the MANAGED backend over UDS
+0/6** — so it remains UDS-and-IOCP-specific, but the baseline itself was 0/6 in that same run, which is
+the honest reason no variant can be credited or excluded. `bench/Bisect-UdsChurnLeak.ps1` is kept for
+whoever picks it up.
+
+**Priority: low.** It is real, it is quiet, and it does not grow. Do not spend a session on it before
+something with a measured cost.
 
 *The original entry follows, and its verdict should be read as retracted.*
 
