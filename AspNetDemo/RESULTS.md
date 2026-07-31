@@ -42,17 +42,30 @@ different OS and different dates.
   across io_uring / epoll / managed x plaintext / OpenSSL TLS and reports **51/52 PASS**. The rewritten
   `PipeIoBridge` pump (every echo-pipe cell), the new endpoint validation (abstract-UDS cells), and the
   `Flush` hand-off (verify cells) all pass on both Linux backends.
-- **The one FAIL is item 0d's twin on io_uring, and it is NOT new.** `iouring+tls/verify-oob-4m` stalls
-  (received=0) at the default 4KB page and passes in 0.2s at `--page 65536` — TLS out-of-band send starved
-  because a ~7000-byte encrypted record cannot cross a 4096 send page, exactly the mechanism that failed
-  RIO before its geometry fix. io_uring kept the 4KB page (unchanged by construction), so it still starves.
-  This is correctness evidence for the Linux `DefaultGeometry` decision (`TODO.md` §3 item 2), not a
-  regression from the shared changes.
+- **The one FAIL was NOT a geometry problem — it was an unbounded writev, now FIXED.** `iouring+tls/verify-oob-4m`
+  stalled (received=0), and `--page 65536` "fixed" it, which first looked like RIO's item 0d. It is not:
+  the real cause is an oversized `writev`. io_uring's TLS out-of-band send chunks the ciphertext into
+  page-sized segments and issued them as ONE `IORING_OP_WRITEV`; a ~4MB response at a 4KB page is ~1024
+  segments, which hits `IOV_MAX` (1024) and the kernel rejects the whole send with -EINVAL. The plaintext
+  OOB path already split chains at `IovMax`; the TLS path (`TlsSend`) bypassed it. Discriminating tests
+  nailed it: at page 4096, 3MB (~768 segs) passes and 5MB (~1280 segs) fails; at page 8192, 4MB (~512
+  segs) passes — the boundary tracks SEGMENT COUNT, not page-vs-record (the 64KB/1MB TLS cells pass at 4KB
+  page despite 7000-byte records). Fixed by routing both OOB paths through one `DispatchChainSplit`; TLS
+  verify now passes at 4MB / 5MB / **16MB** at the default 4KB page. So this is a bug fix, not a case for a
+  different `DefaultGeometry` — and the page-size sweep (below) confirms io_uring wants no page change.
 - **Dynamic shard growth now works on the reuse-port path** (io_uring + epoll over IP), which it never did
   before. It needed two fixes, not the one the handover named — a grown shard was given no listener (Gap A,
   both backends) and io_uring never triggered growth on a full local accept (Gap B, silent drop). Both
   fixed and proved by `bench/run-shard-growth.sh` (each backend grows 2→12 under load, holds at 2 with
   growth off); churn cells stay clean. Details in `TODO.md`'s dynamic-shard-growth section.
+- **io_uring wants NO page/geometry change (handover §3 item 2 answered).** `bench/run-page-sizes.sh` on
+  the bare responder, pages 4/16/64KB x payloads 512B/16KB/256KB, confirms the pre-registered prediction:
+  io_uring is page-INSENSITIVE. Medians (MiB/s, min-max in brackets): 512B 469.6 [469-471] / 468.3 / 472.1;
+  16KB 8,611 [8464-8809] / 8,388 / 8,719; 256KB **12,644 [12359-12950] (p4096)** vs **11,600 [11369-12615]
+  (p65536)** — ranges overlap and if anything the 64KB page is slightly WORSE at 256KB. Unlike RIO (which
+  can't scatter-gather, so page size is its only large-send lever and worth 4.68x), io_uring dispatches one
+  writev over a segment chain, so page size is not a throughput lever. With the writev-cap bug fixed, there
+  is no correctness reason for a bigger page either. Verdict: leave io_uring on `BufferGeometry.Default`.
 
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 

@@ -614,13 +614,23 @@ internal sealed class IoUringShard : SocketSetShard
             return;
         }
 
-        int fd = conn.Fd;
+        DispatchChainSplit(conn, conn.Fd, chain);
+    }
 
-        // One writev is capped at IovMax iovecs; split a larger chain into ordered sub-chains that
-        // serialize through the per-connection send queue (rare — needs >IovMax page-sized segments).
+    /// <summary>Dispatch a chain as one or more writevs, each capped at <see cref="IovMax"/> iovecs (writev
+    /// rejects more with -EINVAL). A larger chain is split into ordered sub-chains that serialize through
+    /// the per-connection send queue, preserving wire order. <paramref name="appData"/> (fire OnWrite on
+    /// completion) rides ONLY the last sub-chain, so a split encrypted response still fires OnWrite exactly
+    /// once — when the whole thing has gone out. Every producer of a chain that can exceed IovMax must go
+    /// through here: the plaintext OOB flush (large Connection.Send) and the TLS ciphertext send (TlsSend)
+    /// both can — a ~4MB response at a 4KB page is ~1024 page segments — and routing only one of them
+    /// through the cap is exactly the bug this centralises out (TLS verify-oob-4m stalled on an oversized
+    /// writev while the plaintext leg passed).</summary>
+    private void DispatchChainSplit(IoUringConnection conn, int fd, in OutChain chain, bool appData = false)
+    {
         if (chain.Count <= IovMax)
         {
-            DispatchChain(conn, fd, chain);
+            DispatchChain(conn, fd, chain, appData);
             return;
         }
 
@@ -629,7 +639,7 @@ internal sealed class IoUringShard : SocketSetShard
             int len = Math.Min(IovMax, chain.Count - start);
             var sub = new OutChain();
             sub.Add(in chain, start, len);
-            DispatchChain(conn, fd, sub);
+            DispatchChain(conn, fd, sub, appData && start + len >= chain.Count);
         }
     }
 
@@ -885,8 +895,10 @@ internal sealed class IoUringShard : SocketSetShard
     // =====================================================================
     // TLS (loop thread; see TlsFilter). No lock: the loop is the single owner, and OOB flushes are
     // already marshaled here — so the filter's not-thread-safe contract holds natively (unlike managed).
-    // All TLS output rides the OOB chain path (TlsSend -> DispatchChain -> WriteV), reusing the validated
-    // scatter-gather send + teardown machinery, so arbitrary-size ciphertext records just work.
+    // All TLS output rides the OOB chain path (TlsSend -> DispatchChainSplit -> WriteV), reusing the
+    // validated scatter-gather send + teardown machinery. Arbitrary-size ciphertext works because the
+    // chain is split at IovMax per writev — for a while it was NOT (TlsSend called DispatchChain directly),
+    // so a ~4MB response at a 4KB page overran the 1024-iovec limit and stalled; see DispatchChainSplit.
     // =====================================================================
 
     // Stand up the per-connection engine at open, arm recv, and take the first handshake step (a client
@@ -1051,7 +1063,9 @@ internal sealed class IoUringShard : SocketSetShard
             }
             off += take;
         }
-        DispatchChain(conn, fd, chain, appData);
+        // Split at IovMax: a large record (or a coalesced flush) chunked by a small page can exceed the
+        // per-writev iovec limit — a ~4MB ciphertext at a 4KB page is ~1024 segments.
+        DispatchChainSplit(conn, fd, chain, appData);
     }
 
     // =====================================================================

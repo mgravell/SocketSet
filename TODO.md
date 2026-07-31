@@ -33,13 +33,12 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
    anywhere; no read site missed. io_uring confirmed as the auto-detected default (`IoUringFactory`).
 3. ~~**The smoke matrix, by hand**~~ **DONE, and the `.sh` runner is now written**: `bench/run-smoke-matrix.sh`
    (io_uring / epoll / managed x plaintext / `--tls-ssl` x verify / echo-cb / echo-pipe / poke / churn,
-   plus `@abstract` UDS echo-pipe on the two native backends). **51/52 PASS.** The pipe path is clean
-   (every echo-pipe cell passes), the abstract-UDS guard correctly does NOT fire, and the Flush/out-of-band
-   verify cells pass everywhere except **the one FAIL: `iouring+tls/verify-oob-4m`** (received=0, stalls
-   15s). That is NOT a regression from the shared changes — it is the io_uring analog of item 0d: TLS
-   out-of-band send starves at the default 4KB page (a ~7000-byte encrypted record cannot make progress
-   through a 4096 send page). `--page 65536` fixes it in 0.2s, exactly as it fixed RIO's 0d. This is
-   correctness evidence for the `DefaultGeometry` decision (§3 item 2), not a bug in the new code.
+   plus `@abstract` UDS echo-pipe on the two native backends). Started at **51/52**, now **52/52** after a
+   bug fix. The pipe path is clean (every echo-pipe cell passes), the abstract-UDS guard correctly does NOT
+   fire. The one initial FAIL (`iouring+tls/verify-oob-4m`) LOOKED like item 0d but was NOT a geometry
+   problem — it was an **unbounded writev** (IOV_MAX), now fixed. See §3 item 2 for the full diagnosis; the
+   short version is the TLS out-of-band send issued a single `writev` of ~1024 page-segments for a 4MB
+   response and the kernel rejected it with -EINVAL. `--page 65536` masked it by cutting the segment count.
 4. ~~**A size sweep against the recorded numbers**, which should be flat.~~ **DONE 2026-07-31 — flat, and
    the one mover was a default flip, not a shared-code regression.** `bench/run-tls-sizes.sh` reproduces
    the payload-sweep table within ~3% everywhere (Kestrel control 12,450.9 vs recorded 12,450.5 = 0.0%)
@@ -57,14 +56,25 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
    2→12 under load; `bench/run-shard-growth.sh`). See the dynamic-shard-growth section below for Gap A
    (listener replay) and Gap B (io_uring's silent local-accept drop) in full. Verified no regression: the
    smoke-matrix churn cells stay clean on both backends.
-2. **Decide whether Linux wants a different `DefaultGeometry`.** The mechanism now exists to say so per
-   backend. io_uring's read pool is per-SHARD so it can afford a big page where epoll's per-SOCKET slab
-   cannot. **Do not override without a measurement** — RIO's override has a 4.68x result and a
-   correctness-gate failure behind it. **NEW EVIDENCE 2026-07-31:** io_uring now has a correctness-gate
-   failure of its own — `iouring+tls/verify-oob-4m` stalls at the default 4KB page and passes at
-   `--page 65536` (the 0d analog; see §2 step 3). So the case for an io_uring page bump is no longer only
-   throughput; it is also this stall. Still needs the throughput/RSS sweep before flipping the default,
-   because io_uring reads all three pool depths and the page rescales them.
+2. ~~**Decide whether Linux wants a different `DefaultGeometry`.**~~ **ANSWERED 2026-07-31: NO, io_uring
+   stays on `BufferGeometry.Default`.** Two things had to be true to justify a bigger page, and neither is:
+
+   - *Correctness.* The `iouring+tls/verify-oob-4m` stall looked like RIO's item 0d but is a different
+     mechanism. The TLS out-of-band send (`TlsSend`) chunks ciphertext into page-sized segments and issued
+     them as ONE `IORING_OP_WRITEV`; a ~4MB response at a 4KB page is ~1024 segments, which hits `IOV_MAX`
+     and the kernel rejects the whole send with -EINVAL. It is SEGMENT COUNT, not page-vs-record:
+     discriminating tests at page 4096 show 3MB (~768 segs) PASS and 5MB (~1280 segs) FAIL, and page 8192
+     + 4MB (~512 segs) PASSES — and the 64KB/1MB TLS cells always passed at a 4KB page despite 7000-byte
+     records. The plaintext OOB path already split at `IovMax` (`PumpFlush`); the TLS path bypassed it.
+     **Fixed** by routing both through one `DispatchChainSplit` (`appData` rides only the last sub-chain so
+     OnWrite still fires once). TLS verify now passes at 4MB/5MB/**16MB** at the default 4KB page. A bigger
+     page would only have masked this — page 65536 still fails at 64MB.
+   - *Throughput.* `bench/run-page-sizes.sh` (bare responder, pages 4/16/64KB) confirms the pre-registered
+     prediction: io_uring is page-INSENSITIVE. 256KB medians 12,644 (p4096) vs 11,600 (p65536) — the 64KB
+     page is if anything slightly slower. Unlike RIO (no scatter-gather, so page size is worth 4.68x),
+     io_uring dispatches one writev over a segment chain, so the page is not a throughput lever.
+
+   Net: RIO needed 64KB for both reasons; io_uring needs it for neither. Leave the default alone.
 3. **Prefix sends on io_uring.** It keeps all-or-nothing; its cap is `IovMax` 1024 against IOCP's 256, so
    the cliff is far away rather than absent. Worth measuring before building.
 4. **kTLS / epoll+kTLS (items 4, 4b, 3c)** — unchanged, and still Linux-only.
@@ -640,6 +650,25 @@ problem, and reclaiming a shard means draining its connections first.
 touching all four backends' startup/teardown. TLS was written twice, epoll made the send machinery a
 third copy, `fa97dd4` paid an ownership rule out three times. Landing dynamic shards before the
 IOCP/RIO factoring below means writing it N times too.
+
+## TLS renegotiation requests
+
+**Status: proposed, not started (added 2026-07-31).** Verify what the four TLS paths actually do when a
+peer requests renegotiation — SChannel (IOCP/RIO), OpenSSL userspace (io_uring/epoll), the managed gate,
+and kTLS — and decide whether to implement it or to reject it cleanly.
+
+Why it needs a look rather than an assumption:
+- **kTLS cannot renegotiate** — once keys are handed to the kernel the session is fixed, so a renegotiation
+  request on a kTLS connection has to be refused or force a fallback, not silently wedge.
+- The userspace filters drive the handshake once and then treat the connection as data-phase
+  (`HandshakeComplete`); a mid-stream `SSL_read`/`SSL_write` returning "want handshake" is a path that may
+  not be exercised anywhere. Renegotiation is also a known DoS vector (CVE-2011-1473 shape), so the safe
+  default may well be to reject — but that should be a decision with a test behind it, not an accident.
+- TLS 1.3 removes renegotiation entirely (it has post-handshake auth / KeyUpdate instead); so part of this
+  is deciding whether we even care below 1.3, and whether KeyUpdate is handled.
+
+First step is a test (extend `SmokeTest` to request a renegotiation / KeyUpdate and observe each backend),
+then a decision: implement, or refuse with a defined error rather than a stall.
 
 ## Factor the shared IOCP/RIO data path
 
