@@ -878,7 +878,54 @@ kernel or the environment.
 
 ### 1c. Configurable read depth (multiple outstanding receives) - IOCP and RIO
 
-**Status: proposed, not started. Feasibility confirmed 2026-07-27.**
+**Status: proposed, not started. Feasibility confirmed 2026-07-27. PREMISE MEASURED 2026-07-31 — the
+window is real and large, but the entry's assumption that CLOSING it is a win may have the sign
+backwards. Read that section before building this.**
+
+### The re-arm window is real: up to 9.5 messages coalesce into one receive
+
+The prerequisite this entry names — "Do first: build a receive-heavy benchmark… does not exist in
+`bench/` yet" — now exists (`Run-Upload.ps1`, 2026-07-31). But the premise is observable without
+implementing anything: if data piles up in the kernel buffer while nothing is posted, receives must
+COALESCE, so `avg bytes/recv` should exceed the message size. Swept over pipeline depth, `--iocp -c 64`,
+with `--recv-buffer 65536` so the measurement is not capped by the buffer:
+
+| message | window=1 | window=8 | window=64 |
+|---|---|---|---|
+| 512 B | 1.00x | 2.16x | **3.87x** |
+| 4 KB | 1.00x | 2.67x | **9.50x** |
+
+**Confirmed: at depth, one receive drains up to 9.5 messages.** The window is hit constantly, exactly as
+the entry predicted, and it scales with in-flight depth.
+
+*(A first attempt at this measured 4KB messages against the default 4096-byte receive buffer, where `avg`
+is capped by the buffer and can never show coalescing — the 4KB row read a flat 1.00x and looked like
+evidence of no window at all. A `-z 16384` row is likewise void: `--size` is clamped to the page size, so
+it silently measured 4KB messages.)*
+
+### But coalescing is not obviously a COST, and that is the problem with the rationale
+
+This entry argues the window is bad because data "is copied out on the next receive rather than going
+straight into ours". What the measurement actually shows is **batching**: 9.5 messages retrieved per
+completion instead of one. Fewer completion-port round trips per message is the same effect that made
+scatter-gather sends worth **+133%** here — this codebase's biggest measured win came from doing exactly
+this on the send side.
+
+So read depth > 1 would *reduce* batching, and might cost rather than gain. That is not a prediction that
+it will — it is a statement that the sign is unknown and the entry assumes it.
+
+**Pre-registered, for whoever builds it:** if the window is a cost, `ReadDepth=4` should raise throughput
+at small messages with deep pipelining (512B/window=64, where coalescing is 3.87x). If throughput is flat
+or falls while `avg bytes/recv` drops toward 1x, the window was providing useful batching and this whole
+line of work should stop.
+
+**Weigh that against the price**, which is not small: the recv slab grows N x `SocketsPerShard`, RIO pays
+non-paged pool per connection on top, and **ordering stops being structural** — TLS records are
+sequence-numbered, so one out-of-order delivery kills the connection rather than degrading it. That is a
+lot of risk for an effect whose sign has not been established.
+
+*Original entry follows.*
+
 
 Both Windows backends currently keep **exactly one receive outstanding per connection**: `RecvBuf` is a
 single slab index leased for the connection lifetime and `RecvArmed` is a bool, so the cycle is strictly
