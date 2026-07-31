@@ -83,10 +83,45 @@ internal sealed class PipeIoBridge
     private bool _flushPending;
     private readonly Queue<ArraySegment<byte>> _staged = new();
 
+    // ---- SS_BRIDGE_STATS=1: how expensive IS the inbound path, really? --------------------------------
+    //
+    // Added 2026-07-31, BEFORE building receive parking, to decide whether it is worth building at all.
+    // Parking's whole payoff is removing the SECOND copy - the staged one - and making backpressure real.
+    // If flushes almost always complete synchronously under real load then staging is rare, parking buys
+    // nothing measurable, and the honest thing is to say so rather than ship a cross-backend change on a
+    // plausible story. This is the inbound version of "confirm the fast path was TAKEN": measure how
+    // often the slow path is even reached before optimising it.
+    //
+    // Off by default (a static readonly bool read once), like the three backend counters.
+    private static readonly bool ReportStats =
+        Environment.GetEnvironmentVariable("SS_BRIDGE_STATS") == "1";
+
+    private static long s_recv, s_recvBytes;        // inbound callbacks and their bytes (copy #1, always paid)
+    private static long s_flushSync, s_flushAsync;  // flushes that completed inline vs went async
+    private static long s_staged, s_stagedBytes;    // copy #2: only paid when a flush was outstanding
+
+    private static void DumpStats(string tag)
+    {
+        long recv = Interlocked.Read(ref s_recv);
+        if (recv == 0) return;
+        long staged = Interlocked.Read(ref s_staged);
+        long async_ = Interlocked.Read(ref s_flushAsync);
+        Console.Error.WriteLine($"[bridge-stats:{tag}] receives={recv:n0} ({Interlocked.Read(ref s_recvBytes) / (double)(1 << 20):n1} MiB) " +
+            $"flush: sync={Interlocked.Read(ref s_flushSync):n0} async={async_:n0} ({(recv > 0 ? 100.0 * async_ / recv : 0):n1}% of receives) | " +
+            $"STAGED (second copy)={staged:n0} ({(recv > 0 ? 100.0 * staged / recv : 0):n1}% of receives, " +
+            $"{Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB)");
+    }
+
+    private static readonly Timer? StatsTimer = ReportStats
+        ? new Timer(static _ => DumpStats("periodic"), null, 2000, 2000)
+        : null;
+
     /// <summary>Inbound data, on the loop thread, in place of <c>OnReceive</c>.</summary>
     internal void OnReceived(ReadOnlySpan<byte> data)
     {
         if (Volatile.Read(ref _completed) != 0 || data.IsEmpty) return;
+
+        if (ReportStats) { Interlocked.Increment(ref s_recv); Interlocked.Add(ref s_recvBytes, data.Length); }
 
         ValueTask<FlushResult> flush;
         lock (_inGate)
@@ -97,6 +132,7 @@ internal sealed class PipeIoBridge
                 var buf = ArrayPool<byte>.Shared.Rent(data.Length);
                 data.CopyTo(buf);
                 _staged.Enqueue(new ArraySegment<byte>(buf, 0, data.Length));
+                if (ReportStats) { Interlocked.Increment(ref s_staged); Interlocked.Add(ref s_stagedBytes, data.Length); }
                 return;
             }
 
@@ -104,10 +140,12 @@ internal sealed class PipeIoBridge
             flush = _pipe.Output.FlushAsync();
             if (flush.IsCompletedSuccessfully)
             {
+                if (ReportStats) Interlocked.Increment(ref s_flushSync);
                 var r = flush.Result;
                 if (r.IsCompleted || r.IsCanceled) _conn.Close(); // reader is gone
                 return;
             }
+            if (ReportStats) Interlocked.Increment(ref s_flushAsync);
             _flushPending = true;
         }
         _ = DrainFlushesAsync(flush);

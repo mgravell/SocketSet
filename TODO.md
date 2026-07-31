@@ -220,10 +220,16 @@ above this one first; item 3 below is what you are here to do.**
    (overlapping ranges) - unlike Linux. **What it spawned, and both are now ahead of item 7:** item 2f
    (make zero-copy survive a fragmented sequence, so this is a default rather than a demo flag) and item
    0d (RIO+TLS out-of-band starvation, the one failing correctness cell).
-7. **Zero-copy RECEIVE + receive parking.** The last structural term against vanilla Kestrel, which is
-   zero-copy in *both* directions while we still copy inbound (and copy a *second* time into `_staged`
-   under backpressure). Parking is also the only thing that makes inbound backpressure real rather than
-   advisory — the same mechanism buys both. Not started.
+7. ~~**Zero-copy RECEIVE + receive parking.** The last structural term against vanilla Kestrel~~
+   **DEPRIORITISED 2026-07-31 — the premise was never measured, and it does not hold.** The inbound path
+   had never been benchmarked at all (no rig POSTed a body until `Run-Upload.ps1`). Measured against a
+   same-session Kestrel control, the inbound gap is **at most ~5%, and only disjoint at 4KB** — at 64KB
+   and 1MB the ranges overlap outright. And `SS_BRIDGE_STATS` shows the second (`_staged`) copy is paid
+   on **0.1% of receives / 0.011% of bytes** even at 1MB uploads, because flushes complete synchronously
+   essentially always.
+   **So neither half is a throughput item.** Zero-copy receive is chasing ≤5%, of which the copy is only
+   a part; parking is chasing 0.011%. The ONLY surviving argument for parking is that inbound
+   backpressure is **advisory** rather than real — a correctness gap, which should be scheduled as one.
 8. **Dynamic shard growth.** Specified, untouched. Now the largest *unstarted* item.
 
 **Deliberately deprioritised: kTLS multishot (item 4).** It is unblocked (OpenSSL 3.2+ enables kTLS RX for

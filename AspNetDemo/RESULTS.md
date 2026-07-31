@@ -447,6 +447,53 @@ worktree binaries were not being throttled - and all three A/Bs agreed with each
 **What the confounder did change** is only the item 0e frequency table, which is corrected above - and it
 made the bug *worse* than recorded, not better.
 
+## The receive path, measured for the first time — and it retires item 7's premise (2026-07-31)
+
+**No rig in this repo had ever measured the inbound path.** `/echo` has consumed request bodies since the
+demo was written and **not one harness had ever POSTed to it**: every benchmark sends a small request and
+scores a large response. That is the same blind spot that let item 0e hide behind a suite that never
+churned connections, and it meant the receive-side work was about to be done blind.
+
+`bench/Run-Upload.ps1` (new) fixes it. POST `/echo`, goodput scored on the REQUEST body — **not
+comparable with the response tables**. IOCP, 12 shards, `-c 64`, 6 scored passes, same-session Kestrel
+control, zero errors:
+
+| body | classic | byo | byo-pin | *kestrel (control)* | best vs kestrel |
+|---|---:|---:|---:|---:|---|
+| 4 KB | 697.7 | 699.0 | 702.0 | 735.2 | **-4.5%** (disjoint) |
+| 64 KB | 1,650.6 | 1,721.6 | **1,832.5** | 1,750.8 | *overlapping* |
+| 1 MB | 1,256.2 | 1,343.2 | 1,390.2 | 1,514.0 | *overlapping* |
+
+### What this retires
+
+The standing story was: *"Kestrel is zero-copy in BOTH directions while we still copy inbound, and copy a
+second time into `_staged` under backpressure — that is the last structural term."* It is the stated
+premise of order-of-work item 7 (zero-copy receive + receive parking), described there as the largest
+remaining item.
+
+**Measured, the inbound gap to Kestrel is at most ~5%, and is only disjoint at 4KB.** At 64KB and 1MB
+the ranges overlap — SocketSet is not measurably behind at all, and `byo-pin`'s 64KB median is *above*
+Kestrel's.
+
+And the second copy, which parking exists to remove, is **almost never paid** (`SS_BRIDGE_STATS=1`, new):
+
+| body | receives | flushes that went async | **staged (second copy)** |
+|---|---:|---:|---:|
+| 4 KB | 1,884,842 | 0 | **0** |
+| 64 KB | 2,240,617 | 0 | **0** |
+| 1 MB | 1,616,016 | 2,719 (0.2%) | **1,721 — 0.1% of receives, 0.7 of 6,289 MiB** |
+
+**So flushes complete synchronously essentially always, and staging costs 0.011% of inbound bytes at
+worst.** Receive parking cannot be justified as a throughput optimisation; there is nothing there to
+win. Zero-copy receive removes copy #1, whose total available prize is the ≤5% above — and only part of
+that gap is the copy.
+
+**What remains true, and is now the ONLY argument for parking:** inbound backpressure is *advisory*
+today. A flush that does not complete synchronously is observed asynchronously and the writer keeps
+accepting bytes, so a slow consumer is not actually throttled. That is a **correctness/semantics** gap,
+not a performance one, and it should be argued and scheduled on that basis. The 0.2%-async figure above
+also says how rarely it currently bites.
+
 ## Windows validation after the OS switch (2026-07-29)
 
 Windows had run nothing since 2026-07-27 while shared code changed underneath it on Linux. This is the
