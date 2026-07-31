@@ -253,6 +253,21 @@ Against the same-session Kestrel control, ranges disjoint unless stated:
 | 256 KB | **-60.3%** | *overlapping* — **parity** |
 | 1 MB | **-52.6%** | **+14.2% — SocketSet is FASTER** |
 
+**The BYO bridge became the DEFAULT on 2026-07-31 on the strength of this table** (`--classic` opts
+out). The justification is the `classic` vs `--byo` columns above, which are the same code either way -
+the flag only chooses which bridge is constructed:
+
+| payload | classic | `--byo` | |
+|---|---:|---:|---|
+| 512 B | 113.2 | 112.3 | overlapping |
+| 16 KB | 3,317.4 | 3,197.4 | overlapping — **byo's median is 3.6% lower here**, the one row that is not a win |
+| 256 KB | 4,052.8 | 7,422.2 | **+83%** |
+| 1 MB | 2,341.9 | 4,422.0 | **+89%** |
+
+So it is never significantly worse and is enormous where it matters. The 16KB row is stated rather than
+buried: it is inside the noise (both legs spread ~10% there), but it is the cell to watch if the bridge
+is ever tuned further.
+
 **This is the first time anything in this repo has beaten vanilla Kestrel at a large payload**, and it is
 the combined effect of the day's work: the segment cap became a prefix (so zero-copy engages at any
 size), the cap itself was split from `MaxSendPages`, and the geometry mechanism let RIO stop being

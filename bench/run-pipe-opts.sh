@@ -62,7 +62,7 @@ echo "size,leg,rep,rps,mib_s,lat_p50_us,lat_p99_us,errors,status" > "$CSV"
 
 # name | extra args | /config fragment that MUST be present | fragment that must be ABSENT
 LEGS=(
-  "classic|||byo=pipe"          # no required fragment; must NOT report byo=pipe
+  "classic|--classic|byo=off|byo=pipe"   # byo is the DEFAULT now: classic must be asked for
   "byo|--byo|byo=pipe|pipeseg="
   "byo+seg|--byo --pipe-segment $SEG|pipeseg=$SEG|pipepinned="
   "byo+seg+pin|--byo --pipe-segment $SEG --pipe-pinned|pipepinned=1|"

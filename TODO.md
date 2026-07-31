@@ -1632,10 +1632,28 @@ control (2026-07-30):** the tuned configuration is now **+14.2% FASTER than vani
 beaten Kestrel at a large payload. `--pipe-segment` still earns +27.6% at 1MB and +37.9% at 256KB over
 plain `--byo`, so segments-per-send remains a real second effect even with the cliff gone.
 
-**The number that matters for anyone NOT opting in is unchanged and bad:** the default `classic` bridge
-is **-60.3% against Kestrel at 256KB** and -52.6% at 1MB. Everything above is behind `--byo`. Making the
-BYO bridge the default — or getting the classic path closer — is the obvious next question, and it has
-never been asked directly.
+**~~The number that matters for anyone NOT opting in is unchanged and bad~~ — ANSWERED 2026-07-31 by
+making BYO the DEFAULT.** The classic bridge was -60.3% against Kestrel at 256KB and -52.6% at 1MB, and
+everything good was behind an opt-in flag. `DemoConfig.ByoPipe` now defaults to true; `--classic`
+(alias `--no-byo`) opts out.
+
+*Three things that were not one-liners, recorded because the sketch "just default the property to true"
+misses them:*
+
+- **`--kestrel` would have thrown on startup.** `Validate` rejected `ByoPipe && VanillaKestrel`, so the
+  default would have failed every vanilla-Kestrel control leg — the leg every headline comparison is
+  measured against. It now turns the default off silently for `--kestrel` and rejects only an EXPLICIT
+  `--byo` alongside it, which is a real contradiction rather than a default that does not apply.
+- **The banner said `byo=pipe` only when ON**, so "classic" was the ABSENCE of a string. Fine while byo
+  was opt-in; useless as a default, and a harness gating on absence cannot tell classic from an older
+  build that had no byo at all. It now always reports `byo=pipe` or `byo=off`.
+- **Three rigs took the classic leg as the no-flag leg** (`Run-Byo.ps1` x2, `run-byo.sh`,
+  `run-pipe-opts.sh`) and asserted it must NOT report `byo=pipe`. All now pass `--classic` explicitly and
+  gate on `byo=off`.
+
+**The classic path is kept, not deprecated:** it is the control every zero-copy claim is measured
+against, and it is the only path available on backends that cannot do zero-copy send at all (RIO,
+managed).
 
 *Original entry (option 1) follows.*
 

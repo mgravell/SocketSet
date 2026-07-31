@@ -108,10 +108,10 @@ function Set-Affinity([System.Diagnostics.Process]$Process, [int64]$Mask, [strin
 # has produced confident nonsense from more than once; the control has to run in the SAME session,
 # reshuffled into the same passes. It takes no --shards (its transport has no shards) and is opted in.
 $legs = @(
-    @{ Name = "classic";        Args = @();                                     Want = "";              Deny = "byo=pipe" }
+    @{ Name = "classic";        Args = @("--classic");                          Want = "byo=off";       Deny = "byo=pipe" }
     @{ Name = "byo";            Args = @("--byo");                              Want = "byo=pipe";      Deny = "pipeseg" }
     @{ Name = "byo-seg64k";     Args = @("--byo", "--pipe-segment", "65536");   Want = "pipeseg=65536"; Deny = "" }
-    @{ Name = "classic-seg64k"; Args = @("--pipe-segment", "65536");            Want = "pipeseg=65536"; Deny = "byo=pipe" }
+    @{ Name = "classic-seg64k"; Args = @("--classic", "--pipe-segment", "65536"); Want = "byo=off";     Deny = "byo=pipe" }
     # The pinned pool is here because Measure-PipeMemory.ps1 (2026-07-29) found that at 2048 connections
     # --pipe-segment WITHOUT it is both the most expensive leg (3.2x classic's RSS) and the slowest. So
     # this is the configuration actually worth recommending, and it had never been throughput-tested at

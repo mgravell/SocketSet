@@ -60,7 +60,7 @@ echo "size,leg,rep,rps,mib_s,lat_p50_us,lat_p99_us,errors,status" > "$CSV"
 
 # name|extra demo args|expected /config fragment
 LEGS=(
-  "classic|| "
+  "classic|--classic|byo=off"
   "byo|--byo|byo=pipe"
 )
 

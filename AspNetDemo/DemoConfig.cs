@@ -68,10 +68,22 @@ internal sealed class DemoConfig
     /// rather than queueing.</summary>
     public int WriteBuffers { get; private set; }
 
-    /// <summary>BYO-buffer bridge: hand Kestrel's own pipes to the transport via ctx.UsePipe instead of
-    /// copying inbound and running an outbound pump in SocketSetConnection. Parallel option so the two can
-    /// be measured against each other on the same harness.</summary>
-    public bool ByoPipe { get; private set; }
+    /// <summary>
+    /// BYO-buffer bridge: hand Kestrel's own pipes to the transport via ctx.UsePipe instead of copying
+    /// inbound and running an outbound pump in SocketSetConnection.
+    ///
+    /// **ON by default since 2026-07-31**, because it stopped being a research path and became the better
+    /// one at every size measured. With a same-session vanilla-Kestrel control it is at parity at 256KB
+    /// and +14.2% at 1MB, where the classic bridge is -60.3% and -52.6%. `--classic` turns it off; the
+    /// classic path is kept because it is the control every zero-copy claim is measured against, and
+    /// because it is the only path on backends that cannot do zero-copy send at all (RIO, managed).
+    /// </summary>
+    public bool ByoPipe { get; private set; } = true;
+
+    /// <summary>Whether <see cref="ByoPipe"/> was asked for explicitly, so `--kestrel` can turn the
+    /// default off silently while still rejecting an explicit `--kestrel --byo`, which is a genuine
+    /// contradiction rather than a default that does not apply.</summary>
+    private bool _byoExplicit;
 
     /// <summary>Pipe block size for the bridge's pipes (0 = framework default, ~4KB). At 4KB a 256KB
     /// response is ~65 pipe segments; at 64KB it is ~5. Drives iovec count, WriteAll iterations and (on
@@ -120,7 +132,11 @@ internal sealed class DemoConfig
                 case "--page" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pg): cfg.PageSize = pg; i++; break;
                 case "--recv-buffer" when i + 1 < args.Length && int.TryParse(args[i + 1], out var rb): cfg.RecvBufferSize = rb; i++; break;
                 case "--write-buffers" when i + 1 < args.Length && int.TryParse(args[i + 1], out var wb): cfg.WriteBuffers = wb; i++; break;
-                case "--byo": cfg.ByoPipe = true; break;
+                case "--byo": cfg.ByoPipe = true; cfg._byoExplicit = true; break;
+                // Opt OUT of the default bridge. Kept because the classic path is the control every
+                // zero-copy claim is measured against, and it is the only path RIO and managed can take.
+                case "--classic":
+                case "--no-byo": cfg.ByoPipe = false; cfg._byoExplicit = true; break;
                 case "--pipe-segment" when i + 1 < args.Length && int.TryParse(args[i + 1], out var ps):
                     cfg.PipeSegment = ps; i++; break;
                 case "--pipe-pinned": cfg.PipePinned = true; break;
@@ -152,8 +168,16 @@ internal sealed class DemoConfig
             throw new PlatformNotSupportedException("--iocp / --rio need Windows.");
         if (Which is Backend.IoUring or Backend.Epoll && !OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("--io-uring / --epoll need Linux.");
-        if (ByoPipe && VanillaKestrel)
-            throw new ArgumentException("--byo configures the SocketSet transport bridge; it cannot combine with --kestrel.");
+        // --kestrel has no SocketSet bridge to configure, so the DEFAULT simply does not apply to it -
+        // silently off. Only an EXPLICIT --byo alongside it is a contradiction worth rejecting. Getting
+        // this wrong would throw on every vanilla-Kestrel control leg in every rig, which is the leg all
+        // the headline comparisons are measured against.
+        if (VanillaKestrel)
+        {
+            if (ByoPipe && _byoExplicit)
+                throw new ArgumentException("--byo configures the SocketSet transport bridge; it cannot combine with --kestrel.");
+            ByoPipe = false;
+        }
         if ((PageSize > 0 || RecvBufferSize > 0 || WriteBuffers > 0) && VanillaKestrel)
             throw new ArgumentException("--page / --recv-buffer / --write-buffers configure the SocketSet transport; they cannot combine with --kestrel.");
     }
@@ -206,7 +230,11 @@ internal sealed class DemoConfig
         string bufs = (PageSize > 0 ? $" page={PageSize}" : "")
                     + (RecvBufferSize > 0 ? $" recvbuf={RecvBufferSize}" : "")
                     + (WriteBuffers > 0 ? $" writebufs={WriteBuffers}" : "")
-                    + (ByoPipe ? " byo=pipe" : "")
+                    // Always state the bridge, in both directions. It used to appear only when ON, so
+                    // "classic" was the ABSENCE of a string - fine while byo was opt-in, useless once it
+                    // is the default, and a harness gating on absence cannot tell "classic" from "an
+                    // older build that had no byo at all".
+                    + (ByoPipe ? " byo=pipe" : " byo=off")
                     + (PipeSegment > 0 ? $" pipeseg={PipeSegment}" : "")
                     + (PipePinned ? " pipepinned=1" : "");
 
@@ -242,7 +270,11 @@ internal sealed class DemoConfig
         Console.WriteLine("    --write-buffers N  write buffers per shard (default 1024). Slab = this x --page, so");
         Console.WriteLine("                     a big page wants fewer; running dry currently CLOSES connections");
         Console.WriteLine("    --byo            BYO-buffer bridge: hand Kestrel's own pipes to the transport");
-        Console.WriteLine("                     (ctx.UsePipe) instead of copying inbound + pumping outbound here");
+        Console.WriteLine("                     (ctx.UsePipe) instead of copying inbound + pumping outbound here.");
+        Console.WriteLine("                     ON BY DEFAULT — parity with vanilla Kestrel at 256KB and +14.2%");
+        Console.WriteLine("                     at 1MB, where the classic bridge is -60.3% and -52.6%");
+        Console.WriteLine("    --classic        turn it off (alias --no-byo). The classic bridge is the control");
+        Console.WriteLine("                     every zero-copy claim is measured against");
         Console.WriteLine();
         Console.WriteLine("  The TLS certificate is a throwaway self-signed one for localhost, so clients must");
         Console.WriteLine("  skip verification: curl -k https://127.0.0.1:5080/plaintext");
