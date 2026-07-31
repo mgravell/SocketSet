@@ -20,25 +20,34 @@ Everything below this section is a dated investigation; this is the summary they
 linked to the section that measured them. **Do not compare Linux and Windows rows** - same silicon, but
 different OS and different dates.
 
-### Headline numbers, Linux, THIS box (7900X bare metal, 12 shards, `-c 64`, ASP.NET bridged path, pinned pool = the fair default as of 2026-07-31)
+### Headline numbers, Linux, THIS box — DEFINITIVE (2026-08-01, `bench/run-tls-sizes.sh` REPS=7 → 6 scored passes, pinned default, same-session Kestrel control)
 
-vs vanilla Kestrel's own socket transport (the control). Plaintext unless noted; MiB/s goodput or rps.
+7900X bare metal, 12 shards, `-c 64`, ASP.NET bridged path, `/payload` GET. Goodput MiB/s, **min-max of 6
+scored passes**; a delta is only claimed where the ranges are DISJOINT. This table SUPERSEDES the scattered
+cross-run numbers used earlier this session and corrects two of my own over-claims (see below).
+**Governor caveat: `powersave` (the box reboots to it and I lacked root to set `performance`) — so RELATIVE
+comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`-governor run.**
 
-| workload | vanilla Kestrel | SocketSet io_uring | SocketSet epoll | verdict |
-|---|---:|---:|---:|---|
-| 2 B `/plaintext` (rps) | 779k | **823k** | ~800k | **+5.6%** |
-| 64 KB | 9,987 | **10,522** | **10,453** | **+5%** |
-| 256 KB (pinned) | ~12,535 | **~12,650** | **~12,660** | **parity / +1%** |
-| 256 KB (unpinned — the old unfair default) | ~12,535 | 10,500 | 10,750 | −14 to −16% *(confounder)* |
-| small-message **TLS** | 576k (SslStream) | **703k** (in-transport OpenSSL) | ~689k | **+22%** |
-| 256 KB **TLS** | ~8,036 | ~3,963 | ~4,851 | **−51% (the one real gap → kTLS/real-hw)** |
+| size | kestrel | io_uring | epoll | plaintext verdict | kestrel+tls | io_uring+tls | epoll+tls | TLS verdict |
+|---|---:|---:|---:|---|---:|---:|---:|---|
+| 512 B | 342-346 | 322-331 | 331-335 | **Kestrel +3-5%** | 244-260 | 283-294 | 290-299 | **us +13-18%** |
+| 4 KB | 2379-2473 | 2290-2372 | 2311-2436 | Kestrel (vs io_uring) | 1648-1671 | 1778-1915 | 2042-2088 | **us +10-25%** |
+| 16 KB | 7331-7496 | 6915-7152 | 7165-7308 | **Kestrel +2-6%** | 4525-4648 | 5167-5346 | 5694-5856 | **us +13-26%** |
+| 64 KB | 9954-10402 | 10122-10407 | 10356-10510 | wash (overlap) | 6629-6789 | 8041-8406 | 8959-9051 | **us +20-35%** |
+| 256 KB | 12239-12529 | 12610-12965 | 12328-12681 | **io_uring +2%**; epoll ≈ | 7732-8265 | 3202-3604 | 4142-4205 | **Kestrel +>50%** |
 
-**Bottom line: with a fair (pinned) pool, SocketSet is ≥ vanilla Kestrel across the entire PLAINTEXT size
-range on this box, and +22% on small-message TLS.** The single remaining loss is LARGE-PAYLOAD userspace
-TLS, which is structural (the wire bytes are encrypted, so zero-copy send can't apply) and whose fix is
-kTLS — invisible on loopback, so it belongs to the real-hardware session. Every other 256KB "gap" in the
-older tables below was the unpinned-pool confounder, now fixed. (Bare epoll hits 13,107 at 256KB, above
-Kestrel — the transport was never the problem.)
+**Corrected bottom line:**
+- **Plaintext `/payload`: Kestrel leads the small-to-mid range (512 B-16 KB, disjoint +2-6%)**, it's a wash
+  at 64 KB, and io_uring edges ahead only at 256 KB. My earlier "we win 64 KB / small plaintext" was WRONG
+  for `/payload` — the +5.6% small-message win is the 2-byte `/plaintext` endpoint (`Results.Text`), a
+  lighter path than `/payload` (`Results.Bytes` + dictionary). Keep those two endpoints distinct.
+- **TLS is the real strength: we win decisively and disjoint from 512 B through 64 KB (+13-35%)** — the
+  in-transport OpenSSL vs `SslStream` advantage, larger and broader than the "+22%" I'd quoted. Only at
+  256 KB does userspace TLS lose (structurally — the wire bytes are encrypted, so zero-copy send can't
+  apply; kTLS narrows it, 256 KB ktls 5,006-5,544 vs tls 3,202-4,205, but doesn't reach Kestrel's 7,732+).
+- The 256 KB PLAINTEXT parity is real and is the pinned-pool fix; the old "−14 to −16%" there was the
+  unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
+  the limit; the bridge is, and only for plaintext where we're already at parity.
 
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 

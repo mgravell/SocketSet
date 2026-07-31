@@ -40,9 +40,13 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > model.** An inline-scheduler experiment made io_uring WORSE (−28%), killing the pump-hop hypothesis; the
 > real cause was per-segment pinning — Kestrel's pipes use a `PinnedBlockMemoryPool` by default, ours used
 > `MemoryPool.Shared`, so our zero-copy send paid ~64 GCHandle pins per 256KB response. With matched
-> (pinned) pools, io_uring AND epoll reach parity/edge ahead at 256KB (~12,650 vs Kestrel ~12,535). Fixed
-> by making the demo's pipe pool pinned by DEFAULT (`--pipe-unpinned` opts out). So with a fair pool we are
-> ≥ Kestrel across the plaintext size range; the bridge's structural pump-hop is NOT the 256KB bottleneck.
+> (pinned) pools, io_uring EDGES ahead at 256KB (12,610-12,965 vs Kestrel 12,239-12,529, disjoint), epoll ≈
+> parity. Fixed by making the demo's pipe pool pinned by DEFAULT (`--pipe-unpinned` opts out); the bridge's
+> structural pump-hop is NOT the 256KB bottleneck. **BUT the definitive 6-pass sweep (2026-08-01) corrected
+> my broader over-claim: on `/payload` plaintext Kestrel actually LEADS 512B-16KB (disjoint +2-6%), 64KB is
+> a wash, and we only edge ahead at 256KB — see the headline table in RESULTS. Where we DO win clearly is
+> TLS: +13-35% disjoint from 512B through 64KB (in-transport OpenSSL vs SslStream), losing only large-payload
+> TLS at 256KB (structural). And the "+5.6% small plaintext" is the 2-byte `/plaintext` endpoint, not `/payload`.**
 > The one plaintext mystery left — we degrade MORE than Kestrel as concurrency rises (92%→80% c64→c128) —
 > and the one correctness gap (advisory inbound backpressure) are both targeted by the **"two half-pipes"**
 > proposal (see its section below): expose real reader/writer to Kestrel, drain directly on the loop side,
