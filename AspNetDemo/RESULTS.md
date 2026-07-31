@@ -14,11 +14,31 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > for the findings and the method, not as a baseline. **Never compare a number across the two.** Where an
 > older section's conclusion has been re-tested, that is stated inline.
 
-## WHERE THINGS STAND (2026-07-30) — the consolidated view
+## WHERE THINGS STAND (2026-07-30, extended through 2026-07-31) — the consolidated view
 
 Everything below this section is a dated investigation; this is the summary they add up to. Cells are
 linked to the section that measured them. **Do not compare Linux and Windows rows** - same silicon, but
 different OS and different dates.
+
+### Headline numbers, Linux, THIS box (7900X bare metal, 12 shards, `-c 64`, ASP.NET bridged path, pinned pool = the fair default as of 2026-07-31)
+
+vs vanilla Kestrel's own socket transport (the control). Plaintext unless noted; MiB/s goodput or rps.
+
+| workload | vanilla Kestrel | SocketSet io_uring | SocketSet epoll | verdict |
+|---|---:|---:|---:|---|
+| 2 B `/plaintext` (rps) | 779k | **823k** | ~800k | **+5.6%** |
+| 64 KB | 9,987 | **10,522** | **10,453** | **+5%** |
+| 256 KB (pinned) | ~12,535 | **~12,650** | **~12,660** | **parity / +1%** |
+| 256 KB (unpinned — the old unfair default) | ~12,535 | 10,500 | 10,750 | −14 to −16% *(confounder)* |
+| small-message **TLS** | 576k (SslStream) | **703k** (in-transport OpenSSL) | ~689k | **+22%** |
+| 256 KB **TLS** | ~8,036 | ~3,963 | ~4,851 | **−51% (the one real gap → kTLS/real-hw)** |
+
+**Bottom line: with a fair (pinned) pool, SocketSet is ≥ vanilla Kestrel across the entire PLAINTEXT size
+range on this box, and +22% on small-message TLS.** The single remaining loss is LARGE-PAYLOAD userspace
+TLS, which is structural (the wire bytes are encrypted, so zero-copy send can't apply) and whose fix is
+kTLS — invisible on loopback, so it belongs to the real-hardware session. Every other 256KB "gap" in the
+older tables below was the unpinned-pool confounder, now fixed. (Bare epoll hits 13,107 at 256KB, above
+Kestrel — the transport was never the problem.)
 
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 
@@ -201,7 +221,16 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 | reuse-port multi-bind | no | no | **yes** (IP) | **yes** (IP) | no | *no* |
 | loop thread per shard | yes | yes | yes | yes | **no** | *no - thread pool + IO queues* |
 
-**The two cells that explain the 256KB result.** Kestrel is zero-copy in *both* directions **and pays no
+**The two cells that explain the 256KB result — LARGELY SUPERSEDED 2026-07-31, read the correction bullet
+at the top of this section first.** The story below (Kestrel pays no bridge; the bridge costs 24-42%; the
+end-state is fewer pipes/hops) was written before two 2026-07-31 findings retired most of it: (a) io_uring
+and epoll both got BYO zero-copy SEND, removing the outbound copy; (b) the residual 256KB gap turned out
+to be a POOL-DEFAULT confounder (our unpinned `MemoryPool.Shared` vs Kestrel's `PinnedBlockMemoryPool`),
+not the adapter — with matched pinned pools BOTH backends reach parity/edge ahead at 256KB, and an
+inline-scheduler experiment proved the pump thread-hop is NOT the bottleneck. So "fewer pipes and hops" is
+no longer the lever for PLAINTEXT; the one remaining large-payload gap is userspace-TLS (which can't
+zero-copy the wire bytes) → kTLS/real-hardware. The original text, kept for the reasoning that led here:
+Kestrel is zero-copy in *both* directions **and pays no
 bridge at all** - its transport contract already *is* a pair of pipes, so there is nothing to adapt. Every
 SocketSet leg in the ASP.NET tables pays an adapter that Kestrel-on-sockets does not have, plus at least
 one copy that Kestrel does not make. That is the structural statement behind "the bridge costs 24-42% at
