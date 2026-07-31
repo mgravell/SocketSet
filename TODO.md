@@ -8,7 +8,7 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 Two things landed on Windows that you need to know about, in this order.
 
-### 1. There is an ACCESS VIOLATION in RIO+TLS under churn, on the shipped defaults — item 0e
+### 1. There is an ACCESS VIOLATION in RIO+TLS under churn, on the default configuration — item 0e
 
 It is Windows-only (RIO), so it does not affect you directly, but it is the highest-priority item in this
 file and it is **not fixed**. If you are picking work, that is the work.
@@ -81,7 +81,7 @@ happened, in one paragraph each:
 6. **And item 2f's first option is DONE, so the flag is no longer required for most of the win.**
    Splitting the zero-copy segment cap from `MaxSendPages` gives **+61.1% at 256KB with no flag at all**,
    and with a same-session Kestrel control the tuned configuration is **-2.4% against vanilla Kestrel**,
-   from -56.9% shipped. It also costs p99 (15.3ms against 6.3ms) on the no-flag path, so it removes a
+   from -56.9% for the default bridge. It also costs p99 (15.3ms against 6.3ms) on the no-flag path, so it removes a
    silent cliff without replacing the recommendation. Details in item 2f.
 
 **What that leaves open**, and it is now the top of the Windows list rather than the bottom:
@@ -996,7 +996,7 @@ a large page RIO beats IOCP everywhere, inverting the standing: RIO was starved,
 So the deep-send-queue rewrite described above is **not needed** to close this gap. Do not build it.
 
 **But this is not yet a default change, and the blocker is not throughput.** Page size trades against
-pool depth. Shipped defaults are `SocketsPerShard` 4096 against `WriteBuffersPerShard` 1024 (4:1
+pool depth. The defaults are `SocketsPerShard` 4096 against `WriteBuffersPerShard` 1024 (4:1
 oversubscribed already); holding pinned memory constant at a 64KB page means ~64 buffers per shard, i.e.
 **64:1**. The sweep ran `-c 64` over 12 shards - about 5 connections per shard - so it never went near
 pool pressure.
@@ -1023,7 +1023,7 @@ Fixed 2026-07-28 (item 0b): it now stages and retries. So a shallow pool costs l
    with `--kestrel` is rejected.
 
 **What is deliberately NOT done: changing the default.** `64KB page + 4KB recv + 256 write buffers` is
-faster at every concurrency tested and has strictly better error behaviour than what ships. It is still
+faster at every concurrency tested and has strictly better error behaviour than what the default does. It is still
 not the default because these are Windows measurements at one payload shape on loopback, and
 `BufferPageSize` is shared with io_uring and epoll where it has not been swept.
 
@@ -1117,14 +1117,14 @@ much stronger than when this entry was written**, and what is left is mechanism,
   all three and the rig now aborts a cell whose banner disagrees. Only io_uring ever needed this: epoll
   reads `BufferPageSize` and none of the pools, so `--page` moves one quantity for it.
 - **The memory claim needs rewording, not retracting.** "A 64KB page is 37% cheaper" is mostly the pool
-  rescale: at matched depth the page itself saves ~9MB of ~41MB. True of what ships; not a property of
+  rescale: at matched depth the page itself saves ~9MB of ~41MB. True of what the default does; not a property of
   the page. Reworded in `AspNetDemo/RESULTS.md`.
 - Decide the mechanism for a per-backend default. The backends want opposite things (RIO large, IOCP
   small/indifferent) and `BufferPageSize` is one global constant with a real default of 4096, so there is
   no way to distinguish "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend
   chooses) or a factory-supplied default; that changes public option semantics and wants its own commit.
 
-### 0e. ACCESS VIOLATION in RIO+TLS under connection churn — ON THE SHIPPED DEFAULTS (2026-07-29)
+### 0e. ACCESS VIOLATION in RIO+TLS under connection churn — ON THE DEFAULTS (2026-07-29)
 
 **Status: FIXED 2026-07-30 (a stale RIO request-queue handle), verified over 100 runs where ~50 crashes
 were expected. The causal story is only PARTLY consistent with the bisection — read "what does not add
@@ -1193,7 +1193,7 @@ confounder, and it **understated the rate roughly threefold**. Both builds, 8 re
 
 | page | write-buffers | pristine `e104568` | today's HEAD |
 |---:|---:|---|---|
-| **4096** | **1024** *(the SHIPPED default)* | **5/8 crash** | **4/8 crash** |
+| **4096** | **1024** *(the DEFAULT)* | **5/8 crash** | **4/8 crash** |
 | 4096 | 512 | 4/8 crash | 4/8 crash |
 | 4096 | 128 | - | 2/8 crash |
 | 4096 | 64 | - | **0 crash, 8/8 WEDGE** |
@@ -1235,7 +1235,7 @@ That is a hypothesis from reading, **not** a diagnosis - none of it is confirmed
 
 **Do not "fix" it by changing pool depths.** Depth moves the frequency around (128 at a 4KB page showed
 0/6) and that is exactly the kind of change that looks like a fix and is a mask. The bug is a lifetime
-race, and the evidence for that is that it happens at the shipped depth too.
+race, and the evidence for that is that it happens at the default depth too.
 
 **Repro rig:** `scratchpad/av-repro.ps1` in the session notes, or just loop the command above ~8 times
 and watch for exit code -1073741819. It needs no special tooling; the exit code is the whole signal.
@@ -1297,7 +1297,7 @@ correctness gate, which no other throughput finding on this list does.
 
 | leg | 3MB out-of-band verify | |
 |---|---:|---|
-| rio+tls, page 4096 (shipped) | 2.68-5.20s (5 passes) | ~0.6-1.1 MiB/s |
+| rio+tls, page 4096 (default) | 2.68-5.20s (5 passes) | ~0.6-1.1 MiB/s |
 | **rio+tls, page 65536** | **0.21-0.22s** (3 passes) | disjoint, **15-25x** |
 | rio, page 4096 *(control)* | 0.08s | TLS-specific |
 | iocp+tls, page 4096 *(control)* | 0.22s | RIO-specific |
@@ -1318,7 +1318,7 @@ longer only a tuning preference.
 
 **Status: DONE 2026-07-28. The justification I gave for it was wrong; the change is right anyway.**
 
-*The wrong part.* This entry claimed the shipped defaults "drop 208 connections at `-c 2048`". That was
+*The wrong part.* This entry claimed the default configuration "drop 208 connections at `-c 2048`". That was
 read off an error column without checking what the errors were. In isolation the same configuration
 serves 73,852 requests with **zero** errors. The counts came from `Run-PoolPressure.ps1`, a harness
 written the same day with **no ephemeral-port gate**, where `Run-Matrix.ps1` has three `Wait-Ports` calls
@@ -1614,7 +1614,7 @@ prefix sends there is a follow-up that wants measuring on Linux, not assuming.
 | 256 KB | 7,346.8 [7168-7743] | 7,329.0 [7035-7545] | **-0.2%, ranges overlap** — no cost where the cap already fit |
 | **1 MB** | **2,422.0** [2399-2503] | **4,374.1** [4365-4449] | **+80.6%, fully disjoint** |
 
-*And the counter proves the mechanism rather than inferring it* — at the shipped ~4KB pipe blocks:
+*And the counter proves the mechanism rather than inferring it* — at the default ~4KB pipe blocks:
 
 | payload | segments/response | before | after |
 |---|---:|---|---|
@@ -1632,7 +1632,7 @@ control (2026-07-30):** the tuned configuration is now **+14.2% FASTER than vani
 beaten Kestrel at a large payload. `--pipe-segment` still earns +27.6% at 1MB and +37.9% at 256KB over
 plain `--byo`, so segments-per-send remains a real second effect even with the cliff gone.
 
-**The number that matters for anyone NOT opting in is unchanged and bad:** the shipped `classic` bridge
+**The number that matters for anyone NOT opting in is unchanged and bad:** the default `classic` bridge
 is **-60.3% against Kestrel at 256KB** and -52.6% at 1MB. Everything above is behind `--byo`. Making the
 BYO bridge the default — or getting the classic path closer — is the obvious next question, and it has
 never been asked directly.
@@ -1648,10 +1648,10 @@ rather than 768 bytes). Smoke matrix re-run: 47/48, the same pre-existing `rio+t
 
 Measured, 6 scored passes, both untouched legs holding as controls:
 
-- **`--byo` with the shipped ~4KB pipe blocks: 5,243.6 -> 8,447.9 MiB/s at 256KB (+61.1%, disjoint)**,
+- **`--byo` with the default ~4KB pipe blocks: 5,243.6 -> 8,447.9 MiB/s at 256KB (+61.1%, disjoint)**,
   declines 194,804 -> **zero**, no flag involved.
 - **With a same-session vanilla-Kestrel control, `--byo --pipe-segment 65536` is -2.4% against Kestrel
-  at 256KB**, where the shipped bridge is -56.9%.
+  at 256KB**, where the default bridge is -56.9%.
 
 **But p99 on the no-flag path nearly triples** - 15,255us against 6,291us classic and 4,509us at 64KB
 blocks. 65 pins and one long send occupancy per response, against one send in flight per connection, is
@@ -1675,7 +1675,7 @@ when the pool is pinned), which is a second, independent reason to look at item 
 **Status: specified, not started. This is what converts a +117.3% flag into a default.**
 
 `--pipe-segment 65536` buys +117.3% at 256KB on IOCP purely by getting the response under
-`IocpConnection.MaxSendPages` = 64 (measured: the shipped configuration declines at **65.00** segments -
+`IocpConnection.MaxSendPages` = 64 (measured: the default configuration declines at **65.00** segments -
 off by one). That is a *demo* flag configuring *Kestrel's* pipes. A library caller with its own pipes,
 or any caller whose sequence happens to be fragmented, still silently falls back to copying and pays the
 same 2.2x. The transport should not be one segment away from a cliff it cannot see.
@@ -1708,7 +1708,7 @@ without `--pipe-segment`, option 2's contract change is not worth making yet.
 | **the same + `--pipe-pinned`** | **388 / 346 MB** | 227k / 216k |
 
 **`--pipe-segment 65536` on its own is the most expensive AND the slowest leg at 2048 connections** -
-~3.2x the shipped bridge's memory and ~15% less throughput. **`--pipe-pinned` removes both**, landing at
+~3.2x the default bridge's memory and ~15% less throughput. **`--pipe-pinned` removes both**, landing at
 or below `classic`. That reverses the Linux reading, where pinning measured +0.7%, "not separable", and
 was filed as optional: on Windows it is `--pipe-segment`'s **required companion**, not a refinement.
 
@@ -1719,7 +1719,7 @@ receive-slab table fell into on 2026-07-28. Any memory claim here needs 2048.
 alone** - and that gap is now closed too. `Run-Byo.ps1` gained a `byo-seg64k-pin` leg: at 256KB, 6 scored
 passes, it measures **11,557.7 [11328-11777]** against `byo-seg64k`'s 11,394.6 [11274-11818] (overlapping
 - **pinning costs nothing on throughput**) and against a same-session vanilla Kestrel of 11,715.7
-(**also overlapping - parity**). Shipped `classic` is -55.0%.
+(**also overlapping - parity**). The default `classic` leg is -55.0%.
 
 **So there is no trade left to weigh on this pairing**: same throughput, parity with Kestrel, and
 346-388MB instead of 1.28GB at 2048 connections. What remains before defaulting is a decision about

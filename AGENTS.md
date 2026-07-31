@@ -34,6 +34,17 @@ These are not style preferences; each one was learned by getting a wrong answer 
 6. **A control in the same session.** Cross-run and cross-machine comparisons have produced confident
    nonsense here more than once. Two hosts and two OSes appear in `RESULTS.md`; never subtract across them.
 
+## This is pre-alpha, and it changes what you are allowed to do
+
+There are **no users, no releases and no back-compat obligation**. Two consequences worth stating because
+both have caused hesitation:
+
+- **Public API and defaults can change freely**, given a measurement. Item 0 sat blocked for days partly
+  on "that changes public option semantics" — which was not a real constraint. Change it, measure it,
+  write down why.
+- **Say "the default", not "shipped".** Nothing ships. "Shipped" implies released code with users, and
+  makes a default change read as a breaking change needing care it does not need.
+
 ## Conventions
 
 - **Commit messages carry the reasoning**, including what was *dis*proved and what remains unverified.

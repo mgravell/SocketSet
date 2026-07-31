@@ -7,7 +7,7 @@
 # on IOCP (that was the prediction and the point - relocating the bridge into the library is not supposed
 # to be faster), so ANY difference here is the per-backend zero-copy path, which is what we are measuring.
 #
-# MEASURE AGAINST `--byo`, NOT AGAINST THE CALLBACK PATH. The classic leg is included as the shipped
+# MEASURE AGAINST `--byo`, NOT AGAINST THE CALLBACK PATH. The classic leg is included as the default
 # baseline, but the honest zero-copy comparison is byo-with-zero-copy against byo-without, or the reading
 # credits zero-copy with whatever pipe mode itself costs. On a backend with no zero-copy path the two byo
 # legs are identical by construction.

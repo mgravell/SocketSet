@@ -12,7 +12,7 @@
     experiment is a flag, not a patch, and this rig runs it.
 
     FOUR LEGS, and the fourth is the one that keeps the reading honest:
-      classic          the shipped bridge (AspNetConnection copies inbound, pumps outbound)
+      classic          the default bridge (AspNetConnection copies inbound, pumps outbound)
       byo              ctx.UsePipe, zero-copy ATTEMPTED and (at 256KB) declined - the null result
       byo-seg64k       ctx.UsePipe with 64KB pipe blocks: zero-copy actually engages
       classic-seg64k   64KB pipe blocks WITHOUT byo - the control
@@ -251,9 +251,9 @@ foreach ($size in $Sizes) {
             @{ a = $byoSeg; b = $byo; what = "zero-copy engaging vs not (byo-seg64k vs byo)" },
             @{ a = $byoSeg; b = $clsSeg; what = "zero-copy alone, block size held equal (byo-seg64k vs classic-seg64k)" },
             @{ a = $clsSeg; b = $cls; what = "pipe block size alone (classic-seg64k vs classic)" },
-            @{ a = $byoSeg; b = $cls; what = "both changes vs shipped (byo-seg64k vs classic)" },
+            @{ a = $byoSeg; b = $cls; what = "both changes vs default (byo-seg64k vs classic)" },
             @{ a = $byoSeg; b = $kes; what = "best configuration vs VANILLA KESTREL, same session" },
-            @{ a = $cls; b = $kes; what = "shipped bridge vs VANILLA KESTREL, same session" })) {
+            @{ a = $cls; b = $kes; what = "default bridge vs VANILLA KESTREL, same session" })) {
         if (-not $pair.a -or -not $pair.b) { continue }
         $delta = 100 * ($pair.a.MedMiBs - $pair.b.MedMiBs) / $pair.b.MedMiBs
         $disjoint = ($pair.a.Min -gt $pair.b.Max) -or ($pair.b.Min -gt $pair.a.Max)

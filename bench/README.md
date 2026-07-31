@@ -15,7 +15,7 @@ itself as an error.
 | `Compare-Commits.ps1` | *"Did this change help?"* Two commits, isolated worktrees, **interleaved**. **Use this for any before/after claim.** `-Bridged` measures through Kestrel rather than the bare responder; `-ExtraArgs` passes demo flags (a change on an opt-in path such as `--byo` measures as nothing without it). |
 | `Run-Byo.ps1` | Windows counterpart of `run-byo.sh`, plus the legs that keep it honest: a `classic-seg64k` control separating pipe block size from zero-copy, and a same-session `kestrel` control. Gates every leg on the `SS_IOCP_STATS` counter, not just `/config`. |
 | **`Soak-Churn.ps1`** | Long connection-churn soak across backends. Exists because **no benchmark here churns connections** — every one holds keep-alive and measures steady state, which is why item 0e hid for months. Watches for all three faces of a lifetime bug: crash, wedge, and a quiet accounting imbalance. |
-| **`Repro-RioChurnCrash.ps1`** | Reproduces **TODO item 0e** — an intermittent access violation in RIO+TLS under churn, present on the shipped defaults. Judge a fix over 20+ reps across all its configs: pool depth moves the *rate* without removing the fault, so a lower rate looks exactly like a fix. |
+| **`Repro-RioChurnCrash.ps1`** | Reproduces **TODO item 0e** — an intermittent access violation in RIO+TLS under churn, present on the default configuration. Judge a fix over 20+ reps across all its configs: pool depth moves the *rate* without removing the fault, so a lower rate looks exactly like a fix. |
 | `Measure-PipeMemory.ps1` | *"What does the pipe block size COST?"* Windows: peak working set vs connection count for the bridge's pipe pool. Run it at **2048** connections — the effect is connections × block, so 64 measures nothing and reads as free. |
 | `Run-TlsSizes.ps1` | Windows: how transports/TLS scale with payload size (and shard count). |
 | `Run-Matrix.ps1` | Windows: fixed-size transport × TLS matrix. |
@@ -168,7 +168,7 @@ io_uring is available with no seccomp workaround. Two consequences, both load-be
   `performance` (`/sys/devices/system/cpu/cpu*/cpufreq/{scaling_governor,energy_performance_preference}`)
   or the clock moves under you and the whole disjoint-ranges discipline is measuring the governor.
   **Does not survive a reboot** — re-check it rather than assuming.
-- **Suspend, which on this box is a REBOOT.** GNOME shipped with a 30-minute idle suspend on AC, and this
+- **Suspend, which on this box is a REBOOT.** GNOME default with a 30-minute idle suspend on AC, and this
   machine has never once resumed from it — a suspend means a hard reset, a lost session, and a run that
   ends with no partial results and no log of why. Disabled 2026-07-28 with
   `gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'` (user-level

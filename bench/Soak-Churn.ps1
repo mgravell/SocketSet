@@ -4,7 +4,7 @@
     bug that only appears when slots are recycled under pressure.
 
 .DESCRIPTION
-    WHY THIS EXISTS. Item 0e (an access violation in RIO+TLS under churn, on the shipped defaults) hid
+    WHY THIS EXISTS. Item 0e (an access violation in RIO+TLS under churn, on the default configuration) hid
     for months because **every benchmark in this repo holds keep-alive connections and measures steady
     state** - not one of them churns. The only thing that opened and closed sockets in anger was a single
     smoke cell, run once, against a ~50% fault. The fix is verified, but its bisection left one signal

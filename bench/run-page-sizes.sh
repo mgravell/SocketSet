@@ -59,7 +59,7 @@ CONNECTIONS=${CONNECTIONS:-64}
 REPS=${REPS:-4}
 PORT=${PORT:-5081}
 FILTER=${FILTER:-}
-# Empty = let --page rescale the pools (the shipped behaviour). A number pins ALL THREE for every page
+# Empty = let --page rescale the pools (the default behaviour). A number pins ALL THREE for every page
 # size, which is what makes the sweep a controlled comparison. FIXED_WRITE_BUFFERS is the old name for
 # this knob, kept working because TODO.md and one commit message cite it - but it pinned only one pool.
 FIXED_POOL_DEPTH=${FIXED_POOL_DEPTH:-${FIXED_WRITE_BUFFERS:-}}

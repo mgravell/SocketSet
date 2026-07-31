@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
     Reproduce TODO item 0e: an intermittent ACCESS VIOLATION (0xC0000005) in RIO+TLS under connection
-    churn, present on the SHIPPED defaults.
+    churn, present on the default configuration.
 
 .DESCRIPTION
     The process dies; it does not throw. `### UNHANDLED ###` never prints, so no managed handler sees it
     - this is a fault in unsafe/native-interop code. The whole signal is the exit code, so this rig needs
     no debugger and no symbols: it runs the churn cell N times and counts how many die.
 
-    WHY A DEDICATED RIG. The fault is intermittent - roughly ONE RUN IN TWO on the shipped defaults - and
-    the smoke matrix runs that cell ONCE. Even at that rate a couple of clean runs in a row are ordinary,
+    WHY A DEDICATED RIG. The fault is intermittent - roughly ONE RUN IN TWO on the defaults - and the
+    smoke matrix runs that cell ONCE. Even at that rate a couple of clean runs in a row are ordinary,
     which is how it went unnoticed: an intermittent crash in a suite you run once per change is
     indistinguishable from a flaky harness. Judge anything claiming to fix it over many reps, not one.
 
@@ -33,7 +33,7 @@
 param(
     [string]$Exe,
     [int]$Reps = 8,
-    # page x write-buffers pairs. The FIRST is the shipped default and is the one that matters.
+    # page x write-buffers pairs. The FIRST is the default and is the one that matters.
     [int[][]]$Configs = @(@(4096, 1024), @(4096, 512), @(65536, 512), @(65536, 256))
 )
 
@@ -69,7 +69,7 @@ foreach ($cfg in $Configs) {
         Start-Sleep -Milliseconds 250
     }
     $total += $crash
-    $note = if ($page -eq 4096 -and $wb -eq 1024) { "  <-- THE SHIPPED DEFAULT" } else { "" }
+    $note = if ($page -eq 4096 -and $wb -eq 1024) { "  <-- THE DEFAULT" } else { "" }
     $colour = if ($crash -gt 0) { "Red" } elseif ($wedge -gt 0) { "Yellow" } else { "Green" }
     Write-Host ("  page={0,-6} write-buffers={1,-5}  {2} pass, {3} wedge, {4} ACCESS VIOLATION{5}" -f `
             $page, $wb, $pass, $wedge, $crash, $note) -ForegroundColor $colour

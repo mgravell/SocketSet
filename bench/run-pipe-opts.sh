@@ -15,7 +15,7 @@
 #   * IOCP's MaxSendPages cap is 64, so 65 segments is one past it - which is why IOCP's zero-copy send
 #     declined every 256KB response and measured as "no gain". (Windows-only; not exercised here.)
 #
-# LEGS. classic is the shipped bridge (no UsePipe) and is the constant control. The three byo legs isolate
+# LEGS. classic is the default bridge (no UsePipe) and is the constant control. The three byo legs isolate
 # one change each, so the comparison is byo-vs-byo rather than byo-vs-classic - otherwise the reading would
 # be credited with whatever pipe mode itself costs.
 #

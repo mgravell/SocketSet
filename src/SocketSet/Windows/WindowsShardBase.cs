@@ -96,7 +96,7 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
     //
     // This replaces closing the connection. Running the write pool dry used to call CloseClient, so a
     // transient shortage dropped a HEALTHY connection rather than slowing it down — and Debug.WriteLine
-    // made it invisible in Release. Measured 2026-07-27, the SHIPPED defaults dropped 208 connections at
+    // made it invisible in Release. Measured 2026-07-27, the defaults dropped 208 connections at
     // -c 2048 with 256KB responses; every configuration with a larger write page dropped 0-1, so a
     // page-size change would have masked this rather than fixed it.
     private readonly List<TConn> _awaitingPage = [];

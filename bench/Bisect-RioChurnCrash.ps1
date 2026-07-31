@@ -46,7 +46,7 @@ if (-not (Test-Path $Exe)) { throw "no SmokeTest.exe at $Exe" }
 
 $ACCESS_VIOLATION = -1073741819
 
-# Baseline = the shipped default geometry, which is where the crash matters most.
+# Baseline = the default geometry, which is where the crash matters most.
 $base = @("--rio", "--tls-schannel", "--page", "4096", "--write-buffers", "1024",
     "-s", "-c", "64", "--churn", "10", "--close-after", "4", "--sockets", "128", "--reset-close")
 
@@ -61,7 +61,7 @@ function Variant([string]$name, [string[]]$argv, [string]$means) {
 # Each variant is the baseline with ONE substitution. Build them explicitly rather than by mutating a
 # shared array — an accidental carry-over between variants would silently test the wrong thing.
 $variants = @(
-    Variant "baseline" $base "the shipped default; expect ~4-5/8"
+    Variant "baseline" $base "the default; expect ~4-5/8"
     Variant "sockets 4096 (no reuse)" (@("--rio", "--tls-schannel", "--page", "4096", "--write-buffers", "1024",
             "-s", "-c", "64", "--churn", "10", "--close-after", "4", "--sockets", "4096", "--reset-close")) "gone => slot reuse / ABA"
     Variant "graceful close (no RST)" (@("--rio", "--tls-schannel", "--page", "4096", "--write-buffers", "1024",

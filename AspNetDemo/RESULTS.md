@@ -23,7 +23,7 @@ different OS and different dates.
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 
 - **An ACCESS VIOLATION in RIO+TLS under churn was found and fixed** (item 0e). It was present on the
-  shipped defaults at roughly **one run in two**, and had been for months. Found while validating an
+  default configuration at roughly **one run in two**, and had been for months. Found while validating an
   unrelated change; the reason it survived is that **no benchmark in this repo churns connections** -
   every one holds keep-alive and measures steady state. There is now a soak rig that does.
 - **The zero-copy segment cliff is gone** (item 2f option 2). `TrySendZeroCopy` reports bytes accepted
@@ -237,7 +237,7 @@ costs epoll nearly twice what it costs io_uring; see the refutation below.
 comparison in this table is within-session and the vanilla-Kestrel control is a real control rather than
 a remembered number. Goodput MiB/s, median [min-max]:
 
-| payload | classic *(shipped)* | `--byo` | **`--byo --pipe-segment 65536`** | *kestrel (control)* |
+| payload | classic *(default)* | `--byo` | **`--byo --pipe-segment 65536`** | *kestrel (control)* |
 |---|---:|---:|---:|---:|
 | 512 B | 113.2 | 112.3 | 112.4 | 126.6 |
 | 16 KB | 3,317.4 | 3,197.4 | 3,442.2 | 3,558.6 |
@@ -246,7 +246,7 @@ a remembered number. Goodput MiB/s, median [min-max]:
 
 Against the same-session Kestrel control, ranges disjoint unless stated:
 
-| payload | shipped bridge | best configuration |
+| payload | default bridge | best configuration |
 |---|---:|---|
 | 512 B | *overlapping* | *overlapping* — ceiling-bound, and every leg spreads 10-18% here |
 | 16 KB | **-6.8%** | *overlapping* — parity |
@@ -256,7 +256,7 @@ Against the same-session Kestrel control, ranges disjoint unless stated:
 **This is the first time anything in this repo has beaten vanilla Kestrel at a large payload**, and it is
 the combined effect of the day's work: the segment cap became a prefix (so zero-copy engages at any
 size), the cap itself was split from `MaxSendPages`, and the geometry mechanism let RIO stop being
-misconfigured. At 256KB the shipped bridge is still **-60.3%**, which is the number that matters for
+misconfigured. At 256KB the default bridge is still **-60.3%**, which is the number that matters for
 anyone not opting in.
 
 **Two honest caveats.** The 512B and 16KB rows are noisy here (10-18% per-leg spread against 4-6% at the
@@ -303,7 +303,7 @@ above does not cover.
 4. **512 B is ceiling-bound** and is not a transport comparison; all seven legs sit inside ~30%.
 5. **kTLS trails everywhere**, which is expected rather than damning: loopback has no NIC, so inline
    offload - kTLS's whole point - cannot appear at any size.
-6. **RIO is starved, not slow.** At its shipped page it is the worst leg in any table; at a 64KB page with
+6. **RIO is starved, not slow.** At its default page it is the worst leg in any table; at a 64KB page with
    a 4KB receive buffer it is the fastest thing measured on Windows.
 7. **Zero-copy send changes the 256KB picture completely, on both backends that can do it.**
    io_uring with `--byo` does **11,536.1** at 256KB against 7,950.2 classic (**+45.1%**), cutting the gap
@@ -317,7 +317,7 @@ above does not cover.
 
 Not a default — a statement of what the code can do, and what it costs. io_uring, 12 shards, `-c 64`:
 
-| payload | shipped bridge (classic) | **`--byo --pipe-segment 65536`** | vs vanilla Kestrel |
+| payload | default bridge (classic) | **`--byo --pipe-segment 65536`** | vs vanilla Kestrel |
 |---|---:|---:|---:|
 | 16 KB | 6,950.6 | **7,388.0** (+6.3%) | Kestrel 7,351.3 -> now level/ahead |
 | 256 KB | 7,950.2 | **12,363.6** (+55.5%) | Kestrel 12,450.5 -> **within 0.7%** |
@@ -372,7 +372,7 @@ second lifetime bug is being masked. See TODO item 0e.
 
 *The pre-fix investigation follows.*
 
-## An ACCESS VIOLATION in RIO+TLS under churn, on the shipped defaults (2026-07-29)
+## An ACCESS VIOLATION in RIO+TLS under churn, on the default configuration (2026-07-29)
 
 **Found while validating an unrelated change, and it is the most serious thing in this file.** The
 process dies with **0xC0000005**, intermittently, usually inside one second, under
@@ -385,7 +385,7 @@ rate about threefold. 8 reps per cell, both builds:
 
 | page | write-buffers | pristine `e104568` | today's HEAD |
 |---:|---:|---|---|
-| **4096** | **1024** *(the SHIPPED default)* | **5/8 crash** | **4/8 crash** |
+| **4096** | **1024** *(the DEFAULT)* | **5/8 crash** | **4/8 crash** |
 | 4096 | 512 | 4/8 crash | 4/8 crash |
 | 4096 | 128 | - | 2/8 crash |
 | 4096 | 64 | - | 0 crash, **8/8 wedge** |
@@ -467,7 +467,7 @@ What it is instead, measured on the same host in one session:
 
 | leg | 3MB out-of-band verify | note |
 |---|---:|---|
-| rio+tls, page 4096 (shipped) | 2.68-5.20s (5 passes) | ~0.6-1.1 MiB/s |
+| rio+tls, page 4096 (default) | 2.68-5.20s (5 passes) | ~0.6-1.1 MiB/s |
 | **rio+tls, page 65536** | **0.21-0.22s** (3 passes) | ranges fully disjoint, **15-25x** |
 | rio, page 4096 *(control)* | 0.08s | so it is TLS-specific |
 | iocp+tls, page 4096 *(control)* | 0.22s | so it is RIO-specific |
@@ -530,7 +530,7 @@ follows `--page` unless `--recv-buffer` overrides it. Split (3MB out-of-band ver
 
 | send page | recv buffer | time |
 |---:|---:|---|
-| 4096 | 4096 *(shipped)* | 3.03, 4.58, 6.15s |
+| 4096 | 4096 *(default)* | 3.03, 4.58, 6.15s |
 | 4096 | 65536 | 1.15, 1.78, 1.77s |
 | **65536** | **4096** | **0.18, 0.18, 0.18s** |
 | 65536 | 65536 | 0.21, 0.20, 0.23s |
@@ -588,7 +588,7 @@ inferred from io_uring's segment counter on 2026-07-29; it is now measured on Wi
 `bench/Run-Byo.ps1` (new), IOCP, 12 shards, `-c 64`, 7 passes with the first discarded, legs reshuffled
 each pass, zero errors across the sweep. Goodput MiB/s, median of 6 scored passes:
 
-| payload | classic *(shipped)* | byo | **byo-seg64k** | classic-seg64k *(control)* |
+| payload | classic *(default)* | byo | **byo-seg64k** | classic-seg64k *(control)* |
 |---|---:|---:|---:|---:|
 | 64 KB | 8,264.0 [8173-8379] | 8,298.4 [7817-8474] | **9,042.4** [8851-9188] | 8,299.1 [8095-8446] |
 | 256 KB | 5,177.4 [5092-5268] | 5,243.6 [5055-5507] | **11,393.3** [10878-11564] | 5,269.5 [5021-6004] |
@@ -598,7 +598,7 @@ each pass, zero errors across the sweep. Goodput MiB/s, median of 6 scored passe
 | **byo-seg64k vs byo** | +9.0% | **+117.3%** |
 | **byo-seg64k vs classic-seg64k** (zero-copy alone, block size held equal) | +9.0% | **+116.2%** |
 | classic-seg64k vs classic (**pipe block size alone**) | *ranges overlap* | *ranges overlap* |
-| byo-seg64k vs classic (both changes vs shipped) | +9.4% | **+120.1%** |
+| byo-seg64k vs classic (both changes vs default) | +9.4% | **+120.1%** |
 
 **The pre-registered prediction was right, and by more than it asked for.** It expected "something like
 io_uring's +45.1%" if the cap was the explanation. It is 117%, and the counter column proves the
@@ -642,7 +642,7 @@ Same rig, 6 scored passes, `--iocp`, 12 shards, `-c 64`. The two untouched legs 
 
 Both controls hold across the two sessions, which is what licenses reading the `byo` row. The counter
 confirms the mechanism rather than inferring it: declines go from 194,804-at-mean-65.00 to **zero**, with
-the shipped pipe configuration and no flag.
+the default pipe configuration and no flag.
 
 **And with a same-session vanilla-Kestrel control, the headline is finally sayable:**
 
@@ -651,7 +651,7 @@ the shipped pipe configuration and no flag.
 | kestrel *(control, same session)* | 11,411.5 [11385-11480] | - |
 | **iocp `--byo --pipe-segment 65536`** | **11,136.2** [11003-11230] | **-2.4%** (disjoint) |
 | iocp `--byo` (no flag) | 8,447.9 [8228-8578] | -26.0% |
-| iocp classic *(shipped)* | 4,918.2 [4724-5219] | **-56.9%** |
+| iocp classic *(default)* | 4,918.2 [4724-5219] | **-56.9%** |
 
 **The gap to vanilla Kestrel at 256KB closes from 56.9% to 2.4%** - and unlike every previous version of
 that claim in this file, the control ran in the same reshuffled passes.
@@ -691,7 +691,7 @@ Isolated worktrees, interleaved, 6 scored passes, `--byo`, 12 shards:
 | **1 MB** | **2,422.0** [2399-2503] | **4,374.1** [4365-4449] | **+80.6%, fully disjoint** |
 
 That is the shape the change was predicted to have: nothing where the sequence already fitted, a large
-gain where it did not. The counter shows why, at the shipped ~4KB pipe blocks:
+gain where it did not. The counter shows why, at the default ~4KB pipe blocks:
 
 | payload | segments/response | before | after |
 |---|---:|---|---|
@@ -719,7 +719,7 @@ because a claim this consequential should not rest on one:
 **Three things, and the third was not expected.**
 
 **1. The bill is real and it is Windows' too.** `--pipe-segment 65536` takes peak RSS to ~1.28 GB at 2048
-connections against ~0.39 GB for the shipped bridge - **~3.2x** - and the 1,282/1,285 MB pair is the most
+connections against ~0.39 GB for the default bridge - **~3.2x** - and the 1,282/1,285 MB pair is the most
 reproducible number in this file. Quoted against `byo` rather than `classic` it is 1.95x and 2.84x on the
 two runs; the `byo` leg itself swings 453-659 MB, so **quote it against `classic` or in absolutes**, not
 as a byo-ratio. Linux's figure was 2.7x, so the two platforms agree on the shape.
@@ -751,7 +751,7 @@ passes, 256KB, 12 shards, same session, zero errors:
 | byo-seg64k | 11,394.6 [11274-11818] | ranges overlap |
 | byo | 8,756.9 [8509-8887] | -25.3% |
 | classic-seg64k | 5,323.5 [5219-5702] | -54.6% |
-| classic *(shipped)* | 5,276.1 [5161-5467] | **-55.0%** |
+| classic *(default)* | 5,276.1 [5161-5467] | **-55.0%** |
 
 **Pinning is free on throughput and worth 3.2x on memory**, so there is no trade to weigh:
 `byo-seg64k-pin` and `byo-seg64k` overlap at 256KB (11,558 vs 11,395), and only one of them is 346-388MB
@@ -760,7 +760,7 @@ at 2048 connections.
 *On the Kestrel comparison, stated precisely:* this run puts the tuned configuration **level** with
 vanilla Kestrel (overlapping ranges); the earlier run put the unpinned variant at -2.4% (disjoint). The
 difference is the **control**, not us - Kestrel's own leg spread 0.8% in that run and 10.5% in this one.
-The defensible claim is *parity at 256KB*, not a signed percentage, and the shipped bridge's -55.0% is
+The defensible claim is *parity at 256KB*, not a signed percentage, and the default bridge's -55.0% is
 the number that actually moved.
 
 **And 2b-result's reading is now retracted for IOCP.** "Zero-copy send removed one copy and bought +3.5%,
@@ -1174,7 +1174,7 @@ being the metric that matters:
 | 64 KB page + 4 KB recv, 64 buffers | 11,475.9 | 5,199.7 | 3,477.6 | 1 | 283 MB |
 
 > **RETRACTED 2026-07-28: the error column above is a harness artifact, not a server defect.** The claim
-> made here — that the shipped defaults "drop 208 connections at -c 2048" — is withdrawn. Re-run in
+> made here — that the default configuration "drop 208 connections at -c 2048" — is withdrawn. Re-run in
 > isolation, that exact configuration served **73,852 requests with zero errors of any kind**. The
 > harness that produced the error counts (`Run-PoolPressure.ps1`, written the same day) runs twelve
 > 2048-connection cells back to back with **no ephemeral-port gate**, where `Run-Matrix.ps1` has three
@@ -1365,13 +1365,13 @@ saving is real but it is overwhelmingly the *pool rescale*, not the page. Re-mea
 
 | config | RSS under load |
 |---|---:|
-| p4K, depth 1024 (shipped) | 98.5 MB |
-| p64K, depth 64 (shipped - page rescales the pool) | **57.2 MB** |
+| p4K, depth 1024 (default) | 98.5 MB |
+| p64K, depth 64 (default - page rescales the pool) | **57.2 MB** |
 | p64K, depth 1024 (pool pinned - page is the only change) | 87.8 MB |
 
-So of the 41 MB the shipped 64KB page saves, only ~9 MB is attributable to the page itself; the other
+So of the 41 MB the default 64KB page saves, only ~9 MB is attributable to the page itself; the other
 ~31 MB is the pool rescaling from 1024 buffers to 64. The headline "a big page is CHEAPER" survives as a
-statement about **what ships**, because the rescale is shipped behaviour and is what a user would get -
+statement about **what the default does**, because the rescale is default behaviour and is what a user would get -
 but it is not a property of the page, and the earlier wording implied it was.
 
 Note also that pinned pool size and resident set are only loosely related: at p64K/depth-1024 the three
@@ -1761,7 +1761,7 @@ disappointment so much as an arithmetic consequence: pinning saves one `GCHandle
 overlap; the segment one does the work. (Pinning *alone*, at 4KB blocks and 65 pins per response, was not
 measured separately - that is the open cell in this table.)
 
-**And byo alone is NOT universally better than the shipped bridge.** It is -3.0% at 16KB (ranges barely
+**And byo alone is NOT universally better than the default bridge.** It is -3.0% at 16KB (ranges barely
 touching) and level at 512B; its win is concentrated at 256KB (+45%). It is **byo + big blocks** that
 beats classic everywhere measured.
 
