@@ -1430,9 +1430,23 @@ internal sealed class IoUringShard : SocketSetShard
             if (local)
             {
                 // reuse-port: each shard has its own listener, so it is already balanced — adopt here.
-                // Reserve our own slot first; if we're full, drop rather than scan-fail deep in adoption.
-                if (TryReserve()) AdoptAccepted(newFd, defaultToken);
-                else LibC.close(newFd);
+                // Reserve our own slot first; if we're full, fall back to capacity-aware placement rather
+                // than dropping. That fallback is what lets a reuse-port SERVER grow: TryPlace adds a shard
+                // when every table is full, and a grown shard is given its own reuse-port listener (see
+                // SocketSet.Listen's replay in TryGrow) so the kernel balances subsequent accepts onto it
+                // directly — this bounce is only for the one connection that triggered the growth. Without
+                // it a full shard closed the accepted fd silently and the set never grew here (epoll's
+                // AcceptBurst already routes every accept through TryPlace, so only io_uring needed this).
+                if (TryReserve())
+                {
+                    AdoptAccepted(newFd, defaultToken);
+                }
+                else
+                {
+                    var target = (IoUringShard?)Parent.TryPlace();
+                    if (target is not null) target.EnqueueInbound(newFd, defaultToken);
+                    else LibC.close(newFd); // genuinely full and growth off/exhausted (TryPlace counted it)
+                }
             }
             else
             {

@@ -35,6 +35,25 @@ different OS and different dates.
   cell went from a 15.2s failure to passing in 0.2s. **Unverified on Linux**; epoll and io_uring are
   unchanged by construction, not by test.
 
+### What changed on 2026-07-31 (Linux cold-start after the Windows work)
+
+- **The shared changes are correctness-clean on Linux.** A new Linux correctness gate,
+  `bench/run-smoke-matrix.sh` (the long-missing `.sh` counterpart of `Run-SmokeMatrix.ps1`), runs 52 cells
+  across io_uring / epoll / managed x plaintext / OpenSSL TLS and reports **51/52 PASS**. The rewritten
+  `PipeIoBridge` pump (every echo-pipe cell), the new endpoint validation (abstract-UDS cells), and the
+  `Flush` hand-off (verify cells) all pass on both Linux backends.
+- **The one FAIL is item 0d's twin on io_uring, and it is NOT new.** `iouring+tls/verify-oob-4m` stalls
+  (received=0) at the default 4KB page and passes in 0.2s at `--page 65536` — TLS out-of-band send starved
+  because a ~7000-byte encrypted record cannot cross a 4096 send page, exactly the mechanism that failed
+  RIO before its geometry fix. io_uring kept the 4KB page (unchanged by construction), so it still starves.
+  This is correctness evidence for the Linux `DefaultGeometry` decision (`TODO.md` §3 item 2), not a
+  regression from the shared changes.
+- **Dynamic shard growth now works on the reuse-port path** (io_uring + epoll over IP), which it never did
+  before. It needed two fixes, not the one the handover named — a grown shard was given no listener (Gap A,
+  both backends) and io_uring never triggered growth on a full local accept (Gap B, silent drop). Both
+  fixed and proved by `bench/run-shard-growth.sh` (each backend grows 2→12 under load, holds at 2 with
+  growth off); churn cells stay clean. Details in `TODO.md`'s dynamic-shard-growth section.
+
 Reading order if you are picking this up cold: `TODO.md`'s top sections, then item 0e, then 2f.
 
 ### Feature / backend matrix

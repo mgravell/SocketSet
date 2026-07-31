@@ -28,6 +28,16 @@ public abstract partial class SocketSet : IDisposable
     private readonly object _growLock = new();
     private readonly ConcurrentBag<Exception> _startupFaults = [];
 
+    // Multi-bind (reuse-port) listens, recorded so a shard grown AFTER Listen can replay them. On that
+    // path each shard binds its OWN listener and the kernel balances accepts across them (io_uring/epoll
+    // over IP); a grown shard has no listener until we bind one too, so without this the kernel never
+    // routes a single accept to it — the one genuinely unfinished piece of dynamic shard growth. Guarded
+    // by _growLock (recorded there, replayed there), so recording the endpoint and binding the shards that
+    // exist is atomic against a concurrent growth: a shard created in between is bound by the replay, one
+    // created after sees the completed record. Stays null on the single-listener path (Windows/UDS/
+    // ListenHandle), where a grown shard already receives bounced connections with no listener changes.
+    private List<(EndPoint Endpoint, object? Token)>? _multiBindListens;
+
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(30);
 
     protected SocketSet(SocketSetOptions options)
@@ -217,6 +227,19 @@ public abstract partial class SocketSet : IDisposable
                 catch (Exception ex) { OnWorkerFaulted(ex); shard.Stop(); return false; }
             }
 
+            // Reuse-port listeners are per-shard, so a shard grown after Listen has none and the kernel
+            // would never balance an accept onto it. Replay every multi-bind listen the set was asked for
+            // (recorded under this same lock). Done BEFORE publish so the shard is a full listening peer by
+            // the time any reader can observe it. The single-listener path leaves _multiBindListens null and
+            // needs nothing here — a grown shard there already takes bounced connections.
+            if (_multiBindListens is { } listens)
+            {
+                foreach (var (endpoint, token) in listens)
+                {
+                    shard.Listen(endpoint, token, local: true);
+                }
+            }
+
             // Copy-on-write publish. Readers snapshot into a local, so they see either the old array or
             // the new one, never a torn view - and a reader holding the old snapshot simply misses the
             // new shard until its next call, which is harmless.
@@ -273,9 +296,15 @@ public abstract partial class SocketSet : IDisposable
         if (Options.Factory.CanMultiBind(endpoint))
         {
             // Reuse-port: every shard binds its own listener and the kernel balances accepts (io_uring/IP).
-            foreach (var shard in _shards)
+            // Record it and bind the current shards under the growth lock so the two are atomic against a
+            // concurrent grow — a shard added in between is bound by TryGrow's replay, never left unbound.
+            lock (_growLock)
             {
-                shard.Listen(endpoint, userToken, local: true);
+                (_multiBindListens ??= []).Add((endpoint, userToken));
+                foreach (var shard in _shards)
+                {
+                    shard.Listen(endpoint, userToken, local: true);
+                }
             }
         }
         else

@@ -24,29 +24,41 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
 
 ### 2. What to check, in order
 
-1. **Build both targets.** `net10.0` and `net472` — the netfx build broke twice this week on things like
-   `OperatingSystem.IsLinux()`.
-2. **The banner, not the flag.** `SmokeTest --http` and AspNetDemo's `/config` print the RESOLVED
-   geometry (`/config` gained a `geometry` field). Confirm epoll and io_uring report
-   `page=4096 recvbuf=4096 writebufs=1024 oobwritebufs=256 readpages=256`. **A `0` means a read site was
-   missed** and something is running a geometry nobody chose.
-3. **The smoke matrix, by hand** — there is still no `.sh` equivalent of `Run-SmokeMatrix.ps1`, and
-   **writing one is worth more than one run of it**. Cover `--verify-echo` (callback AND `--pipe`, since
-   the pipe path is what changed), `--verify`, `--churn`, `--poke`, plaintext and TLS, on epoll and
-   io_uring. Include an `@abstract` UDS case: it must still work here.
+**STEPS 1-3 DONE 2026-07-31; step 4 (the size sweep) still outstanding.** Results inline below.
+
+1. ~~**Build both targets.**~~ **DONE** — `net10.0` and `net472` both build clean, 0 errors (7 pre-existing
+   XML-doc warnings only).
+2. ~~**The banner, not the flag.**~~ **DONE** — io_uring, epoll and managed all report
+   `page=4096 recvbuf=4096 writebufs=1024 oobwritebufs=256 readpages=256` via `SmokeTest --http`. No `0`
+   anywhere; no read site missed. io_uring confirmed as the auto-detected default (`IoUringFactory`).
+3. ~~**The smoke matrix, by hand**~~ **DONE, and the `.sh` runner is now written**: `bench/run-smoke-matrix.sh`
+   (io_uring / epoll / managed x plaintext / `--tls-ssl` x verify / echo-cb / echo-pipe / poke / churn,
+   plus `@abstract` UDS echo-pipe on the two native backends). **51/52 PASS.** The pipe path is clean
+   (every echo-pipe cell passes), the abstract-UDS guard correctly does NOT fire, and the Flush/out-of-band
+   verify cells pass everywhere except **the one FAIL: `iouring+tls/verify-oob-4m`** (received=0, stalls
+   15s). That is NOT a regression from the shared changes — it is the io_uring analog of item 0d: TLS
+   out-of-band send starves at the default 4KB page (a ~7000-byte encrypted record cannot make progress
+   through a 4096 send page). `--page 65536` fixes it in 0.2s, exactly as it fixed RIO's 0d. This is
+   correctness evidence for the `DefaultGeometry` decision (§3 item 2), not a bug in the new code.
 4. **A size sweep against the recorded numbers**, which should be flat. Anything that moves is one of the
-   shared changes above, since nothing else about those backends was touched.
+   shared changes above, since nothing else about those backends was touched. **STILL TO DO** —
+   `bench/run-tls-sizes.sh`, compare against `AspNetDemo/RESULTS.md`'s "Linux baseline on bare metal".
 
 ### 3. Then the Linux-only work, in priority order
 
-1. **Multi-bind listener replay for shard growth.** Growth is implemented and measured on the
-   single-listener path (Windows) but a grown shard gets **no accepts** on the reuse-port path, which is
-   io_uring and epoll over IP. The set must remember what it was asked to listen on and replay it. This
-   is the only genuinely unfinished piece of that feature.
+1. ~~**Multi-bind listener replay for shard growth.**~~ **DONE 2026-07-31 — and it was two gaps, not the
+   one the handover named.** Reuse-port growth now works end-to-end on both io_uring and epoll (each grows
+   2→12 under load; `bench/run-shard-growth.sh`). See the dynamic-shard-growth section below for Gap A
+   (listener replay) and Gap B (io_uring's silent local-accept drop) in full. Verified no regression: the
+   smoke-matrix churn cells stay clean on both backends.
 2. **Decide whether Linux wants a different `DefaultGeometry`.** The mechanism now exists to say so per
    backend. io_uring's read pool is per-SHARD so it can afford a big page where epoll's per-SOCKET slab
    cannot. **Do not override without a measurement** — RIO's override has a 4.68x result and a
-   correctness-gate failure behind it.
+   correctness-gate failure behind it. **NEW EVIDENCE 2026-07-31:** io_uring now has a correctness-gate
+   failure of its own — `iouring+tls/verify-oob-4m` stalls at the default 4KB page and passes at
+   `--page 65536` (the 0d analog; see §2 step 3). So the case for an io_uring page bump is no longer only
+   throughput; it is also this stall. Still needs the throughput/RSS sweep before flipping the default,
+   because io_uring reads all three pool depths and the page rescales them.
 3. **Prefix sends on io_uring.** It keeps all-or-nothing; its cap is `IovMax` 1024 against IOCP's 256, so
    the cliff is far away rather than absent. Worth measuring before building.
 4. **kTLS / epoll+kTLS (items 4, 4b, 3c)** — unchanged, and still Linux-only.
@@ -514,11 +526,30 @@ so step 1 was nearly free rather than the work it was billed as. Teardown (step 
 placement rather than doubling, because each shard pins `SocketsPerShard` x the buffer sizes and there is
 no shrink.
 
-**Gaps, all deliberate:**
+**REUSE-PORT PATH DONE 2026-07-31 (Linux, io_uring + epoll over IP), and it was TWO gaps, not one.** The
+handover called listener replay "the only genuinely unfinished piece"; a reading of the accept path found
+a second, and a rig (`bench/run-shard-growth.sh`, pure reuse-port server under client load, shard count
+sampled from `/proc` worker-thread names — no server reporting code needed) proved both:
 
-- **Multi-bind listeners are not replayed** onto a grown shard, so on io_uring/epoll over IP a new shard
-  gets no accepts. That is survey step 3 and the only genuinely unfinished piece. It needs the set to
-  remember what it was asked to listen on. **Untestable here — the Linux box is where it matters.**
+- **Gap A — a grown shard had no listener.** On reuse-port each shard binds its OWN listener and the kernel
+  balances accepts; a shard grown after `Listen` had none, so the kernel never routed a single accept to
+  it. Fixed: `SocketSet.Listen` records the multi-bind listens (under `_growLock`) and `TryGrow` replays
+  them onto the new shard before publishing it. This alone made **epoll** grow end-to-end (2→12 under
+  load), because epoll's `AcceptBurst` already routes every accept through `Parent.TryPlace` (which grows).
+- **Gap B — io_uring never TRIGGERED growth on a pure server.** io_uring's reuse-port fast path adopts
+  locally and, when its own slot table was full, **closed the accepted fd silently** — it never called
+  `TryPlace`, so a pure server (accepts only, no connects) stayed pinned at its start count. Measured:
+  io_uring `on` grew 0 shards until fixed, where epoll grew 10. Fixed: on a full local table, fall back to
+  `Parent.TryPlace` + bounce (`EnqueueInbound`), mirroring the single-listener path — the bounce is only
+  for the one connection that triggered the grow; subsequent accepts balance onto the grown shard's own
+  replayed listener. The silent drop is now counted by `TryPlace` (`PlacementFailures`) too.
+
+  After both: `run-shard-growth.sh` shows io_uring AND epoll grow 2→12 with growth on and hold at 2 with
+  growth off; the smoke-matrix churn cells (which also exercise the accept path) stay clean on both.
+
+*Original gaps entry follows.*
+
+- ~~**Multi-bind listeners are not replayed** onto a grown shard~~ **DONE — see above (Gap A).**
 - **Growth blocks the placing thread** while the new shard's startup gate is waited on (up to the 30s
   startup timeout). Acceptable for the accept path, which is already off the hot loop, but it is a
   serialisation point under a burst.
