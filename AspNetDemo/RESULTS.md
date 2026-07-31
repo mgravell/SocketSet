@@ -123,7 +123,7 @@ rather than code in this repo, so it is marked as such and should be re-checked 
 | `ReceiveBufferSize` split | yes | yes | yes | yes | **no** | *n/a - pool block size (4KB)* |
 | multi-segment send | 64 x `WSABUF` | **capped at 1** | writev <=1024 iov | n/a - direct `send()` | n/a - one `SetBuffer` | *yes - SAEA `BufferList`* |
 | chained pooled pages (`GetWriteSpan`) | no | must not | **yes** | n/a | no | *n/a* |
-| BYO zero-copy **send** | **yes** - any length (256 segs/send, then a PREFIX) | impossible (registered ids) | **yes** (all-or-nothing, <=1024 iov) | no | no | ***yes - sends from the pipe*** |
+| BYO zero-copy **send** | **yes** - any length (256 segs/send, then a PREFIX) | impossible (registered ids) | **yes** - any length (1024 iov/send, then a PREFIX) | no | no | ***yes - sends from the pipe*** |
 | BYO zero-copy **receive** | no | no | no | no | no | ***yes - into `GetMemory()`*** |
 | internal zero-copy echo | no | no | **yes** (borrowed read buffers) | no | no | *n/a* |
 | pipe mode (`UsePipe`) | yes | yes | yes | yes | yes | *it **is** pipes* |

@@ -750,20 +750,32 @@ internal sealed class IoUringShard : SocketSetShard
     /// (pinning and iovec construction are thread-agnostic); the loop thread only issues it.</summary>
     private readonly ConcurrentQueue<(uint Slot, uint Generation, ZcJob Job)> _zeroCopy = [];
 
-    internal unsafe bool TrySendZeroCopy(IoUringConnection conn, in ReadOnlySequence<byte> data, bool pinned,
+    // Returns the number of BYTES accepted for zero-copy send, which may be a PREFIX of `data`: the caller
+    // (PipeIoBridge) then re-presents the remainder, so a sequence longer than IovMax is streamed as
+    // several zero-copy sends rather than falling off a cliff into a full copy. Returns 0 when zero-copy is
+    // not possible at all (TLS, closed, empty), and the caller takes the copy path. Measured 2026-07-31:
+    // the >IovMax decline is far (a 4MB response at Kestrel's 4KB blocks = 1024 segments) but a hard cliff
+    // when hit - an 8MB response went 100% copy (zero-copy=2 of ~61k segments) before this.
+    internal unsafe long TrySendZeroCopy(IoUringConnection conn, in ReadOnlySequence<byte> data, bool pinned,
                                          out ValueTask<bool> completion)
     {
         completion = default;
         // TLS must encrypt, so the bytes on the wire are never the caller's bytes. Refusing (rather than
         // silently copying) keeps the fallback the obvious path - the caller then uses Send().
-        if (conn.Tls is not null || conn.KtlsSsl != 0) return false;
-        if (Volatile.Read(ref conn.Fd) == 0) return false;
-        if (data.IsEmpty) return false;
+        if (conn.Tls is not null || conn.KtlsSsl != 0) return 0;
+        if (Volatile.Read(ref conn.Fd) == 0) return 0;
+        if (data.IsEmpty) return 0;
 
-        // Count first: pinning half a sequence and then discovering it is too fragmented would mean
-        // unwinding pins for nothing. IovMax is 1024, so this refuses far later than IOCP's 64.
+        // Count the non-empty segments, CAPPED at IovMax: a single writev takes at most IovMax iovecs, so
+        // beyond that we send the first IovMax as a prefix. Counting first (rather than pinning as we go)
+        // avoids unwinding pins if we stop early. Empty segments carry no iovec, so they don't count.
         int n = 0;
-        foreach (var _ in data) if (++n > IovMax) return false;
+        foreach (var seg in data)
+        {
+            if (seg.IsEmpty) continue;
+            if (++n == IovMax) break; // cap: the rest becomes the caller's remainder
+        }
+        if (n == 0) return 0; // all-empty sequence: nothing to send zero-copy
 
         // THE PIN COST IS THE THING TO WATCH, and it is why `pinned` is not a micro-optimisation. With an
         // ordinary MemoryPool this takes one GCHandle pin per SEGMENT, and Kestrel's default 4KB blocks
@@ -779,6 +791,7 @@ internal sealed class IoUringShard : SocketSetShard
         foreach (var seg in data)
         {
             if (seg.IsEmpty) continue;
+            if (i == n) break; // filled the prefix; the remainder is the caller's to re-present
             byte* p;
             if (job.Handles is null)
             {
@@ -797,7 +810,7 @@ internal sealed class IoUringShard : SocketSetShard
             total += seg.Length;
             i++;
         }
-        if (i == 0) { job.Count = 0; job.Finish(false); return false; }
+        if (i == 0) { job.Count = 0; job.Finish(false); return 0; }
 
         job.Count = i;
         job.Total = total;
@@ -807,7 +820,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         _zeroCopy.Enqueue((conn.Slot, Volatile.Read(ref conn.Generation), job));
         Poke();
-        return true;
+        return total; // bytes accepted — the full sequence, or an IovMax-segment prefix of it
     }
 
     /// <summary>Loop thread: issue a zero-copy job, or queue it behind an in-flight send.</summary>

@@ -160,6 +160,14 @@ if command -v modprobe >/dev/null && [ -d /proc/net ] && (lsmod 2>/dev/null | gr
 else
     echo "note: kTLS cells skipped — the 'tls' kernel module is not loaded (modprobe tls to enable)"
 fi
+# Big-pipe echo: 8MB over the pipe with a deep pipeline window, so the outbound pipe accumulates far more
+# than IovMax (1024) segments in flight. This is the io_uring zero-copy PREFIX path — a >IovMax sequence is
+# sent as several zero-copy writevs rather than falling back to a full copy (proven separately on the demo:
+# an 8MB response goes 100% zero-copy). Byte-exact here is the correctness guard for the prefix boundary
+# math. Both native backends (epoll's pipe path exercises the same many-segment send without zero-copy).
+for bi in 0 1; do   # iouring, epoll
+    add_cell "${backend_names[$bi]}/echo-pipe-8m-deep" "${backend_args[$bi]} --verify-echo 8388608 -z 4096 --pipe --window 2048" echo-cb-64k
+done
 
 # Filter (glob).
 sel_names=(); sel_args=(); sel_rules=()

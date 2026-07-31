@@ -14,9 +14,10 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > was a writev/IOV_MAX bug (fixed, NOT a geometry problem — so io_uring keeps `BufferGeometry.Default`),
 > and **epoll gained a real kTLS path (item 3c)** — whose pre-registered throughput prediction then
 > FALSIFIED itself (epoll+ktls trails epoll+tls ~9%, so the kTLS small-message penalty is the record path,
-> not multishot forfeiture). All committed and pushed to `main`. What is genuinely still open on Linux:
-> prefix sends on io_uring (§3 item 3), the TLS-renegotiation audit, and kTLS multishot with RX offload
-> (items 4/4b, which need OpenSSL 3.2+ and real hardware). The original handover text follows.
+> not multishot forfeiture), and **io_uring got zero-copy prefix sends** (§3 item 3 — measured that an 8MB
+> response was 100% copy, fixed it to 100% zero-copy). All committed and pushed to `main`. What is
+> genuinely still open on Linux: the TLS-renegotiation audit, and kTLS multishot with RX offload (items
+> 4/4b, which need OpenSSL 3.2+ and real hardware). The original handover text follows.
 
 Linux has not been run since 2026-07-29 and **shared code changed underneath it**. Correctness first,
 measurement second — the same discipline the Windows switch needed, for the same reason.
@@ -88,11 +89,17 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
      io_uring dispatches one writev over a segment chain, so the page is not a throughput lever.
 
    Net: RIO needed 64KB for both reasons; io_uring needs it for neither. Leave the default alone.
-3. **Prefix sends on io_uring.** It keeps all-or-nothing; its cap is `IovMax` 1024 against IOCP's 256, so
-   the cliff is far away rather than absent. Worth measuring before building. **STILL OPEN — the highest
-   remaining Linux code item.** (Note: the zero-copy SEND path still DECLINES at >`IovMax` segments; the
-   2026-07-31 writev fix capped the TLS out-of-band CHAIN at `IovMax` but did not add a prefix to the
-   zero-copy path — that is this item.)
+3. ~~**Prefix sends on io_uring.**~~ **DONE 2026-07-31 — measured first, then built.** The measurement
+   settled "is the cliff real?": at 256KB the pipe path is 100% zero-copy (`zero-copy=1,952` segs, 0
+   copied), but at **8MB it went 100% COPY** (`zero-copy=2` of ~61k segments, overflowing into
+   `pinned-managed=53,790` per-response pinned allocations) — because 8MB / 4KB blocks = 2048 segments >
+   `IovMax` 1024, so `TrySendZeroCopy` declined wholesale and the bridge copied the entire response. Far
+   (needs >4MB) but a hard cliff. **Built:** `IoUringShard.TrySendZeroCopy` now returns BYTES ACCEPTED and
+   caps the iovecs at `IovMax`, sending the first 1024 segments as a prefix; `PipeIoBridge` already
+   re-presents the remainder (it did for IOCP), so a large sequence streams as several zero-copy writevs.
+   After: 8MB is **100% zero-copy** (`zero-copy=61,472`, 0 copied). Byte-exact under concurrency (23 x 8MB
+   downloads, all `x`, exact length) and a new `echo-pipe-8m-deep` smoke cell (8MB, window 2048) guards the
+   prefix boundary math on io_uring and epoll.
 4. **kTLS / epoll+kTLS.** ~~item 3c (epoll+kTLS pump)~~ **DONE 2026-07-31 — epoll runs real kTLS**, smoke
    matrix has `+ktls` cells (58/58). Its throughput comparison is DONE too and falsified the pre-registered
    prediction (epoll+ktls trails epoll+tls ~9%, so the kTLS penalty is the record path, not multishot
@@ -1839,9 +1846,10 @@ now goes out zero-copy. Option 3 (coalescing small trailing segments) remains, a
 **Option 2, done 2026-07-30.** `Connection.TrySendZeroCopy` returns **bytes accepted** instead of a
 bool; IOCP sends the first `MaxZeroCopySegments` segments and reports how many bytes that was, and
 `PipeIoBridge` advances its reader by exactly that much and re-offers the remainder on the next read.
-io_uring keeps all-or-nothing (returns `data.Length` or 0), so **nothing about that backend changes** —
-its cap is `IovMax` 1024 against IOCP's 256, so its cliff is far away rather than absent. Adopting
-prefix sends there is a follow-up that wants measuring on Linux, not assuming.
+io_uring kept all-or-nothing at first — its cap is `IovMax` 1024 against IOCP's 256, so its cliff is far
+away rather than absent. **That follow-up is now DONE too (2026-07-31): io_uring adopts the same prefix
+behaviour, after measuring that the cliff is real (an 8MB response was 100% copy before, 100% zero-copy
+after). See §3 item 3 for the measurement and the change.**
 
 *Measured, isolated worktrees, interleaved, 6 scored passes, `--byo`:*
 

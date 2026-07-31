@@ -239,15 +239,15 @@ internal sealed unsafe class IoUringConnection : Connection
     /// </summary>
     /// <remarks>
     /// The base contract became "bytes accepted, possibly a prefix" on 2026-07-30, so IOCP could stop
-    /// falling off a cliff at its <c>WSABUF</c> cap. io_uring keeps ALL-OR-NOTHING behaviour here -
-    /// either the whole sequence or 0 - which is exactly what it did before, so nothing about this
-    /// backend changes. Its cap is <c>IovMax</c> = 1024 against IOCP's 256, so the cliff is far away
-    /// rather than absent; adopting prefix sends here is a follow-up, and it wants measuring on Linux
-    /// rather than assuming (see TODO item 2f).
+    /// falling off a cliff at its <c>WSABUF</c> cap. io_uring adopted the same PREFIX behaviour on
+    /// 2026-07-31 (the shard returns bytes accepted, capping the iovecs at <c>IovMax</c> = 1024): the
+    /// decline is far (a 4MB response at 4KB blocks is 1024 segments) but measured to be a hard cliff when
+    /// hit - an 8MB response went 100% copy before this. So the shard now sends the first IovMax segments
+    /// and reports their byte count; the bridge re-presents the remainder as the next zero-copy send.
     /// </remarks>
     internal override long TrySendZeroCopy(in ReadOnlySequence<byte> data, bool pinned,
                                            out ValueTask<bool> completion)
-        => Shard.TrySendZeroCopy(this, in data, pinned, out completion) ? data.Length : 0;
+        => Shard.TrySendZeroCopy(this, in data, pinned, out completion);
 
     public override bool Flush()
     {
