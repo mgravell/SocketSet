@@ -1226,8 +1226,17 @@ reuse pressure. That is the strongest available evidence that slot reuse was sho
 window rather than exposing a separate bug — but it is evidence, not proof: **0e was a ~1-in-2 fault and
 still hid for months** behind a suite that ran its cell once. Treat "there is no second bug" as unproven.
 
-**The structural hazard remains real regardless**, and would be the thing to harden if this area ever
-misbehaves again: completions carry only the slot (`r.SocketContext`), *not* a
+**The structural hazard is now DETECTED on IOCP (2026-07-31), though not removed.** `IocpOp` carries the
+connection generation it was armed for, and the completion dispatch drops any completion whose generation
+does not match the slot's current tenant, counting it as `STALE COMPLETIONS` in `SS_IOCP_STATS`. It
+should always read 0 — and does, through TCP and TLS churn — because the invariant below is what makes a
+slot-only completion safe in the first place. The point is that if the invariant ever breaks, it now
+announces itself instead of silently applying a dead connection's completion to whoever holds the slot,
+which is how a lifetime bug becomes corruption rather than a log line. **RIO has no equivalent yet**: its
+`RequestContext` currently carries only the op kind, and packing a generation alongside it is the obvious
+follow-up given 0e lived on that backend.
+
+The underlying hazard is unchanged: completions carry only the slot (`r.SocketContext`), *not* a
 generation, so a stale completion landing on a re-tenanted slot is structurally possible; the
 defer-recycle rule (`TryFinalize` refusing to free while `RecvArmed || SendBusy`) is the only thing
 preventing it. Any path that clears those flags without the completion having drained reopens it.

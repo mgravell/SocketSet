@@ -51,6 +51,14 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         public OpKind Kind;
         public uint Slot;
         public int Buf;                     // recv-pool index (Recv) / write-pool index (Send)
+
+        // The connection generation this op was armed for. A completion carries only a SLOT, so nothing
+        // in the completion itself distinguishes "my connection" from "whoever holds this slot now" -
+        // the defer-recycle rule (TryFinalize refusing to free while RecvArmed || SendBusy) is the ONLY
+        // thing preventing a stale completion landing on a re-tenanted slot. That rule should hold, so
+        // this check should never fire; it exists because item 0e cost a day to find and the next
+        // lifetime bug should announce itself instead of corrupting a live connection's state.
+        public uint Generation;
     }
 
     // Accept op context. No slot yet (there is no connection until the accept completes), so it carries
@@ -232,8 +240,12 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
                 {
                     case OpKind.Accept: HandleAccept((AcceptOp*)e.lpOverlapped, failed); break;
                     case OpKind.Connect: HandleConnect(op->Slot, failed); break;
-                    case OpKind.Recv: HandleRecv(op->Slot, bytes, failed); break;
-                    case OpKind.Send: HandleSend(op->Slot, bytes, failed); break;
+                    case OpKind.Recv:
+                        if (StaleCompletion(op)) break;
+                        HandleRecv(op->Slot, bytes, failed); break;
+                    case OpKind.Send:
+                        if (StaleCompletion(op)) break;
+                        HandleSend(op->Slot, bytes, failed); break;
                 }
             }
         }
@@ -379,7 +391,24 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     private static long s_zcPrefix;                                // ...of which sent a PREFIX and left a remainder
     private static long s_zcDeclineTls, s_zcDeclineClosed, s_zcDeclineEmpty, s_zcDeclineSegs;
     private static long s_zcDeclineSegSum, s_zcDeclineSegMax;      // true segment count at a fragmentation decline
+    private static long s_staleCompletions;                        // MUST stay 0 - see StaleCompletion
     private static long s_sendPages, s_sendPageBufs;               // the COPYING path: WSASends, and their WSABUFs
+
+    /// <summary>
+    /// A completion whose op was armed for a PREVIOUS tenant of this slot. Should be impossible: a slot
+    /// is not freed while an op is outstanding (TryFinalize refuses while RecvArmed || SendBusy), which
+    /// is what makes it safe for a completion to carry only a slot number. If this ever returns true,
+    /// that invariant is broken somewhere and the correct response is to drop the completion rather than
+    /// apply it to whoever holds the slot now - applying it is how a lifetime bug becomes corruption
+    /// instead of a log line. Counted always; the count is printed by SS_IOCP_STATS.
+    /// </summary>
+    private bool StaleCompletion(IocpOp* op)
+    {
+        var conn = _conns[op->Slot - 1];
+        if (op->Generation == conn.Generation) return false;
+        Interlocked.Increment(ref s_staleCompletions);
+        return true;
+    }
 
     private static void DumpStats(string tag)
     {
@@ -394,7 +423,8 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             // this counter exists to prevent: a banner that reports a limit the code is not applying.
             $"(cap={IocpConnection.MaxZeroCopySegments} mean-segs={(dseg > 0 ? (double)dsum / dseg : 0):n2} " +
             $"max-segs={Interlocked.Read(ref s_zcDeclineSegMax):n0}) " +
-            $"| copying path: WSASends={classic:n0} WSABUFs={Interlocked.Read(ref s_sendPageBufs):n0}");
+            $"| copying path: WSASends={classic:n0} WSABUFs={Interlocked.Read(ref s_sendPageBufs):n0} " +
+            $"| STALE COMPLETIONS={Interlocked.Read(ref s_staleCompletions):n0} (must be 0)");
     }
 
     // Periodic as well as at shutdown, for the reason io_uring's is: a rig kills the server, and a
@@ -519,6 +549,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         IocpOp* op = SendOp(slot);
         op->Kind = OpKind.Send;
         op->Slot = slot;
+        op->Generation = conn.Generation;
         op->Buf = -1; // no write-pool page backs this send
 
         Win32.WSABUF* bufs = stackalloc Win32.WSABUF[IocpConnection.MaxZeroCopySegments];
@@ -797,6 +828,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         IocpOp* op = RecvOp(slot);
         op->Kind = OpKind.Connect;
         op->Slot = slot;
+        op->Generation = conn.Generation;
         op->Buf = 0;
 
         uint sent = 0;
@@ -1108,6 +1140,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         IocpOp* op = SendOp(slot);
         op->Kind = OpKind.Send;
         op->Slot = slot;
+        op->Generation = conn.Generation;
         op->Buf = conn.SendPages[0];
 
         // Skip whatever a previous partial send already delivered, then describe the remainder.
@@ -1354,6 +1387,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         IocpOp* op = RecvOp(slot);
         op->Kind = OpKind.Recv;
         op->Slot = slot;
+        op->Generation = conn.Generation;
         op->Buf = conn.RecvBuf;
 
         Win32.WSABUF b; b.len = (uint)_recvBufSize; b.buf = _recvBuffer.Address(conn.RecvBuf);
