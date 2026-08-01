@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Does the outbound HALF-PIPE (CycleBuffer PipeWriter, direct Send, no pump/hop) beat the classic pump and
+# BYO on the axis it targets -- CONCURRENCY at small/mid payloads? (branch cyclebuffer-halfpipe)
+#
+# WHAT THIS TESTS, pre-registered (2026-08-01). The half-pipe removes the per-connection ThreadPool pump
+# task + its thread hop + the outbound Pipe state machine, at the cost of a COPY on send (Connection.Send
+# instead of the transport's zero-copy writev). So:
+#   * It should NOT win at 256KB -- BYO's zero-copy send wins there, and the copy the half-pipe reintroduces
+#     is exactly what costs. This rig deliberately uses a SMALL payload where the copy is cheap and the
+#     removed machinery dominates.
+#   * The hypothesis is CONCURRENCY: at c64 the three legs should be close; if the pump-task-contention
+#     theory (TODO "Two half-pipes" #1) is right, half-pipe should degrade LESS than classic (and than BYO)
+#     as c goes 64 -> 128 -> 256, because there are no N pump tasks contending.
+#   * FALSIFIER: if half-pipe does not pull ahead of classic as c rises, the pump-contention hypothesis is
+#     wrong -- and that is the finding. Say so; do not bury it.
+#
+# House rules honored: banner-gated legs (a flag that parsed but was ignored measures identically), same
+# session per rep, shuffled leg order, pass 1 discarded + 6 scored, ranges reported not just medians.
+#
+# Usage:  ./run-halfpipe.sh
+#         BACKEND=epoll SIZE=16384 CONCS="64 128 256" REPS=7 ./run-halfpipe.sh
+set -uo pipefail
+
+BACKEND=${BACKEND:-io-uring}      # io-uring | epoll
+SIZE=${SIZE:-1024}                # fixed small/mid payload; the copy is cheap here on purpose
+CONCS=${CONCS:-"64 128 256"}
+SHARDS=${SHARDS:-12}
+DURATION=${DURATION:-8s}
+WARMUP=${WARMUP:-2s}
+REPS=${REPS:-7}                   # pass 1 discarded; 6 scored
+PORT=${PORT:-5087}
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUT="${OUT:-$REPO/bench/results}"
+BOMB="$REPO/bench/.tools/bombardier"
+DEMO="$REPO/AspNetDemo/bin/Release/net10.0/AspNetDemo"
+
+mkdir -p "$OUT"
+STAMP=$(date +%Y%m%d-%H%M%S)
+CSV="$OUT/halfpipe-$STAMP.csv"
+LOGS="$OUT/logs-halfpipe-$STAMP"
+mkdir -p "$LOGS"
+
+for tool in jq curl taskset shuf awk; do
+  command -v "$tool" >/dev/null || { echo "missing required tool: $tool"; exit 1; }
+done
+[[ -x "$BOMB" ]] || { echo "missing $BOMB"; exit 1; }
+
+echo "building AspNetDemo (Release)..."
+dotnet build "$REPO/AspNetDemo/AspNetDemo.csproj" -c Release -v q --nologo >/dev/null || { echo "build failed"; exit 1; }
+
+source "$REPO/bench/cpu-split.sh"
+
+echo "conc,leg,rep,rps,mib_s,lat_p50_us,lat_p99_us,errors,status" > "$CSV"
+
+# name|extra demo args|required /config fragment|forbidden fragment (or empty)
+LEGS=(
+  "classic|--classic|byo=off|half-pipe=1"
+  "byo|--byo|byo=pipe|half-pipe=1"
+  "halfpipe|--half-pipe|half-pipe=1|byo=pipe"
+)
+
+measure() {
+  local name="$1" extra="$2" want="$3" forbid="$4" conc="$5" rep="$6"
+  local log="$LOGS/$name.c$conc.r$rep.log"
+  taskset -c "$SERVER_CPUS" "$DEMO" --"$BACKEND" --shards "$SHARDS" $extra --port "$PORT" >"$log" 2>&1 &
+  local pid=$! cfg="" i
+  for ((i=0;i<80;i++)); do
+    cfg=$(curl -s --max-time 3 "http://127.0.0.1:$PORT/config" 2>/dev/null) && [[ -n "$cfg" ]] && break
+    sleep 0.4
+  done
+  if [[ -z "$cfg" ]]; then
+    echo "    $name: no /config"; echo "$conc,$name,$rep,,,,,,NOSTART" >>"$CSV"
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
+  fi
+  # Trust the banner: the required fragment must be present and the forbidden one absent.
+  if [[ "$cfg" != *"$want"* ]]; then
+    echo "    $name: MISMATCH (wanted '$want') -> $cfg"; echo "$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
+  fi
+  if [[ -n "$forbid" && "$cfg" == *"$forbid"* ]]; then
+    echo "    $name: has forbidden '$forbid' -> $cfg"; echo "$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
+  fi
+
+  local url="http://127.0.0.1:$PORT/payload?n=$SIZE"
+  taskset -c "$CLIENT_CPUS" "$BOMB" -k -o json -p r -c "$conc" -d "$WARMUP" -t 10s "$url" >/dev/null 2>&1
+  local j; j=$(taskset -c "$CLIENT_CPUS" "$BOMB" -k -l -o json -p r -c "$conc" -d "$DURATION" -t 10s "$url" 2>/dev/null)
+  kill $pid 2>/dev/null; wait $pid 2>/dev/null; sleep 1
+
+  local rps; rps=$(jq -r '.result.rps.mean // empty' <<<"$j")
+  if [[ -z "$rps" ]]; then echo "    $name: no result"; echo "$conc,$name,$rep,,,,,,FAILED" >>"$CSV"; return; fi
+  local p50 p99 errs mib
+  p50=$(jq -r '.result.latency.percentiles."50"' <<<"$j")
+  p99=$(jq -r '.result.latency.percentiles."99"' <<<"$j")
+  errs=$(jq -r '.result.others + .result.req4xx + .result.req5xx' <<<"$j")
+  mib=$(awk -v r="$rps" -v s="$SIZE" 'BEGIN{printf "%.1f", r*s/1048576}')
+  printf "    %-8s c%-4s %10.0f rps  p99 %7.0fus  err %s\n" "$name" "$conc" "$rps" "$p99" "$errs"
+  echo "$conc,$name,$rep,${rps%.*},$mib,${p50%.*},${p99%.*},$errs,$([[ $errs -gt 0 ]] && echo ERRORS || echo ok)" >>"$CSV"
+}
+
+echo
+echo "HALF-PIPE concurrency A/B on $BACKEND: 3 legs x $(wc -w <<<"$CONCS") concurrencies x $REPS passes (pass 1 discarded)"
+echo "  payload=${SIZE}B shards=$SHARDS -d $DURATION  server=$SERVER_CPUS client=$CLIENT_CPUS"
+echo "  csv: $CSV"
+echo
+
+for conc in $CONCS; do
+  echo "=== concurrency c${conc} (payload ${SIZE}B) ==="
+  for ((rep=1; rep<=REPS; rep++)); do
+    mapfile -t SHUF < <(printf '%s\n' "${LEGS[@]}" | shuf)
+    for spec in "${SHUF[@]}"; do
+      IFS='|' read -r name extra want forbid <<<"$spec"
+      measure "$name" "$extra" "$want" "$forbid" "$conc" "$rep"
+    done
+  done
+done
+
+echo
+echo "=== rps, median of scored passes, min-max in brackets ==="
+awk -F, 'NR>1 && $3>1 && $4!="" { k=$1"|"$2; n[k]++; v[k"_"n[k]]=$4+0 }
+  END { for (k in n) { c=n[k]
+      for(i=1;i<=c;i++) a[i]=v[k"_"i]
+      for(x=1;x<c;x++)for(y=x+1;y<=c;y++) if(a[x]>a[y]){t=a[x];a[x]=a[y];a[y]=t}
+      split(k,p,"|"); printf "c%-5s %-9s %10.0f  [%.0f-%.0f]  n=%d\n", p[1], p[2], a[int((c+1)/2)], a[1], a[c], c } }' "$CSV" | sort -n -k1.2
+
+echo
+echo "csv: $CSV"
+echo "Reading: half-pipe should NOT win at large payloads (it copies on send); the bet is that it degrades"
+echo "LESS than classic as c rises (no pump tasks). If it does not, the pump-contention hypothesis was wrong."
