@@ -10,10 +10,11 @@ using SocketSets;
 namespace SocketSets.AspNet;
 
 /// <summary>Reports the ALPN id agreed by a TLS session this transport terminated. ASP.NET Core has no
-/// public feature for this (ITlsHandshakeFeature carries the cipher suite, not the protocol), so the demo
-/// defines its own to make the negotiated value observable from a request handler.</summary>
-internal interface ITransportTlsFeature
+/// public feature for this (ITlsHandshakeFeature carries the cipher suite, not the protocol), so this
+/// library defines its own; read it from a request handler via <c>HttpContext.Features</c>.</summary>
+public interface ITransportTlsFeature
 {
+    /// <summary>The ALPN protocol id negotiated by the transport-terminated TLS session, or null.</summary>
     string? NegotiatedProtocol { get; }
 }
 
@@ -51,12 +52,15 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     public IDuplexPipe TransportSide { get; }
 
     private readonly bool _byo;
+    private readonly SocketSetTransportMetrics _metrics;
 
     public SocketSetConnection(Connection conn, bool tls, bool byo = false,
-                              int pipeSegment = 0, MemoryPool<byte>? pipePool = null, bool halfPipe = false)
+                              int pipeSegment = 0, MemoryPool<byte>? pipePool = null, bool halfPipe = false,
+                              SocketSetTransportMetrics? metrics = null)
     {
         _conn = conn;
         _byo = byo;
+        _metrics = metrics ?? new SocketSetTransportMetrics();
         var sched = PipeScheduler.ThreadPool;
         // EXPERIMENT (SS_PIPE_SCHED=inline): resume the OUTBOUND reader (the SocketSet pump) INLINE on the
         // thread that flushed — i.e. Kestrel's request thread — instead of hopping to the ThreadPool. This
@@ -77,7 +81,7 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
             // The outbound leg is a CycleBuffer-backed PipeWriter that drains itself to Connection.Send on
             // Kestrel's flush thread — no outbound Pipe, no pump, no thread hop. byo is off in this mode, so
             // TransportSide (the ctx.UsePipe view) is never consulted.
-            _half = new HalfPipeWriter(conn);
+            _half = new HalfPipeWriter(conn, _metrics);
             TransportSide = null!;
         }
         else
@@ -179,7 +183,7 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
             {
                 ReadResult result = await reader.ReadAsync();
                 ReadOnlySequence<byte> buffer = result.Buffer;
-                if (!buffer.IsEmpty && !_conn.Send(buffer)) { Interlocked.Increment(ref SocketSetConnectionListener.SendFalse); break; } // socket gone
+                if (!buffer.IsEmpty && !_conn.Send(buffer)) { _metrics.OnSendFalse(); break; } // socket gone
                 reader.AdvanceTo(buffer.End);
                 if (result.IsCompleted || result.IsCanceled) break;
             }
