@@ -1,5 +1,7 @@
 # Kestrel writes past an `Advance` into a previously-acquired transport buffer
 
+> Filed upstream: **[dotnet/aspnetcore#68148](https://github.com/dotnet/aspnetcore/issues/68148)**
+
 Minimal, self-contained repro (one file, `Program.cs`; no SocketSet, no CycleBuffer, no external
 transport). It hosts `KestrelServer` over a fake in-memory connection transport that feeds one canned
 HTTP/1.1 request and exposes an instrumented `PipeWriter` as `ConnectionContext.Transport.Output`. The

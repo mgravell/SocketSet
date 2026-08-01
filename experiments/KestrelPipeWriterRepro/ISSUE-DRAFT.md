@@ -1,8 +1,7 @@
-# DRAFT issue for dotnet/aspnetcore — for review before filing
+# Issue for dotnet/aspnetcore — FILED as dotnet/aspnetcore#68148 (2026-08-01)
 
-> This is a draft only. `gh` is not installed on the repro machine, so nothing has been sent.
-> Suggested repo: **dotnet/aspnetcore**. Search first for existing issues mentioning
-> `IBufferWriter` / `Advance` / transport `PipeWriter` before filing.
+> Filed: https://github.com/dotnet/aspnetcore/issues/68148
+> The text below is the source draft; the filed issue may have been edited on submission.
 
 ---
 
