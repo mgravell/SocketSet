@@ -233,11 +233,91 @@ in the same session as everything else.
   http.sys columns as an outer bound, not as a row to subtract from.
 - **Loopback.** Client and server share this host; absolute values are not comparable to a two-machine
   test, and this is exactly where a kernel stack's advantages are most distorted.
+- ~~**One open confounder on the TLS legs.**~~ **RETIRED the same day — the TLS 1.3 floor is FREE.** A
+  dedicated `iocp+tls-min12` leg overlaps the 1.3 leg at all four sizes, so the floor costs no measurable
+  throughput and these numbers ARE continuous with earlier Windows figures. See the falsification section
+  above. *Original caveat text follows, for its reasoning.*
 - **One open confounder on the TLS legs.** These are the first Windows TLS numbers taken with the new
   SChannel **TLS 1.3 floor** (2026-08-01). Every SocketSet TLS leg here negotiated 1.3; there is no
   same-session 1.2 comparison. It cannot explain finding 4 (both RIO and IOCP got the same floor), but it
   is unmeasured against the older 1.2-capable configuration, so do not read these as continuous with any
   pre-2026-08-01 Windows TLS figure.
+
+### FALSIFIED: the IOCP+TLS page hypothesis is wrong, and a bigger page makes 1 MB WORSE (2026-08-01, same day, second session)
+
+The table above proposed that `iocp+tls` trails `rio+tls` at ≥16 KB because the TLS out-of-band path
+chunks ciphertext into page-sized segments and IOCP resolves `page=4096` where RIO resolves `page=65536`.
+**Pre-registered falsifier, written before the run: "if the page is the mechanism, `iocp+tls` at 256 KB
+moves from ~3,700 toward RIO's ~5,100+."** It does not. 7 legs x 4 sizes x 6 scored passes, one session,
+zero errors, `--page` banner-gated (`Want = page=65536`) so the flag is confirmed TAKEN, not just passed.
+
+| payload | `iocp+tls` (baseline) | **`iocp+tls-p64k`** | verdict | `rio+tls` (target) | `kestrel+tls` (ceiling) |
+|---|---:|---:|---|---:|---:|
+| 512 B | 127.7-135.2 | 134.2-137.0 | *overlapping* | 136.3-139.6 | 134.4-135.8 |
+| 16 KB | 3155-3267 | 3226-3325 | *overlapping* | 3381-3498 | 2984-3106 |
+| 256 KB | 3547-3950 | 3952-4065 | **+6.6%**, disjoint by 1.9 MiB/s — see below | 4551-5355 | 6715-6902 |
+| 1 MB | 2244-2304 | **2014-2060** | **−9.5%, disjoint — a REGRESSION** | 2568-2767 | 4440-4588 |
+
+**The verdict is falsified, not "inconclusive", and the 256 KB row is why the distinction matters.** That
+row *is* technically disjoint (min 3951.8 against max 3949.9 — by **1.9 MiB/s**, which is a rounding
+error dressed as a result), and it is the row the hypothesis pointed at. But the pre-registered bar was
+"toward RIO's ~5,100+", and 4,023 closes roughly **17%** of the gap to RIO and **6%** of the gap to
+Kestrel. A mechanism that explained the anomaly would have closed most of it. This one does not, it does
+nothing at 16 KB, and **at 1 MB it is a disjoint 9.5% regression** — so a bigger page is not merely "not
+the explanation", it is not a fix either, in the direction of actively harmful at the largest payload.
+
+**Three controls, and they are what make the null result trustworthy rather than an experiment that
+simply failed to do anything:**
+
+1. **The plaintext control moved nothing, exactly as pre-registered.** `iocp-p64k` vs `iocp` overlaps at
+   every one of the four sizes. That was predicted (plaintext IOCP escapes the page path via zero-copy
+   send), so the experiment demonstrably discriminates — the flag is not inert everywhere.
+2. **The page was the ONLY variable.** `SmokeTest`'s `--page` rescales three pool depths to hold pinned
+   memory constant, which would have confounded this outright — so it was checked rather than assumed:
+   the demo's `/config` geometry reads `writebufs=1024 oobwritebufs=256 readpages=256` at BOTH 4 KB and
+   64 KB pages, i.e. the demo's `--page` does not co-vary the pools. The two rigs differ here; do not
+   carry the SmokeTest caveat across to `AspNetDemo`.
+3. **The flag was confirmed taken**, not just parsed — the leg is gated on `page=65536` appearing in the
+   banner. Without that gate this whole table would be indistinguishable from one where `--page` did
+   nothing at all.
+
+#### Settled as a side-effect: the TLS 1.3 floor costs NOTHING, so the morning's caveat is retired
+
+The 2026-08-01 headline table carried an open caveat: it was the first Windows TLS measurement taken with
+the new SChannel TLS 1.3 floor, with no same-session 1.2 comparison, so it was not continuous with any
+earlier Windows TLS figure. Measured here as its own leg:
+
+| payload | `iocp+tls` (1.3 floor) | `iocp+tls-min12` (1.2 floor) | |
+|---|---:|---:|---|
+| 512 B | 127.7-135.2 | 134.0-136.8 | *overlapping* |
+| 16 KB | 3155-3267 | 3213-3291 | *overlapping* |
+| 256 KB | 3547-3950 | 3661-3985 | *overlapping* |
+| 1 MB | 2244-2304 | 2209-2356 | *overlapping* |
+
+**Overlapping at every size.** The floor is free, the caveat is retired, and the 2026-08-01 TLS numbers
+ARE continuous with earlier Windows figures after all. (Note this also means the 1.3 default costs no
+throughput to keep — the security argument does not have to be traded against anything.)
+
+#### REPLICATED in an independent session: `rio+tls` really does beat `iocp+tls`
+
+This was the surprising cell in the morning table, so it matters that a second session reproduces it with
+disjoint ranges at all three larger sizes:
+
+| payload | `rio+tls/s12` | `iocp+tls/s12` | |
+|---|---:|---:|---|
+| 16 KB | 3381-3498 | 3155-3267 | **RIO +8%** |
+| 256 KB | 4551-5355 | 3547-3950 | **RIO +38%** |
+| 1 MB | 2568-2767 | 2244-2304 | **RIO +17%** |
+
+Two independent sessions, same direction, same rough magnitudes, while RIO trails IOCP badly on
+*plaintext* at the same sizes. It is a real property of the two TLS send paths, and the buffer geometry is
+now ruled out as the cause.
+
+**What to do next, and the honest answer is instrument before hypothesising again.** The page was a
+plausible mechanism and it was wrong; the next guess deserves data first. `SS_IOCP_STATS=1` already exists
+and reports zero-copy declines and segment counts per response — it is what turned the "IOCP zero-copy
+does nothing at 256 KB" mystery into the measured 65.00-segments-against-a-64-cap answer. Point it at the
+TLS path and compare against RIO before proposing a fix.
 
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 

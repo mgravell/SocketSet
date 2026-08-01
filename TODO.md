@@ -99,17 +99,28 @@ then decide. Do not merge it as-is.
    **−2.6% at 16 KB**; our **TLS collapses at large payloads** (`iocp+tls` is LAST of eight legs at 256 KB
    and 1 MB, Kestrel `SslStream` +83% / +100% disjoint); and **http.sys CROSSES OVER** rather than
    dominating — last at 512 B (−18%) and 16 KB (−30%), first at 256 KB (+9%) and 1 MB (+112%).
-7. **NEW AND NOW THE TOP WINDOWS PERF ITEM: `rio+tls` beats `iocp+tls` at every size ≥16 KB** (+7% / +39%
-   / +18%, all disjoint) — which is BACKWARDS from plaintext, where RIO trails IOCP badly. `rio+tls` at
-   16 KB is also our only disjoint TLS win over Kestrel in the whole table (+11%).
-   **Pre-registered hypothesis: it is the page size, via the geometry sentinel.** RIO resolves
-   `page=65536`, IOCP resolves `page=4096`. The TLS out-of-band path chunks ciphertext into page-sized
-   segments, so IOCP issues ~16x the segments for the same response; plaintext IOCP escapes this because
-   zero-copy send bypasses the page path, and TLS cannot because the record layer must produce the bytes
-   first. **The falsifying test is one flag, no code: `--iocp --tls --page 65536`.** If the hypothesis
-   holds, `iocp+tls` at 256 KB moves from ~3,700 toward RIO's ~5,100+. If it does not move, the page is
-   not the mechanism and the difference is in the two send paths. Do this before item 5: it is a bigger
-   gap, on the leg that is currently last, and the first experiment costs nothing.
+7. **STILL THE TOP WINDOWS PERF ITEM: `rio+tls` beats `iocp+tls` at every size ≥16 KB — and the page
+   hypothesis for it is FALSIFIED (2026-08-01).** REPLICATED in a second independent session (+8% / +38%
+   / +17% at 16 KB / 256 KB / 1 MB, all disjoint), while RIO trails IOCP badly on plaintext at the same
+   sizes. So it is a real property of the two TLS send paths.
+
+   ~~Pre-registered hypothesis: it is the page size, via the geometry sentinel.~~ **WRONG, and a bigger
+   page is not even a workaround.** `--iocp --tls --page 65536`, banner-gated so the flag is confirmed
+   TAKEN: 256 KB moved 3,774 → 4,023 (disjoint by **1.9 MiB/s**, i.e. a rounding error dressed as a
+   result) against a pre-registered bar of "toward RIO's ~5,100+" — it closes ~17% of the gap. 16 KB
+   overlaps. **1 MB is a disjoint −9.5% REGRESSION.** Full table in `RESULTS.md`.
+
+   **The null result is trustworthy because the controls worked:** the plaintext companion (`iocp-p64k`)
+   overlapped at all four sizes exactly as pre-registered (zero-copy send bypasses the page path), so the
+   flag is not inert everywhere; and the page was verified to be the ONLY variable — `SmokeTest`'s
+   `--page` rescales three pool depths, but `AspNetDemo`'s does not (`/config` geometry reads
+   `writebufs=1024 oobwritebufs=256 readpages=256` at both page sizes). **Do not carry the SmokeTest
+   pool-rescaling caveat across to the demo; they differ.**
+
+   **NEXT STEP — instrument, do not hypothesise again.** The page was plausible and wrong, so the next
+   guess deserves data first. `SS_IOCP_STATS=1` already reports zero-copy declines and per-response
+   segment counts, and it is exactly what turned "IOCP zero-copy does nothing at 256 KB" into the measured
+   65.00-segments-against-a-64-cap answer. Point it at the TLS path, compare with RIO, then propose.
 8. **Accept-cost rig (http.sys is untested where it should win).** The 2026-08-01 table is **keep-alive
    only at c64**, so connection accept — the thing a kernel-mode HTTP stack should win most decisively —
    is entirely out of scope, and NO claim about accept cost in either direction is currently supported.

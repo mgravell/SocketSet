@@ -51,6 +51,12 @@ internal sealed class DemoConfig
 
     public bool Tls { get; private set; }
 
+    /// <summary>Lower the TLS floor to 1.2 (the default is 1.3, matching both providers since 2026-08-01).
+    /// Exists so the floor change is MEASURABLE rather than assumed harmless: every Windows TLS number
+    /// taken on 2026-08-01 negotiated 1.3, with no same-session 1.2 comparison, which leaves them
+    /// discontinuous with every earlier figure. This flag is what closes that.</summary>
+    public bool TlsMin12 { get; private set; }
+
     /// <summary>Kernel-TLS offload. Implies <see cref="Tls"/>; Linux + io_uring only.</summary>
     public bool Ktls { get; private set; }
 
@@ -144,6 +150,7 @@ internal sealed class DemoConfig
                 // --- TLS ---
                 case "--tls": cfg.Tls = true; break;
                 case "--ktls": cfg.Tls = cfg.Ktls = true; break;
+                case "--tls-min12": cfg.TlsMin12 = true; break;
 
                 // --- shape ---
                 case "--shards" when i + 1 < args.Length && int.TryParse(args[i + 1], out var n): cfg.Shards = n; i++; break;
@@ -208,6 +215,13 @@ internal sealed class DemoConfig
             ByoPipe = false;
         }
 
+        if (TlsMin12 && !Tls)
+            throw new ArgumentException("--tls-min12 lowers the TLS floor; it needs --tls.");
+        if (TlsMin12 && (VanillaKestrel || HttpSys))
+            throw new ArgumentException(
+                "--tls-min12 configures OUR TLS provider. Kestrel's SslStream and http.sys both negotiate " +
+                "under their own/OS policy, so the flag would silently do nothing on those legs.");
+
         if (Ktls && !OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("--ktls needs Linux (kernel TLS); Windows has no kTLS equivalent.");
         if (Ktls && Which is not (Backend.Auto or Backend.IoUring or Backend.Epoll))
@@ -245,16 +259,18 @@ internal sealed class DemoConfig
     {
         if (!Tls || VanillaKestrel) return null;
 
+        var min = TlsMin12 ? TlsProtocol.Tls12 : TlsProtocol.Tls13;
+
         // Server-only: the provider's client half is unused here, so no trust material is configured.
         if (Ktls || !OperatingSystem.IsWindows())
-            return new Tls.OpenSsl.OpenSslTlsProvider(cert.CertPem, cert.KeyPem, kernelOffload: Ktls);
+            return new Tls.OpenSsl.OpenSslTlsProvider(cert.CertPem, cert.KeyPem, kernelOffload: Ktls, minProtocol: min);
 
-        return CreateSChannelProvider(cert);
+        return CreateSChannelProvider(cert, min);
     }
 
     [SupportedOSPlatform("windows")]
-    private static TlsProvider CreateSChannelProvider(DemoCertificate cert)
-        => new Tls.SChannel.SChannelTlsProvider(cert.Certificate);
+    private static TlsProvider CreateSChannelProvider(DemoCertificate cert, TlsProtocol min)
+        => new Tls.SChannel.SChannelTlsProvider(cert.Certificate, minProtocol: min);
 
     /// <summary>Map the demo's A/B flags onto the SocketSet.AspNetCore transport options. The demo owns the
     /// flag matrix; the library owns the transport, so this is the one place the two meet.</summary>
@@ -301,7 +317,18 @@ internal sealed class DemoConfig
             (true, _, _, true) => "http.sys (kernel schannel, netsh-bound cert)",
             (true, true, _, _) => "ktls (openssl + kernel offload)",
             (true, false, true, _) => "kestrel/sslstream",
-            (true, false, false, _) => OperatingSystem.IsWindows() ? "schannel (sspi)" : "openssl",
+            // The floor is part of the banner ONLY when lowered, so every existing rig's gate string
+            // ("tls=schannel (sspi)", "tls=openssl") is byte-identical to before and keeps working. And
+            // the lowered form is deliberately "(sspi, min=tls12)" rather than "(sspi) min=tls12": the
+            // rigs match with a wildcard, so a suffix would let "*tls=schannel (sspi)*" match BOTH legs
+            // and a floor A/B would silently gate-pass whichever leg it actually ran.
+            (true, false, false, _) => (OperatingSystem.IsWindows(), TlsMin12) switch
+            {
+                (true, false) => "schannel (sspi)",
+                (true, true) => "schannel (sspi, min=tls12)",
+                (false, false) => "openssl",
+                (false, true) => "openssl (min=tls12)",
+            },
         };
 
         // Buffer sizes are appended only when overridden, so the strings the bench harnesses match on

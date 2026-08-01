@@ -44,7 +44,13 @@ param(
     [int]$WarmupPasses = 1,
     [int]$Port = 5080,
     [switch]$NoPin,
-    [string]$Filter = "*",
+    # Add the opt-in experiment legs (page-size and TLS-floor A/Bs). Off by default so the canonical
+    # headline sweep is always the same set of legs.
+    [switch]$Experimental,
+    # Accepts SEVERAL patterns, ORed. A single wildcard cannot express "these three unrelated legs", which
+    # is exactly what a targeted A/B needs — and running the full set instead just to get a subset is how
+    # a 15-minute experiment becomes an hour.
+    [string[]]$Filter = @("*"),
     [string]$OutDir = "$PSScriptRoot\results"
 )
 
@@ -139,6 +145,34 @@ $base = @(
        Tls = "http.sys (kernel schannel, netsh-bound cert)"; LegPort = 5443 }
 )
 
+# Opt-in legs for a specific pre-registered experiment (2026-08-01), kept OUT of the default sweep so the
+# canonical table stays one stable set of legs. `Want` is an extra list of banner fragments that must ALSO
+# appear in /config -- without it, --page 65536 would be gated on transport and tls only, so a page flag
+# that silently did nothing would measure identically to one that worked. That is house rule 1, and this
+# experiment is entirely ABOUT the page, so it is the one flag that most needs confirming.
+# NOT named $experimental: PowerShell variables are CASE-INSENSITIVE, so $experimental and the
+# [switch]$Experimental parameter are the SAME variable, and assigning an array to it fails with
+# "Cannot convert System.Object[] to SwitchParameter" — reported against the CALLER's line, which makes
+# it read as a bad argument at the call site rather than a name collision inside the script.
+$experimentalLegs = @(
+    # THE HYPOTHESIS: iocp+tls is last of eight legs at >=256KB because the TLS out-of-band path chunks
+    # ciphertext into page-sized segments and IOCP resolves page=4096 where RIO resolves page=65536.
+    # Falsifier: if the page is the mechanism, this leg moves 256KB from ~3,700 toward RIO's ~5,100+.
+    # If it does not move, the page is NOT the mechanism and the difference is in the two send paths.
+    @{ Name = "iocp+tls-p64k"; Args = @("--iocp", "--tls", "--page", "65536"); T = "socketset/iocp";
+       Tls = "schannel (sspi)"; Want = @("page=65536") }
+    # Plaintext companion: IOCP plaintext already escapes the page path via zero-copy send, so this leg
+    # should NOT move much. It is here as the control that separates "the page helps the TLS path" from
+    # "the page helps IOCP generally" -- without it, a TLS gain has two explanations.
+    @{ Name = "iocp-p64k";     Args = @("--iocp", "--page", "65536");          T = "socketset/iocp";
+       Tls = "off"; Want = @("page=65536") }
+    # The TLS 1.3 floor control. Every Windows TLS number from 2026-08-01 negotiated 1.3 with no
+    # same-session 1.2 comparison, leaving them discontinuous with every earlier figure. This closes that.
+    @{ Name = "iocp+tls-min12"; Args = @("--iocp", "--tls", "--tls-min12");    T = "socketset/iocp";
+       Tls = "schannel (sspi, min=tls12)" }
+)
+if ($Experimental) { $base += $experimentalLegs }
+
 # Expand SocketSet legs across the shard sweep; the no-shard servers appear once.
 # Clone rather than "+": hashtable addition throws on a duplicate key, and Name is being replaced.
 $legs = @(foreach ($b in $base) {
@@ -151,9 +185,9 @@ $legs = @(foreach ($b in $base) {
     else {
         foreach ($s in $Shards) { $c = $b.Clone(); $c.Name = "$($b.Name)/s$s"; $c.ShardCount = $s; $c }
     }
-}) | Where-Object { $_.Name -like $Filter }
+}) | Where-Object { $n = $_.Name; @($Filter | Where-Object { $n -like $_ }).Count -gt 0 }
 
-if (-not $legs) { throw "no legs matched filter '$Filter'" }
+if (-not $legs) { throw "no legs matched filter '$($Filter -join "', '")'" }
 
 # PREFLIGHT: drop any leg whose EXTERNAL precondition is not met, and say why.
 #
@@ -201,6 +235,13 @@ function Invoke-Leg($Leg, [int]$Size, [int]$Rep) {
         if ($null -eq $cfg) { Write-Host "    $($Leg.Name): no /config" -ForegroundColor Red; return $null }
         if ($cfg.config -notlike "*transport=$($Leg.T)*" -or $cfg.config -notlike "*tls=$($Leg.Tls)*") {
             Write-Host "    $($Leg.Name): MISMATCH -> $($cfg.config)" -ForegroundColor Red; return $null
+        }
+        # Extra banner fragments (e.g. page=65536). A leg whose whole point is a flag MUST confirm the
+        # flag took: transport and tls would both match whether or not --page did anything at all.
+        foreach ($w in @($Leg.Want)) {
+            if ($w -and $cfg.config -notlike "*$w*") {
+                Write-Host "    $($Leg.Name): banner missing '$w' -> $($cfg.config)" -ForegroundColor Red; return $null
+            }
         }
 
         foreach ($phase in @($WarmupDuration, $Duration)) {
