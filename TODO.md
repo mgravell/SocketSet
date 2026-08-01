@@ -793,6 +793,46 @@ flag does not touch TLS 1.3 KeyUpdate.
   to match the OpenSSL refusal + 1.3 floor for parity. **This is the one remaining TLS backlog item, and
   it is Windows-only.**
 
+## Package `SocketSet.AspNetCore` as a consumable library (proposed 2026-08-01)
+
+**Status: proposed, not started.** The AspNet bridge currently lives entirely in `AspNetDemo/` — a demo
+project — so the reusable part cannot be consumed by anyone else. Extract it into a real library project
+`SocketSet.AspNetCore` with its own `README.md` written for a hypothetical external consumer, and reduce
+`AspNetDemo` to what a demo actually is: **arg parsing, config, endpoints, and the banner** — driving the
+library rather than *being* it.
+
+**The split (what moves vs what stays):**
+- **MOVE to `SocketSet.AspNetCore`** (the reusable transport bridge): `SocketSetConnection`,
+  `SocketSetTransport` + `SocketSetConnectionListener` (the `IConnectionListenerFactory`/`IConnectionListener`),
+  `HalfPipeWriter`, `PinnedBlockMemoryPool`, `ITransportTlsFeature`/`TransportTlsFeature`. Add a public
+  registration extension — `builder.WebHost.UseSocketSet(options => ...)` (or an `IServiceCollection` one)
+  — that wires the factory into Kestrel. That extension IS the public API; everything above stays internal.
+- **STAY in `AspNetDemo`**: `DemoConfig` (the CLI A/B matrix — demo-only), `Program.cs` (endpoints, `/config`
+  `/stats`, banner), the `--kestrel` vanilla control leg. `DemoConfig` MAPS its parsed args into the
+  library's options type; it does not define the transport.
+
+**Design calls to make (pre-registered concerns):**
+1. **A real options type.** Introduce `SocketSetTransportOptions` in the library (backend/factory, TLS
+   provider, shards, pin, page/recv/write sizes, pinned pool, bridge mode). It must be SEPARATE from
+   `DemoConfig` (which is the demo's arg matrix, not a public API). The demo builds options from its flags.
+2. **Bridge mode as an enum, not env vars.** Expose `classic | byo | half-pipe` as an option value. The
+   experiment knobs (`SS_PIPE_SCHED`, `SS_HALF_DRAIN`) should NOT be public API — keep them as internal/env
+   experiment toggles or drop them from the packaged surface.
+3. **The static counters must go.** `SocketSetConnectionListener.Accepts/Closes/SendFalse/...` are `static`
+   mutable fields feeding the demo's `/stats`. A library cannot ship process-global mutable counters —
+   make them per-listener instance state (and expose via a metrics/`EventSource` or an options callback the
+   demo reads). This is the one non-mechanical part of the move.
+4. **Package metadata.** `net10.0`, `PackageId=SocketSet.AspNetCore`, framework-reference ASP.NET Core,
+   ProjectReference the SocketSet core (+ the vendored `RESPite` for the half-pipe — decide whether to
+   vendor into this package or keep the dependency explicit). Fill in description/authors/license.
+5. **README for an outsider.** How to add the transport to a minimal Kestrel app, the options, the TLS
+   story (transport-terminated OpenSSL/SChannel + kTLS), the bridge-mode tradeoffs (BYO for large, half-pipe
+   for small-mid — link RESULTS.md numbers), and the platform matrix (io_uring/epoll/IOCP/RIO/managed).
+
+**Done when:** `AspNetDemo` builds against `SocketSet.AspNetCore` with no transport implementation of its
+own, the smoke/bench rigs still pass (they gate on `/config` — unchanged), and the library builds + packs
+standalone. Nothing here needs a measurement; it is a refactor. Keep the `--kestrel` control working.
+
 ## Two half-pipes: replace the Kestrel bridge's two full `Pipe`s (proposed 2026-07-31)
 
 **Status: OUTBOUND HALF BUILT AND CORRECT (2026-08-01, branch `cyclebuffer-halfpipe`). Inbound half not
@@ -851,12 +891,27 @@ path — both toggles, pick per workload. **Alloc MEASURED (`bench/run-halfpipe-
 (gen0 193 vs 192, ~1350 B/req both) — so the win is CPU/scheduling, NOT GC; the "leaner allocations" framing
 was wrong (corrected in RESULTS.md).
 
-**STILL TODO on this branch:** (a) the tail-latency cost (+12–18% p99 small-mid) — acceptable, or does
-draining need to hop off the request thread (reintroducing some of what we removed)? (b) plaintext + TLS
-legs (only plaintext measured). (c) Windows (IOCP/RIO) — should work via `Connection.Send`, untested. (d)
-the harder inbound `PipeReader` half (real backpressure). (e) SPARE-CYCLES: clone+fork aspnetcore and fix
-[[aspnetcore-issue-68148]] ourselves (user to fork); low priority — the workaround holds, won't ship before
-.NET 12.
+**FOLLOW-UP WORK STARTED (2026-08-01, branch `halfpipe-followups`, pushed, NOT merged):**
+- **(a) p99 experiment — BUILT, UNVERIFIED.** `SS_HALF_DRAIN=pool` (banner `drain=inline|pool`): moves the
+  Send off the Kestrel request thread — copy committed bytes to a pooled array + discard on the request
+  thread (CycleBuffer stays lock-free), then Send on the ThreadPool, chained for order. Diagnostic for "is
+  request-thread Send the p99 culprit?". Compiles 0/0, inline path unchanged, but **NOT byte-exact-verified
+  and NOT A/B'd** — the box stopped launching AspNetDemo servers mid-session (see below). Verify + A/B
+  before trusting.
+- **(b) TLS crossover — knob added, UNRUN.** `run-halfpipe.sh` now takes `TLS=ssl`. Could not run: TLS
+  server startup failed in that session (the pre-existing BYO+TLS path failed identically — environmental,
+  not a code regression).
+- **ENVIRONMENT NOTE:** after ~40 server start/kill cycles the box could no longer start AspNetDemo servers
+  at all (even the proven plaintext form); `dotnet build` still worked. A fresh session clears it. Both (a)
+  and (b) just need re-running there. Also: env-prefixed `bash run-*.sh` invocations were dropped by the
+  harness intermittently — run the rigs plainly or `export` first.
+- **(e) aspnetcore fix — SPIKED.** [[aspnetcore-issue-68148]] root-caused to `BufferWriter<T>.Commit()`
+  retaining `_span` (src/Shared/ServerInfrastructure/BufferWriter.cs) + `Http1OutputProducer` reusing the
+  writer for headers-then-body. UNTESTED one-line candidate on branch `fix/bufferwriter-advance-contract`,
+  pushed to `github.com/mgravell/aspnetcore` (clone at `~/code/aspnetcore`); `SPIKE-68148-NOTES.md` there.
+
+**STILL TODO:** (c) Windows (IOCP/RIO) — should work via `Connection.Send`, untested. (d) the harder
+inbound `PipeReader` half (real backpressure). Plus finish (a)/(b)/(e) above in a fresh environment.
 
 ---
 
