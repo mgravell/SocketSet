@@ -8,10 +8,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>SocketSets.AspNet</RootNamespace>
+    <!-- RESPITE001: the vendored CycleBuffer is marked [Experimental]; we opt in (see HalfPipeWriter). -->
+    <NoWarn>$(NoWarn);RESPITE001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../src/SocketSet/SocketSet.csproj" />
+    <ProjectReference Include="../vendor/RESPite.Vendored.csproj" />
   </ItemGroup>
 
 </Project>

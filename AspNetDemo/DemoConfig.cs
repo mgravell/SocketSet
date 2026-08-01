@@ -98,6 +98,14 @@ internal sealed class DemoConfig
     /// out (it costs less pinned RSS but reintroduces the per-segment pin, so it is the unfair comparison).</summary>
     public bool PipePinned { get; private set; } = true;
 
+    /// <summary>EXPERIMENT (branch cyclebuffer-halfpipe): the outbound "half-pipe". Replace the outbound
+    /// <c>Pipe</c> with a <c>CycleBuffer</c>-backed <c>PipeWriter</c> that drains itself to
+    /// <c>Connection.Send</c> on Kestrel's flush thread — no pump task, no ThreadPool hop, no async read
+    /// loop. Copies on send (not zero-copy), so it targets the small/mid payloads and the per-connection
+    /// pump/hop cost, not 256KB throughput. Mutually exclusive with BYO (turns it off) — it IS the outbound
+    /// path, not a pipe handed to the transport. Inbound stays a stock Pipe.</summary>
+    public bool HalfPipe { get; private set; }
+
     public string Scheme => Tls ? "https" : "http";
 
     private DemoConfig() { }
@@ -145,6 +153,9 @@ internal sealed class DemoConfig
                     cfg.PipeSegment = ps; i++; break;
                 case "--pipe-pinned": cfg.PipePinned = true; break;
                 case "--pipe-unpinned": cfg.PipePinned = false; break; // opt out of the (default) pinned pool
+                // EXPERIMENT: outbound half-pipe (CycleBuffer PipeWriter -> direct Send). Turns BYO off:
+                // it replaces the outbound leg rather than handing a pipe to the transport.
+                case "--half-pipe": cfg.HalfPipe = true; cfg.ByoPipe = false; break;
 
                 case "-h":
                 case "--help": cfg.Help = true; break;
@@ -185,6 +196,10 @@ internal sealed class DemoConfig
         }
         if ((PageSize > 0 || RecvBufferSize > 0 || WriteBuffers > 0) && VanillaKestrel)
             throw new ArgumentException("--page / --recv-buffer / --write-buffers configure the SocketSet transport; they cannot combine with --kestrel.");
+        if (HalfPipe && VanillaKestrel)
+            throw new ArgumentException("--half-pipe configures the SocketSet outbound leg; it cannot combine with --kestrel.");
+        if (HalfPipe && _byoExplicit && ByoPipe)
+            throw new ArgumentException("--half-pipe replaces the outbound leg; it cannot combine with an explicit --byo.");
     }
 
     /// <summary>
@@ -241,7 +256,10 @@ internal sealed class DemoConfig
                     // older build that had no byo at all".
                     + (ByoPipe ? " byo=pipe" : " byo=off")
                     + (PipeSegment > 0 ? $" pipeseg={PipeSegment}" : "")
-                    + (PipePinned ? " pipepinned=1" : "");
+                    + (PipePinned ? " pipepinned=1" : "")
+                    // House rule: trust the banner, not the flag. A half-pipe run MUST say so, or an A/B
+                    // where the flag silently did nothing would measure identically to one that worked.
+                    + (HalfPipe ? " half-pipe=1" : "");
 
         return VanillaKestrel
             ? $"transport={transport} tls={tls} port={Port}"
