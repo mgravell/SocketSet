@@ -34,18 +34,52 @@ var builder = WebApplication.CreateBuilder();
 // HTTP responder does ~270k rps on the same box). Warnings and errors still surface.
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
 
-builder.WebHost.ConfigureKestrel(o =>
+if (cfg.HttpSys)
 {
-    o.Listen(IPAddress.Loopback, cfg.Port, lo =>
+    // http.sys — the OS's own kernel-mode HTTP stack, and NOT a Kestrel transport: it replaces the whole
+    // server, so none of the Kestrel/SocketSet configuration below applies to it. It is here as the
+    // strongest available "the OS already does this" control: request parsing, connection management and
+    // response framing all happen in kernel mode, which is a different shape of answer from Kestrel's
+    // user-mode loop and from ours.
+    //
+    // Needs NO elevation and no netsh setup for this prefix, verified on this box: a non-admin process
+    // binds http://localhost:<port>/ through http.sys successfully. That is worth stating because the
+    // usual folklore is that http.sys always needs `netsh http add urlacl`, which would have made this
+    // leg admin-only and therefore useless in an unattended rig.
+    builder.WebHost.UseHttpSys(o =>
     {
-        // Pin every configuration to HTTP/1.1. Otherwise the TLS legs could negotiate HTTP/2 via ALPN
-        // while the plaintext legs stayed on 1.1, and the comparison would be measuring two protocols.
-        lo.Protocols = HttpProtocols.Http1;
-        if (cfg.VanillaKestrel && cfg.Tls) lo.UseHttps(cert!.Certificate); // Kestrel's own SslStream leg
+        // BOTH explicit hosts, and that is not belt-and-braces. http.sys routes on the request's Host
+        // header against the registered prefix, so a server bound only to `localhost` answers 400 to
+        // http://127.0.0.1:<port>/ — and every bench rig in this repo requests 127.0.0.1. Registering one
+        // prefix would have produced a leg that starts, banners correctly, and fails every request.
+        //
+        // The wildcard forms (`http://+:<port>/`, `http://*:<port>/`) are what the folklore warns about
+        // and it is right: both fail with "Access is denied" unelevated, verified on this box. Explicit
+        // hosts do not. That difference is the whole reason this leg can run in an unattended rig.
+        o.UrlPrefixes.Add($"http://localhost:{cfg.Port}/");
+        o.UrlPrefixes.Add($"http://127.0.0.1:{cfg.Port}/");
+        // Match the other legs' shape as closely as http.sys allows. It has no per-listener protocol
+        // switch equivalent to Kestrel's HttpProtocols.Http1; over plaintext it speaks HTTP/1.1 anyway,
+        // which is what keeps this comparable.
+        o.MaxConnections = null;      // no artificial cap; the other legs have none either
+        o.MaxAccepts = Environment.ProcessorCount * 2;
     });
-});
+}
+else
+{
+    builder.WebHost.ConfigureKestrel(o =>
+    {
+        o.Listen(IPAddress.Loopback, cfg.Port, lo =>
+        {
+            // Pin every configuration to HTTP/1.1. Otherwise the TLS legs could negotiate HTTP/2 via ALPN
+            // while the plaintext legs stayed on 1.1, and the comparison would be measuring two protocols.
+            lo.Protocols = HttpProtocols.Http1;
+            if (cfg.VanillaKestrel && cfg.Tls) lo.UseHttps(cert!.Certificate); // Kestrel's own SslStream leg
+        });
+    });
+}
 
-if (!cfg.VanillaKestrel)
+if (!cfg.VanillaKestrel && !cfg.HttpSys)
 {
     // Replace Kestrel's socket transport with SocketSet (the SocketSet.AspNetCore library). When TLS is on
     // it is terminated DOWN HERE, in the transport (SChannel/SSPI on Windows, OpenSSL — optionally kTLS — on

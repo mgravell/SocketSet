@@ -41,6 +41,14 @@ internal sealed class DemoConfig
         _ => SocketSetFactory.Default,
     };
 
+    /// <summary>Serve with <b>http.sys</b>, Windows' kernel-mode HTTP stack, instead of Kestrel. Not a
+    /// transport swap like the SocketSet legs — it replaces the entire server, so no Kestrel option and no
+    /// bridge setting applies. It is the outer bound of the comparison: if the kernel doing HTTP is not
+    /// faster than a user-mode loop, that is a finding about the workload, not about any of these stacks.
+    /// Plaintext only here — an https prefix needs a certificate bound with `netsh http add sslcert`,
+    /// which requires elevation, so a TLS http.sys leg cannot be produced unattended.</summary>
+    public bool HttpSys { get; private set; }
+
     public bool Tls { get; private set; }
 
     /// <summary>Kernel-TLS offload. Implies <see cref="Tls"/>; Linux + io_uring only.</summary>
@@ -131,6 +139,7 @@ internal sealed class DemoConfig
                 case "--rio": cfg.Which = Backend.Rio; break;
                 case "--io-uring": cfg.Which = Backend.IoUring; break;
                 case "--epoll": cfg.Which = Backend.Epoll; break;
+                case "--httpsys": cfg.HttpSys = true; break;
 
                 // --- TLS ---
                 case "--tls": cfg.Tls = true; break;
@@ -173,6 +182,28 @@ internal sealed class DemoConfig
     private void Validate()
     {
         if (Help) return;
+
+        // http.sys replaces the SERVER, not the transport, so almost nothing else here applies to it.
+        // Reject the combinations rather than silently ignoring them: a leg that quietly dropped --iocp
+        // would measure http.sys while its banner and the harness both said SocketSet.
+        if (HttpSys)
+        {
+            if (!OperatingSystem.IsWindows())
+                throw new PlatformNotSupportedException("--httpsys needs Windows (http.sys is the in-box kernel HTTP stack).");
+            if (VanillaKestrel)
+                throw new ArgumentException("--httpsys replaces the server entirely; it cannot combine with --kestrel.");
+            if (Which != Backend.Auto)
+                throw new ArgumentException("--httpsys is not a SocketSet backend; drop the backend override.");
+            if (Tls)
+                throw new ArgumentException(
+                    "--httpsys is plaintext-only here: an https prefix needs a certificate bound with " +
+                    "`netsh http add sslcert`, which needs elevation. Compare it against the PLAINTEXT legs.");
+            if (HalfPipe || _byoExplicit)
+                throw new ArgumentException("--httpsys has no SocketSet bridge; --byo/--classic/--half-pipe do not apply.");
+            if (PageSize > 0 || RecvBufferSize > 0 || WriteBuffers > 0)
+                throw new ArgumentException("--page / --recv-buffer / --write-buffers configure the SocketSet transport; they cannot combine with --httpsys.");
+            ByoPipe = false;
+        }
 
         if (Ktls && !OperatingSystem.IsLinux())
             throw new PlatformNotSupportedException("--ktls needs Linux (kernel TLS); Windows has no kTLS equivalent.");
@@ -242,7 +273,9 @@ internal sealed class DemoConfig
 
     public string Describe()
     {
-        string transport = VanillaKestrel
+        string transport = HttpSys
+            ? "http.sys"
+            : VanillaKestrel
             ? "kestrel-sockets"
             : Which switch
             {
@@ -279,7 +312,9 @@ internal sealed class DemoConfig
                     // where the flag silently did nothing would measure identically to one that worked.
                     + (HalfPipe ? " half-pipe=1" : "");
 
-        return VanillaKestrel
+        // http.sys and vanilla Kestrel both take the short form: neither has shards, a bridge, or any
+        // buffer geometry, so printing those fields would invent configuration they do not have.
+        return VanillaKestrel || HttpSys
             ? $"transport={transport} tls={tls} port={Port}"
             : $"transport={transport} tls={tls} shards={Shards} pin={Pin} port={Port}{bufs}";
     }
@@ -294,6 +329,9 @@ internal sealed class DemoConfig
         Console.WriteLine("    --iocp / --rio   force a Windows backend");
         Console.WriteLine("    --io-uring       force the Linux io_uring backend");
         Console.WriteLine("    --epoll          force the Linux epoll backend (io_uring's fallback)");
+        Console.WriteLine("    --httpsys        Windows http.sys, the KERNEL-mode HTTP stack — not a transport");
+        Console.WriteLine("                     swap but a whole different server; the outer-bound control.");
+        Console.WriteLine("                     Plaintext only (an https prefix needs elevation to bind a cert)");
         Console.WriteLine();
         Console.WriteLine("  tls (default: off)");
         Console.WriteLine("    --tls            terminate TLS in the transport (SChannel on Windows, OpenSSL on Linux),");

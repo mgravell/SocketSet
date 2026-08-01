@@ -118,12 +118,26 @@ $base = @(
     # that attributable to the send path rather than to the cipher.
     @{ Name = "rio";         Args = @("--rio");              T = "socketset/rio";   Tls = "off" }
     @{ Name = "rio+tls";     Args = @("--rio", "--tls");     T = "socketset/rio";   Tls = "schannel (sspi)" }
+    # http.sys — the OS's KERNEL-mode HTTP stack, added 2026-08-01. Not another transport under Kestrel:
+    # a different server entirely, which is exactly why it is worth having. Every other leg here is a
+    # user-mode HTTP implementation, so the whole table has been measuring variations on one design; this
+    # is the outer bound, where request parsing and response framing happen in the kernel and the only
+    # user-mode work is the endpoint itself.
+    #
+    # PLAINTEXT ONLY, and deliberately so rather than an oversight: an https prefix needs a certificate
+    # bound with `netsh http add sslcert`, which needs elevation, so a TLS http.sys leg cannot be produced
+    # unattended. Compare it against the plaintext legs only — reading it against a +tls leg would be
+    # comparing a kernel stack doing no crypto with a user-mode stack doing crypto.
+    @{ Name = "httpsys";     Args = @("--httpsys");          T = "http.sys";        Tls = "off" }
 )
 
-# Expand SocketSet legs across the shard sweep; Kestrel legs appear once (no shards to vary).
+# Expand SocketSet legs across the shard sweep; the no-shard servers appear once.
 # Clone rather than "+": hashtable addition throws on a duplicate key, and Name is being replaced.
 $legs = @(foreach ($b in $base) {
-    if ($b.T -eq "kestrel-sockets") {
+    # Keyed on "has no shards to vary" rather than on kestrel specifically — http.sys has no shard concept
+    # either, and expanding it per shard count would silently run the identical configuration N times and
+    # present the repeats as a swept axis.
+    if ($b.T -eq "kestrel-sockets" -or $b.T -eq "http.sys") {
         $c = $b.Clone(); $c.ShardCount = 0; $c
     }
     else {
