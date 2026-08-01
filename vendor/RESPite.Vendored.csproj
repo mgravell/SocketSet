@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>$(NoWarn);RESPITE001;CS1591</NoWarn>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <AssemblyName>RESPite.Vendored</AssemblyName>
+    <RootNamespace>RESPite</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Using Include="RESPite.Internal" />
+  </ItemGroup>
+</Project>
