@@ -29,6 +29,7 @@ using Microsoft.AspNetCore.Http.Features;
 // ---------------------------------------------------------------------------
 
 Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+Console.WriteLine($"[repro] runtime: {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}");
 
 // Each connection gets its own SpyPipeWriter; we report the FIRST one (Kestrel may bind more than one
 // default endpoint, so more than one one-shot connection can occur -- reporting one keeps the trace clean).
