@@ -222,6 +222,24 @@ internal sealed class DemoConfig
     private static TlsProvider CreateSChannelProvider(DemoCertificate cert)
         => new Tls.SChannel.SChannelTlsProvider(cert.Certificate);
 
+    /// <summary>Map the demo's A/B flags onto the SocketSet.AspNetCore transport options. The demo owns the
+    /// flag matrix; the library owns the transport, so this is the one place the two meet.</summary>
+    public void ApplyTo(SocketSetTransportOptions o, DemoCertificate? cert)
+    {
+        o.Factory = Factory;
+        o.Shards = Shards;
+        o.PinWorkerThreads = Pin;
+        o.Tls = cert is null ? null : CreateTlsProvider(cert);
+        o.PipePinned = PipePinned;
+        o.PipeSegment = PipeSegment;
+        o.PageSize = PageSize;
+        o.ReceiveBufferSize = RecvBufferSize;
+        o.WriteBuffers = WriteBuffers;
+        o.Mode = HalfPipe ? SocketSetBridgeMode.HalfPipe
+               : ByoPipe ? SocketSetBridgeMode.Byo
+               : SocketSetBridgeMode.Classic;
+    }
+
     public string Describe()
     {
         string transport = VanillaKestrel

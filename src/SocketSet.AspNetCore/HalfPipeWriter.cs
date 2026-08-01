@@ -24,6 +24,7 @@ namespace SocketSets.AspNet;
 internal sealed class HalfPipeWriter : PipeWriter
 {
     private readonly Connection _conn;
+    private readonly SocketSetTransportMetrics _metrics;
     private CycleBuffer _cb = CycleBuffer.Create();
     private byte[]? _scratch;      // fallback when a GetMemory hint exceeds a CycleBuffer segment
     private int _scratchLen;       // >0 while the last GetMemory handed back the scratch buffer
@@ -33,7 +34,11 @@ internal sealed class HalfPipeWriter : PipeWriter
     // CycleBuffer itself stays single-thread (Kestrel-only), which is what keeps the whole thing lock-free.
     private volatile bool _peerGone;
 
-    public HalfPipeWriter(Connection conn) => _conn = conn;
+    public HalfPipeWriter(Connection conn, SocketSetTransportMetrics metrics)
+    {
+        _conn = conn;
+        _metrics = metrics;
+    }
 
     public override Memory<byte> GetMemory(int sizeHint = 0)
     {
@@ -81,7 +86,7 @@ internal sealed class HalfPipeWriter : PipeWriter
                 else
                 {
                     _peerGone = true; // socket gone: signal Kestrel to stop writing
-                    Interlocked.Increment(ref SocketSetConnectionListener.SendFalse);
+                    _metrics.OnSendFalse();
                 }
             }
         }

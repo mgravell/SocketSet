@@ -8,13 +8,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>SocketSets.AspNet</RootNamespace>
-    <!-- RESPITE001: the vendored CycleBuffer is marked [Experimental]; we opt in (see HalfPipeWriter). -->
-    <NoWarn>$(NoWarn);RESPITE001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The transport implementation now lives in the library; the demo only maps flags onto its options.
+         SocketSet core is referenced directly too, because DemoConfig names its types (backend factory,
+         TLS providers). -->
+    <ProjectReference Include="../src/SocketSet.AspNetCore/SocketSet.AspNetCore.csproj" />
     <ProjectReference Include="../src/SocketSet/SocketSet.csproj" />
-    <ProjectReference Include="../vendor/RESPite.Vendored.csproj" />
   </ItemGroup>
 
 </Project>

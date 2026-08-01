@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>SocketSets.AspNet</RootNamespace>
+    <!-- RESPITE001: the vendored CycleBuffer is [Experimental]; the half-pipe opts in (see HalfPipeWriter). -->
+    <NoWarn>$(NoWarn);RESPITE001</NoWarn>
+
+    <!-- Package metadata for external consumers. -->
+    <PackageId>SocketSet.AspNetCore</PackageId>
+    <Description>A Kestrel connection transport backed by SocketSet (io_uring / epoll / IOCP / RIO / managed), with optional transport-terminated TLS (OpenSSL/SChannel, plus kTLS on Linux). Add it with builder.WebHost.UseSocketSet(...).</Description>
+    <Authors>Marc Gravell</Authors>
+    <PackageTags>kestrel;transport;io_uring;epoll;iocp;rio;tls;ktls;sockets;aspnetcore</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../SocketSet/SocketSet.csproj" />
+    <ProjectReference Include="../../vendor/RESPite.Vendored.csproj" />
+  </ItemGroup>
+
+</Project>

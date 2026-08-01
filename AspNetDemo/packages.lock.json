@@ -13,6 +13,13 @@
       },
       "socketset": {
         "type": "Project"
+      },
+      "socketset.aspnetcore": {
+        "type": "Project",
+        "dependencies": {
+          "RESPite.Vendored": "[1.0.0, )",
+          "SocketSet": "[1.0.0, )"
+        }
       }
     }
   }

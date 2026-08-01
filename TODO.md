@@ -795,7 +795,22 @@ flag does not touch TLS 1.3 KeyUpdate.
 
 ## Package `SocketSet.AspNetCore` as a consumable library (proposed 2026-08-01)
 
-**Status: proposed, not started.** The AspNet bridge currently lives entirely in `AspNetDemo/` — a demo
+**Status: DONE, build-verified, NOT runtime-verified (2026-08-01, branch `package-aspnetcore-lib`).** The
+extraction is complete: new project `src/SocketSet.AspNetCore/` holds the transport (`SocketSetConnection`,
+`SocketSetTransport`/`Listener`, `HalfPipeWriter`, `PinnedBlockMemoryPool`, `ITransportTlsFeature` [now
+public]) + a public `UseSocketSet(o => ...)` extension, `SocketSetTransportOptions` (with a
+`SocketSetBridgeMode` enum: Classic/Byo/HalfPipe), and `SocketSetTransportMetrics` (a DI singleton with
+`Interlocked` counters + `ResolvedGeometry` — the static `/stats` counters are GONE, as the plan required).
+`AspNetDemo` now only maps its flags via `DemoConfig.ApplyTo(options, cert)` and drives the library. Library
++ demo + SmokeTest all build 0/0; `/config` gating strings are preserved (`DemoConfig.Describe()` unchanged,
+geometry now from `metrics.ResolvedGeometry`); no rig gates on the console banner. README.md written for
+external consumers. **Still needed before merge to main: a RUNTIME smoke** (the box could not start servers
+this session) — confirm `/config`, a byte-exact `/payload`, and `/stats` counters work end-to-end on
+io_uring/epoll, plaintext + TLS. Only then merge. (Original plan + design calls kept below for reference.)
+
+---
+
+**Original plan (2026-08-01):** The AspNet bridge currently lives entirely in `AspNetDemo/` — a demo
 project — so the reusable part cannot be consumed by anyone else. Extract it into a real library project
 `SocketSet.AspNetCore` with its own `README.md` written for a hypothetical external consumer, and reduce
 `AspNetDemo` to what a demo actually is: **arg parsing, config, endpoints, and the banner** — driving the

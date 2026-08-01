@@ -47,16 +47,16 @@ builder.WebHost.ConfigureKestrel(o =>
 
 if (!cfg.VanillaKestrel)
 {
-    // Replace Kestrel's socket transport with SocketSet. When TLS is on it is terminated DOWN HERE, in
-    // the transport (SChannel/SSPI on Windows, OpenSSL — optionally kTLS — on Linux), so Kestrel's HTTP
-    // stack sees plaintext and never constructs an SslStream.
-    builder.Services.RemoveAll<IConnectionListenerFactory>();
-    builder.Services.AddSingleton(cfg);
-    builder.Services.AddSingleton(new TransportTlsProvider(cfg.CreateTlsProvider(cert!)));
-    builder.Services.AddSingleton<IConnectionListenerFactory, SocketSetTransportFactory>();
+    // Replace Kestrel's socket transport with SocketSet (the SocketSet.AspNetCore library). When TLS is on
+    // it is terminated DOWN HERE, in the transport (SChannel/SSPI on Windows, OpenSSL — optionally kTLS — on
+    // Linux), so Kestrel's HTTP stack sees plaintext and never constructs an SslStream. The demo only maps
+    // its A/B flags onto the library's options.
+    builder.WebHost.UseSocketSet(o => cfg.ApplyTo(o, cert));
 }
 
 var app = builder.Build();
+// The library registers this singleton; null on the vanilla-Kestrel leg (no SocketSet transport).
+var metrics = app.Services.GetService<SocketSetTransportMetrics>();
 
 app.MapGet("/", () => "Hello from SocketSet — ASP.NET Core running its HTTP stack over a SocketSet transport!\n");
 app.MapGet("/ping", () => Results.Json(new { ok = true }));
@@ -102,7 +102,7 @@ app.MapGet("/config", (HttpContext http) => Results.Json(new
     config = cfg.Describe(),
     // What the BACKEND chose, which is not always what was asked for: unset sizes are "backend chooses"
     // sentinels, so RIO runs a 64KB page nobody typed. Gate on this, not on the flags you passed.
-    geometry = SocketSets.AspNet.SocketSetConnectionListener.ResolvedGeometry,
+    geometry = metrics?.ResolvedGeometry,
     certificate = cert?.Describe(),
     isHttps = http.Request.IsHttps,
     protocol = http.Request.Protocol,
@@ -111,11 +111,11 @@ app.MapGet("/config", (HttpContext http) => Results.Json(new
 
 app.MapGet("/stats", () => Results.Json(new
 {
-    accepts = SocketSetConnectionListener.Accepts,
-    closes = SocketSetConnectionListener.Closes,
-    closedEmpty = SocketSetConnectionListener.ClosedEmpty,
-    writeFail = SocketSetConnectionListener.WriteFail,
-    sendFalse = SocketSetConnectionListener.SendFalse,
+    accepts = metrics?.Accepts ?? 0,
+    closes = metrics?.Closes ?? 0,
+    closedEmpty = metrics?.ClosedEmpty ?? 0,
+    writeFail = metrics?.WriteFail ?? 0,
+    sendFalse = metrics?.SendFalse ?? 0,
     // GC / memory, for the allocation-and-RSS axis (the half-pipe's "leaner machinery" claim). Read these
     // before and after a fixed load and diff: gen0 collections and allocatedBytes are the alloc signal;
     // rssBytes/gcHeapBytes are the footprint signal. GetTotalAllocatedBytes is process-wide, so drive ONE
@@ -134,7 +134,3 @@ Console.WriteLine($"[aspnet demo] listening on {cfg.Scheme}://127.0.0.1:{cfg.Por
 
 app.Run();
 return 0;
-
-/// <summary>DI carrier for the transport's TLS engine (null = plaintext). A wrapper rather than the
-/// provider itself so the container can resolve "no TLS" without a null registration.</summary>
-internal sealed record TransportTlsProvider(SocketSets.Tls.TlsProvider? Provider);
