@@ -824,9 +824,20 @@ started. A/B on the concurrency sweep is the next step — the hypothesis below 
   a fresh lease and relocated bytes, corrupting the body; fixed defensively by re-leasing at the current
   end before each `Commit` since Kestrel writes contiguously.
 
-**STILL TODO on this branch:** the A/B (below) — c128/c256 concurrency sweep + small-message + alloc/RSS,
-half-pipe vs classic vs BYO, same session. Until that runs, the pump-contention hypothesis is UNMEASURED.
-Then the harder inbound `PipeReader` half (real backpressure).
+**A/B DONE (2026-08-01, `bench/run-halfpipe.sh`, io_uring, 1 KB, RESULTS.md has the table):** half-pipe
+wins throughput at every concurrency — +5.5/+3.2/+3.8% over classic at c64/c128/c256 (range-clean at
+c64/c128, overlapping at c256), and +5.6–7.0% over BYO (zero-copy send isn't worth its overhead at 1 KB).
+BUT the pre-registered pump-contention hypothesis (#1) is **NOT supported**: the lead is roughly FLAT with
+concurrency, not growing — so the win is a per-request machinery saving (cheaper CycleBuffer cycle + no
+pump task + no hop), not high-c contention relief. And it costs p99 (+16/+27/+56% at c64/128/256), because
+the drain+Send runs on the Kestrel request thread. **Falsifier fired for the mechanism; the flat win is
+the finding.**
+
+**STILL TODO on this branch:** (a) does the win hold at plaintext-tiny (`OK`) and does it INVERT at 64 KB+
+where the send-copy should cost (BYO's zero-copy should retake the lead)? (b) alloc/gen-0/RSS axis, not yet
+measured. (c) the tail-latency cost — is it acceptable, or does draining need to hop off the request thread
+(which would reintroduce some of what we removed)? (d) then the harder inbound `PipeReader` half (real
+backpressure).
 
 ---
 
