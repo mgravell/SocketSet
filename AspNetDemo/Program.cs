@@ -21,7 +21,12 @@ if (cfg.Help) { DemoConfig.PrintUsage(); return 0; }
 
 // ONE certificate for whichever TLS leg runs (see DemoCertificate): the point of this demo is comparing
 // transports, so the certificate must not be a variable.
-using var cert = cfg.Tls ? DemoCertificate.Create() : null;
+//
+// EXCEPT http.sys, which is not "a leg that takes a certificate" at all: it terminates TLS in the kernel
+// against a cert bound to the ip:port by netsh (bench/Enable-HttpSysTls.ps1). Creating one here would be
+// worse than pointless — it would appear in /config as though it were the cert in use, when the actual
+// one is whatever an administrator bound to that port, possibly with different parameters.
+using var cert = cfg.Tls && !cfg.HttpSys ? DemoCertificate.Create() : null;
 
 // NOTE: our flags are deliberately NOT forwarded to CreateBuilder — the command-line configuration
 // provider treats a bare "--flag" as a key expecting a value and throws on it.
@@ -56,8 +61,14 @@ if (cfg.HttpSys)
         // The wildcard forms (`http://+:<port>/`, `http://*:<port>/`) are what the folklore warns about
         // and it is right: both fail with "Access is denied" unelevated, verified on this box. Explicit
         // hosts do not. That difference is the whole reason this leg can run in an unattended rig.
-        o.UrlPrefixes.Add($"http://localhost:{cfg.Port}/");
-        o.UrlPrefixes.Add($"http://127.0.0.1:{cfg.Port}/");
+        //
+        // The scheme follows --tls, but note what that does NOT do: it configures no certificate. An
+        // https prefix tells http.sys to expect TLS on that port; WHICH certificate it presents comes
+        // from the machine SSL config (netsh add sslcert), so an https prefix on an unbound port starts
+        // cleanly and then fails every handshake.
+        string scheme = cfg.Tls ? "https" : "http";
+        o.UrlPrefixes.Add($"{scheme}://localhost:{cfg.Port}/");
+        o.UrlPrefixes.Add($"{scheme}://127.0.0.1:{cfg.Port}/");
         // Match the other legs' shape as closely as http.sys allows. It has no per-listener protocol
         // switch equivalent to Kestrel's HttpProtocols.Http1; over plaintext it speaks HTTP/1.1 anyway,
         // which is what keeps this comparable.

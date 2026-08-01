@@ -194,10 +194,13 @@ internal sealed class DemoConfig
                 throw new ArgumentException("--httpsys replaces the server entirely; it cannot combine with --kestrel.");
             if (Which != Backend.Auto)
                 throw new ArgumentException("--httpsys is not a SocketSet backend; drop the backend override.");
-            if (Tls)
-                throw new ArgumentException(
-                    "--httpsys is plaintext-only here: an https prefix needs a certificate bound with " +
-                    "`netsh http add sslcert`, which needs elevation. Compare it against the PLAINTEXT legs.");
+            // --httpsys --tls is allowed, but ONLY because the certificate is bound OUT OF BAND: http.sys
+            // terminates TLS in the kernel using whatever cert is bound to this ip:port in the machine SSL
+            // config (bench/Enable-HttpSysTls.ps1, run once elevated). We hand it no certificate and there
+            // is no in-process cert to hand — which is exactly why this leg is not like-for-like with
+            // Kestrel's SslStream or our in-transport SChannel, and why Describe() names it distinctly.
+            // If nothing is bound to the port, http.sys fails the connection at handshake rather than at
+            // startup, so the failure appears as "every request errors", not as a refusal to launch.
             if (HalfPipe || _byoExplicit)
                 throw new ArgumentException("--httpsys has no SocketSet bridge; --byo/--classic/--half-pipe do not apply.");
             if (PageSize > 0 || RecvBufferSize > 0 || WriteBuffers > 0)
@@ -288,12 +291,17 @@ internal sealed class DemoConfig
                 _ => $"socketset/auto({Factory.GetType().Name.Replace("Factory", "").ToLowerInvariant()})",
             };
 
-        string tls = (Tls, Ktls, VanillaKestrel) switch
+        string tls = (Tls, Ktls, VanillaKestrel, HttpSys) switch
         {
-            (false, _, _) => "off",
-            (true, true, _) => "ktls (openssl + kernel offload)",
-            (true, false, true) => "kestrel/sslstream",
-            (true, false, false) => OperatingSystem.IsWindows() ? "schannel (sspi)" : "openssl",
+            (false, _, _, _) => "off",
+            // Named distinctly from "schannel (sspi)" ON PURPOSE, and the rigs gate on this string. It IS
+            // SChannel underneath, but terminated in the KERNEL against a cert bound out of band by netsh
+            // — a different experiment from our in-transport SSPI, and a table row that quietly said
+            // "schannel (sspi)" for both would invite exactly the comparison that is not valid.
+            (true, _, _, true) => "http.sys (kernel schannel, netsh-bound cert)",
+            (true, true, _, _) => "ktls (openssl + kernel offload)",
+            (true, false, true, _) => "kestrel/sslstream",
+            (true, false, false, _) => OperatingSystem.IsWindows() ? "schannel (sspi)" : "openssl",
         };
 
         // Buffer sizes are appended only when overridden, so the strings the bench harnesses match on
@@ -331,7 +339,8 @@ internal sealed class DemoConfig
         Console.WriteLine("    --epoll          force the Linux epoll backend (io_uring's fallback)");
         Console.WriteLine("    --httpsys        Windows http.sys, the KERNEL-mode HTTP stack — not a transport");
         Console.WriteLine("                     swap but a whole different server; the outer-bound control.");
-        Console.WriteLine("                     Plaintext only (an https prefix needs elevation to bind a cert)");
+        Console.WriteLine("                     With --tls it needs a cert bound to the port out of band:");
+        Console.WriteLine("                     run bench/Enable-HttpSysTls.ps1 ONCE, elevated (default port 5443)");
         Console.WriteLine();
         Console.WriteLine("  tls (default: off)");
         Console.WriteLine("    --tls            terminate TLS in the transport (SChannel on Windows, OpenSSL on Linux),");

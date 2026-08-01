@@ -129,6 +129,14 @@ $base = @(
     # unattended. Compare it against the plaintext legs only — reading it against a +tls leg would be
     # comparing a kernel stack doing no crypto with a user-mode stack doing crypto.
     @{ Name = "httpsys";     Args = @("--httpsys");          T = "http.sys";        Tls = "off" }
+    # http.sys TLS. Needs its OWN port, which is why Port became per-leg: an `netsh add sslcert` binding
+    # makes that ip:port HTTPS for every listener, so it cannot share 5080 with the plaintext legs. The
+    # certificate is bound out of band by bench/Enable-HttpSysTls.ps1 (once, elevated) -- so unlike every
+    # other leg here, this one has an EXTERNAL precondition, and it fails as "every request errors"
+    # rather than as a startup refusal if the binding is missing. The rig therefore skips it (loudly)
+    # when nothing is bound, instead of reporting a leg of zeros as though it were a measurement.
+    @{ Name = "httpsys+tls"; Args = @("--httpsys", "--tls"); T = "http.sys";
+       Tls = "http.sys (kernel schannel, netsh-bound cert)"; LegPort = 5443 }
 )
 
 # Expand SocketSet legs across the shard sweep; the no-shard servers appear once.
@@ -147,13 +155,32 @@ $legs = @(foreach ($b in $base) {
 
 if (-not $legs) { throw "no legs matched filter '$Filter'" }
 
+# PREFLIGHT: drop any leg whose EXTERNAL precondition is not met, and say why.
+#
+# http.sys+TLS is the only leg here that depends on machine state this rig cannot create (a certificate
+# bound with `netsh http add sslcert`, which needs elevation - see bench/Enable-HttpSysTls.ps1). Without
+# it, http.sys starts cleanly, banners correctly, and then fails every TLS handshake - which reaches the
+# results table as "no /config", i.e. a timeout rather than a diagnosis, indistinguishable from a broken
+# server. Naming the real cause here is the same lesson Verify-AspNet.ps1 records.
+$legs = @($legs | Where-Object {
+    if (-not $_.LegPort -or $_.Tls -eq "off") { return $true }
+    $bound = & netsh http show sslcert ipport=127.0.0.1:$($_.LegPort) 2>&1 | Out-String
+    if ($bound -match "Certificate Hash") { return $true }
+    Write-Host ("  SKIP {0}: no certificate bound to 127.0.0.1:{1}. Run ELEVATED, once:" -f $_.Name, $_.LegPort) -ForegroundColor Yellow
+    Write-Host ("       $PSScriptRoot\Enable-HttpSysTls.ps1 -Port {0}" -f $_.LegPort) -ForegroundColor Yellow
+    return $false
+})
+
 function Invoke-Leg($Leg, [int]$Size, [int]$Rep) {
     $scheme = if ($Leg.Tls -eq "off") { "http" } else { "https" }
-    $url = "${scheme}://127.0.0.1:$Port/payload?n=$Size"
+    # Per-leg port override. Only http.sys+TLS uses it, because its certificate is bound to a specific
+    # ip:port in the machine SSL config and cannot move to the shared port without re-running netsh.
+    $legPort = if ($Leg.LegPort) { $Leg.LegPort } else { $Port }
+    $url = "${scheme}://127.0.0.1:$legPort/payload?n=$Size"
     $argList = @($Leg.Args)
     # Shard count is meaningless for kestrel (its own transport) and is rejected as an unknown flag.
     if ($Leg.ShardCount -gt 0) { $argList += @("--shards", "$($Leg.ShardCount)") }
-    $argList += @("--port", "$Port")
+    $argList += @("--port", "$legPort")
 
     # Leg names carry a shard suffix like "iocp+tls/s16"; the slash would become a path separator.
     $safe = $Leg.Name -replace '[\\/:*?"<>|]', '-'
@@ -167,7 +194,7 @@ function Invoke-Leg($Leg, [int]$Size, [int]$Rep) {
         $cfg = $null
         $deadline = (Get-Date).AddSeconds(40)
         while ((Get-Date) -lt $deadline) {
-            $raw = & curl.exe -sk --max-time 3 "${scheme}://127.0.0.1:$Port/config" 2>$null
+            $raw = & curl.exe -sk --max-time 3 "${scheme}://127.0.0.1:$legPort/config" 2>$null
             if ($LASTEXITCODE -eq 0 -and $raw) { try { $cfg = $raw | ConvertFrom-Json; break } catch { } }
             Start-Sleep -Milliseconds 400
         }

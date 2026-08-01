@@ -17,10 +17,19 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 > server-side renegotiation refusal), verified against controls by a new `bench/Verify-TlsFloor.ps1` and an
 > `openssl s_client` A/B. **The TLS backlog is now empty on both providers.**
 >
-> **The one honest gap this session leaves:** everything above is CORRECTNESS. No throughput number was
-> taken on Windows today, so items 5 and 6 are untouched and nothing here may be compared with the numbers
-> in `RESULTS.md`. Also, `Verify-AspNet.ps1` has no Linux equivalent yet — the extraction is runtime-verified
-> on IOCP/RIO/managed but not on io_uring/epoll, which is the first thing to do on the next Linux session.
+> **UPDATE (later 2026-08-01): the throughput half is done too, and it moved three conclusions.** A full
+> 8-leg re-baseline (`Run-TlsSizes.ps1`, 6 scored passes, one session, zero errors) now supersedes the
+> Windows tables in `RESULTS.md`. (a) Our **plaintext reached parity with Kestrel** at 512 B / 256 KB /
+> 1 MB, losing only a disjoint −2.6% at 16 KB. (b) Our **TLS collapses at large payloads** — `iocp+tls` is
+> LAST of eight legs at 256 KB and 1 MB. (c) An **http.sys baseline** was added (no elevation needed for
+> plaintext; `bench/Enable-HttpSysTls.ps1` for TLS) and it **crosses over** rather than dominating: last at
+> 512 B and 16 KB, first by 2x at 1 MB. The pre-registered "http.sys will kick us into orbit" prediction is
+> therefore **half falsified**, and the half that held is on a workload (keep-alive, c64) that excludes
+> accept — where a kernel stack should win most. Items 7 and 8 in the list below are what came out of it.
+>
+> **The gaps this session leaves:** `Verify-AspNet.ps1` has no Linux equivalent yet — the extraction is
+> runtime-verified on IOCP/RIO/managed but not on io_uring/epoll, which is the first thing to do on the
+> next Linux session. And accept cost is unmeasured on every stack (item 8).
 >
 > *The original cold-start plan follows, unchanged.*
 
@@ -82,10 +91,44 @@ then decide. Do not merge it as-is.
 4. ~~**SChannel min-protocol / renegotiation parity**~~ **DONE 2026-08-01 — see the TLS section below.**
    The TLS backlog is now empty on both providers.
 5. **RIO send page-quantization (item 0 below, NOT fixed)** — IOCP is fixed, RIO isn't; the standing RIO
-   perf item. **Now the top Windows item.**
-6. Re-measure the Windows baseline after the copy-removal (pre-registered to help Windows more than Linux).
-   Still open, and note the trap recorded in the 2026-07-29 section: a cross-day delta spanning several
-   commits is a changelog, not an attribution — use `Compare-Commits.ps1`.
+   perf item. Re-measured 2026-08-01 and still real: `rio/s12` trails `iocp/s12` disjointly by **−33% at
+   256 KB and −47% at 1 MB** on plaintext. **No longer the TOP item — see the new item 7.**
+6. ~~Re-measure the Windows baseline~~ **DONE 2026-08-01** — `bench/Run-TlsSizes.ps1`, 8 legs x 4 sizes x
+   6 scored passes, one session, zero errors. See the new DEFINITIVE table at the top of `RESULTS.md`.
+   Headline: our **plaintext is at parity with Kestrel** at 512 B / 256 KB / 1 MB and loses a disjoint
+   **−2.6% at 16 KB**; our **TLS collapses at large payloads** (`iocp+tls` is LAST of eight legs at 256 KB
+   and 1 MB, Kestrel `SslStream` +83% / +100% disjoint); and **http.sys CROSSES OVER** rather than
+   dominating — last at 512 B (−18%) and 16 KB (−30%), first at 256 KB (+9%) and 1 MB (+112%).
+7. **NEW AND NOW THE TOP WINDOWS PERF ITEM: `rio+tls` beats `iocp+tls` at every size ≥16 KB** (+7% / +39%
+   / +18%, all disjoint) — which is BACKWARDS from plaintext, where RIO trails IOCP badly. `rio+tls` at
+   16 KB is also our only disjoint TLS win over Kestrel in the whole table (+11%).
+   **Pre-registered hypothesis: it is the page size, via the geometry sentinel.** RIO resolves
+   `page=65536`, IOCP resolves `page=4096`. The TLS out-of-band path chunks ciphertext into page-sized
+   segments, so IOCP issues ~16x the segments for the same response; plaintext IOCP escapes this because
+   zero-copy send bypasses the page path, and TLS cannot because the record layer must produce the bytes
+   first. **The falsifying test is one flag, no code: `--iocp --tls --page 65536`.** If the hypothesis
+   holds, `iocp+tls` at 256 KB moves from ~3,700 toward RIO's ~5,100+. If it does not move, the page is
+   not the mechanism and the difference is in the two send paths. Do this before item 5: it is a bigger
+   gap, on the leg that is currently last, and the first experiment costs nothing.
+8. **Accept-cost rig (http.sys is untested where it should win).** The 2026-08-01 table is **keep-alive
+   only at c64**, so connection accept — the thing a kernel-mode HTTP stack should win most decisively —
+   is entirely out of scope, and NO claim about accept cost in either direction is currently supported.
+   **The obstacle is TIME_WAIT, and it is why this is a rig rather than a flag:** `bench/README.md`'s
+   ephemeral-port gate exists because omitting it once manufactured a fake "208 dropped connections"
+   defect, and a `Connection: close` sweep would measure port exhaustion rather than accept.
+   Three options, assessed 2026-08-01:
+   - *Widen the budget* — `netsh int ipv4 set dynamicport tcp start=10000 num=55000` plus
+     `TcpTimedWaitDelay=30`. Machine-wide, needs elevation, buys ~1,800 conn/s. Moves the ceiling; does
+     not remove the problem.
+   - **RST-close the client (`SO_LINGER` 0) — recommended.** Sidesteps TIME_WAIT entirely rather than
+     budgeting around it, and the repo already proves the pattern: `SmokeTest --churn --reset-close` is
+     exactly this, which is how the churn cells do thousands of connections in 10s with no port gate.
+     bombardier cannot do it, so this needs a small purpose-built HTTP client.
+   - *Change the measurement shape* — a bounded burst (open N, time to first byte on all N, cool down,
+     repeat) reporting **conn/s and accept p99** rather than MiB/s. Stays under any port budget by
+     construction, and conn/s is the number that actually separates a kernel stack from a user-mode one.
+   Recommended: the last two together. **Constraint to respect:** http.sys and Kestrel would be comparable
+   to each other, but neither to `SmokeTest --churn`, which accepts without HTTP. Same layer or nothing.
 
 ---
 

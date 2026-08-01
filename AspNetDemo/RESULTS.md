@@ -77,7 +77,9 @@ scaling, not peak throughput.
 
 Windows last ran 2026-07-29 and shared code changed underneath it across two Linux sessions. This is the
 catch-up, and it is deliberately all correctness: **nothing in this section is a throughput measurement**,
-so nothing here should be compared with, or added to, any table above it.
+so nothing here should be compared with, or added to, any table above it. (The throughput re-baseline that
+followed it later the same day is the section immediately above — "Headline numbers, Windows — DEFINITIVE
+(2026-08-01)".)
 
 | gate | result |
 |---|---|
@@ -116,6 +118,126 @@ the resulting `HttpRequestException` presents as a TLS failure. Use the framewor
 `DangerousAcceptAnyServerCertificateValidator`. That makes **nine** confounders in `bench/README.md`'s
 tradition, and the general lesson is the familiar one: the harness is a suspect too, and a timeout is not a
 diagnosis — the rig now reports the last connect exception instead of the bare timeout.
+
+### Headline numbers, Windows — DEFINITIVE (2026-08-01, `bench/Run-TlsSizes.ps1`, 12 shards, `-c 64`, 6 scored passes, ONE session)
+
+7900X, IOCP/RIO/Kestrel/**http.sys**, ASP.NET bridged path, `/payload` GET, keep-alive. Goodput MiB/s,
+**min-max of 6 scored passes** (pass 1 discarded as host warm-up), zero errors in all 224 runs. All eight
+legs are reshuffled into the same passes, so **every comparison here is within-session**. A delta is only
+quoted where the ranges are DISJOINT. This SUPERSEDES the 2026-07-30 Windows tables below, which predate
+two default flips (BYO became the default bridge, and the pipe pool became pinned) — their
+"classic *(default)*" column header is simply wrong now.
+
+| payload | kestrel | iocp/s12 | rio/s12 | **httpsys** | kestrel+tls | iocp+tls/s12 | rio+tls/s12 | **httpsys+tls** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 B | 140.8-146.0 | 135.2-142.3 | 143.3-144.7 | 117.3-119.3 | 132.3-136.0 | 130.3-136.3 | 138.1-139.7 | 99.3-101.1 |
+| 16 KB | 3962-4008 | 3837-3898 | 3809-3909 | 2724-2794 | 3056-3148 | 3103-3292 | 3462-3515 | 2204-2240 |
+| 256 KB | 10487-10934 | 9683-10819 | 6496-7055 | **11629-11875** | 6626-6906 | 3531-3828 | 5055-5237 | **10144-10591** |
+| 1 MB | 5727-6151 | 6040-6130 | 2985-3295 | **12742-13223** | 4446-4625 | 2260-2316 | 2575-2712 | **7269-7523** |
+
+#### 1. http.sys does NOT dominate — it CROSSES OVER, and the pre-registered prediction is half falsified
+
+The prediction going in (the repo owner's, stated before the run) was that http.sys would "kick us into
+orbit". It does, at large payloads, and it is **last** at small ones. Both halves are disjoint:
+
+| payload | http.sys vs the best user-mode plaintext leg |
+|---|---|
+| 512 B | **−18%** (117-119 vs kestrel 141-146) — http.sys LAST of all 8 legs |
+| 16 KB | **−30%** (2724-2794 vs kestrel 3962-4008) — http.sys LAST of all 8 legs |
+| 256 KB | **+9%** (11629-11875 vs kestrel 10487-10934) — http.sys FIRST |
+| 1 MB | **+112%** (12742-13223 vs iocp 6040-6130) — http.sys FIRST, by more than 2x |
+
+So "the kernel stack is always faster" is false here, and so is "we are competitive with the kernel at
+large payloads". **The honest reading is that this workload flatters user-mode at small messages and the
+kernel at large ones**, and the mechanism is visible in the p99 column: at 1 MB http.sys runs p99
+**11.8 ms** against IOCP's 36.1 ms and Kestrel's 30.5 ms, i.e. it is not just moving more bytes, it is
+doing so with a third of the tail. At 512 B its p99 (1,044 us) is no better than anyone else's, and it
+loses on rate.
+
+**What this does NOT show, and the limitation is the interesting part.** The rig is **keep-alive only at
+c64**, so connection accept — the thing a kernel-mode stack should win most decisively — is entirely out
+of scope. This table therefore measures http.sys where it is least differentiated. Exercising accept on
+Windows is genuinely hard (TIME_WAIT; `bench/README.md`'s ephemeral-port gate exists because omitting it
+once manufactured a fake "208 dropped connections" defect), so it needs a purpose-built RST-closing
+client rather than a flag on this rig — see TODO. Until that exists, **no claim about accept cost, in
+either direction, is supported by anything in this file.**
+
+#### 2. Our plaintext is at parity with Kestrel almost everywhere; the one disjoint loss is 16 KB
+
+| payload | iocp/s12 vs kestrel |
+|---|---|
+| 512 B | *overlapping* — parity |
+| 16 KB | **−2.6%** (3837-3898 vs 3962-4008), disjoint — the one real plaintext loss |
+| 256 KB | *overlapping* — parity |
+| 1 MB | *overlapping* — parity (iocp median is actually 0.2% higher) |
+
+That is a better plaintext position than the 2026-07-30 table suggested, and it is what the BYO+pinned
+defaults bought. Do not compute that improvement as a delta against the old table — different session.
+
+#### 3. THE BAD NEWS, stated as prominently as the good: our TLS collapses at large payloads
+
+`iocp+tls` is **LAST of all eight legs at both 256 KB and 1 MB**, and the gap to Kestrel's `SslStream` is
+disjoint and enormous:
+
+| payload | kestrel+tls vs iocp+tls |
+|---|---|
+| 512 B | *overlapping* — parity |
+| 16 KB | *overlapping* (3056-3148 vs 3103-3292) |
+| 256 KB | **Kestrel +83%** (6626-6906 vs 3531-3828) |
+| 1 MB | **Kestrel +100%** (4446-4625 vs 2260-2316) |
+
+This is the SAME SHAPE the Linux table records ("Only at 256 KB does userspace TLS lose (structurally) —
+the wire bytes are encrypted, so zero-copy send can't apply"), so it is consistent rather than surprising
+— but on Windows it starts earlier and bites harder, and Linux's compensating **+13-35% win at 512 B-64 KB
+does not reproduce here**. On Windows the small-message TLS story is parity, not a win.
+
+#### 4. NEW, UNEXPLAINED, and the most actionable thing in this table: `rio+tls` beats `iocp+tls` everywhere ≥16 KB
+
+| payload | rio+tls/s12 | iocp+tls/s12 | |
+|---|---:|---:|---|
+| 16 KB | 3462-3515 | 3103-3292 | **RIO +7%**, disjoint |
+| 256 KB | 5055-5237 | 3531-3828 | **RIO +39%**, disjoint |
+| 1 MB | 2575-2712 | 2260-2316 | **RIO +18%**, disjoint |
+
+That is backwards from plaintext, where RIO trails IOCP badly (256 KB 6496-7055 vs 9683-10819; 1 MB
+2985-3295 vs 6040-6130, both disjoint). And `rio+tls` at 16 KB is our **only disjoint TLS win over
+Kestrel** in the whole table (3462-3515 vs kestrel+tls 3056-3148, **+11%**).
+
+**Hypothesis, pre-registered before anyone tests it:** it is the PAGE SIZE, via the geometry sentinel.
+RIO resolves `page=65536`, IOCP resolves `page=4096` (both confirmed in this session's `/config`). The TLS
+out-of-band send chunks ciphertext into page-sized segments, so at a 4 KB page IOCP issues ~16x the
+segments RIO does for the same response — the same mechanism that made RIO's *plaintext* send need a 64 KB
+page. Plaintext IOCP escapes it because zero-copy send bypasses the page path entirely; TLS cannot,
+because the bytes must be produced by the record layer first.
+
+**What would falsify it:** run `--iocp --tls --page 65536`. If the hypothesis holds, `iocp+tls` at 256 KB
+should move from ~3,700 toward RIO's ~5,100 or better. If it does not move, the page is not the mechanism
+and the difference is somewhere in the two backends' send paths. **This is untested — it is the top
+Windows perf item, ahead of the standing RIO plaintext item, because it is a bigger gap on the leg that
+is currently last.**
+
+#### 5. RIO plaintext still needs its page fix, and this quantifies it
+
+`rio/s12` trails `iocp/s12` disjointly at 256 KB (−33%) and 1 MB (−47%), while being at parity or ahead
+at 512 B and 16 KB. That is the standing item-0/item-5 RIO send quantization, unchanged and now measured
+in the same session as everything else.
+
+#### Caveats that belong next to these numbers rather than under them
+
+- **The http.sys legs are not peer rows.** Its TLS is terminated in the KERNEL against a certificate bound
+  out of band by `netsh` (`bench/Enable-HttpSysTls.ps1`), so `httpsys+tls` is a different experiment from
+  `kestrel+tls` (SslStream, in-process cert) and from `iocp+tls` (our SSPI, in-process cert) — same
+  RSA-2048/SHA-256 parameters, different key, different termination point. And the rig pins the server
+  process and the load generator to disjoint core sets, but **http.sys works on kernel threads that
+  user-mode affinity does not constrain**, so it is not pinned in the sense the other legs are. Treat both
+  http.sys columns as an outer bound, not as a row to subtract from.
+- **Loopback.** Client and server share this host; absolute values are not comparable to a two-machine
+  test, and this is exactly where a kernel stack's advantages are most distorted.
+- **One open confounder on the TLS legs.** These are the first Windows TLS numbers taken with the new
+  SChannel **TLS 1.3 floor** (2026-08-01). Every SocketSet TLS leg here negotiated 1.3; there is no
+  same-session 1.2 comparison. It cannot explain finding 4 (both RIO and IOCP got the same floor), but it
+  is unmeasured against the older 1.2-capable configuration, so do not read these as continuous with any
+  pre-2026-08-01 Windows TLS figure.
 
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 
@@ -485,7 +607,13 @@ Bridge cost at 256KB is therefore **23.9% on io_uring and 40.3% on epoll** - ess
 copy removal, because both sides of the subtraction rose. Copy count does NOT explain why the same bridge
 costs epoll nearly twice what it costs io_uring; see the refutation below.
 
-### Headline numbers, Windows — the current picture (2026-07-30, IOCP, 12 shards, `-c 64`)
+### Headline numbers, Windows — ~~the current picture~~ SUPERSEDED (2026-07-30, IOCP, 12 shards, `-c 64`)
+
+> **SUPERSEDED by the 2026-08-01 table at the top of this file.** Kept for its reasoning — the
+> classic-vs-byo comparison is what justified the default flip and is not reproduced elsewhere — but
+> **do not quote these absolute numbers**, and do not subtract them from the 2026-08-01 ones: different
+> session, and two defaults changed in between (BYO became the default bridge, the pipe pool became
+> pinned). The column header "classic *(default)*" below is stale for exactly that reason.
 
 **One session, all legs reshuffled into the same passes, 6 scored passes, zero errors** — so every
 comparison in this table is within-session and the vanilla-Kestrel control is a real control rather than
