@@ -319,6 +319,58 @@ and reports zero-copy declines and segment counts per response — it is what tu
 does nothing at 256 KB" mystery into the measured 65.00-segments-against-a-64-cap answer. Point it at the
 TLS path and compare against RIO before proposing a fix.
 
+### INSTRUMENTED: neither buffer count nor syscall count is the IOCP+TLS bottleneck — something per-BYTE is (2026-08-01)
+
+Following the falsification above, the next step was recorded as "instrument, do not hypothesise again".
+Done, with `SS_IOCP_STATS=1` / `SS_RIO_STATS=1` under identical 256 KB TLS load (`-c 64`, 8 s, 12 shards).
+**These are single short runs for MECHANISM, not scored throughput** — the rates are consistent with the
+scored table but are not a substitute for it.
+
+| | WSABUFs / response | WSASends / response | rps |
+|---|---:|---:|---:|
+| `iocp+tls`, page 4096 | **65.0** | **2.0** | 12,115 |
+| `iocp+tls`, page 65536 | **5.0** | **1.0** | 13,013 |
+
+**This is the strongest form of the falsification, and it is mechanical rather than statistical.** The page
+flag did *exactly* what it was supposed to: 65 buffers collapsed to 5, two `WSASend`s collapsed to one — a
+**13x reduction in buffer count and a halving of send syscalls — and it bought about 7%.** A hypothesis
+that survives its own mechanism working perfectly and delivering nothing is dead. (65 pages x 4 KB =
+266,240 B, which is the 256 KB payload plus TLS record framing — so the accounting is exactly as expected;
+nothing is being mis-measured.)
+
+Meanwhile, from the same load, RIO:
+
+```
+[rio-stats] RIOSends=634,264 (31,770 MiB, 52,523 B/send) commits: send=1.00/send
+            notify-rearms=0.22/send port-wakes=0.28/send  out-of-band flushes=126,840  staged=31,725 MiB
+```
+
+**5.0 RIOSends per response against IOCP's 1.0 — RIO issues FIVE TIMES the send calls and is still ~22%
+faster.** So send-call count is not the constraint either, in either direction.
+
+**One thing this settles outright:** `declined: tls=96,906` against `zero-copy sends=0` — the IOCP TLS path
+declines zero-copy on **100%** of responses, by design (the record layer must produce ciphertext, so there
+is no caller buffer to send from). Every TLS byte goes through the copying path. That is now measured
+rather than inferred, and it is why the plaintext and TLS legs behave so differently: plaintext IOCP wins
+by *not copying*, and that option does not exist here.
+
+**Where that leaves the RIO-beats-IOCP anomaly — hypothesis, explicitly NOT yet tested.** Both backends
+copy exactly once (RIO's `staged=31,725 MiB` ≈ its total send bytes). What differs is what the send call
+must do with those bytes: `WSASend` probes and page-locks the user buffers on **every call**, whereas RIO
+sends from buffers **registered once** with `RIORegisterBuffer` — which is the entire reason RIO exists.
+That would make the cost per-BYTE-locked rather than per-call, which fits every number above: it is
+insensitive to buffer count, insensitive to syscall count, and scales with payload (the gap grows 16 KB →
+256 KB → 1 MB).
+
+*The previous hypothesis in this file was plausible, mechanical, and wrong, so this one is written down
+with its test attached rather than acted on.* **A discriminating test:** if page-locking is the cost, then
+IOCP+TLS throughput should be roughly invariant to how the same bytes are arranged across buffers (already
+consistent with the 65→5 result) but should improve markedly if the same payload is sent from memory that
+is already locked/pinned. **The real fix it implies is not a tuning knob:** let the TLS record layer frame
+ciphertext *directly into* the pinned send buffers, so the IOCP zero-copy path becomes reachable for TLS
+at all — which would convert a 100% decline rate into the same fast path plaintext already uses. That is a
+design item, not a flag, and it is now the highest-value Windows TLS work.
+
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 
 - **An ACCESS VIOLATION in RIO+TLS under churn was found and fixed** (item 0e). It was present on the

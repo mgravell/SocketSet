@@ -117,11 +117,42 @@ then decide. Do not merge it as-is.
    `writebufs=1024 oobwritebufs=256 readpages=256` at both page sizes). **Do not carry the SmokeTest
    pool-rescaling caveat across to the demo; they differ.**
 
-   **NEXT STEP — instrument, do not hypothesise again.** The page was plausible and wrong, so the next
-   guess deserves data first. `SS_IOCP_STATS=1` already reports zero-copy declines and per-response
-   segment counts, and it is exactly what turned "IOCP zero-copy does nothing at 256 KB" into the measured
-   65.00-segments-against-a-64-cap answer. Point it at the TLS path, compare with RIO, then propose.
-8. **Accept-cost rig (http.sys is untested where it should win).** The 2026-08-01 table is **keep-alive
+   ~~**NEXT STEP — instrument, do not hypothesise again.**~~ **DONE 2026-08-01, and it makes the
+   falsification MECHANICAL rather than statistical.** `SS_IOCP_STATS=1` / `SS_RIO_STATS=1` under identical
+   256 KB TLS load:
+
+   | | WSABUFs/response | WSASends/response | rps |
+   |---|---:|---:|---:|
+   | `iocp+tls` page 4096 | 65.0 | 2.0 | 12,115 |
+   | `iocp+tls` page 65536 | 5.0 | 1.0 | 13,013 |
+
+   The page flag did exactly what it was designed to do — **13x fewer buffers, half the send syscalls — and
+   it bought ~7%.** A hypothesis whose mechanism works perfectly and delivers nothing is dead. And RIO
+   issues **5.0 RIOSends per response against IOCP's 1.0 while being ~22% faster**, so send-call count is
+   not the constraint in either direction. **Neither buffer count nor syscall count is the bottleneck;
+   something per-BYTE is.**
+
+   **Settled outright:** `declined: tls=96,906` with `zero-copy sends=0` — the IOCP TLS path declines
+   zero-copy on **100%** of responses, by design (the record layer must produce ciphertext, so there is no
+   caller buffer to send from). Measured now, not inferred. It is also why plaintext and TLS diverge so
+   sharply: plaintext IOCP wins by NOT copying, and TLS cannot take that option.
+
+   **NEW HYPOTHESIS, written down with its test rather than acted on** (the last one was plausible,
+   mechanical and wrong): both backends copy exactly once, so the difference is what the send call does
+   with the bytes — `WSASend` probes and page-locks user buffers on EVERY call, while RIO sends from
+   buffers registered once via `RIORegisterBuffer`. That predicts a cost that is per-byte-locked:
+   insensitive to buffer count (matches 65→5), insensitive to syscall count (matches RIO's 5 vs 1), and
+   growing with payload (matches 16 KB → 256 KB → 1 MB).
+
+8. **THE ACTUAL FIX THIS IMPLIES, and it is a design item rather than a knob: make TLS able to zero-copy
+   on IOCP.** Today the TLS record layer frames ciphertext into its own accumulator, which is why
+   `TrySendZeroCopy` declines 100% of TLS responses. If SChannel framed ciphertext DIRECTLY into the
+   pinned send buffers (`EncryptMessage` already writes header/data/trailer into one caller-supplied span —
+   see `SChannelTlsFilter`'s "outbound is zero-copy framing" note), the existing IOCP zero-copy path would
+   become reachable for TLS, converting a 100% decline into the same fast path plaintext already uses.
+   That is the highest-value Windows TLS work, and it plausibly also explains part of the Linux
+   large-payload TLS loss, since the same structural shape appears there.
+9. **Accept-cost rig (http.sys is untested where it should win).** The 2026-08-01 table is **keep-alive
    only at c64**, so connection accept — the thing a kernel-mode HTTP stack should win most decisively —
    is entirely out of scope, and NO claim about accept cost in either direction is currently supported.
    **The obstacle is TIME_WAIT, and it is why this is a rig rather than a flag:** `bench/README.md`'s
