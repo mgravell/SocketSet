@@ -43,7 +43,10 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
 
     public SocketSetConnectionListener(EndPoint endpoint, SocketSetTransportOptions options, SocketSetTransportMetrics metrics)
     {
-        _pipePool = (options.Mode == SocketSetBridgeMode.Byo && options.PipePinned)
+        // Created whenever pinned is requested (as before the extraction): it backs the inbound pipe in
+        // every mode, and the outbound pipe in Classic/Byo. In Byo it additionally lets zero-copy send skip
+        // per-segment pinning.
+        _pipePool = options.PipePinned
             ? new PinnedBlockMemoryPool(options.PipeSegment > 0 ? options.PipeSegment : 4096)
             : null;
         EndPoint = endpoint;
