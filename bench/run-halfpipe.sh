@@ -22,6 +22,7 @@
 set -uo pipefail
 
 BACKEND=${BACKEND:-io-uring}      # io-uring | epoll
+TLS=${TLS:-}                      # empty=plaintext; "ssl"=transport OpenSSL TLS (--tls, https + curl -k)
 SIZES=${SIZES:-1024}              # payload(s) to sweep; small on purpose (the half-pipe copies on send)
 CONCS=${CONCS:-"64 128 256"}      # concurrency/-ies to sweep. Sweep ONE axis at a time for a clean read:
                                   # SIZES=1024 CONCS="64 128 256" (concurrency) or SIZES="256 4096 65536
@@ -53,6 +54,10 @@ dotnet build "$REPO/AspNetDemo/AspNetDemo.csproj" -c Release -v q --nologo >/dev
 
 source "$REPO/bench/cpu-split.sh"
 
+# TLS wiring: append --tls to every leg, switch scheme to https, and gate the banner on tls=openssl.
+TLS_ARG=""; SCHEME=http; TLS_WANT="tls=off"
+if [[ "$TLS" == "ssl" ]]; then TLS_ARG="--tls"; SCHEME=https; TLS_WANT="tls=openssl"; fi
+
 echo "size,conc,leg,rep,rps,mib_s,lat_p50_us,lat_p99_us,errors,status" > "$CSV"
 
 # name|extra demo args|required /config fragment|forbidden fragment (or empty)
@@ -65,17 +70,17 @@ LEGS=(
 measure() {
   local name="$1" extra="$2" want="$3" forbid="$4" size="$5" conc="$6" rep="$7"
   local log="$LOGS/$name.s$size.c$conc.r$rep.log"
-  taskset -c "$SERVER_CPUS" "$DEMO" --"$BACKEND" --shards "$SHARDS" $extra --port "$PORT" >"$log" 2>&1 &
+  taskset -c "$SERVER_CPUS" "$DEMO" --"$BACKEND" --shards "$SHARDS" $extra $TLS_ARG --port "$PORT" >"$log" 2>&1 &
   local pid=$! cfg="" i
   for ((i=0;i<80;i++)); do
-    cfg=$(curl -s --max-time 3 "http://127.0.0.1:$PORT/config" 2>/dev/null) && [[ -n "$cfg" ]] && break
+    cfg=$(curl -sk --max-time 3 "$SCHEME://127.0.0.1:$PORT/config" 2>/dev/null) && [[ -n "$cfg" ]] && break
     sleep 0.4
   done
   if [[ -z "$cfg" ]]; then
     echo "    $name: no /config"; echo "$size,$conc,$name,$rep,,,,,,NOSTART" >>"$CSV"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
   fi
-  # Trust the banner: the required fragment must be present and the forbidden one absent.
+  # Trust the banner: the leg fragment present, its forbidden one absent, and the TLS mode as configured.
   if [[ "$cfg" != *"$want"* ]]; then
     echo "    $name: MISMATCH (wanted '$want') -> $cfg"; echo "$size,$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
@@ -84,8 +89,12 @@ measure() {
     echo "    $name: has forbidden '$forbid' -> $cfg"; echo "$size,$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
   fi
+  if [[ "$cfg" != *"$TLS_WANT"* ]]; then
+    echo "    $name: TLS MISMATCH (wanted '$TLS_WANT') -> $cfg"; echo "$size,$conc,$name,$rep,,,,,,TLS-MISMATCH" >>"$CSV"
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
+  fi
 
-  local url="http://127.0.0.1:$PORT/payload?n=$size"
+  local url="$SCHEME://127.0.0.1:$PORT/payload?n=$size"
   taskset -c "$CLIENT_CPUS" "$BOMB" -k -o json -p r -c "$conc" -d "$WARMUP" -t 10s "$url" >/dev/null 2>&1
   local j; j=$(taskset -c "$CLIENT_CPUS" "$BOMB" -k -l -o json -p r -c "$conc" -d "$DURATION" -t 10s "$url" 2>/dev/null)
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; sleep 1
