@@ -259,7 +259,8 @@ internal sealed class DemoConfig
                     + (PipePinned ? " pipepinned=1" : "")
                     // House rule: trust the banner, not the flag. A half-pipe run MUST say so, or an A/B
                     // where the flag silently did nothing would measure identically to one that worked.
-                    + (HalfPipe ? " half-pipe=1" : "");
+                    // Also report the drain mode (SS_HALF_DRAIN env), so the inline-vs-pool A/B is banner-gated.
+                    + (HalfPipe ? $" half-pipe=1 drain={(Environment.GetEnvironmentVariable("SS_HALF_DRAIN") == "pool" ? "pool" : "inline")}" : "");
 
         return VanillaKestrel
             ? $"transport={transport} tls={tls} port={Port}"

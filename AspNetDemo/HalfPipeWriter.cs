@@ -33,6 +33,12 @@ internal sealed class HalfPipeWriter : PipeWriter
     // CycleBuffer itself stays single-thread (Kestrel-only), which is what keeps the whole thing lock-free.
     private volatile bool _peerGone;
 
+    // EXPERIMENT (SS_HALF_DRAIN=pool): move the SEND off the Kestrel request thread. The inline default
+    // pays +12-18% p99 because drain+Send runs on that thread; this measures whether hopping Send off it
+    // recovers the tail. See DrainViaPool. Default = inline (the measured, shipped behaviour).
+    private static readonly bool _poolDrain = Environment.GetEnvironmentVariable("SS_HALF_DRAIN") == "pool";
+    private Task _sendTail = Task.CompletedTask; // pool mode: chains sends so they stay ordered
+
     public HalfPipeWriter(Connection conn) => _conn = conn;
 
     public override Memory<byte> GetMemory(int sizeHint = 0)
@@ -74,18 +80,52 @@ internal sealed class HalfPipeWriter : PipeWriter
             ReadOnlySequence<byte> seq = _cb.GetAllCommitted();
             if (!seq.IsEmpty)
             {
-                if (_conn.Send(seq))
-                {
-                    _cb.DiscardCommitted(seq.Length); // Send copied it — safe to recycle now
-                }
-                else
-                {
-                    _peerGone = true; // socket gone: signal Kestrel to stop writing
-                    Interlocked.Increment(ref SocketSetConnectionListener.SendFalse);
-                }
+                if (_poolDrain) DrainViaPool(seq);
+                else DrainInline(seq);
             }
         }
         return new ValueTask<FlushResult>(new FlushResult(isCanceled: false, isCompleted: _peerGone || _completed));
+    }
+
+    // Default: drain + Send synchronously on the calling (Kestrel) thread. Lock-free; Send copies, so the
+    // CycleBuffer can be recycled the instant it returns.
+    private void DrainInline(ReadOnlySequence<byte> seq)
+    {
+        if (_conn.Send(seq))
+        {
+            _cb.DiscardCommitted(seq.Length); // Send copied it — safe to recycle now
+        }
+        else
+        {
+            _peerGone = true; // socket gone: signal Kestrel to stop writing
+            Interlocked.Increment(ref SocketSetConnectionListener.SendFalse);
+        }
+    }
+
+    // EXPERIMENT: copy the committed bytes into a pooled array on the request thread (cheap memcpy) and
+    // discard immediately — so the CycleBuffer stays single-thread/lock-free — then run the SEND on the
+    // ThreadPool, chained through _sendTail so sends stay in order. Costs one extra copy + a Task per flush
+    // vs inline, and has NO backpressure (fire-and-forget), so it is a diagnostic for "is request-thread
+    // Send the p99 culprit?", not a shipping path. If p99 recovers, the loop-thread zero-copy drain (which
+    // avoids the copy) is the real fix.
+    private void DrainViaPool(ReadOnlySequence<byte> seq)
+    {
+        int len = checked((int)seq.Length);
+        byte[] buf = ArrayPool<byte>.Shared.Rent(len);
+        seq.CopyTo(buf);
+        _cb.DiscardCommitted(len);
+        _sendTail = _sendTail.ContinueWith(_ =>
+        {
+            try
+            {
+                if (!_conn.Send(new ReadOnlySpan<byte>(buf, 0, len)))
+                {
+                    _peerGone = true;
+                    Interlocked.Increment(ref SocketSetConnectionListener.SendFalse);
+                }
+            }
+            finally { ArrayPool<byte>.Shared.Return(buf); }
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
     }
 
     /// <summary>Loop thread saw the peer close: stop draining (Kestrel is being torn down anyway).</summary>
