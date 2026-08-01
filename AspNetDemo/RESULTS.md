@@ -119,7 +119,18 @@ the resulting `HttpRequestException` presents as a TLS failure. Use the framewor
 tradition, and the general lesson is the familiar one: the harness is a suspect too, and a timeout is not a
 diagnosis — the rig now reports the last connect exception instead of the bare timeout.
 
-### Headline numbers, Windows — DEFINITIVE (2026-08-01, `bench/Run-TlsSizes.ps1`, 12 shards, `-c 64`, 6 scored passes, ONE session)
+### Headline numbers, Windows — ~~DEFINITIVE~~ **PARTLY STALE, see the warning** (2026-08-01, `bench/Run-TlsSizes.ps1`, 12 shards, `-c 64`, 6 scored passes, ONE session)
+
+> ⚠ **STALE FOR OUR LEGS, VALID FOR THE CONTROLS. Measured hours BEFORE the `PooledBufferWriter` fix
+> later the same day**, which is disjointly worth **+18.8% at 256 KB and +58.6% at 1 MB on TLS** and
+> **+33.3% on `--classic` plaintext at 1 MB**. So every `iocp+tls` / `rio+tls` figure below UNDERSTATES
+> current `main`, and the plaintext `iocp`/`rio` rows are unaffected only because BYO plaintext uses
+> zero-copy send and skips the fixed path. The `kestrel*` and `httpsys*` columns are untouched by our
+> code and remain valid.
+> **Consequences:** (a) the "our TLS collapses at large payloads" finding below is still directionally
+> true but its MAGNITUDES are wrong; (b) finding 4 (`rio+tls` beats `iocp+tls`) is unresolved — both legs
+> move; (c) **re-running this sweep is the top documentation item.** Do not quote a TLS delta from this
+> table until it is re-run.
 
 7900X, IOCP/RIO/Kestrel/**http.sys**, ASP.NET bridged path, `/payload` GET, keep-alive. Goodput MiB/s,
 **min-max of 6 scored passes** (pass 1 discarded as host warm-up), zero errors in all 224 runs. All eight
