@@ -73,6 +73,50 @@ pump contending on the ThreadPool as connections multiply. Everyone still drops 
 loopback itself saturates — so c64 is the sweet spot and these higher-c numbers are about *relative*
 scaling, not peak throughput.
 
+### Windows catch-up after the OS switch back (2026-08-01) — correctness only, no new throughput numbers
+
+Windows last ran 2026-07-29 and shared code changed underneath it across two Linux sessions. This is the
+catch-up, and it is deliberately all correctness: **nothing in this section is a throughput measurement**,
+so nothing here should be compared with, or added to, any table above it.
+
+| gate | result |
+|---|---|
+| `bench/Run-SmokeMatrix.ps1` (transport; 48 cells, IOCP/RIO/managed x plaintext/SChannel) | **48/48 PASS** |
+| `bench/Verify-AspNet.ps1` (bridge, NEW; 18 cells, backend x mode x TLS) on main | **18/18 PASS** |
+| ...the same rig on `package-aspnetcore-lib` | **18/18 PASS, and IDENTICAL to main on every cell** |
+| `bench/Verify-TlsFloor.ps1` (SChannel min-protocol, NEW; 12 cells) | **12/12 PASS** |
+
+Four things worth carrying forward:
+
+- **The shared-code changes are clean on Windows.** The stale-completion detectors, dynamic shard growth
+  and the geometry sentinel all landed without moving a Windows backend. In particular
+  `rio+tls/verify-oob-4m` passes in **0.3s** where it was a 15.2s FAILURE before the geometry fix (item 0d),
+  and `rio+tls/churn` is **5/5 clean** — the item-0e access violation that used to strike about one run in
+  two did not appear.
+- **The geometry sentinel resolves per-backend on Windows, and says so.** RIO reports
+  `page=65536 recvbuf=4096 writebufs=256 oobwritebufs=64 readpages=64`; IOCP reports
+  `page=4096 ... writebufs=1024`. Distinct, and **no `0` anywhere**, so no read site missed the
+  "backend chooses" sentinel. This is the Windows half of the check Linux did on 2026-07-31.
+- **`--half-pipe` is byte-exact on IOCP and RIO**, plaintext and TLS, at every size to 8MB. It was merged
+  to main off-by-default with only the *argument* that it "uses only cross-platform `Connection.Send`, so it
+  SHOULD work". It does. That claim is now measured rather than reasoned — but note it is a CORRECTNESS
+  result only; the half-pipe's throughput crossover is measured on Linux (§ "The size crossover") and has
+  NOT been measured on Windows.
+- **The library extraction is behaviour-preserving, measured rather than inspected.** Running the identical
+  18-cell rig on main and on the branch gave zero differences in Result *or* Detail (accepts, sendFalse,
+  full resolved-geometry string). A refactor that worked but shifted the geometry or moved a counter would
+  pass a one-sided "does it still work" check and fail this one.
+
+**A rig bug is recorded here because it produced a clean-looking wrong answer, which is what this file is
+for.** The first `Verify-AspNet.ps1` run FAILED every TLS cell with "no /config after 20s" while the server
+logged a successful bind — it looked exactly like a broken SChannel provider. The cause was entirely in the
+harness: a PowerShell **scriptblock** assigned to `ServerCertificateCustomValidationCallback` throws "There
+is no Runspace available to run scripts in this thread" when the handshake runs on a TLS worker thread, and
+the resulting `HttpRequestException` presents as a TLS failure. Use the framework's static
+`DangerousAcceptAnyServerCertificateValidator`. That makes **nine** confounders in `bench/README.md`'s
+tradition, and the general lesson is the familiar one: the harness is a suspect too, and a timeout is not a
+diagnosis — the rig now reports the last connect exception instead of the bare timeout.
+
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 
 - **An ACCESS VIOLATION in RIO+TLS under churn was found and fixed** (item 0e). It was present on the

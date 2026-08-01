@@ -147,7 +147,10 @@ for (int i = 0; i < args.Length; i++)
             // the in-box engine instead of OpenSSL, and with no SslStream anywhere.
             if (!OperatingSystem.IsWindows())
                 throw new PlatformNotSupportedException("--tls-schannel is Windows-only; use --tls-ssl elsewhere.");
-            options.Tls = SocketSets.Tls.SChannel.SChannelTlsProvider.CreateSelfSignedLoopback("localhost");
+            // Same TLS 1.3 floor and the same --tls-min12 opt-out as --tls-ssl above: the two providers
+            // having DIFFERENT defaults is exactly the parity gap this flag closes.
+            options.Tls = SocketSets.Tls.SChannel.SChannelTlsProvider.CreateSelfSignedLoopback("localhost",
+                minProtocol: args.Contains("--tls-min12") ? SocketSets.Tls.TlsProtocol.Tls12 : SocketSets.Tls.TlsProtocol.Tls13);
             options.TlsClient.TargetHost = "localhost";
             break;
 #endif

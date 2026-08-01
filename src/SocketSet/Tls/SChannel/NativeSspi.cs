@@ -109,6 +109,14 @@ internal static unsafe partial class NativeSspi
     /// itself needs Windows 11 / Server 2022 (client and server); older builds simply settle on 1.2.</summary>
     internal const int SP_PROT_DISABLE_BELOW_TLS1_2 = SP_PROT_SSL2 | SP_PROT_SSL3 | SP_PROT_TLS1_0 | SP_PROT_TLS1_1;
 
+    /// <summary>Disable everything below TLS 1.3, i.e. TLS 1.3 only. The OpenSSL provider's default floor,
+    /// mirrored here — see <see cref="SocketSets.Tls.TlsProtocol"/> for why 1.3 is the default rather than
+    /// 1.2. NOTE the platform floor this implies: SChannel only speaks TLS 1.3 on Windows 11 / Server 2022
+    /// and later, so on an older build this disables every protocol the OS has and the handshake fails
+    /// outright rather than quietly settling on 1.2. That is the intended shape (a silent downgrade is the
+    /// failure mode a floor exists to prevent), but it is why the failure is a LOUD one.</summary>
+    internal const int SP_PROT_DISABLE_BELOW_TLS1_3 = SP_PROT_DISABLE_BELOW_TLS1_2 | SP_PROT_TLS1_2;
+
     // ===================== ALPN =====================
     // SEC_APPLICATION_PROTOCOL_NEGOTIATION_EXT
     internal const int SecApplicationProtocolNegotiationExt_None = 0;
@@ -256,6 +264,21 @@ internal struct SecPkgContextStreamSizes
     public int cbMaximumMessage; // 16384 — the TLS plaintext record limit
     public int cBuffers;
     public int cbBlockSize;
+}
+
+/// <summary>SecPkgContext_ConnectionInfo — what was actually negotiated. Only <c>dwProtocol</c> is read
+/// here (an SP_PROT_* bit, so the client and server bit of a version are distinct values — test with a
+/// MASK, never equality), but the whole struct must be declared or SSPI writes past the buffer.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct SecPkgContextConnectionInfo
+{
+    public int dwProtocol;
+    public int aiCipher;
+    public int dwCipherStrength;
+    public int aiHash;
+    public int dwHashStrength;
+    public int aiExch;
+    public int dwExchStrength;
 }
 
 /// <summary>SecPkgContext_ApplicationProtocol — the ALPN outcome, read back with

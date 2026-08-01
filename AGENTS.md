@@ -68,3 +68,13 @@ both have caused hesitation:
   and **`bench/run-smoke-matrix.sh`** on Linux (60 cells: io_uring/epoll/managed x plaintext/OpenSSL-TLS,
   plus `@abstract`-UDS and `+ktls` cells). Each reduces to one PASS/FAIL line per cell in ~3-6 minutes.
   Both exist because the gate was previously run by hand and so was skipped between OSes.
+- **Those gate the TRANSPORT. Two narrower gates cover things they cannot see** (Windows only so far; both
+  want a Linux equivalent):
+  - **`bench/Verify-AspNet.ps1`** — the ASP.NET BRIDGE, which nothing gated until 2026-08-01. 18 cells
+    (backend x `byo`/`classic`/`half-pipe` x plaintext/TLS), ~15s: `/config` banner, byte-exact `/payload`
+    1B-8MB and POST `/echo`, `/stats` counters. Run it on any bridge or `AspNetDemo` change. Run it on
+    BOTH sides of a refactor — comparing two runs cell-by-cell is what turns "it works" into "it is
+    behaviour-preserving".
+  - **`bench/Verify-TlsFloor.ps1`** — that the TLS min-version floor is APPLIED, not merely configured. The
+    discriminating cell is one that must be REFUSED; "TLS still works" cannot distinguish a floor that took
+    from one that did nothing.

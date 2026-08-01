@@ -329,7 +329,20 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
                     // Under TLS 1.3 this is the ROUTINE path, not an exotic one: NewSessionTicket and
                     // KeyUpdate both surface here. The extra bytes are handshake records — feed them back
                     // through ISC/ASC, sending whatever it produces, then resume decrypting.
+                    //
+                    // Under TLS 1.2 on the SERVER it is something else entirely: a client-initiated
+                    // renegotiation, i.e. the CVE-2011-1473 DoS shape (a client forcing repeated expensive
+                    // server handshakes). Refuse it, matching OpenSslTlsProvider's SSL_OP_NO_RENEGOTIATION.
+                    // Note the same deliberate asymmetry as there: the CLIENT still accepts server-initiated
+                    // renegotiation, which is a legitimate (if legacy) 1.2 pattern with no DoS upside to
+                    // refusing. This only becomes reachable at an opt-in TLS 1.2 floor — at the default 1.3
+                    // floor there is no renegotiation in the protocol at all.
                     Compact(extra);
+                    if (!_client && !NegotiatedTls13())
+                    {
+                        Fault("client-initiated TLS 1.2 renegotiation refused", SEC_I_RENEGOTIATE);
+                        return TlsInboundStatus.Faulted;
+                    }
                     if (!PostHandshake(output)) return TlsInboundStatus.Faulted;
                     continue;
 
@@ -340,6 +353,28 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
         }
 
         return result;
+    }
+
+    /// <summary>Whether the connection actually negotiated TLS 1.3, which decides whether a
+    /// SEC_I_RENEGOTIATE is a routine post-handshake message or a real renegotiation request.
+    ///
+    /// Queried rather than inferred from the provider's floor, because the two differ: at an opt-in TLS 1.2
+    /// floor a connection may still land on 1.3, and treating its NewSessionTicket as an attack would break
+    /// the connection. FAILS CLOSED — if the query fails we report "not 1.3", so the caller refuses. This is
+    /// a security control, and the cost of being wrong in that direction is one dropped connection against
+    /// an unbounded handshake-DoS window.</summary>
+    private bool NegotiatedTls13()
+    {
+        if (!_hasCtx) return false;
+        SecPkgContextConnectionInfo info = default;
+        int status;
+        fixed (SecHandle* ctx = &_ctx)
+        {
+            status = QueryContextAttributes(ctx, SECPKG_ATTR_CONNECTION_INFO, &info);
+        }
+        if (status != SEC_E_OK) return false;
+        // SP_PROT_TLS1_3 carries BOTH the client and server bit; mask, never compare.
+        return (info.dwProtocol & SP_PROT_TLS1_3) != 0;
     }
 
     /// <summary>Drive the handshake machinery mid-stream (TLS 1.3 post-handshake messages, or a TLS 1.2

@@ -36,6 +36,12 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
     private readonly bool _ownsCerts; // set by CreateSelfSignedLoopback: dispose + delete the key on exit
     private bool _disposed;
 
+    // NOTE: the floor is deliberately NOT retained as a field. The renegotiation refusal in
+    // SChannelTlsFilter needs the protocol that was actually NEGOTIATED, not the floor that was
+    // configured — at a 1.2 floor a connection may still land on 1.3 — so it queries
+    // SECPKG_ATTR_CONNECTION_INFO per connection instead. A cached floor here would be the wrong
+    // answer in exactly the case that matters.
+
     /// <param name="serverCertificate">Certificate (WITH private key) to present to inbound connections, or
     /// null for a client-only provider. The key must be one SChannel can open — an ephemeral in-memory key
     /// is invisible to it; see <see cref="CreateSelfSignedLoopback"/> for the round-trip that fixes that.</param>
@@ -43,28 +49,33 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
     /// certificate); if null, the client uses the system trust stores.</param>
     /// <param name="verifyServer">Whether the client verifies the server certificate + hostname. True is the
     /// safe default; false is the man-in-the-middle footgun and exists only for bring-up.</param>
+    /// <param name="minProtocol">Lowest TLS version to negotiate. Defaults to
+    /// <see cref="TlsProtocol.Tls13"/>, matching <see cref="OpenSsl.OpenSslTlsProvider"/> — see
+    /// <see cref="NativeSspi.SP_PROT_DISABLE_BELOW_TLS1_3"/> for the Windows-version floor that implies.</param>
     public SChannelTlsProvider(
         X509Certificate2? serverCertificate = null,
         X509Certificate2? trustCertificate = null,
-        bool verifyServer = true)
-        : this(serverCertificate, trustCertificate, verifyServer, ownsCerts: false)
+        bool verifyServer = true,
+        TlsProtocol minProtocol = TlsProtocol.Tls13)
+        : this(serverCertificate, trustCertificate, verifyServer, minProtocol, ownsCerts: false)
     {
     }
 
     private SChannelTlsProvider(
-        X509Certificate2? serverCertificate, X509Certificate2? trustCertificate, bool verifyServer, bool ownsCerts)
+        X509Certificate2? serverCertificate, X509Certificate2? trustCertificate, bool verifyServer,
+        TlsProtocol minProtocol, bool ownsCerts)
     {
         _serverCert = serverCertificate;
         _trust = trustCertificate;
         _verifyServer = verifyServer;
         _ownsCerts = ownsCerts;
 
-        _clientCred = Acquire(null, inbound: false);
+        _clientCred = Acquire(null, inbound: false, minProtocol);
         if (serverCertificate is not null)
         {
             try
             {
-                _serverCred = Acquire(serverCertificate, inbound: true);
+                _serverCred = Acquire(serverCertificate, inbound: true, minProtocol);
             }
             catch
             {
@@ -158,9 +169,14 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
 
     /// <summary>Build an SSPI credential handle over the SChannel package. Lives in native memory so the
     /// pointer handed to every filter is stable for the provider's lifetime.</summary>
-    private static SecHandle* Acquire(X509Certificate2? cert, bool inbound)
+    private static SecHandle* Acquire(X509Certificate2? cert, bool inbound, TlsProtocol minProtocol)
     {
-        var tlsParams = new TlsParameters { grbitDisabledProtocols = SP_PROT_DISABLE_BELOW_TLS1_2 };
+        var tlsParams = new TlsParameters
+        {
+            grbitDisabledProtocols = minProtocol == TlsProtocol.Tls13
+                ? SP_PROT_DISABLE_BELOW_TLS1_3
+                : SP_PROT_DISABLE_BELOW_TLS1_2,
+        };
         nint certHandle = cert?.Handle ?? 0;
 
         var creds = new SchCredentials
@@ -229,7 +245,8 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
     /// <see cref="OpenSsl.OpenSslTlsProvider.CreateSelfSignedLoopback"/>.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    public static SChannelTlsProvider CreateSelfSignedLoopback(string host = "localhost")
+    public static SChannelTlsProvider CreateSelfSignedLoopback(string host = "localhost",
+        TlsProtocol minProtocol = TlsProtocol.Tls13)
     {
         using var rsa = RSA.Create(2048);
         var req = new CertificateRequest($"CN={host}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
@@ -257,7 +274,7 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
 
         try
         {
-            return new SChannelTlsProvider(serverCert, trust, verifyServer: true, ownsCerts: true);
+            return new SChannelTlsProvider(serverCert, trust, verifyServer: true, minProtocol, ownsCerts: true);
         }
         catch
         {

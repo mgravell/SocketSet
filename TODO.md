@@ -6,6 +6,24 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ## READ FIRST IF YOU ARE ON WINDOWS (written 2026-08-01, switching back from Linux)
 
+> **THIS CATCH-UP IS DONE (2026-08-01 Windows session). Items 1-4 of the priority list below are all
+> closed; what remains is item 5 (RIO page-quantization) and item 6 (the baseline re-measurement).** In one
+> paragraph: the shared changes are correctness-clean on Windows (**48/48** smoke cells, including
+> `rio+tls/verify-oob-4m` in 0.3s where it was a 15.2s FAILURE, and `rio+tls/churn` 5/5 clean with no sign
+> of the item-0e access violation); the bridge got its first runtime gate, **`bench/Verify-AspNet.ps1`**
+> (18 cells, backend x bridge-mode x TLS), which found **`--half-pipe` byte-exact on IOCP and RIO** and
+> showed the **`SocketSet.AspNetCore` extraction to be behaviour-IDENTICAL to main on all 18 cells** — so
+> it is verified and **MERGED**; and **SChannel reached TLS parity with OpenSSL** (1.3 floor by default +
+> server-side renegotiation refusal), verified against controls by a new `bench/Verify-TlsFloor.ps1` and an
+> `openssl s_client` A/B. **The TLS backlog is now empty on both providers.**
+>
+> **The one honest gap this session leaves:** everything above is CORRECTNESS. No throughput number was
+> taken on Windows today, so items 5 and 6 are untouched and nothing here may be compared with the numbers
+> in `RESULTS.md`. Also, `Verify-AspNet.ps1` has no Linux equivalent yet — the extraction is runtime-verified
+> on IOCP/RIO/managed but not on io_uring/epoll, which is the first thing to do on the next Linux session.
+>
+> *The original cold-start plan follows, unchanged.*
+
 Windows last ran **2026-07-29**; **shared code and the AspNet bridge changed underneath it** across two
 Linux sessions (2026-07-31, 2026-08-01). Correctness first: run **`bench/Run-SmokeMatrix.ps1`** (48 cells,
 IOCP/RIO/managed) before anything else — it is the gate, and it is how a shared-code change that broke a
@@ -34,15 +52,21 @@ Windows backend announces itself.
   unverified) and the dotnet/aspnetcore#68148 spike on the user's `mgravell/aspnetcore` fork.
 
 ### Prime Windows opportunities (priority order)
-1. **`Run-SmokeMatrix.ps1`** — correctness gate for the shared-code changes. First, always.
-2. **Runtime-verify `package-aspnetcore-lib` on IOCP/RIO** (`/config` gating strings intact, byte-exact
-   `/payload` 1B–8MB, `/stats` counters non-zero), then MERGE to main if clean. Highest value — it unblocks
-   the packaging AND is a fresh env where servers actually start.
-3. **Byte-exact `--half-pipe` on IOCP and RIO** (the "should work, untested" item; plaintext + POST `/echo`).
-4. **SChannel min-protocol / renegotiation parity** — the open Windows TLS item.
+1. ~~**`Run-SmokeMatrix.ps1`** — correctness gate for the shared-code changes. First, always.~~ **DONE
+   2026-08-01: 48/48 PASS.**
+2. ~~**Runtime-verify `package-aspnetcore-lib` on IOCP/RIO**~~ **DONE 2026-08-01 and MERGED.** Verified with
+   a new rig (`bench/Verify-AspNet.ps1`) rather than by hand, and the rig was run on main FIRST so the
+   extraction could be shown behaviour-IDENTICAL (18/18, zero cell differences) rather than merely working.
+3. ~~**Byte-exact `--half-pipe` on IOCP and RIO**~~ **DONE 2026-08-01 — it is byte-exact on both,
+   plaintext and TLS, 1B-8MB.** The "uses only cross-platform `Connection.Send`, so it SHOULD work" claim
+   is now measured. Correctness only: its throughput crossover is still Linux-only data.
+4. ~~**SChannel min-protocol / renegotiation parity**~~ **DONE 2026-08-01 — see the TLS section below.**
+   The TLS backlog is now empty on both providers.
 5. **RIO send page-quantization (item 0 below, NOT fixed)** — IOCP is fixed, RIO isn't; the standing RIO
-   perf item.
+   perf item. **Now the top Windows item.**
 6. Re-measure the Windows baseline after the copy-removal (pre-registered to help Windows more than Linux).
+   Still open, and note the trap recorded in the 2026-07-29 section: a cross-day delta spanning several
+   commits is a changelog, not an attribution — use `Compare-Commits.ps1`.
 
 ---
 
@@ -828,16 +852,64 @@ flag does not touch TLS 1.3 KeyUpdate.
   epoll. (Not a SmokeTest matrix cell: it needs the external `openssl` binary. kTLS is out of scope — the
   kernel owns TX keys, so it can't do a userspace TX KeyUpdate.)
 
-**Still open (smaller):**
-- **SChannel (IOCP/RIO)** was NOT re-audited here (Windows box). It has an explicit `SEC_I_RENEGOTIATE`
-  path (`SChannelTlsFilter.cs:328`) that handles both TLS 1.2 renegotiation and TLS 1.3 KeyUpdate — so it
-  *accepts* renegotiation rather than refusing it, and has no min-version floor. Decide on Windows whether
-  to match the OpenSSL refusal + 1.3 floor for parity. **This is the one remaining TLS backlog item, and
-  it is Windows-only.**
+**~~Still open (smaller)~~ — SChannel parity DONE 2026-08-01, and the TLS backlog is now EMPTY on both
+providers.** `SChannelTlsProvider` takes a `minProtocol` (defaulting to `TlsProtocol.Tls13`, mirroring
+OpenSSL) which selects `SP_PROT_DISABLE_BELOW_TLS1_3`; `SChannelTlsFilter` refuses client-initiated TLS 1.2
+renegotiation on the SERVER only, keeping the same deliberate asymmetry as OpenSSL (a client still accepts
+server-initiated renegotiation — legitimate legacy 1.2 behaviour with no DoS upside to refusing).
+`SmokeTest --tls-schannel` honours the existing `--tls-min12` opt-out.
+
+Two things worth keeping:
+
+- **The refusal is gated on the NEGOTIATED protocol, not on the configured floor.** They differ: at an
+  opt-in 1.2 floor a connection may still land on 1.3, and treating its NewSessionTicket as an attack would
+  break it. `SEC_I_RENEGOTIATE` is the ROUTINE TLS 1.3 path (NewSessionTicket, KeyUpdate), so getting this
+  wrong breaks every TLS 1.3 connection at the first post-handshake message rather than failing visibly.
+  Queried via `SECPKG_ATTR_CONNECTION_INFO`, and **fails closed** (query failure ⇒ "not 1.3" ⇒ refuse).
+- **Both halves were verified against a control, and the renegotiation one changed my reading of the
+  original entry.** The floor: `bench/Verify-TlsFloor.ps1` (new, 12 cells) — a TLS1.2-only client is
+  REFUSED at the default floor and ACCEPTED under `--tls-min12` (reporting `Tls12`), with TLS1.3-only
+  connecting in both. The `--tls-min12` leg is the control that proves the probe can see a 1.2 handshake at
+  all; without it, a floor that refused *everything* would look identical. The renegotiation: driven with
+  `openssl s_client -tls1_2 -state`, feeding `R`, same session, build with and without the change —
+
+  | | after `RENEGOTIATING` |
+  |---|---|
+  | control (no refusal) | ServerHello → Certificate → **ServerKeyExchange** → ServerDone |
+  | with refusal | connection closed, **no ServerHello** |
+
+  So the pre-change server really did perform the full asymmetric handshake on demand — the entry above
+  said it "*accepts* renegotiation", and that is now confirmed by observation rather than by reading the
+  code. (Needs the external `openssl` binary, like the Linux KeyUpdate check, so it is a documented manual
+  procedure rather than a SmokeTest matrix cell. `Verify-TlsFloor.ps1` IS scripted, and it is the more
+  important of the two: at the default 1.3 floor renegotiation is not reachable at all.)
+
+**One consequence to state plainly, because it is a real behaviour change and not just a hardening:** the
+default now REFUSES any peer that cannot do TLS 1.3, and SChannel only speaks 1.3 on Windows 11 /
+Server 2022 and later. On an older Windows the default disables every protocol the OS has and the handshake
+fails outright rather than quietly settling on 1.2. That is the intended shape — a silent downgrade is the
+failure mode a floor exists to prevent — but it is why the failure is loud, and `--tls-min12` /
+`minProtocol: TlsProtocol.Tls12` is the opt-out. Pre-alpha, no back-compat obligation, so this is a default
+change rather than a breaking one.
 
 ## Package `SocketSet.AspNetCore` as a consumable library (proposed 2026-08-01)
 
-**Status: DONE, build-verified, NOT runtime-verified (2026-08-01, branch `package-aspnetcore-lib`).** The
+**Status: DONE, RUNTIME-VERIFIED ON WINDOWS, and MERGED TO MAIN (2026-08-01).** The runtime gap below is
+closed: `bench/Verify-AspNet.ps1` (new) runs 18 cells — {iocp,rio,managed} x {byo,classic,half-pipe} x
+{plaintext,SChannel TLS} — gating the `/config` banner (backend + mode + TLS named, geometry with no `0`),
+byte-exact `/payload` at 13 sizes 1B-8MB, byte-exact POST `/echo` at 1B/4KB/1MB, and `/stats` accepts>0 /
+writeFail==0. **18/18 PASS — and the same rig was run on main FIRST, with the two runs IDENTICAL on all 18
+cells (same Result and same Detail: accepts, sendFalse, full geometry string, zero differences).** So the
+extraction is measured as behaviour-PRESERVING, not merely working; a refactor that worked but shifted the
+resolved geometry or moved a counter would pass a one-sided check and fail that one.
+
+**The one honest gap: this is verified on Windows (IOCP/RIO/managed), not on Linux.** The extraction was
+WRITTEN on Linux against io_uring/epoll, so its OS-independence is now evidenced from the opposite side —
+but the Linux backends' 60/60 was against the PRE-extraction demo. **Next Linux session: port
+`Verify-AspNet.ps1`'s cells to io_uring/epoll and run them.** That is a small job and it is the last thing
+standing between this and "verified everywhere it runs".
+
+*Original status follows.* The
 extraction is complete: new project `src/SocketSet.AspNetCore/` holds the transport (`SocketSetConnection`,
 `SocketSetTransport`/`Listener`, `HalfPipeWriter`, `PinnedBlockMemoryPool`, `ITransportTlsFeature` [now
 public]) + a public `UseSocketSet(o => ...)` extension, `SocketSetTransportOptions` (with a
