@@ -62,18 +62,32 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         _byo = byo;
         _metrics = metrics ?? new SocketSetTransportMetrics();
         var sched = PipeScheduler.ThreadPool;
-        // EXPERIMENT (SS_PIPE_SCHED=inline): resume the OUTBOUND reader (the SocketSet pump) INLINE on the
-        // thread that flushed — i.e. Kestrel's request thread — instead of hopping to the ThreadPool. This
-        // is safe for the outbound pipe because only Kestrel flushes it (never the loop thread), so no pump
-        // work lands on the loop thread. Tests how much of the bridge cost is the read-side thread hop.
-        var outReader = Environment.GetEnvironmentVariable("SS_PIPE_SCHED") == "inline"
-            ? PipeScheduler.Inline : sched;
+        // EXPERIMENT (SS_PIPE_SCHED): which pipe reader resumes INLINE instead of hopping to the ThreadPool.
+        //
+        //   inline       — the OUTBOUND reader (the SocketSet pump) resumes on the thread that flushed,
+        //                  i.e. Kestrel's request thread. Safe: only Kestrel flushes that pipe, so no pump
+        //                  work lands on a loop thread. Measured on Linux/io_uring: −28%.
+        //   inline-read  — the INBOUND reader resumes on whoever wrote, i.e. the TRANSPORT LOOP THREAD.
+        //                  This is the READ-side hop, and it had never been tested on any OS: the knob
+        //                  above only ever touched the outbound pipe, so every "thread hop" number on file
+        //                  is about the write side.
+        //   inline-both  — both of the above.
+        //
+        // DANGER, and why this is an experiment rather than an option: an inline INBOUND reader runs
+        // Kestrel's whole request pipeline on the transport's loop thread, which blocks that loop for every
+        // backend that owns one (all but managed). Kestrel runs its own IO queues for exactly this reason.
+        // So a WIN here is not directly shippable — its value is that it UPPER-BOUNDS what removing the
+        // read-side hop could ever be worth, which is what decides whether an inbound half-pipe (a real
+        // fix, no loop blocking) is worth building. A null result deprioritises that work outright.
+        string? pipeSched = Environment.GetEnvironmentVariable("SS_PIPE_SCHED");
+        var outReader = pipeSched is "inline" or "inline-both" ? PipeScheduler.Inline : sched;
+        var inReader = pipeSched is "inline-read" or "inline-both" ? PipeScheduler.Inline : sched;
         // minimumSegmentSize and the pool are the two levers behind the "65 segments per 256KB response"
         // measurement (see PinnedBlockMemoryPool). Both default to the framework's choices so an unflagged
         // run is byte-for-byte the old behaviour.
         var pool = pipePool ?? MemoryPool<byte>.Shared;
         int seg = pipeSegment > 0 ? pipeSegment : -1; // -1 = PipeOptions' own default
-        _inbound = new Pipe(new PipeOptions(pool, readerScheduler: sched, writerScheduler: sched,
+        _inbound = new Pipe(new PipeOptions(pool, readerScheduler: inReader, writerScheduler: sched,
             useSynchronizationContext: false, pauseWriterThreshold: 1 << 20, resumeWriterThreshold: 1 << 19,
             minimumSegmentSize: seg));
         if (halfPipe)

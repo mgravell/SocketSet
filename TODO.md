@@ -99,8 +99,13 @@ then decide. Do not merge it as-is.
    **−2.6% at 16 KB**; our **TLS collapses at large payloads** (`iocp+tls` is LAST of eight legs at 256 KB
    and 1 MB, Kestrel `SslStream` +83% / +100% disjoint); and **http.sys CROSSES OVER** rather than
    dominating — last at 512 B (−18%) and 16 KB (−30%), first at 256 KB (+9%) and 1 MB (+112%).
-7. **STILL THE TOP WINDOWS PERF ITEM: `rio+tls` beats `iocp+tls` at every size ≥16 KB — and the page
-   hypothesis for it is FALSIFIED (2026-08-01).** REPLICATED in a second independent session (+8% / +38%
+7. **`rio+tls` beats `iocp+tls` at every size ≥16 KB — page hypothesis FALSIFIED, and the whole item now
+   NEEDS RE-MEASURING (2026-08-01).** ⚠ The `PooledBufferWriter` fix later the same day moved `iocp+tls`
+   at 1 MB from ~2,363 to ~3,748 — past the `rio+tls` figure of ~2,658 recorded before it. **That does NOT
+   mean the anomaly inverted**: RIO reaches the same `Flush` path and will have moved too, and the two
+   numbers are from different builds. **Re-run the `rio+tls` vs `iocp+tls` comparison on current `main`
+   before doing any more work on this item** — the gap may be smaller, gone, or reversed, and every
+   conclusion below predates the fix. REPLICATED in a second independent session (+8% / +38%
    / +17% at 16 KB / 256 KB / 1 MB, all disjoint), while RIO trails IOCP badly on plaintext at the same
    sizes. So it is a real property of the two TLS send paths.
 
@@ -152,7 +157,55 @@ then decide. Do not merge it as-is.
    become reachable for TLS, converting a 100% decline into the same fast path plaintext already uses.
    That is the highest-value Windows TLS work, and it plausibly also explains part of the Linux
    large-payload TLS loss, since the same structural shape appears there.
-9. **Accept-cost rig (http.sys is untested where it should win).** The 2026-08-01 table is **keep-alive
+9. **THE READ-SIDE THREAD HOP — half of the "thread hops" term has never been measured, on any OS
+   (raised 2026-08-01).** `SS_PIPE_SCHED=inline` has existed for a while and reads as though the hop
+   question were settled (Linux io_uring: **−28%**). It is not: that knob only ever moved the **OUTBOUND**
+   reader, the SocketSet pump. The **INBOUND** reader — the one that resumes *Kestrel's request pipeline*
+   when data arrives — was hard-wired to `PipeScheduler.ThreadPool`. So every "thread hop" number on file
+   is about the WRITE side, and the read side is untouched ground.
+
+   Now testable: `SS_PIPE_SCHED=inline-read` / `inline-both`, reported in `/config` as `pipesched=<mode>`
+   so a rig can gate on it. `bench/Run-PipeSched.ps1` is the interleaved A/B (same binary both sides,
+   modes reshuffled per pass, banner-gated, ranges not medians).
+
+   **It is an EXPERIMENT, not a candidate default, and that is the point.** An inline inbound reader runs
+   Kestrel's whole request pipeline on the transport's loop thread, blocking that loop for every backend
+   that owns one (all but managed) — Kestrel runs its own IO queues for exactly this reason. So a win is
+   not shippable as-is. Its value is that it **UPPER-BOUNDS what removing the read hop could ever be
+   worth**, which is precisely what decides whether an **inbound half-pipe** (a real fix: the loop drains
+   on its own timeline, no pipeline on the loop thread) is worth building. **A null result deprioritises
+   the read half-pipe outright**, which is just as useful an answer.
+
+   *Pre-registered:* the read hop is a per-REQUEST cost, not per-byte — one resumption per request
+   whatever the body size. So the gain should be largest at SMALL payloads (highest request rate =
+   highest hop rate) and fade toward nothing at 1 MB. **If the gain instead GROWS with payload, the
+   mechanism is not the hop** and the rig has found something else. Small payloads are also exactly where
+   vanilla Kestrel still beats us (Windows 16 KB −2.6% disjoint), which is why that is where to look.
+
+   **MEASURED 2026-08-01, THE PREDICTION HELD, AND IT IS THE BIGGEST FINDING OF THE SESSION.** With a
+   vanilla-Kestrel control in the same passes:
+
+   | payload | default vs Kestrel | inline-both vs Kestrel |
+   |---|---|---|
+   | 512 B | **−2.8%**, disjoint | *overlapping* — **parity** |
+   | 4 KB | **−3.2%**, disjoint | *overlapping* — **parity** |
+   | 16 KB | **−2.9%**, disjoint | **+1.7%, DISJOINT — ahead** |
+   | 256 KB | *(every mode overlaps — no effect)* | |
+
+   **The ~3% disjoint small-payload deficit to Kestrel IS the thread hops, essentially in full** — the
+   first mechanism ever found for it; copies, pool pinning and segment counts were each measured and did
+   not explain it. And the falsifier did not fire: disjoint at 512 B/4 KB/16 KB, nothing at 256 KB, i.e.
+   per-request exactly as predicted.
+
+   **CONSEQUENCE — the inbound half-pipe is now justified by a number instead of an argument, and this
+   should be the next substantial piece of work on the ASP.NET path.** Calibrate it honestly though:
+   the ceiling this measurement supports is ~2-4% at small payloads, and a real half-pipe will likely
+   capture somewhat less than `Inline` does (Inline also skips work a correct implementation must still
+   do). It is not a step change; it is the difference between losing to Kestrel by 3% and matching or
+   beating it. The outbound half is already built and merged (off by default); this is the other half of
+   the "two half-pipes" proposal, and its case is now measured.
+
+10. **Accept-cost rig (http.sys is untested where it should win).** The 2026-08-01 table is **keep-alive
    only at c64**, so connection accept — the thing a kernel-mode HTTP stack should win most decisively —
    is entirely out of scope, and NO claim about accept cost in either direction is currently supported.
    **The obstacle is TIME_WAIT, and it is why this is a rig rather than a flag:** `bench/README.md`'s
@@ -173,6 +226,41 @@ then decide. Do not merge it as-is.
    to each other, but neither to `SmokeTest --churn`, which accepts without HTTP. Same layer or nothing.
 
 ---
+
+## READ FIRST IF YOU ARE ON LINUX (2026-08-01 addendum — SHARED CODE CHANGED UNDER YOU AGAIN)
+
+> **Written at the end of the 2026-08-01 Windows session. Linux has not run since 2026-08-01 morning and
+> two SHARED changes landed after that, one of them on the hottest path. Correctness first:
+> `bench/run-smoke-matrix.sh` (60 cells) before anything else.**
+>
+> **1. `PooledBufferWriter` hand-off pessimisation — FIXED, and this is the one that matters to you.**
+> `TakeArray()` left the writer empty, so the next use re-rented at the first size hint and grew by
+> DOUBLING, with a `Buffer.BlockCopy` per doubling. `OutboundConnection.Flush` calls `TakeArray` on EVERY
+> out-of-band flush on EVERY backend — **io_uring, epoll and managed all reach it** — so since the
+> hand-off landed, the per-connection accumulator has restarted from empty on every response and re-paid
+> that growth. Fixed by remembering high-water capacity.
+> Measured on Windows/IOCP, interleaved, disjoint: **classic plaintext 1 MB +33.3%; TLS 256 KB +18.8%;
+> TLS 1 MB +58.6%.** Nothing at 16 KB (few doublings).
+> **PRE-REGISTERED FOR LINUX: expect the same shape — a win that GROWS with payload, largest on TLS and on
+> `--classic`, ~nothing at small payloads, and ~nothing on plaintext `--byo` (zero-copy send skips `Flush`
+> entirely).** If Linux shows a win at SMALL payloads, or on plaintext `--byo`, the mechanism is not the
+> one described here and that is a finding. Rig: `bench/run-tls-sizes.sh`, or port `Compare-Commits.ps1`'s
+> interleaved shape.
+>
+> **2. IOCP-only "owned staging" for TLS ciphertext** (`StageOutboundOwned` / `SupportsOwnedStaging`).
+> Opt-in per backend and **false everywhere except IOCP**, so Linux behaviour is unchanged by construction.
+> Measured NEUTRAL on Windows; it is a simplification, not a win. If you want it on io_uring/epoll their
+> drains must first tolerate a staged segment LARGER than one page.
+>
+> **3. `SS_PIPE_SCHED` gained `inline-read` / `inline-both`** (the INBOUND reader; the old `inline` only
+> ever moved the outbound one). Off by default, reported in `/config` as `pipesched=`. On Windows this
+> found that **the ~3% small-payload deficit to vanilla Kestrel IS the thread hops** — see item 9 and
+> RESULTS. **Re-running `bench/Run-PipeSched.ps1`'s equivalent on io_uring/epoll is high value**, because
+> the old Linux `inline` result (−28%) measured the *other* half and reads as though the question were
+> settled. It is not.
+>
+> **Also still open from the morning:** `Verify-AspNet.ps1` has no Linux equivalent, so the
+> `SocketSet.AspNetCore` extraction is runtime-verified on IOCP/RIO/managed but NOT on io_uring/epoll.
 
 ## READ FIRST IF YOU ARE ON LINUX (rewritten 2026-07-31, after three days of Windows work)
 

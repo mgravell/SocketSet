@@ -172,6 +172,12 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         }
     }
 
+    /// <summary>IOCP's drain consumes a Pending segment across as many write pages as it needs
+    /// (see <see cref="DrainPendingIntoPages"/> and <see cref="WindowsConnection.PendingHeadOffset"/>), so
+    /// ciphertext can be staged whole instead of pre-chunked and copied. RIO's drain does not, and is
+    /// deliberately left on the copying path until it does.</summary>
+    protected override bool SupportsOwnedStaging => true;
+
     protected override void OnInitialize()
     {
         EnsureWinsock();
@@ -629,7 +635,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         conn.RecvBuf = -1;
         conn.SendBuf = -1;
         conn.SendPageCount = 0;
-        conn.Pending?.Clear();
+        DiscardPending(conn); // returns the buffers AND clears PendingHeadOffset (a stale one corrupts)
         conn.Tls = null;      // disposed by TryFinalize; cleared here so a rolled-back claim starts clean
         conn.IsClient = false;
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
@@ -1190,9 +1196,13 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         while (pending.Count > 0)
         {
             var seg = pending.Peek();
+            // A segment may now be LARGER than a page: StageOutboundOwned hands over the whole ciphertext
+            // buffer rather than pre-chunking it, so the head is consumed across as many pages as it takes.
+            int off = conn.PendingHeadOffset;
+            int remain = seg.Count - off;
             int pi = conn.SendPageCount - 1;
             int used = pi >= 0 ? conn.SendLens[pi] : _writeBufSize; // no page yet -> force a lease
-            if (pi < 0 || used + seg.Count > _writeBufSize)
+            if (pi < 0 || used >= _writeBufSize)
             {
                 if (conn.SendPageCount >= IocpConnection.MaxSendPages) break; // cap this send; rest follows
                 if (!_writeBuffer.TryLease(out int wi, out _)) break;         // pool dry; send what we have
@@ -1201,12 +1211,22 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
                 conn.SendLens[pi] = 0;
                 used = 0;
             }
-            // A staged segment never exceeds one page (StageOutbound chunks it), so it always fits here.
-            pending.Dequeue();
-            Marshal.Copy(seg.Array!, seg.Offset, (nint)(_writeBuffer.Address(conn.SendPages[pi]) + used), seg.Count);
-            conn.SendLens[pi] = used + seg.Count;
-            added += seg.Count;
-            ArrayPool<byte>.Shared.Return(seg.Array!);
+            int n = Math.Min(remain, _writeBufSize - used);
+            Marshal.Copy(seg.Array!, seg.Offset + off, (nint)(_writeBuffer.Address(conn.SendPages[pi]) + used), n);
+            conn.SendLens[pi] = used + n;
+            added += n;
+            if (n == remain)
+            {
+                pending.Dequeue();
+                conn.PendingHeadOffset = 0;
+                ArrayPool<byte>.Shared.Return(seg.Array!);
+            }
+            else
+            {
+                // Partly copied: keep it at the head and resume at the offset on the next page/pass. The
+                // send cap and a dry pool both land here, so the remainder must survive the loop exit.
+                conn.PendingHeadOffset = off + n;
+            }
         }
         return added;
     }
@@ -1287,7 +1307,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             // cosmetic here.)
             _tlsCipher!.Reset();
             tls.ProcessOutbound(new ReadOnlySpan<byte>(wp, next), _tlsCipher);
-            StageOutbound(conn, _tlsCipher.WrittenSpan);
+            StageCipher(conn);
             next = 0;
         }
 

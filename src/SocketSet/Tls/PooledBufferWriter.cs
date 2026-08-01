@@ -16,8 +16,23 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
     private byte[]? _buf;
     private int _pos;
 
+    /// <summary>Largest capacity this writer has ever held, so a re-rent after <see cref="TakeArray"/>
+    /// starts there instead of at the size hint.
+    ///
+    /// Without this, hand-off mode is a PESSIMISATION on a hot path and measurably so: TakeArray leaves
+    /// the writer with no buffer, so the next response re-rents at the first size hint (one TLS record's
+    /// worth) and then grows by doubling — and every doubling in <see cref="Ensure"/> is a
+    /// <see cref="Buffer.BlockCopy"/> of everything written so far. Encrypting a 256 KB response that way
+    /// costs ~4 extra full copies of the ciphertext, which is MORE than the one copy hand-off was
+    /// introduced to remove. Measured 2026-08-01: with the naive version the whole optimisation read as a
+    /// null result.</summary>
+    private int _capacity;
+
     public PooledBufferWriter(int initialCapacity = 1024)
-        => _buf = ArrayPool<byte>.Shared.Rent(Math.Max(1, initialCapacity));
+    {
+        _buf = ArrayPool<byte>.Shared.Rent(Math.Max(1, initialCapacity));
+        _capacity = _buf.Length;
+    }
 
     public int WrittenCount => _pos;
     public ReadOnlySpan<byte> WrittenSpan => _buf is null ? default : _buf.AsSpan(0, _pos);
@@ -59,7 +74,16 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
     private void Ensure(int sizeHint)
     {
         if (sizeHint < 1) sizeHint = 1;
-        if (_buf is null) { _buf = ArrayPool<byte>.Shared.Rent(sizeHint); _pos = 0; return; }
+        if (_buf is null)
+        {
+            // Re-rent at the high-water mark, not at the hint: this writer is reused for the same shape of
+            // work every time, so starting small guarantees the doubling loop below runs on every single
+            // response. See _capacity.
+            _buf = ArrayPool<byte>.Shared.Rent(Math.Max(sizeHint, _capacity));
+            _capacity = _buf.Length;
+            _pos = 0;
+            return;
+        }
         if (_buf.Length - _pos >= sizeHint) return;
 
         int size = Math.Max(_buf.Length * 2, _pos + sizeHint);
@@ -67,6 +91,7 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
         Buffer.BlockCopy(_buf, 0, bigger, 0, _pos);
         ArrayPool<byte>.Shared.Return(_buf);
         _buf = bigger;
+        _capacity = bigger.Length;
     }
 
     public void Dispose()

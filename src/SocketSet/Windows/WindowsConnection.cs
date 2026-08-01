@@ -75,6 +75,13 @@ internal abstract class WindowsConnection : OutboundConnection
     public int SendTotal;      // total bytes of the current send
     public Queue<ArraySegment<byte>>? Pending;
 
+    /// <summary>Bytes of the HEAD <see cref="Pending"/> segment already copied onto the wire. Non-zero only
+    /// while a segment is being consumed across several send pages, which became possible when ciphertext
+    /// started being staged whole (see <c>StageOutboundOwned</c>) instead of pre-chunked to the page size.
+    /// Loop-thread only, and MUST be cleared wherever <see cref="Pending"/> is — a stale offset would skip
+    /// the first bytes of an unrelated later segment, i.e. silently corrupt the stream rather than fail.</summary>
+    public int PendingHeadOffset;
+
     /// <summary>This connection wanted a write page and the pool was dry, so its bytes are staged in
     /// <see cref="Pending"/> and it is queued for retry on a later loop pass. Loop-thread only. Exists
     /// because the alternative — what this replaced — was tearing down a healthy connection because a

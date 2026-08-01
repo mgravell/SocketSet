@@ -371,6 +371,99 @@ ciphertext *directly into* the pinned send buffers, so the IOCP zero-copy path b
 at all — which would convert a 100% decline rate into the same fast path plaintext already uses. That is a
 design item, not a flag, and it is now the highest-value Windows TLS work.
 
+### A PESSIMISATION IN THE FLUSH HAND-OFF, CROSS-PLATFORM: +58.6% on TLS at 1 MB (2026-08-01)
+
+`PooledBufferWriter.TakeArray()` detaches the writer's buffer and leaves it EMPTY, so the next use
+re-rents at the first size hint and grows by DOUBLING — and every doubling in `Ensure()` is a
+`Buffer.BlockCopy` of everything written so far. `OutboundConnection.Flush` uses `TakeArray` on **every
+out-of-band flush on every backend** (io_uring, epoll, IOCP, RIO, managed), so since the hand-off landed
+the per-connection accumulator has restarted from empty on every response and re-paid that growth. Fixed
+by remembering the high-water capacity and re-renting at it.
+
+Interleaved A/B (`Compare-Commits.ps1`, isolated worktrees, 4 scored passes), IOCP, bridged:
+
+| leg | payload | before | after | change |
+|---|---|---:|---:|---|
+| `--classic` plaintext | 16 KB | 3,364.1 | 3,301.6 | −1.9% — *overlapping, noise* |
+| `--classic` plaintext | 256 KB | 4,567.2 | 4,968.3 | +8.8% — *overlapping, unproven* |
+| `--classic` plaintext | 1 MB | 2,977.3 | **3,970.1** | **+33.3%, DISJOINT** |
+| `--tls` | 256 KB | 3,907.8 | **4,642.4** | **+18.8%, DISJOINT** |
+| `--tls` | 1 MB | 2,362.6 | **3,748.0** | **+58.6%, DISJOINT** |
+
+**The size-dependence is the mechanism showing itself**: more bytes = more doublings = more re-copying,
+so the win grows with payload and vanishes at 16 KB. And **TLS gains most because ALL TLS traffic takes
+the out-of-band path**, so it always paid the growth, where plaintext BYO uses zero-copy send and skips
+`Flush` entirely.
+
+**Note the shape of the mistake, because this file's history now contains it twice.** `fa97dd4` replaced
+an unpooled `ToArray()` with a rent PLUS a copy and concluded "allocation was the cost, per-byte copying
+is not"; its successor removed that copy via hand-off and reintroduced copying through the growth path.
+Each step measured better than the last, and each left a copy behind. The lesson is not "copies are the
+cost" — it is that a change measured only against its predecessor can carry a new regression under a net
+win.
+
+**This also moves the IOCP+TLS picture, but does NOT settle it.** `iocp+tls` at 1 MB goes ~2,363 →
+~3,748, which is above the `rio+tls` figure of ~2,658 recorded earlier the same day — *but that RIO number
+predates this fix and RIO uses the same `Flush` path*, so it will move too. **The RIO-beats-IOCP-on-TLS
+anomaly must be re-measured on this branch before anything is concluded about it; do not read the
+inversion off these two numbers.**
+
+**UNVERIFIED ON LINUX.** This is a shared-code change on the hottest path, and io_uring / epoll / managed
+all reach it through `OutboundConnection.Flush`. It is plausibly a Linux win of similar shape and has not
+been built or run there.
+
+### THE THREAD HOPS ARE THE SMALL-PAYLOAD DEFICIT TO KESTREL, and half of them had never been measured (2026-08-01, branch `tls-zerocopy-send`)
+
+`SS_PIPE_SCHED=inline` has existed for a while and made the hop question look settled (Linux io_uring:
+−28%). It was not: **that knob only ever moved the OUTBOUND reader** (the SocketSet pump). The INBOUND
+reader — the one that resumes *Kestrel's request pipeline* when data arrives — was hard-wired to
+`PipeScheduler.ThreadPool`, so every "thread hop" figure on file describes the write side only.
+`inline-read` / `inline-both` (new) and `bench/Run-PipeSched.ps1` measure the missing half: same binary
+every leg, modes reshuffled per pass, banner-gated on `pipesched=`, 6 scored passes, **a vanilla-Kestrel
+control in the same passes**.
+
+| payload | off *(today's default)* | inline-read | **inline-both** | *kestrel (control)* |
+|---|---:|---:|---:|---:|
+| 512 B | 136.8-141.1 | 143.2-144.3 | **144.0-145.3** | *144.0-145.4* |
+| 4 KB | 1044.1-1059.7 | 1071.9-1087.9 | **1089.5-1110.6** | *1084.4-1102.0* |
+| 16 KB | 3744.9-3893.7 | 3907.5-3979.2 | **3990.0-4033.6** | *3933.6-3974.3* |
+| 256 KB | 10540-11291 | 10280-11220 | 10732-11274 | *(not run)* |
+
+**Against the same-session control:**
+
+| payload | default vs Kestrel | inline-both vs Kestrel |
+|---|---|---|
+| 512 B | **−2.8%**, disjoint | *overlapping* — **parity** |
+| 4 KB | **−3.2%**, disjoint | *overlapping* — **parity** |
+| 16 KB | **−2.9%**, disjoint | **+1.7%, DISJOINT — ahead** |
+| 256 KB | *(all modes overlap — no effect)* | |
+
+**So the ~3% disjoint small-payload deficit to vanilla Kestrel is the thread hops, essentially in full.**
+Removing both erases it at 512 B and 4 KB and inverts it at 16 KB. That is the first mechanism found for
+that deficit; every previous candidate (copies, pool pinning, segment counts) was measured and did not
+explain it.
+
+**The pre-registered prediction held, which is why this is a mechanism and not a coincidence.** Written
+before the run: the read hop is a per-REQUEST cost, not per-byte — one resumption per request whatever the
+body size — so the gain must be largest where request rate is highest and must fade to nothing at large
+payloads; **and a gain that GREW with payload would falsify it**. Observed: disjoint at 512 B / 4 KB /
+16 KB, and every mode overlapping at 256 KB. The falsifier did not trigger. (Worth noting against the rest
+of this session, in which three separate pre-registered hypotheses were killed.)
+
+**NOT A SHIPPABLE DEFAULT, and the distinction is the whole point of the item.** An inline INBOUND reader
+runs Kestrel's entire request pipeline **on the transport's loop thread**, blocking that loop for every
+backend that owns one (all but managed) — Kestrel runs its own IO queues for exactly this reason. This
+measurement is an **upper bound** on what removing the read hop can be worth, not a configuration to
+adopt. What it does is convert the "two half-pipes" proposal from a plausible idea into a costed one:
+
+- The outbound half-pipe is already built and merged (off by default) — it removes the write hop *properly*,
+  with no loop blocking.
+- **The INBOUND half-pipe is now justified by a number rather than by argument**, and the number is
+  ~2-4% at small payloads. Real and repeatable, but calibrate expectations: it is not a step change, and a
+  real half-pipe would likely capture somewhat less than `Inline` does, since `Inline` also skips work a
+  correct implementation still has to do.
+- 256 KB is untouched by any of this, consistent with everything else on file.
+
 ### What changed on 2026-07-30, because it moves several conclusions in this file
 
 - **An ACCESS VIOLATION in RIO+TLS under churn was found and fixed** (item 0e). It was present on the

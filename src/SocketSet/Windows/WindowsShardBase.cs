@@ -159,6 +159,58 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
         }
     }
 
+    /// <summary>
+    /// Stage an ALREADY-POOLED buffer by taking ownership of it, with no copy and no chunking. The drain
+    /// returns it to <see cref="ArrayPool{T}"/>, exactly as for <see cref="StageOutbound"/>'s own rentals.
+    ///
+    /// This exists because the TLS send path was measured (2026-08-01) to copy every ciphertext byte
+    /// TWICE — once here into page-sized pooled chunks, and again in the drain into the write pages — on
+    /// top of one <see cref="ArrayPool{T}"/> rent per page. At a 4 KB page a 256 KB response paid 65 rents
+    /// and ~525 KB of memcpy that the plaintext path (zero-copy send) does not pay at all. The encrypt
+    /// scratch is already a pooled array of exactly the right bytes, so handing it over removes the first
+    /// copy and all but one of the rents outright.
+    ///
+    /// ONLY safe where the drain can consume a segment LARGER than one write page — it no longer chunks,
+    /// so a caller whose drain assumes "a segment fits in a page" would truncate. <see cref="Windows.IocpShard"/>
+    /// handles this via <see cref="WindowsConnection.PendingHeadOffset"/>; RIO does not, which is why this
+    /// is opt-in per backend rather than a change to <see cref="StageOutbound"/>.
+    /// </summary>
+    protected void StageOutboundOwned(TConn conn, byte[] buffer, int length)
+    {
+        if (length <= 0) { ArrayPool<byte>.Shared.Return(buffer); return; }
+        (conn.Pending ??= new()).Enqueue(new ArraySegment<byte>(buffer, 0, length));
+    }
+
+    /// <summary>Whether this backend's drain can consume a <see cref="WindowsConnection.Pending"/> segment
+    /// that spans several write pages. False keeps the pre-chunking path, which is always correct.</summary>
+    protected virtual bool SupportsOwnedStaging => false;
+
+    /// <summary>Stage ciphertext from the shard's encrypt scratch, taking the cheap path where the backend
+    /// supports it. One place, so the two TLS call sites cannot drift apart.</summary>
+    protected void StageCipher(TConn conn)
+    {
+        if (SupportsOwnedStaging)
+        {
+            var (buf, len) = _tlsCipher!.TakeArray(); // scratch re-rents lazily on next use
+            StageOutboundOwned(conn, buf, len);
+        }
+        else
+        {
+            StageOutbound(conn, _tlsCipher!.WrittenSpan);
+        }
+    }
+
+    /// <summary>Drop every queued segment AND return its buffer. Clearing the queue alone leaks the pooled
+    /// arrays back to the GC rather than the pool — harmless-looking, and worse now that one segment can be
+    /// a whole response rather than a single page.</summary>
+    protected static void DiscardPending(TConn conn)
+    {
+        if (conn.Pending is { Count: > 0 } q)
+            while (q.Count > 0) ArrayPool<byte>.Shared.Return(q.Dequeue().Array!);
+        conn.Pending?.Clear();
+        conn.PendingHeadOffset = 0;
+    }
+
     /// <summary>Deliver a flushed out-of-band write on the loop thread: encrypt if TLS, stage into
     /// Pending, then kick a send if idle. Dropped if the slot was re-tenanted or its send half is
     /// closed.</summary>
@@ -181,7 +233,7 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
             }
             _tlsCipher!.Reset();
             tls.ProcessOutbound(new ReadOnlySpan<byte>(data, 0, len), _tlsCipher);
-            StageOutbound(conn, _tlsCipher.WrittenSpan);
+            StageCipher(conn);
         }
         else
         {
@@ -216,7 +268,9 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
     {
         _tlsCipher!.Reset();
         conn.Tls!.ProcessOutbound(new ReadOnlySpan<byte>(plaintext, len), _tlsCipher);
-        QueueCipher(conn, slot, _tlsCipher.WrittenSpan);
+        if (_tlsCipher.WrittenCount == 0) return;
+        StageCipher(conn);
+        if (!conn.SendBusy && !conn.Closing && conn.Socket != 0) StartPendingSend(conn, slot);
     }
 
     /// <summary>Advance the handshake with freshly-received bytes. False once the connection is gone.</summary>

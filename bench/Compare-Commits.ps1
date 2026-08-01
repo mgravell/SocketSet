@@ -118,17 +118,27 @@ function Measure-One([string]$exe, [int]$port, [int]$sz) {
         -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ab.out" -RedirectStandardError "$env:TEMP\ab.err"
     try { $proc.ProcessorAffinity = [IntPtr]$serverMask } catch { }
     try {
-        $url = if ($Bridged) { "http://127.0.0.1:$port/payload?n=$sz" } else { "http://127.0.0.1:$port/" }
+        # A TLS side speaks https and presents a self-signed cert, so both the gate and the load need -k.
+        # Hard-wiring http here meant `-ExtraArgs --tls` produced "config mismatch" on every measurement:
+        # the rig was talking plaintext to an https listener and reporting it as a TRANSPORT mismatch,
+        # which reads as "the build is wrong" rather than "the harness cannot reach it".
+        $scheme = if ($ExtraArgs -contains "--tls" -or $ExtraArgs -contains "--ktls") { "https" } else { "http" }
+        $url = if ($Bridged) { "${scheme}://127.0.0.1:$port/payload?n=$sz" } else { "${scheme}://127.0.0.1:$port/" }
         if ($Bridged) {
             # Trust the banner, not the flag: refuse to measure a side whose transport is not the one asked for.
             $cfg = $null
             $deadline = (Get-Date).AddSeconds(40)
             while ((Get-Date) -lt $deadline) {
-                $raw = & curl.exe -s --max-time 3 "http://127.0.0.1:$port/config" 2>$null
+                $raw = & curl.exe -sk --max-time 3 "${scheme}://127.0.0.1:$port/config" 2>$null
                 if ($LASTEXITCODE -eq 0 -and $raw) { try { $cfg = ($raw | ConvertFrom-Json).config; break } catch { } }
                 Start-Sleep -Milliseconds 400
             }
             if ($cfg -notlike "*transport=socketset/$Backend*") { Write-Warning "config mismatch: $cfg"; return $null }
+            # And gate TLS explicitly: without this a --tls side that silently fell back to plaintext would
+            # pass the transport check and be measured as a TLS leg.
+            if ($scheme -eq "https" -and $cfg -notlike "*tls=*" -or ($scheme -eq "https" -and $cfg -like "*tls=off*")) {
+                Write-Warning "expected a TLS side, banner says: $cfg"; return $null
+            }
         }
         else { Start-Sleep 4 }
 
@@ -138,7 +148,9 @@ function Measure-One([string]$exe, [int]$port, [int]$sz) {
         # starts a FRESH server process, so each one pays its own JIT and pool-fill transient, not just
         # the first. A rig that can only resolve 10% cannot answer the questions it is pointed at.
         foreach ($phase in @($WarmupDuration, $Duration)) {
-            $b = Start-Process $bombardier -ArgumentList @("-c", "$Connections", "-d", $phase, "-o", "json", "-p", "r", $url) `
+            # -k: skip certificate verification (the demo's cert is a throwaway self-signed one). Harmless
+            # on the plaintext legs, and required on the TLS ones.
+            $b = Start-Process $bombardier -ArgumentList @("-k", "-c", "$Connections", "-d", $phase, "-o", "json", "-p", "r", $url) `
                 -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ab.json" -RedirectStandardError "$env:TEMP\ab.jerr"
             try { $b.ProcessorAffinity = [IntPtr]$clientMask } catch { }
             $b.WaitForExit()

@@ -29,6 +29,11 @@
 .EXAMPLE
     .\Verify-AspNet.ps1 -Filter "*half-pipe*" -KeepLogs
 #>
+#Requires -Version 7
+# PowerShell 7+, and the guard is not decorative: under Windows PowerShell 5.1 this fails on EVERY cell
+# with "The property 'DefaultRequestVersion' cannot be found on this object" (5.1 binds the .NET Framework
+# HttpClient, which has no such property). That reads as 18/18 product failures rather than as the wrong
+# host, which is exactly the kind of clean-looking wrong answer this repo's rigs exist to avoid.
 [CmdletBinding()]
 param(
     # Cell name filter. Cell names are "<backend>/<mode><+tls>".

@@ -76,9 +76,15 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
         // sentinels, and RIO picks a 64KB page nobody typed — so reporting only the explicit values would
         // describe a geometry the transport is not running.
         var g = _set.Options;
+        // SS_PIPE_SCHED rides along here rather than in the demo's own banner, because it is read by the
+        // LIBRARY (SocketSetConnection) and a rig must be able to gate on it: an inline-scheduler A/B where
+        // the variable was mistyped or not inherited by the child process would measure two identical legs
+        // and report the difference as noise. Absent when unset, so existing gate strings are unchanged.
+        string sched = Environment.GetEnvironmentVariable("SS_PIPE_SCHED") is { Length: > 0 } s
+            ? $" pipesched={s}" : "";
         _metrics.ResolvedGeometry = $"page={g.BufferPageSize} recvbuf={g.ReceiveBufferSize} "
             + $"writebufs={g.WriteBuffersPerShard} oobwritebufs={g.OutOfBandWriteBuffersPerShard} "
-            + $"readpages={g.BufferPagesPerShard}";
+            + $"readpages={g.BufferPagesPerShard}{sched}";
         _set.Listen(EndPoint);
         Console.WriteLine($"[socketset transport] resolved: {_metrics.ResolvedGeometry}");
     }
