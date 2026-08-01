@@ -795,8 +795,72 @@ flag does not touch TLS 1.3 KeyUpdate.
 
 ## Two half-pipes: replace the Kestrel bridge's two full `Pipe`s (proposed 2026-07-31)
 
-**Status: proposed, not started. The most promising forward perf/correctness idea for the ASP.NET path,
-and the concrete form of "integrate the drain into the loop thread."**
+**Status: OUTBOUND HALF BUILT AND CORRECT (2026-08-01, branch `cyclebuffer-halfpipe`). Inbound half not
+started. A/B on the concurrency sweep is the next step — the hypothesis below is not yet measured.**
+
+**Progress 2026-08-01 (branch `cyclebuffer-halfpipe`, NOT merged to main):**
+- Vendored StackExchange.Redis `CycleBuffer` (segmented pooled producer/consumer buffer, MIT) under
+  `vendor/`. Isolation micro-bench `experiments/BufferBench`: the write→commit→consume→discard CYCLE is
+  **2.2–3.5× cheaper than `Pipe`** single-threaded, and **1.15–1.77× cheaper cross-thread** with a
+  lock+condvar SPSC wrapper and 256KB backpressure (both zero-alloc). So the machinery win survives paying
+  for coordination. Cross-thread is a conservative floor for the integration — see next.
+- Built the **outbound half-pipe** (`--half-pipe`): `AspNetDemo/HalfPipeWriter.cs`, a `PipeWriter` Kestrel
+  writes to that is backed directly by a `CycleBuffer` and **drains itself to `Connection.Send` on
+  Kestrel's own flush thread**. No outbound `Pipe`, no pump `Task`, no ThreadPool hop, no async read loop.
+  Key realization that made it lock-free: `Connection.Send` COPIES synchronously, so producer
+  (GetMemory/Advance) and consumer (FlushAsync drain) are BOTH the single Kestrel write thread — the
+  CycleBuffer is never touched cross-thread. So the SINGLE-thread bench numbers apply, not the cross-thread
+  ones, AND the ThreadPool hop is deleted. Trades zero-copy send for a copy, so it targets small/mid +
+  concurrency, NOT 256KB. Inbound stays a stock `Pipe`. Mutually exclusive with BYO. Banner: `half-pipe=1`.
+- **Correctness gate PASSED** (byte-exact HTTP, io_uring AND epoll): `/payload?n` from 1B to 8MB exact;
+  POST echo/drain at 500KB exact. (SmokeTest covers the raw transport, not the bridge — these HTTP checks
+  ARE the half-pipe's gate.)
+- Found + fixed TWO bugs from Kestrel's `PipeWriter` usage, both live in `HalfPipeWriter`: (1) it reads
+  `PipeWriter.UnflushedBytes` (Http1OutputProducer + System.Text.Json) → must implement it
+  (`_cb.GetCommittedLength()`), not leave it throwing; (2) Kestrel does `GetMemory` ONCE then `Advance`
+  headers, then writes the BODY into the same retained buffer and `Advance`s again — a second Advance with
+  no intervening GetMemory. This is an `IBufferWriter` contract violation (isolated repro:
+  `experiments/KestrelPipeWriterRepro`, to be filed upstream). CycleBuffer's `Commit` (correctly) assumed
+  a fresh lease and relocated bytes, corrupting the body; fixed defensively by re-leasing at the current
+  end before each `Commit` since Kestrel writes contiguously.
+
+**A/B DONE (2026-08-01, `bench/run-halfpipe.sh`, io_uring, 1 KB, RESULTS.md has the table):** half-pipe
+wins throughput at every concurrency — +5.5/+3.2/+3.8% over classic at c64/c128/c256 (range-clean at
+c64/c128, overlapping at c256), and +5.6–7.0% over BYO (zero-copy send isn't worth its overhead at 1 KB).
+BUT the pre-registered pump-contention hypothesis (#1) is **NOT supported**: the lead is roughly FLAT with
+concurrency, not growing — so the win is a per-request machinery saving (cheaper CycleBuffer cycle + no
+pump task + no hop), not high-c contention relief. And it costs p99 (+16/+27/+56% at c64/128/256), because
+the drain+Send runs on the Kestrel request thread. **Falsifier fired for the mechanism; the flat win is
+the finding.**
+
+**MERGE-READY as a runtime toggle (2026-08-01).** `--half-pipe` is off by default (`HalfPipe` defaults
+false), mutually exclusive with BYO/classic, and the branch touches **zero `src/SocketSet` code** — the
+transport core and every Windows backend are untouched. So squashing to main is additive and off-by-default;
+it cannot affect the default or Windows paths. The only cost to main is a new opt-in flag + the vendored
+`CycleBuffer` (`vendor/`, MIT). Windows caveat: `HalfPipeWriter` uses only `Connection.Send` (cross-platform),
+so it SHOULD work on IOCP/RIO, but that is UNTESTED — Linux-only verified so far.
+
+**Workaround for the Kestrel bug is IN (not blocked on upstream).** The `Advance`-relocation corruption is
+[[aspnetcore-issue-68148]] (filed; not expected to land before .NET 12). `HalfPipeWriter.Advance` re-leases
+before each `Commit`, which sidesteps it entirely — so the half-pipe does not wait on a framework fix.
+
+**Crossover MEASURED (2026-08-01, `bench/run-halfpipe.sh` size sweep, RESULTS.md):** half-pipe wins
+256 B–16 KB (+3–8.5%, range-clean), wash at 64 KB, and at 256 KB **BYO's zero-copy retakes decisively**
+(half-pipe −36% vs BYO; the send-copy finally costs). So half-pipe is the small-to-mid path, BYO the large
+path — both toggles, pick per workload. **Alloc MEASURED (`bench/run-halfpipe-alloc.sh`):** WASH vs classic
+(gen0 193 vs 192, ~1350 B/req both) — so the win is CPU/scheduling, NOT GC; the "leaner allocations" framing
+was wrong (corrected in RESULTS.md).
+
+**STILL TODO on this branch:** (a) the tail-latency cost (+12–18% p99 small-mid) — acceptable, or does
+draining need to hop off the request thread (reintroducing some of what we removed)? (b) plaintext + TLS
+legs (only plaintext measured). (c) Windows (IOCP/RIO) — should work via `Connection.Send`, untested. (d)
+the harder inbound `PipeReader` half (real backpressure). (e) SPARE-CYCLES: clone+fork aspnetcore and fix
+[[aspnetcore-issue-68148]] ourselves (user to fork); low priority — the workaround holds, won't ship before
+.NET 12.
+
+---
+
+**Original proposal (2026-07-31), for the full design + pre-registered evaluation:**
 
 Today `SocketSetConnection` builds TWO full `System.IO.Pipelines.Pipe`s (`_inbound`, `_outbound`), each
 with the complete reader+writer state machine, scheduler-dispatched continuations, and the

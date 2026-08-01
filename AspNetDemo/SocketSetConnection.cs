@@ -32,7 +32,8 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
 {
     private readonly Connection _conn;
     private readonly Pipe _inbound;
-    private readonly Pipe _outbound;
+    private readonly Pipe? _outbound;          // null in half-pipe mode (the half-pipe IS the outbound leg)
+    private readonly HalfPipeWriter? _half;    // non-null in half-pipe mode
     private readonly CancellationTokenSource _closedCts = new();
     private Task? _pump;
 
@@ -52,7 +53,7 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     private readonly bool _byo;
 
     public SocketSetConnection(Connection conn, bool tls, bool byo = false,
-                              int pipeSegment = 0, MemoryPool<byte>? pipePool = null)
+                              int pipeSegment = 0, MemoryPool<byte>? pipePool = null, bool halfPipe = false)
     {
         _conn = conn;
         _byo = byo;
@@ -71,13 +72,24 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         _inbound = new Pipe(new PipeOptions(pool, readerScheduler: sched, writerScheduler: sched,
             useSynchronizationContext: false, pauseWriterThreshold: 1 << 20, resumeWriterThreshold: 1 << 19,
             minimumSegmentSize: seg));
-        _outbound = new Pipe(new PipeOptions(pool, readerScheduler: outReader, writerScheduler: sched,
-            useSynchronizationContext: false, minimumSegmentSize: seg));
+        if (halfPipe)
+        {
+            // The outbound leg is a CycleBuffer-backed PipeWriter that drains itself to Connection.Send on
+            // Kestrel's flush thread — no outbound Pipe, no pump, no thread hop. byo is off in this mode, so
+            // TransportSide (the ctx.UsePipe view) is never consulted.
+            _half = new HalfPipeWriter(conn);
+            TransportSide = null!;
+        }
+        else
+        {
+            _outbound = new Pipe(new PipeOptions(pool, readerScheduler: outReader, writerScheduler: sched,
+                useSynchronizationContext: false, minimumSegmentSize: seg));
+            // The transport's view is the mirror of Kestrel's: it WRITES what it receives (into the inbound
+            // pipe Kestrel reads from) and READS what it should send (from the outbound pipe Kestrel writes to).
+            TransportSide = new TransportDuplexPipe(_outbound.Reader, _inbound.Writer);
+        }
 
         Transport = this;
-        // The transport's view is the mirror of Kestrel's: it WRITES what it receives (into the inbound
-        // pipe Kestrel reads from) and READS what it should send (from the outbound pipe Kestrel writes to).
-        TransportSide = new TransportDuplexPipe(_outbound.Reader, _inbound.Writer);
         ConnectionId = Guid.NewGuid().ToString("n");
         Features = new FeatureCollection();
         Items = new Dictionary<object, object?>();
@@ -111,7 +123,9 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     /// here — SocketSet reads the outbound pipe itself.</summary>
     public void Start()
     {
-        if (!_byo) _pump = Task.Run(PumpOutboundAsync);
+        // Half-pipe and BYO both drive the outbound leg without this pump: half-pipe drains on Kestrel's
+        // flush thread, BYO hands the pipe to the transport. Only the classic path runs a pump here.
+        if (!_byo && _outbound is not null) _pump = Task.Run(PumpOutboundAsync);
     }
 
     private sealed class TransportDuplexPipe(PipeReader input, PipeWriter output) : IDuplexPipe
@@ -122,7 +136,7 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
 
     // --- IDuplexPipe: what Kestrel reads/writes ---
     public PipeReader Input => _inbound.Reader;
-    public PipeWriter Output => _outbound.Writer;
+    public PipeWriter Output => _half ?? _outbound!.Writer;
 
     // --- ConnectionContext surface ---
     public override IDuplexPipe Transport { get; set; }
@@ -151,13 +165,14 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     public void OnClosedByPeer()
     {
         _inbound.Writer.Complete();
-        _outbound.Reader.CancelPendingRead();
+        _outbound?.Reader.CancelPendingRead();
+        _half?.MarkPeerGone();
         _closedCts.Cancel();
     }
 
     private async Task PumpOutboundAsync()
     {
-        PipeReader reader = _outbound.Reader;
+        PipeReader reader = _outbound!.Reader; // only started when _outbound is non-null (see Start)
         try
         {
             while (true)
@@ -183,6 +198,7 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     public override void Abort(ConnectionAbortedException abortReason)
     {
         _conn.Close(); // a genuine abort IS abrupt — a RST here is correct
+        _half?.MarkPeerGone();
         _inbound.Writer.Complete(abortReason);
         _closedCts.Cancel();
     }
@@ -194,7 +210,8 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         // Graceful: signal the pump to finish and let it drain all buffered output to the socket, THEN
         // tidy up — but do NOT abortive-Close here (see the pump's finally). The connection closes via the
         // client's close → SocketSet recv-EOF teardown, which runs after the response is already sent.
-        _outbound.Writer.Complete();
+        _outbound?.Writer.Complete();
+        _half?.Complete();
         _inbound.Writer.Complete();
         if (_pump is { } p) { try { await p; } catch { /* ignore */ } }
         _closedCts.Dispose();

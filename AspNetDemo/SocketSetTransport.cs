@@ -97,7 +97,7 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
         // With TLS this fires only after the handshake has completed, so conn.NegotiatedProtocol is
         // already settled by the time the features are built.
         Interlocked.Increment(ref Accepts);
-        var c = new SocketSetConnection(conn, _tls is not null, _config.ByoPipe, _config.PipeSegment, _pipePool);
+        var c = new SocketSetConnection(conn, _tls is not null, _config.ByoPipe, _config.PipeSegment, _pipePool, _config.HalfPipe);
         conn.UserToken = c;
         return c;
     }

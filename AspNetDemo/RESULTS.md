@@ -566,6 +566,82 @@ recommendation. 512B and 64KB are unmoved by both.
 - **Linux bridged legs below 64KB have not been re-run at six passes.** The fix cannot affect them (see
   item 1), but they are three-pass numbers.
 
+## Outbound half-pipe A/B — a flat ~3–5% throughput win at 1 KB, NOT the concurrency-contention story I pre-registered (2026-08-01, branch `cyclebuffer-halfpipe`)
+
+`bench/run-halfpipe.sh`, io_uring, 12 shards, `/payload?n=1024`, REPS=7 → 6 scored passes, same session,
+shuffled leg order, banner-gated (`half-pipe=1` / `byo=off` / `byo=pipe`). Three legs: **classic** (outbound
+`Pipe` + ThreadPool pump), **byo** (transport-driven pipe, zero-copy send), **half-pipe** (`CycleBuffer`
+`PipeWriter` draining to `Connection.Send` on Kestrel's flush thread — no pump, no hop; copies on send).
+Median rps, min-max of 6 scored passes:
+
+| c | byo | classic | half-pipe | half-pipe vs classic | ranges |
+|---|---:|---:|---:|---|---|
+| 64  | 656,782 [650–669k] | 666,387 [653–683k] | **702,713 [684–717k]** | +5.5% | disjoint (barely) |
+| 128 | 717,958 [709–727k] | 734,856 [726–751k] | **758,033 [757–774k]** | +3.2% | **disjoint** |
+| 256 | 756,852 [744–767k] | 777,671 [767–788k] | **807,271 [781–826k]** | +3.8% | overlap (don't quote) |
+
+Half-pipe also beats byo everywhere (+5.6–7.0%): at 1 KB the transport's zero-copy send is not worth its
+iovec/pin overhead against a cheap copy, so byo is the SLOWEST leg here.
+
+**The pre-registered hypothesis is NOT supported.** I predicted the win would GROW with concurrency because
+N per-connection pump tasks contend more as `c` rises (TODO "Two half-pipes" #1). It doesn't: the lead is
+roughly FLAT (+5.5 / +3.2 / +3.8%), if anything largest at c64. So the gain is a **per-request machinery
+saving** — cheaper `CycleBuffer` cycle (measured 2.2–3.5× vs `Pipe` in isolation) + no pump `Task` + no
+ThreadPool hop — not concurrency-contention relief. The specific mechanism I bet on was wrong; the flat
+win is the finding.
+
+**And it costs tail latency, worsening with concurrency** — the opposite direction from throughput, because
+the drain + `Send` now runs synchronously on the Kestrel request thread (the pump offloaded it to the
+ThreadPool). p99 (µs), median of 6:
+
+| c | classic p99 | half-pipe p99 | penalty |
+|---|---:|---:|---|
+| 64  | 449 | 519  | +16% |
+| 128 | 835 | 1058 | +27% |
+| 256 | 1490 | 2330 | +56% |
+
+**Bottom line:** a real but modest throughput win at small payloads (range-clean at c64/c128, overlapping
+at c256), bought with a growing p99 penalty. **Caveats:** `powersave` governor (relative comparisons sound,
+absolute low); single-box loopback; this is the outbound half only — the inbound `PipeReader` half (real
+backpressure) is not built.
+
+### The size crossover — half-pipe wins small→mid, BYO retakes at 256 KB (2026-08-01, `bench/run-halfpipe.sh` SIZES sweep, c64, 6 scored passes)
+
+Same rig, same session, fixed c64, sweeping payload. Median rps; "vs" is half-pipe over that leg; range-clean
+unless noted:
+
+| payload | byo | classic | half-pipe | hp vs classic | hp vs byo |
+|---|---:|---:|---:|---|---|
+| 256 B | 669,793 | 685,938 | **719,957** | +5.0% | +7.5% |
+| 1 KB | 654,529 | 660,298 | **702,291** | +6.4% | +7.3% |
+| 4 KB | 586,454 | 596,322 | **636,210** | +6.7% | +8.5% |
+| 16 KB | 449,318 | 448,318 | **463,732** | +3.4% | +3.2% |
+| 64 KB | 165,363 | 165,235 | 167,774 | +1.5% (overlap) | +1.5% (overlap) |
+| 256 KB | 50,840 | 29,508 | 32,513 | +10.2% | **−36.0%** |
+
+**The crossover is real and sharp.** Half-pipe is the throughput winner across 256 B–16 KB (+3–8.5%, ranges
+disjoint), a three-way wash at 64 KB, and at 256 KB **BYO's zero-copy send dominates** (12,710 vs 8,128
+MiB/s) — the copy the half-pipe reintroduces finally costs, exactly as pre-registered. Note half-pipe still
+beats *classic* at 256 KB (+10%, both copy), but both copy-legs are ~35–45% behind BYO. So: **half-pipe for
+the small-to-mid API/JSON range, BYO for large payloads** — and both are runtime toggles, so pick per
+workload. (p99 tax holds across sizes: +12–18% at small-mid.)
+
+### Allocation/RSS — a WASH, so the win is CPU/scheduling, not GC (2026-08-01, `bench/run-halfpipe-alloc.sh`, 1 KB, 1M reqs/leg)
+
+`GC.GetTotalAllocatedBytes` + `CollectionCount` diffed over a FIXED request count, one leg per process:
+
+| leg | gen0 | bytes/req | RSS MB |
+|---|---:|---:|---:|
+| classic | 192 | 1343 | 137 |
+| byo | 213 | 1482 | 130 |
+| half-pipe | 193 | 1354 | 137 |
+
+Half-pipe allocates the SAME as classic per request (the CycleBuffer's zero-alloc steady state is a small
+fraction of ASP.NET's per-request allocation, which dominates); BYO allocates slightly MORE (its zero-copy
+send bookkeeping). So the "leaner machinery → fewer allocations" claim does **not** hold — the half-pipe's
+throughput win is CPU-cycle/scheduling (no pump task, no ThreadPool hop, cheaper buffer ops), not GC
+pressure. Honest correction to the isolation-bench framing.
+
 ## FIXED 2026-07-30: the access violation was a stale RIO request-queue handle
 
 `closesocket` destroys the RIO request queue, but `conn.Rq` was only cleared in `TryFinalize` — which
