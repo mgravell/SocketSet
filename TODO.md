@@ -4,6 +4,48 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## READ FIRST IF YOU ARE ON WINDOWS (written 2026-08-01, switching back from Linux)
+
+Windows last ran **2026-07-29**; **shared code and the AspNet bridge changed underneath it** across two
+Linux sessions (2026-07-31, 2026-08-01). Correctness first: run **`bench/Run-SmokeMatrix.ps1`** (48 cells,
+IOCP/RIO/managed) before anything else — it is the gate, and it is how a shared-code change that broke a
+Windows backend announces itself.
+
+### What changed since Windows last ran
+
+**Shared `src/SocketSet` (touches IOCP/RIO directly):**
+- **Stale-completion detectors** added on IOCP and RIO (defensive — make the next lifetime bug announce
+  itself). **Dynamic shard growth** (MinShards→MaxShards) for the single-listener path; capacity exhaustion
+  is now visible instead of silently dropping connections. If you touch either, verify on IOCP/RIO.
+- OpenSSL TLS gained a `MinProtocol` floor (defaults TLS 1.3) — Linux-only; **the SChannel provider has no
+  equivalent floor/renegotiation parity yet — that is the open Windows TLS item.**
+- Full detail: the Linux READ-FIRST below + `git log` since 2026-07-29.
+
+**AspNet bridge — the 2026-08-01 session (AspNetDemo + a NEW library + `vendor/`, NOT `src/SocketSet`):**
+- **Half-pipe (`--half-pipe`), MERGED to main.** A CycleBuffer-backed outbound `PipeWriter` that drains to
+  `Connection.Send` on Kestrel's flush thread. Uses ONLY cross-platform `Connection.Send`, so it SHOULD
+  work on IOCP/RIO — but is UNTESTED there. Off by default, so it cannot affect the default IOCP/RIO paths.
+- **`SocketSet.AspNetCore` library extraction — branch `package-aspnetcore-lib` (pushed, NOT merged).** The
+  reusable bridge is now a real library (`builder.UseSocketSet(...)`); the demo just maps flags. Builds 0/0
+  but was never RUNTIME-verified (the Linux box stopped starting servers mid-session — an environment
+  failure, not a code one). A clean Windows run validates the extraction cross-platform AND is the green
+  light to merge it to main.
+- Also unmerged, non-blocking: `halfpipe-followups` (an `SS_HALF_DRAIN=pool` p99 experiment, built but
+  unverified) and the dotnet/aspnetcore#68148 spike on the user's `mgravell/aspnetcore` fork.
+
+### Prime Windows opportunities (priority order)
+1. **`Run-SmokeMatrix.ps1`** — correctness gate for the shared-code changes. First, always.
+2. **Runtime-verify `package-aspnetcore-lib` on IOCP/RIO** (`/config` gating strings intact, byte-exact
+   `/payload` 1B–8MB, `/stats` counters non-zero), then MERGE to main if clean. Highest value — it unblocks
+   the packaging AND is a fresh env where servers actually start.
+3. **Byte-exact `--half-pipe` on IOCP and RIO** (the "should work, untested" item; plaintext + POST `/echo`).
+4. **SChannel min-protocol / renegotiation parity** — the open Windows TLS item.
+5. **RIO send page-quantization (item 0 below, NOT fixed)** — IOCP is fixed, RIO isn't; the standing RIO
+   perf item.
+6. Re-measure the Windows baseline after the copy-removal (pre-registered to help Windows more than Linux).
+
+---
+
 ## READ FIRST IF YOU ARE ON LINUX (rewritten 2026-07-31, after three days of Windows work)
 
 > **THIS CATCH-UP IS DONE (end of 2026-07-31 Linux session). What follows is kept for its reasoning; the
