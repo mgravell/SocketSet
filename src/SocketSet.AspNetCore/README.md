@@ -11,7 +11,7 @@ A Kestrel **connection transport** backed by [SocketSet](../SocketSet) — run A
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
 
-builder.WebHost.UseSocketSet(o =>
+builder.UseSocketSet(o =>
 {
     // o.Factory = SocketSetFactory.IoUring;   // default: io_uring on Linux, IOCP on Windows
     // o.Shards  = Environment.ProcessorCount;
@@ -32,7 +32,7 @@ Set `o.Tls` to terminate TLS below Kestrel — Kestrel then sees plaintext and n
 `SslStream`. On Linux this is OpenSSL (optionally with kTLS kernel offload); on Windows, SChannel.
 
 ```csharp
-builder.WebHost.UseSocketSet(o =>
+builder.UseSocketSet(o =>
 {
     o.Tls = new OpenSslTlsProvider(certPem, keyPem, kernelOffload: true); // Linux
 });

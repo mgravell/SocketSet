@@ -51,7 +51,7 @@ if (!cfg.VanillaKestrel)
     // it is terminated DOWN HERE, in the transport (SChannel/SSPI on Windows, OpenSSL — optionally kTLS — on
     // Linux), so Kestrel's HTTP stack sees plaintext and never constructs an SslStream. The demo only maps
     // its A/B flags onto the library's options.
-    builder.WebHost.UseSocketSet(o => cfg.ApplyTo(o, cert));
+    builder.UseSocketSet(o => cfg.ApplyTo(o, cert));
 }
 
 var app = builder.Build();

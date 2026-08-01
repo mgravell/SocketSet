@@ -1,5 +1,5 @@
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Connections;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -13,27 +13,27 @@ public static class SocketSetBuilderExtensions
     /// TLS provider is set on the options, TLS is terminated in the transport (below Kestrel), so Kestrel's
     /// HTTP stack sees plaintext and never constructs an SslStream.
     /// </summary>
+    /// <remarks>
+    /// The services are manipulated directly (not via a deferred <c>ConfigureServices</c> callback) so the
+    /// replacement runs AFTER the host's default socket-transport registration — this is what guarantees the
+    /// SocketSet factory wins. Resolve <see cref="SocketSetTransportMetrics"/> from DI for diagnostics.
+    /// </remarks>
     /// <example>
     /// <code>
-    /// builder.WebHost.UseSocketSet(o =>
-    /// {
-    ///     o.Shards = 4;
-    ///     o.Mode = SocketSetBridgeMode.Byo;
-    /// });
+    /// var builder = WebApplication.CreateBuilder(args);
+    /// builder.UseSocketSet(o => { o.Shards = 4; o.Mode = SocketSetBridgeMode.Byo; });
     /// </code>
     /// </example>
-    public static IWebHostBuilder UseSocketSet(this IWebHostBuilder hostBuilder, Action<SocketSetTransportOptions>? configure = null)
+    public static WebApplicationBuilder UseSocketSet(this WebApplicationBuilder builder, Action<SocketSetTransportOptions>? configure = null)
     {
         var options = new SocketSetTransportOptions();
         configure?.Invoke(options);
 
-        return hostBuilder.ConfigureServices(services =>
-        {
-            // Replace Kestrel's built-in socket transport factory.
-            services.RemoveAll<IConnectionListenerFactory>();
-            services.AddSingleton(options);
-            services.TryAddSingleton<SocketSetTransportMetrics>();
-            services.AddSingleton<IConnectionListenerFactory, SocketSetTransportFactory>();
-        });
+        // Replace the host's built-in socket transport factory (registered by CreateBuilder's Kestrel setup).
+        builder.Services.RemoveAll<IConnectionListenerFactory>();
+        builder.Services.AddSingleton(options);
+        builder.Services.TryAddSingleton<SocketSetTransportMetrics>();
+        builder.Services.AddSingleton<IConnectionListenerFactory, SocketSetTransportFactory>();
+        return builder;
     }
 }
