@@ -119,9 +119,69 @@ the resulting `HttpRequestException` presents as a TLS failure. Use the framewor
 tradition, and the general lesson is the familiar one: the harness is a suspect too, and a timeout is not a
 diagnosis — the rig now reports the last connect exception instead of the bare timeout.
 
-### Headline numbers, Windows — ~~DEFINITIVE~~ **PARTLY STALE, see the warning** (2026-08-01, `bench/Run-TlsSizes.ps1`, 12 shards, `-c 64`, 6 scored passes, ONE session)
+### Headline numbers, Windows — CURRENT (2026-08-01 evening, POST `PooledBufferWriter` fix, `bench/Run-TlsSizes.ps1`, 12 shards, `-c 64`, 6 scored passes, ONE session)
 
-> ⚠ **STALE FOR OUR LEGS, VALID FOR THE CONTROLS. Measured hours BEFORE the `PooledBufferWriter` fix
+8 legs reshuffled into the same passes, zero errors. Goodput MiB/s, **min-max of 6 scored passes**; a delta
+is quoted only where ranges are DISJOINT. **This replaces the morning table below**, which was measured
+before the flush fix.
+
+| payload | kestrel | iocp/s12 | rio/s12 | httpsys | kestrel+tls | iocp+tls/s12 | rio+tls/s12 | httpsys+tls |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 B | 144.5-145.9 | 137.2-141.7 | 142.9-144.8 | 118.8-120.7 | 134.6-136.6 | 128.7-136.7 | **137.7-139.9** | 99.8-100.9 |
+| 16 KB | 3949-4005 | 3759-3880 | 3849-3941 | 2739-2817 | 3111-3168 | **3314-3385** | **3541-3568** | 2188-2250 |
+| 256 KB | 10028-11479 | 10550-11324 | 7762-8268 | **11464-11845** | 6557-6836 | 4407-4753 | 4707-5811 | 10168-10402 |
+| 1 MB | 5864-6140 | 5961-6090 | 3909-4224 | **12522-12785** | 4264-4525 | 3686-3744 | 2988-3374 | 7210-7541 |
+
+**THE HEADLINE CHANGE: we now BEAT vanilla Kestrel on TLS at 16 KB, on both backends, disjoint.**
+
+| payload | vs `kestrel+tls` | was (morning) |
+|---|---|---|
+| 512 B | `iocp+tls` overlapping — parity; **`rio+tls` +2.5% ahead**, disjoint | parity |
+| 16 KB | **`iocp+tls` +6.6% AHEAD**, **`rio+tls` +13.7% AHEAD**, both disjoint | overlapping |
+| 256 KB | Kestrel ahead: +46% vs iocp, +21% vs rio | Kestrel **+83%** |
+| 1 MB | Kestrel ahead: **+19%** vs iocp | Kestrel **+100%** |
+
+The large-payload TLS deficit is **halved at 256 KB and cut from +100% to +19% at 1 MB**. It is still a
+real structural loss (encrypted wire bytes cannot use zero-copy send) but it is no longer the collapse the
+morning table described.
+
+**Cross-session comparison is legitimate here, and only because the controls say so.** The legs our code
+cannot touch — `kestrel`, `kestrel+tls`, `httpsys`, `httpsys+tls` — reproduce across the two sessions to
+within **1.6%** on every one of 12 cells (most under 1%). So the movement in our legs is attributable to
+the change rather than to the session. Absent that agreement this comparison would be exactly the
+cross-run subtraction this file forbids elsewhere.
+
+**The mechanism confirmed itself through WHICH legs moved**, which is stronger than the sizes of the
+moves:
+
+- **RIO plaintext gained a lot** (256 KB 6772 → 7897, 1 MB 3236 → 4102) — RIO has no zero-copy send, so
+  *all* its traffic goes through `Flush` and paid the re-growth.
+- **IOCP plaintext did not move** (16 KB and 1 MB medians within 1%) — plaintext BYO uses zero-copy send
+  and skips `Flush` entirely. This was pre-registered and held.
+- **Every TLS leg moved**, on both backends — all TLS output is out-of-band.
+
+So the fix helped precisely the legs that use the fixed path and left alone precisely those that do not.
+
+#### TODO item 7 (`rio+tls` beats `iocp+tls`) — RESOLVED, and the answer is "it depends on size now"
+
+| payload | `rio+tls` | `iocp+tls` | verdict |
+|---|---:|---:|---|
+| 16 KB | 3541-3568 | 3314-3385 | **RIO still ahead, +6.6% disjoint** |
+| 256 KB | 4707-5811 | 4407-4753 | *overlapping* — **the gap is GONE** |
+| 1 MB | 2988-3374 | 3686-3744 | **INVERTED — IOCP now ahead +14%, disjoint** |
+
+The anomaly was largest at large payloads and that is exactly where the flush fix helped IOCP most, so
+most of it was this bug rather than a property of the two send paths. **What survives is a ~6.6% RIO lead
+at 16 KB only** — much smaller, and no longer the top Windows item. Anyone resuming the "why does RIO's
+TLS send beat IOCP's" investigation should note that three of its four data points have evaporated.
+
+
+
+### Headline numbers, Windows — SUPERSEDED morning table (2026-08-01, pre-flush-fix)
+
+> ⚠ **SUPERSEDED by the CURRENT table above. Kept because it is still the record of the http.sys
+> crossover and of the plaintext-parity result, both of which the evening run reproduces.
+> STALE FOR OUR TLS LEGS. Measured hours BEFORE the `PooledBufferWriter` fix
 > later the same day**, which is disjointly worth **+18.8% at 256 KB and +58.6% at 1 MB on TLS** and
 > **+33.3% on `--classic` plaintext at 1 MB**. So every `iocp+tls` / `rio+tls` figure below UNDERSTATES
 > current `main`, and the plaintext `iocp`/`rio` rows are unaffected only because BYO plaintext uses

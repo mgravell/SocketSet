@@ -93,19 +93,32 @@ then decide. Do not merge it as-is.
 5. **RIO send page-quantization (item 0 below, NOT fixed)** — IOCP is fixed, RIO isn't; the standing RIO
    perf item. Re-measured 2026-08-01 and still real: `rio/s12` trails `iocp/s12` disjointly by **−33% at
    256 KB and −47% at 1 MB** on plaintext. **No longer the TOP item — see the new item 7.**
-6. ~~Re-measure the Windows baseline~~ **DONE 2026-08-01** — `bench/Run-TlsSizes.ps1`, 8 legs x 4 sizes x
-   6 scored passes, one session, zero errors. See the new DEFINITIVE table at the top of `RESULTS.md`.
-   Headline: our **plaintext is at parity with Kestrel** at 512 B / 256 KB / 1 MB and loses a disjoint
-   **−2.6% at 16 KB**; our **TLS collapses at large payloads** (`iocp+tls` is LAST of eight legs at 256 KB
-   and 1 MB, Kestrel `SslStream` +83% / +100% disjoint); and **http.sys CROSSES OVER** rather than
-   dominating — last at 512 B (−18%) and 16 KB (−30%), first at 256 KB (+9%) and 1 MB (+112%).
-7. **`rio+tls` beats `iocp+tls` at every size ≥16 KB — page hypothesis FALSIFIED, and the whole item now
-   NEEDS RE-MEASURING (2026-08-01).** ⚠ The `PooledBufferWriter` fix later the same day moved `iocp+tls`
-   at 1 MB from ~2,363 to ~3,748 — past the `rio+tls` figure of ~2,658 recorded before it. **That does NOT
-   mean the anomaly inverted**: RIO reaches the same `Flush` path and will have moved too, and the two
-   numbers are from different builds. **Re-run the `rio+tls` vs `iocp+tls` comparison on current `main`
-   before doing any more work on this item** — the gap may be smaller, gone, or reversed, and every
-   conclusion below predates the fix. REPLICATED in a second independent session (+8% / +38%
+6. ~~Re-measure the Windows baseline~~ **DONE 2026-08-01, then RE-DONE the same evening after the flush
+   fix invalidated it.** The CURRENT table is at the top of `RESULTS.md`; the morning one is marked
+   superseded. Headline now:
+   - **We BEAT vanilla Kestrel on TLS at 16 KB on both backends, disjoint** (`iocp+tls` +6.6%,
+     `rio+tls` +13.7%) — the morning run had this as overlapping.
+   - The large-payload TLS deficit **halved at 256 KB and went +100% → +19% at 1 MB**. Still a real
+     structural loss (encrypted bytes cannot use zero-copy send), no longer a collapse.
+   - **Plaintext is at parity with Kestrel** at 256 KB and 1 MB; Kestrel keeps a disjoint ~2.6% at 16 KB
+     and ~3% at 512 B — and item 9 shows that residue is the thread hops.
+   - **http.sys CROSSES OVER** rather than dominating: last at 512 B (−18%) and 16 KB (−30%), first at
+     256 KB and 1 MB (+112%). Unchanged by our work, and it reproduced across both sessions.
+   - Method note worth keeping: the four control legs reproduced across the two sessions to within
+     **1.6%** on all 12 cells, which is what made a morning-vs-evening comparison legitimate at all.
+7. ~~**`rio+tls` beats `iocp+tls` at every size ≥16 KB**~~ **RESOLVED 2026-08-01 (evening): it was mostly
+   the flush bug, and three of its four data points have evaporated.** Re-measured on current `main`, one
+   session, 6 scored passes:
+
+   | payload | `rio+tls` | `iocp+tls` | verdict |
+   |---|---:|---:|---|
+   | 16 KB | 3541-3568 | 3314-3385 | RIO still ahead, **+6.6% disjoint** |
+   | 256 KB | 4707-5811 | 4407-4753 | *overlapping* — **gap GONE** (was +38%) |
+   | 1 MB | 2988-3374 | 3686-3744 | **INVERTED — IOCP ahead +14% disjoint** (was RIO +17%) |
+
+   The anomaly was largest where the `PooledBufferWriter` re-growth cost most, so most of it was that bug.
+   **What survives is a 6.6% RIO lead at 16 KB only** — no longer the top Windows item, and no longer
+   worth a profiling session on its own. The page hypothesis remains falsified either way. REPLICATED in a second independent session (+8% / +38%
    / +17% at 16 KB / 256 KB / 1 MB, all disjoint), while RIO trails IOCP badly on plaintext at the same
    sizes. So it is a real property of the two TLS send paths.
 
