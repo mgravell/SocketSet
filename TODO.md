@@ -795,7 +795,17 @@ flag does not touch TLS 1.3 KeyUpdate.
 
 ## Package `SocketSet.AspNetCore` as a consumable library (proposed 2026-08-01)
 
-**Status: proposed, not started.** The AspNet bridge currently lives entirely in `AspNetDemo/` — a demo
+**Status: DONE on branch `package-aspnetcore-lib` (pushed), build-verified, RUNTIME-verify + merge PENDING.**
+The extraction is complete there: `src/SocketSet.AspNetCore/` holds the transport + a public
+`builder.UseSocketSet(o => ...)` extension (on `WebApplicationBuilder`, so the factory replacement runs
+after Kestrel's default and wins), `SocketSetTransportOptions` + `SocketSetBridgeMode` enum
+(Classic/Byo/HalfPipe), and `SocketSetTransportMetrics` (DI singleton, `Interlocked` counters + geometry —
+the static `/stats` counters are gone). `AspNetDemo` maps flags via `DemoConfig.ApplyTo(options, cert)`.
+Library + demo + SmokeTest build 0/0; `/config` gating strings preserved; README written. **Before merge:
+a runtime smoke** (this session's box could not start servers) — `/config`, byte-exact `/payload`, `/stats`
+counters on io_uring/epoll, plaintext + TLS. The plan/design detail below is retained for reference.
+
+**Status (superseded): proposed, not started.** The AspNet bridge currently lives entirely in `AspNetDemo/` — a demo
 project — so the reusable part cannot be consumed by anyone else. Extract it into a real library project
 `SocketSet.AspNetCore` with its own `README.md` written for a hypothetical external consumer, and reduce
 `AspNetDemo` to what a demo actually is: **arg parsing, config, endpoints, and the banner** — driving the
