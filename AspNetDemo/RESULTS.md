@@ -601,10 +601,46 @@ ThreadPool). p99 (µs), median of 6:
 | 256 | 1490 | 2330 | +56% |
 
 **Bottom line:** a real but modest throughput win at small payloads (range-clean at c64/c128, overlapping
-at c256), bought with a growing p99 penalty. Untested here: whether the win holds at plaintext-tiny (`OK`)
-or inverts at 64 KB+ (where the send-copy should cost). **Caveats:** `powersave` governor (relative
-comparisons sound, absolute low); single-box loopback; this is the outbound half only — the inbound
-`PipeReader` half (real backpressure) is not built.
+at c256), bought with a growing p99 penalty. **Caveats:** `powersave` governor (relative comparisons sound,
+absolute low); single-box loopback; this is the outbound half only — the inbound `PipeReader` half (real
+backpressure) is not built.
+
+### The size crossover — half-pipe wins small→mid, BYO retakes at 256 KB (2026-08-01, `bench/run-halfpipe.sh` SIZES sweep, c64, 6 scored passes)
+
+Same rig, same session, fixed c64, sweeping payload. Median rps; "vs" is half-pipe over that leg; range-clean
+unless noted:
+
+| payload | byo | classic | half-pipe | hp vs classic | hp vs byo |
+|---|---:|---:|---:|---|---|
+| 256 B | 669,793 | 685,938 | **719,957** | +5.0% | +7.5% |
+| 1 KB | 654,529 | 660,298 | **702,291** | +6.4% | +7.3% |
+| 4 KB | 586,454 | 596,322 | **636,210** | +6.7% | +8.5% |
+| 16 KB | 449,318 | 448,318 | **463,732** | +3.4% | +3.2% |
+| 64 KB | 165,363 | 165,235 | 167,774 | +1.5% (overlap) | +1.5% (overlap) |
+| 256 KB | 50,840 | 29,508 | 32,513 | +10.2% | **−36.0%** |
+
+**The crossover is real and sharp.** Half-pipe is the throughput winner across 256 B–16 KB (+3–8.5%, ranges
+disjoint), a three-way wash at 64 KB, and at 256 KB **BYO's zero-copy send dominates** (12,710 vs 8,128
+MiB/s) — the copy the half-pipe reintroduces finally costs, exactly as pre-registered. Note half-pipe still
+beats *classic* at 256 KB (+10%, both copy), but both copy-legs are ~35–45% behind BYO. So: **half-pipe for
+the small-to-mid API/JSON range, BYO for large payloads** — and both are runtime toggles, so pick per
+workload. (p99 tax holds across sizes: +12–18% at small-mid.)
+
+### Allocation/RSS — a WASH, so the win is CPU/scheduling, not GC (2026-08-01, `bench/run-halfpipe-alloc.sh`, 1 KB, 1M reqs/leg)
+
+`GC.GetTotalAllocatedBytes` + `CollectionCount` diffed over a FIXED request count, one leg per process:
+
+| leg | gen0 | bytes/req | RSS MB |
+|---|---:|---:|---:|
+| classic | 192 | 1343 | 137 |
+| byo | 213 | 1482 | 130 |
+| half-pipe | 193 | 1354 | 137 |
+
+Half-pipe allocates the SAME as classic per request (the CycleBuffer's zero-alloc steady state is a small
+fraction of ASP.NET's per-request allocation, which dominates); BYO allocates slightly MORE (its zero-copy
+send bookkeeping). So the "leaner machinery → fewer allocations" claim does **not** hold — the half-pipe's
+throughput win is CPU-cycle/scheduling (no pump task, no ThreadPool hop, cheaper buffer ops), not GC
+pressure. Honest correction to the isolation-bench framing.
 
 ## FIXED 2026-07-30: the access violation was a stale RIO request-queue handle
 

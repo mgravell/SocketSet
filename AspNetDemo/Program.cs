@@ -116,6 +116,16 @@ app.MapGet("/stats", () => Results.Json(new
     closedEmpty = SocketSetConnectionListener.ClosedEmpty,
     writeFail = SocketSetConnectionListener.WriteFail,
     sendFalse = SocketSetConnectionListener.SendFalse,
+    // GC / memory, for the allocation-and-RSS axis (the half-pipe's "leaner machinery" claim). Read these
+    // before and after a fixed load and diff: gen0 collections and allocatedBytes are the alloc signal;
+    // rssBytes/gcHeapBytes are the footprint signal. GetTotalAllocatedBytes is process-wide, so drive ONE
+    // leg per process (the bench starts a fresh server per leg, so that holds).
+    gen0 = GC.CollectionCount(0),
+    gen1 = GC.CollectionCount(1),
+    gen2 = GC.CollectionCount(2),
+    allocatedBytes = GC.GetTotalAllocatedBytes(),
+    gcHeapBytes = GC.GetTotalMemory(false),
+    rssBytes = Environment.WorkingSet,
 }));
 
 Console.WriteLine($"[aspnet demo] {cfg.Describe()}");

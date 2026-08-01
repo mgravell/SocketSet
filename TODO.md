@@ -833,11 +833,30 @@ pump task + no hop), not high-c contention relief. And it costs p99 (+16/+27/+56
 the drain+Send runs on the Kestrel request thread. **Falsifier fired for the mechanism; the flat win is
 the finding.**
 
-**STILL TODO on this branch:** (a) does the win hold at plaintext-tiny (`OK`) and does it INVERT at 64 KB+
-where the send-copy should cost (BYO's zero-copy should retake the lead)? (b) alloc/gen-0/RSS axis, not yet
-measured. (c) the tail-latency cost — is it acceptable, or does draining need to hop off the request thread
-(which would reintroduce some of what we removed)? (d) then the harder inbound `PipeReader` half (real
-backpressure).
+**MERGE-READY as a runtime toggle (2026-08-01).** `--half-pipe` is off by default (`HalfPipe` defaults
+false), mutually exclusive with BYO/classic, and the branch touches **zero `src/SocketSet` code** — the
+transport core and every Windows backend are untouched. So squashing to main is additive and off-by-default;
+it cannot affect the default or Windows paths. The only cost to main is a new opt-in flag + the vendored
+`CycleBuffer` (`vendor/`, MIT). Windows caveat: `HalfPipeWriter` uses only `Connection.Send` (cross-platform),
+so it SHOULD work on IOCP/RIO, but that is UNTESTED — Linux-only verified so far.
+
+**Workaround for the Kestrel bug is IN (not blocked on upstream).** The `Advance`-relocation corruption is
+[[aspnetcore-issue-68148]] (filed; not expected to land before .NET 12). `HalfPipeWriter.Advance` re-leases
+before each `Commit`, which sidesteps it entirely — so the half-pipe does not wait on a framework fix.
+
+**Crossover MEASURED (2026-08-01, `bench/run-halfpipe.sh` size sweep, RESULTS.md):** half-pipe wins
+256 B–16 KB (+3–8.5%, range-clean), wash at 64 KB, and at 256 KB **BYO's zero-copy retakes decisively**
+(half-pipe −36% vs BYO; the send-copy finally costs). So half-pipe is the small-to-mid path, BYO the large
+path — both toggles, pick per workload. **Alloc MEASURED (`bench/run-halfpipe-alloc.sh`):** WASH vs classic
+(gen0 193 vs 192, ~1350 B/req both) — so the win is CPU/scheduling, NOT GC; the "leaner allocations" framing
+was wrong (corrected in RESULTS.md).
+
+**STILL TODO on this branch:** (a) the tail-latency cost (+12–18% p99 small-mid) — acceptable, or does
+draining need to hop off the request thread (reintroducing some of what we removed)? (b) plaintext + TLS
+legs (only plaintext measured). (c) Windows (IOCP/RIO) — should work via `Connection.Send`, untested. (d)
+the harder inbound `PipeReader` half (real backpressure). (e) SPARE-CYCLES: clone+fork aspnetcore and fix
+[[aspnetcore-issue-68148]] ourselves (user to fork); low priority — the workaround holds, won't ship before
+.NET 12.
 
 ---
 

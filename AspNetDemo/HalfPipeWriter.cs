@@ -28,15 +28,16 @@ internal sealed class HalfPipeWriter : PipeWriter
     private byte[]? _scratch;      // fallback when a GetMemory hint exceeds a CycleBuffer segment
     private int _scratchLen;       // >0 while the last GetMemory handed back the scratch buffer
     private bool _completed;
-    private bool _peerGone;
-    private static readonly bool _dbg = Environment.GetEnvironmentVariable("HP_DEBUG") == "1";
+    // Written by the loop thread (MarkPeerGone, on peer close/abort) and read+written by the Kestrel write
+    // thread (FlushAsync); volatile for cross-thread visibility. It is the ONLY cross-thread field — the
+    // CycleBuffer itself stays single-thread (Kestrel-only), which is what keeps the whole thing lock-free.
+    private volatile bool _peerGone;
 
     public HalfPipeWriter(Connection conn) => _conn = conn;
 
     public override Memory<byte> GetMemory(int sizeHint = 0)
     {
         Memory<byte> m = _cb.GetUncommittedMemory(sizeHint);
-        if (_dbg) Console.Error.WriteLine($"[hp] GetMemory(hint={sizeHint}) -> len={m.Length} scratch={(m.Length < Math.Max(1,sizeHint))}");
         if (m.Length >= Math.Max(1, sizeHint)) { _scratchLen = 0; return m; }
         // Rare: the hint is bigger than a CycleBuffer segment (8KB pages). PipeWriter must return >= hint
         // contiguous, so hand back a scratch array and fold it into the buffer on Advance. Kestrel writes
@@ -71,14 +72,8 @@ internal sealed class HalfPipeWriter : PipeWriter
         if (!_peerGone)
         {
             ReadOnlySequence<byte> seq = _cb.GetAllCommitted();
-            if (_dbg) Console.Error.WriteLine($"[hp] FlushAsync seqLen={seq.Length}");
             if (!seq.IsEmpty)
             {
-                if (_dbg)
-                {
-                    var head = seq.Slice(0, Math.Min(24, seq.Length)).ToArray();
-                    Console.Error.WriteLine($"[hp] flush len={seq.Length} head={Convert.ToHexString(head)} '{System.Text.Encoding.ASCII.GetString(head).Replace('\r','.').Replace('\n','.')}'");
-                }
                 if (_conn.Send(seq))
                 {
                     _cb.DiscardCommitted(seq.Length); // Send copied it — safe to recycle now

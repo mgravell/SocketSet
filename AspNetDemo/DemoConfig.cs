@@ -298,6 +298,10 @@ internal sealed class DemoConfig
         Console.WriteLine("                     at 1MB, where the classic bridge is -60.3% and -52.6%");
         Console.WriteLine("    --classic        turn it off (alias --no-byo). The classic bridge is the control");
         Console.WriteLine("                     every zero-copy claim is measured against");
+        Console.WriteLine("    --half-pipe      EXPERIMENTAL: replace the outbound leg with a CycleBuffer-backed");
+        Console.WriteLine("                     PipeWriter that drains to Connection.Send on Kestrel's flush thread");
+        Console.WriteLine("                     (no pump, no hop). Copies on send; wins small payloads, not 256KB.");
+        Console.WriteLine("                     Turns BYO off. See TODO 'Two half-pipes' + AspNetDemo/RESULTS.md.");
         Console.WriteLine();
         Console.WriteLine("  The TLS certificate is a throwaway self-signed one for localhost, so clients must");
         Console.WriteLine("  skip verification: curl -k https://127.0.0.1:5080/plaintext");

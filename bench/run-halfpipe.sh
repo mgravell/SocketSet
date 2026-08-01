@@ -22,8 +22,10 @@
 set -uo pipefail
 
 BACKEND=${BACKEND:-io-uring}      # io-uring | epoll
-SIZE=${SIZE:-1024}                # fixed small/mid payload; the copy is cheap here on purpose
-CONCS=${CONCS:-"64 128 256"}
+SIZES=${SIZES:-1024}              # payload(s) to sweep; small on purpose (the half-pipe copies on send)
+CONCS=${CONCS:-"64 128 256"}      # concurrency/-ies to sweep. Sweep ONE axis at a time for a clean read:
+                                  # SIZES=1024 CONCS="64 128 256" (concurrency) or SIZES="256 4096 65536
+                                  # 262144" CONCS=64 (the crossover: where does BYO's zero-copy retake it?)
 SHARDS=${SHARDS:-12}
 DURATION=${DURATION:-8s}
 WARMUP=${WARMUP:-2s}
@@ -51,7 +53,7 @@ dotnet build "$REPO/AspNetDemo/AspNetDemo.csproj" -c Release -v q --nologo >/dev
 
 source "$REPO/bench/cpu-split.sh"
 
-echo "conc,leg,rep,rps,mib_s,lat_p50_us,lat_p99_us,errors,status" > "$CSV"
+echo "size,conc,leg,rep,rps,mib_s,lat_p50_us,lat_p99_us,errors,status" > "$CSV"
 
 # name|extra demo args|required /config fragment|forbidden fragment (or empty)
 LEGS=(
@@ -61,8 +63,8 @@ LEGS=(
 )
 
 measure() {
-  local name="$1" extra="$2" want="$3" forbid="$4" conc="$5" rep="$6"
-  local log="$LOGS/$name.c$conc.r$rep.log"
+  local name="$1" extra="$2" want="$3" forbid="$4" size="$5" conc="$6" rep="$7"
+  local log="$LOGS/$name.s$size.c$conc.r$rep.log"
   taskset -c "$SERVER_CPUS" "$DEMO" --"$BACKEND" --shards "$SHARDS" $extra --port "$PORT" >"$log" 2>&1 &
   local pid=$! cfg="" i
   for ((i=0;i<80;i++)); do
@@ -70,61 +72,65 @@ measure() {
     sleep 0.4
   done
   if [[ -z "$cfg" ]]; then
-    echo "    $name: no /config"; echo "$conc,$name,$rep,,,,,,NOSTART" >>"$CSV"
+    echo "    $name: no /config"; echo "$size,$conc,$name,$rep,,,,,,NOSTART" >>"$CSV"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
   fi
   # Trust the banner: the required fragment must be present and the forbidden one absent.
   if [[ "$cfg" != *"$want"* ]]; then
-    echo "    $name: MISMATCH (wanted '$want') -> $cfg"; echo "$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
+    echo "    $name: MISMATCH (wanted '$want') -> $cfg"; echo "$size,$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
   fi
   if [[ -n "$forbid" && "$cfg" == *"$forbid"* ]]; then
-    echo "    $name: has forbidden '$forbid' -> $cfg"; echo "$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
+    echo "    $name: has forbidden '$forbid' -> $cfg"; echo "$size,$conc,$name,$rep,,,,,,MISMATCH" >>"$CSV"
     kill $pid 2>/dev/null; wait $pid 2>/dev/null; return
   fi
 
-  local url="http://127.0.0.1:$PORT/payload?n=$SIZE"
+  local url="http://127.0.0.1:$PORT/payload?n=$size"
   taskset -c "$CLIENT_CPUS" "$BOMB" -k -o json -p r -c "$conc" -d "$WARMUP" -t 10s "$url" >/dev/null 2>&1
   local j; j=$(taskset -c "$CLIENT_CPUS" "$BOMB" -k -l -o json -p r -c "$conc" -d "$DURATION" -t 10s "$url" 2>/dev/null)
   kill $pid 2>/dev/null; wait $pid 2>/dev/null; sleep 1
 
   local rps; rps=$(jq -r '.result.rps.mean // empty' <<<"$j")
-  if [[ -z "$rps" ]]; then echo "    $name: no result"; echo "$conc,$name,$rep,,,,,,FAILED" >>"$CSV"; return; fi
+  if [[ -z "$rps" ]]; then echo "    $name: no result"; echo "$size,$conc,$name,$rep,,,,,,FAILED" >>"$CSV"; return; fi
   local p50 p99 errs mib
   p50=$(jq -r '.result.latency.percentiles."50"' <<<"$j")
   p99=$(jq -r '.result.latency.percentiles."99"' <<<"$j")
   errs=$(jq -r '.result.others + .result.req4xx + .result.req5xx' <<<"$j")
-  mib=$(awk -v r="$rps" -v s="$SIZE" 'BEGIN{printf "%.1f", r*s/1048576}')
-  printf "    %-8s c%-4s %10.0f rps  p99 %7.0fus  err %s\n" "$name" "$conc" "$rps" "$p99" "$errs"
-  echo "$conc,$name,$rep,${rps%.*},$mib,${p50%.*},${p99%.*},$errs,$([[ $errs -gt 0 ]] && echo ERRORS || echo ok)" >>"$CSV"
+  mib=$(awk -v r="$rps" -v s="$size" 'BEGIN{printf "%.1f", r*s/1048576}')
+  printf "    %-8s s%-6s c%-4s %10.0f rps  %8s MiB/s  p99 %7.0fus  err %s\n" "$name" "$size" "$conc" "$rps" "$mib" "$p99" "$errs"
+  echo "$size,$conc,$name,$rep,${rps%.*},$mib,${p50%.*},${p99%.*},$errs,$([[ $errs -gt 0 ]] && echo ERRORS || echo ok)" >>"$CSV"
 }
 
 echo
-echo "HALF-PIPE concurrency A/B on $BACKEND: 3 legs x $(wc -w <<<"$CONCS") concurrencies x $REPS passes (pass 1 discarded)"
-echo "  payload=${SIZE}B shards=$SHARDS -d $DURATION  server=$SERVER_CPUS client=$CLIENT_CPUS"
+echo "HALF-PIPE A/B on $BACKEND: 3 legs x $(wc -w <<<"$SIZES") size(s) x $(wc -w <<<"$CONCS") conc(s) x $REPS passes (pass 1 discarded)"
+echo "  sizes='$SIZES' concs='$CONCS' shards=$SHARDS -d $DURATION  server=$SERVER_CPUS client=$CLIENT_CPUS"
 echo "  csv: $CSV"
 echo
 
-for conc in $CONCS; do
-  echo "=== concurrency c${conc} (payload ${SIZE}B) ==="
-  for ((rep=1; rep<=REPS; rep++)); do
-    mapfile -t SHUF < <(printf '%s\n' "${LEGS[@]}" | shuf)
-    for spec in "${SHUF[@]}"; do
-      IFS='|' read -r name extra want forbid <<<"$spec"
-      measure "$name" "$extra" "$want" "$forbid" "$conc" "$rep"
+for size in $SIZES; do
+  for conc in $CONCS; do
+    echo "=== payload ${size}B, concurrency c${conc} ==="
+    for ((rep=1; rep<=REPS; rep++)); do
+      mapfile -t SHUF < <(printf '%s\n' "${LEGS[@]}" | shuf)
+      for spec in "${SHUF[@]}"; do
+        IFS='|' read -r name extra want forbid <<<"$spec"
+        measure "$name" "$extra" "$want" "$forbid" "$size" "$conc" "$rep"
+      done
     done
   done
 done
 
 echo
-echo "=== rps, median of scored passes, min-max in brackets ==="
-awk -F, 'NR>1 && $3>1 && $4!="" { k=$1"|"$2; n[k]++; v[k"_"n[k]]=$4+0 }
+echo "=== rps (and MiB/s), median of scored passes, min-max in brackets ==="
+awk -F, 'NR>1 && $4>1 && $5!="" { k=$1"|"$2"|"$3; n[k]++; r[k"_"n[k]]=$5+0; m[k"_"n[k]]=$6+0 }
   END { for (k in n) { c=n[k]
-      for(i=1;i<=c;i++) a[i]=v[k"_"i]
-      for(x=1;x<c;x++)for(y=x+1;y<=c;y++) if(a[x]>a[y]){t=a[x];a[x]=a[y];a[y]=t}
-      split(k,p,"|"); printf "c%-5s %-9s %10.0f  [%.0f-%.0f]  n=%d\n", p[1], p[2], a[int((c+1)/2)], a[1], a[c], c } }' "$CSV" | sort -n -k1.2
+      for(i=1;i<=c;i++){a[i]=r[k"_"i]; b[i]=m[k"_"i]}
+      for(x=1;x<c;x++)for(y=x+1;y<=c;y++){ if(a[x]>a[y]){t=a[x];a[x]=a[y];a[y]=t} if(b[x]>b[y]){t=b[x];b[x]=b[y];b[y]=t} }
+      split(k,p,"|"); printf "s%-7s c%-5s %-9s %10.0f rps  [%.0f-%.0f]   %8.1f MiB/s   n=%d\n",
+        p[1], p[2], p[3], a[int((c+1)/2)], a[1], a[c], b[int((c+1)/2)], c } }' "$CSV" | sort -t_ -k1 | sort -n -k1.2 -k2.2
 
 echo
 echo "csv: $CSV"
-echo "Reading: half-pipe should NOT win at large payloads (it copies on send); the bet is that it degrades"
-echo "LESS than classic as c rises (no pump tasks). If it does not, the pump-contention hypothesis was wrong."
+echo "Reading: the crossover. Half-pipe copies on send, so as size grows BYO's zero-copy send should retake"
+echo "the lead; below that it wins on cheaper machinery. Concurrency sweep (fixed small size): the win was"
+echo "flat, not growing -- so it is per-request machinery, not pump-contention relief."
