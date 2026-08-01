@@ -51,6 +51,25 @@ Windows backend announces itself.
 - Also unmerged, non-blocking: `halfpipe-followups` (an `SS_HALF_DRAIN=pool` p99 experiment, built but
   unverified) and the dotnet/aspnetcore#68148 spike on the user's `mgravell/aspnetcore` fork.
 
+### BRANCH DISPOSITION as of 2026-08-01 (audited on Windows; do not re-derive this)
+
+| branch | state | action |
+|---|---|---|
+| `package-aspnetcore-lib` | runtime-verified 18/18, **MERGED to main** | delete when convenient |
+| `cyclebuffer-halfpipe` | **fully superseded by main.** Tree-compared: the ONLY files it has that main lacks are `AspNetDemo/{HalfPipeWriter,PinnedBlockMemoryPool,SocketSetConnection,SocketSetTransport}.cs` — the OLD paths of files the extraction moved to `src/SocketSet.AspNetCore/`. Its vendored `CycleBuffer`, the `KestrelPipeWriterRepro` experiment and the half-pipe itself are all on main already | nothing to land; delete when convenient |
+| `halfpipe-followups` | **partially landed.** `bench/run-halfpipe.sh`'s `TLS=ssl` knob cherry-picked to main. The `SS_HALF_DRAIN=pool` experiment was NOT taken | see below |
+| `rio-scatter-gather` | 0 commits ahead of main (its finding is recorded in main) | delete when convenient |
+
+**The one genuinely outstanding piece is `SS_HALF_DRAIN=pool` on `halfpipe-followups`, and it needs
+TWO things, not one.** (1) It is BUILT, UNVERIFIED by its own commit message, and its claim is a p99
+effect from moving `Send` off the Kestrel request thread — that is a Linux throughput measurement, so it
+cannot be settled on the Windows box. (2) **It edits `AspNetDemo/HalfPipeWriter.cs`, which no longer
+exists at that path** — the extraction moved it to `src/SocketSet.AspNetCore/HalfPipeWriter.cs`, so the
+branch will conflict and needs a port before it can even be measured. Do the port on Linux, then measure,
+then decide. Do not merge it as-is.
+
+*Branch deletions are left to the repo owner — nothing above is deleted, only assessed.*
+
 ### Prime Windows opportunities (priority order)
 1. ~~**`Run-SmokeMatrix.ps1`** — correctness gate for the shared-code changes. First, always.~~ **DONE
    2026-08-01: 48/48 PASS.**
