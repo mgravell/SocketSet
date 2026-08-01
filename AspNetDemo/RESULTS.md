@@ -49,6 +49,12 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### Stability soak (2026-08-01, before switching OS)
+
+`bench/run-smoke-matrix.sh` with `CHURN_REPS=15` (vs the usual 5): **60/60 cells PASS, every churn cell
+15/15 clean** across io_uring / epoll / managed, plaintext and TLS. Heavy slot-reuse / teardown stress
+surfaced no intermittent lifetime fault (the item-0e shape). So the Linux backends are handed off clean.
+
 ### Concurrency: we lead at c64 but degrade MORE than Kestrel above it (2026-08-01, 256 KB plaintext, 3 passes, ranges)
 
 | c | kestrel | io_uring | epoll |
