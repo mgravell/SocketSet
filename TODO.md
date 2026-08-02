@@ -508,6 +508,9 @@ patched connects and runs (abstract: 680k PING / 515k GET, p50 47µs through the
 TCP-loopback hop — a real UDS-vs-TCP A/B (add a uds leg to `run-proxy-ab.sh`) is now unlocked and also
 retires the ephemeral-port/TIME_WAIT confounder class for local benches.
 
+**~~BLOCKED~~ PUSHED 2026-08-02: `mgravell/redis` existed already (Marc synced it to current), and the
+branch is up — `marc/uds-abstract-sockets`, one PR-shaped commit.** Remaining: open the upstream PR when
+Marc wants to make the pitch. Original note for the record:
 **BLOCKED ON THE FORK EXISTING.** `gh repo fork redis/redis` is refused (the redis org is SAML-gated and
 the fork API is gated by the SOURCE org) — and per Marc, org-level policy disables tokens, so SSO-
 authorizing the token is NOT a route. **Fork old-school via the GitHub web UI** (his account carries the
