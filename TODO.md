@@ -393,6 +393,30 @@ DOWNSTREAM accepts and TLS UPSTREAM connects? `TlsProvider` hangs off the option
 exists (`SmokeTest --resp --tls-trust` connects TLS out), but per-connection asymmetry on a single
 instance may need an API knob. Scope it first; it may be the actual blocker.
 
+### PROXY CORRECTNESS: HELLO must be intercepted, never forwarded (found 2026-08-02, empirically)
+
+`HELLO 3` through the proxy is FORWARDED to the shared upstream leg, which then flips to RESP3 (or
+desyncs) **for every multiplexed client on it** — measured: after one client sends `HELLO 3`, a plain
+RESP2 SET/GET on a DIFFERENT connection gets no replies at all. Same class as the SELECT bug the proxy
+already fixed (`dbd4ad4d`): per-client protocol state cannot ride a shared leg. Envoy's answer is to not
+support HELLO at all (verified: it swallows the handshake, no reply — so Envoy is RESP2-only). Ours needs
+to intercept HELLO like SELECT: answer locally (RESP2 downstream at minimum, translation later) and keep
+the upstream leg's protocol fixed. `verify-proxy.cs` should gain a HELLO cell once the intended behaviour
+is decided. Relevant context from Marc (client libraries team at Redis): real clients DEFAULT to RESP3
+now, for smart-handoff and client-side-caching — so "reject HELLO" is a real compatibility cost, and
+handling it properly is a differentiator Envoy has declined to build.
+
+### NEXT CODE WORK: callback-granularity flush in the level-2/3 clients (the −P 16 collapse)
+
+The definitive run measured L2/L3 at depth for the first time: **they collapse** (L3 1.12M vs L1's 2.46M
+at `-P 16` GET) while winning `-P 1` outright (Envoy parity). Mechanism: `SendRawSynchronized` does
+`Connection.Send` — stage+flush — **per reply frame**, and at depth that is 16 flushes per receive
+callback on the loop thread, where L1's pump coalesces. Fix: stage via `GetSpan`/`Advance` during
+`Feed`, ONE `Flush` at end of the receive callback; same deferral for the upstream leg's `_outBuffer`.
+Envoy batches at event-loop-iteration granularity for the same reason. **Pre-registered: restores most of
+the depth loss without moving `-P 1`** (a `-P 1` callback holds one command either way). If `-P 1`
+regresses, the batching is wrong; if depth does not recover, the collapse is not the flush count.
+
 ### BACKLOG: tune the frame scanner (raised by Marc 2026-08-02)
 
 `RespReader`'s frame scanning is worth a pass — plausibly a few more percent. **Aim it correctly, because
@@ -409,6 +433,11 @@ the two pipeline regimes load it completely differently:**
 SHARED WITH SE.Redis.** Every gain lands in the client library as well as the proxy — and SE.Redis
 pipelines heavily, i.e. it lives in exactly the `-P 16` regime where the scanner dominates. That makes
 this the rare item that pays on both consumers at once, and it is aligned with the funded work.
+
+**Fairness note for any Envoy comparison (empirical, 2026-08-02):** `RespReader` carries the full RESP3
+prefix space on every scan; Envoy cannot even negotiate RESP3 (`HELLO 3` through it gets NO reply, while
+Garnet direct answers a `%8` map). So the parse-cost comparison is structurally tilted toward Envoy, and
+that is FAIR TO US to state: per Marc (client libraries team at Redis), real clients default to RESP3.
 
 **Measure it in isolation first.** The proxy A/B cannot attribute a scanner change: too much else is in
 the path. A micro-benchmark over representative RESP frames (mixed inline-array commands, varied bulk

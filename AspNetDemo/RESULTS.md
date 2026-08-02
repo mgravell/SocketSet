@@ -49,6 +49,54 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### LEVEL 3 (shard-affine upstream legs): ENVOY PARITY at `-P 1` — and a pre-registered COLLAPSE at `-P 16` (2026-08-02, definitive)
+
+One upstream leg PER SHARD, placed on that shard (`SocketSet.ConnectShard`, new), each client routed to
+the leg sharing its loop thread (`SocketSetShard.CurrentShardIndex`, new; captured in `OnAccept`, which
+runs ON the owning loop). Forward and reply never cross threads — the Envoy architecture on our
+transport. The path here matters as much as the result: the PING-vs-GET discriminator put the whole
+residual gap in the upstream leg (+96µs/req vs Envoy's +56µs), and **v1 (SocketSet upstream WITHOUT
+affinity) was NET NEGATIVE** — it traded the parked-reader wake chain for a cross-shard marshal per page,
+and the leg-count optimum flipping (2→5) was the tell. Affinity is the load-bearing property; v1 failing
+without it is the evidence. Smoke matrix 60/60 after the shared-code additions; `verify-proxy.cs` 12/12
+on the affine leg, first run.
+
+**`-P 1`, pinned, 5 passes — the arc of the day in one column (GET):**
+
+| leg | ops/s | % of ceiling |
+|---|---:|---:|
+| direct *(ceiling, NOT a peer)* | 499,929 | 100% |
+| **envoy** | 451,584 (451,584-458,986) | 90% |
+| **socketset L3 (affine)** | **451,613 (451,584-451,613)** | **90%** |
+| socketset L2-u2 | 358,919 | 72% |
+| worker-saea | 187,889 | 38% |
+
+**Statistically identical to Envoy** (SET likewise: 444,444 vs 444,416), both legs pinned at 90% of a
+CLIENT-LIMITED ceiling — so "at least parity" is the strongest claim this generator can support, and
+separating them needs more client capacity. p50 confirms independently: ours 119µs vs Envoy 127µs. From
+−48% at level 1, via −22% at level 2, to parity. The quantisation audit flags the pegged-at-ceiling cells
+(direct, and the two 90% legs at 2 distinct values), which is exactly what pegging looks like.
+
+**AND THE DEPTH REGIME INVERTED — L2/L3 were measured at `-P 16` for the FIRST time here, and they
+collapse:** L3 1,124,965 / L2-u2 925,878 against **L1's 2,461,118** (and Envoy's 1,590,563). So the
+regime split is now INTERNAL: **L1 wins depth, L3 wins latency, no configuration wins both yet.**
+Mechanism (legible, and the same lesson as `inline-both` this morning): at depth, L1's pump tasks
+parallelise parsing across the ThreadPool and coalesce replies per send; L2/L3 serialise
+16-commands-per-read on 8 loop threads and `SendRawSynchronized` does stage+flush **per reply frame** —
+16 flushes per receive callback. The fix is callback-granularity flushing (stage during `Feed`, one
+`Flush` at callback end, same deferral on the leg's `_outBuffer`) — Envoy batches at event-loop-iteration
+granularity for the same reason. Pre-registered in TODO: it should restore most of the depth loss and
+move `-P 1` not at all; either failure falsifies the mechanism.
+
+**RESP3/HELLO, tested empirically the same day (Marc's question, and he would know — client libraries
+team at Redis):** Garnet direct answers `HELLO 3` with a `%8` map; **Envoy swallows it — no reply — so
+Envoy is RESP2-only** and never pays RESP3 parse complexity, while `RespReader` carries the full RESP3
+prefix space on every scan. A structural parse-cost tilt toward Envoy that is fair to us to state, since
+real clients now default to RESP3. **And our proxy is WORSE than Envoy here today: it FORWARDS the HELLO,
+poisoning the shared leg** — after one client's `HELLO 3`, a plain RESP2 GET on a different connection
+gets no reply. Same bug class as the fixed SELECT issue; recorded in TODO as a correctness item (intercept
+HELLO per-client, never forward).
+
 ### LEVEL 2 (framing on the loop thread): the Envoy deficit goes −48% → −22%, and it UNLOCKS a second lever (2026-08-02)
 
 Level 2 replaces level 1's transport → `PipeIoBridge` → two `Pipe`s → `pipeReader.AsStream()` path with
