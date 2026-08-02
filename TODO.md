@@ -240,6 +240,61 @@ then decide. Do not merge it as-is.
 
 ---
 
+## DIRECTION CHANGE (2026-08-02): the consumers are RESP, not ASP.NET — and one of them is SE.Redis itself
+
+**Read this before planning work.** It reorders the backlog more than any measurement in this file, and it
+reverses one conclusion reached earlier the same day.
+
+**The context that decides priority:** Marc is *paid* for Redis work. He was on the ASP.NET Core team
+until ~2025 and is not any more. So "can we beat Kestrel" is unfunded, competes with a team he has left,
+and is structurally confounded anyway — the Kestrel bridge costs 24-40%, so every bridged number measures
+the bridge as much as the transport, and the "control" leg is a different APPLICATION path rather than
+just a different transport.
+
+**Two real consumers now exist, and neither is ASP.NET:**
+
+1. **`RESPite.Proxy`** — an Envoy-style RESP proxy on `StackExchange/StackExchange.Redis`, branch
+   `marc/proxy-spike2` (newest of `marc/proxy*`), under `toys/`. It already went Kestrel → hand-rolled
+   `WorkerPool`/SAEA, which is precisely the work SocketSet exists to make unnecessary. It exposes
+   `RunClientAsync(IDuplexPipe)` — the seam SocketSet plugs into — and `ProxyClient` is untouched by the
+   swap, so the transport is the only variable. **That is the comparison AspNetDemo structurally cannot
+   make.** The real target is beating **Envoy** running adjacent, with `redis-benchmark` driving
+   {direct | Envoy | our proxy} against one backend. See `AspNetDemo/RESULTS.md` for first numbers.
+
+2. **SE.Redis itself, as its IO core, in ordinary CLIENT mode.** This is not academic and it changes the
+   engineering constraints more than the proxy does:
+
+   - **IT PUTS WINDOWS BACK TO FIRST-CLASS, reversing the "Windows is an instrument, not a product"
+     call made earlier today.** That call rested on nobody hosting web servers on Windows. SE.Redis is a
+     CLIENT library with an enormous Windows install base (dev machines, Windows services, App Service).
+     IOCP quality becomes a production concern again, and **item 8 (TLS zero-copy on IOCP) is relevant
+     again** — SE.Redis clients do TLS to Azure Redis constantly.
+   - **The managed backend and net472 stop being ignorable.** The managed path is the fallback wherever
+     io_uring/IOCP specialisation is unavailable, and SE.Redis supports down-level targets. It appears in
+     NO throughput table here, and `ReceiveBufferSize` does not even reach it (see "Known gaps"). Fine
+     for a proxy; not fine for a client core.
+   - **THE CLIENT REGIME IS NOT THE ONE ANYTHING HERE MEASURES.** Every rig is many-connections,
+     server-side-accept. SE.Redis is ~1-2 connections per endpoint, multiplexed, deeply pipelined, with
+     TAIL LATENCY as the product because an app blocks on the call. A 12-shard design spreads many
+     connections over loops; with ONE connection the question is "what does a single loop cost", which is
+     unmeasured. **A single-connection, deep-pipeline, p99-scored rig is the missing measurement.**
+   - **Thread-theft returns, relocated.** The proxy escapes Kestrel's constraint because the handler is
+     bounded and non-blocking. In client mode that is only half true: completing a `TaskCompletionSource`
+     can run arbitrary USER continuations, and doing that on the loop thread reinvents exactly the problem
+     Kestrel's IO queues exist to prevent. The 2026-08-02 `inline-both` result — both readers on the loop,
+     consistently WORSE than inlining neither, on both Linux backends — is the live warning.
+   - **API STABILITY BECOMES A CONSTRAINT.** `AGENTS.md` says public API and defaults can change freely
+     because there are no users. That stops being true the moment SE.Redis depends on this. The
+     `Connection` / `AcceptContext` / `UsePipe` / `SocketSetOptions` surface should be settled BEFORE that
+     dependency is taken, not after. Note the single-writer-until-Flush contract on the `IBufferWriter`
+     surface is a real interface requirement for a multiplexed client, not an implementation detail —
+     SE.Redis can satisfy it (it serialises through its own backlog) but it must be designed against.
+
+**What this demotes:** the inbound half-pipe (aspnetcore-specific engineering to recover something the
+proxy gets by construction, and now measured at ~4% on io_uring ONLY — see the pipesched section);
+"beat Kestrel" as a scoreboard; and RIO performance work. **What it does NOT demote:** the Windows
+CORRECTNESS gates, which are now more important, not less.
+
 ## READ FIRST IF YOU ARE ON LINUX (2026-08-01 addendum — SHARED CODE CHANGED UNDER YOU AGAIN)
 
 > **Written at the end of the 2026-08-01 Windows session. Linux has not run since 2026-08-01 morning and
