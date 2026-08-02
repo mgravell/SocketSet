@@ -398,8 +398,14 @@ instance may need an API knob. Scope it first; it may be the actual blocker.
 `HELLO 3` through the proxy is FORWARDED to the shared upstream leg, which then flips to RESP3 (or
 desyncs) **for every multiplexed client on it** — measured: after one client sends `HELLO 3`, a plain
 RESP2 SET/GET on a DIFFERENT connection gets no replies at all. Same class as the SELECT bug the proxy
-already fixed (`dbd4ad4d`): per-client protocol state cannot ride a shared leg. Envoy's answer is to not
-support HELLO at all (verified: it swallows the handshake, no reply — so Envoy is RESP2-only). Ours needs
+already fixed (`dbd4ad4d`): per-client protocol state cannot ride a shared leg. Envoy 1.39.0's answer is to not
+support HELLO at all (verified: it swallows the handshake, no reply). **Main-branch Envoy (1.40-track)
+adds `RedisProxy.protocol_version` (RESP2 default / RESP3)** — verified absent from our 1.39.0 binary via
+`--mode validate` — and its design is ALL-OR-NOTHING PER LISTENER: RESP3 mode demands downstream `HELLO 3`
+before any data command (`-NOPROTO` otherwise) and negotiates `HELLO 3` on each upstream pool connection.
+So the cheap correct v1 for us is Envoy's shape (one protocol per listener); PER-CLIENT protocol
+adaptation on a multiplexed leg is the thing nobody has built and the real differentiator. When 1.40
+ships, a RESP3-negotiated A/B (`redis-benchmark -3`) is possible — blocked on our fix first. Ours needs
 to intercept HELLO like SELECT: answer locally (RESP2 downstream at minimum, translation later) and keep
 the upstream leg's protocol fixed. `verify-proxy.cs` should gain a HELLO cell once the intended behaviour
 is decided. Relevant context from Marc (client libraries team at Redis): real clients DEFAULT to RESP3

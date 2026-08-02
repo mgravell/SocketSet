@@ -90,8 +90,16 @@ move `-P 1` not at all; either failure falsifies the mechanism.
 
 **RESP3/HELLO, tested empirically the same day (Marc's question, and he would know — client libraries
 team at Redis):** Garnet direct answers `HELLO 3` with a `%8` map; **Envoy swallows it — no reply — so
-Envoy is RESP2-only** and never pays RESP3 parse complexity, while `RespReader` carries the full RESP3
-prefix space on every scan. A structural parse-cost tilt toward Envoy that is fair to us to state, since
+Envoy is RESP2-only AS SHIPPED (1.39.0)** and never pays RESP3 parse complexity, while `RespReader`
+carries the full RESP3 prefix space on every scan.
+**CORRECTED same day, on a reliable tip from Marc: `RedisProxy.protocol_version` (RESP2 default / RESP3)
+EXISTS — on main/1.40-track.** Verified both ways: `--mode validate` rejects the field on our 1.39.0
+binary ("no such field", all three plausible placements), and the latest docs describe it, including a
+`-NOPROTO` reply for `HELLO 3` in RESP2 mode that 1.39 demonstrably lacks (it answers with silence).
+Notably, Envoy's design is ALL-OR-NOTHING PER LISTENER — RESP3 mode requires downstream `HELLO 3` before
+any data command — i.e. they sidestepped mixed-protocol multiplexing rather than solving it. A
+RESP3-negotiated A/B (`redis-benchmark -3`) becomes possible when 1.40 ships, and is blocked on OUR
+HELLO fix first. A structural parse-cost tilt toward Envoy that is fair to us to state, since
 real clients now default to RESP3. **And our proxy is WORSE than Envoy here today: it FORWARDS the HELLO,
 poisoning the shared leg** — after one client's `HELLO 3`, a plain RESP2 GET on a different connection
 gets no reply. Same bug class as the fixed SELECT issue; recorded in TODO as a correctness item (intercept
