@@ -439,6 +439,29 @@ Envoy batches at event-loop-iteration granularity for the same reason. **Pre-reg
 the depth loss without moving `-P 1`** (a `-P 1` callback holds one command either way). If `-P 1`
 regresses, the batching is wrong; if depth does not recover, the collapse is not the flush count.
 
+### UDS / ABSTRACT-SOCKET BENCHMARKING (Marc's item, built 2026-08-02; push blocked on SAML)
+
+**Premise corrected then built:** redis-benchmark already has `-s <socket>` (pathname UDS) — what was
+missing is ABSTRACT sockets, because hiredis's `redisContextConnectUnix` strncpy's the path and a
+leading NUL cannot ride that. Patched on a local redis clone, branch **`marc/uds-abstract-sockets`**
+(`/home/marc/code/redis`): `@name` → abstract namespace (the socat/systemd convention), Linux-gated,
+with the exact-addrlen subtlety documented (padding NULs become part of an abstract name). One hiredis
+function, so **redis-cli gains it too**; both `-s` help texts updated. The proxy gained
+`--listen-uds /path-or-@abstract` (banner `listen=`), which is the SIDECAR deployment shape.
+
+**Verified with the stock binary as the control:** stock `-s @name` fails "No such file or directory";
+patched connects and runs (abstract: 680k PING / 515k GET, p50 47µs through the affine proxy; pathname:
+806k / 415k). **Teaser, properly un-measured:** the UDS hop's p50 looked meaningfully better than the
+TCP-loopback hop — a real UDS-vs-TCP A/B (add a uds leg to `run-proxy-ab.sh`) is now unlocked and also
+retires the ephemeral-port/TIME_WAIT confounder class for local benches.
+
+**BLOCKED ON ONE CLICK: pushing the fork.** `gh repo fork redis/redis` is refused — the redis org is
+under Redis Ltd SAML and the token needs enterprise SSO authorization (the fork API is gated by the
+SOURCE org). Marc: authorize at the link gh printed (`gh repo fork redis/redis --clone=false` will
+re-print it), then `cd ~/code/redis && git remote add fork git@github.com:mgravell/redis.git && git push
+fork marc/uds-abstract-sockets`. Upstream pitch when ready: "support the established @ convention for
+abstract sockets in -s" — small, one function, benefits cli and benchmark alike.
+
 ### BACKLOG: tune the frame scanner (raised by Marc 2026-08-02)
 
 `RespReader`'s frame scanning is worth a pass — plausibly a few more percent. **Aim it correctly, because
