@@ -439,6 +439,39 @@ Envoy batches at event-loop-iteration granularity for the same reason. **Pre-reg
 the depth loss without moving `-P 1`** (a `-P 1` callback holds one command either way). If `-P 1`
 regresses, the batching is wrong; if depth does not recover, the collapse is not the flush count.
 
+### GARNET AS THE FOURTH CONSUMER (Marc's item, 2026-08-02): host Garnet on SocketSet
+
+Garnet has a pluggable network server API and runs on managed SAEA sockets. Scoped against a checkout
+(`~/code/garnet`): the seam is **`IGarnetServer` / `GarnetServerBase` + `NetworkHandler` (abstract) +
+`INetworkSender`**, with `TcpNetworkHandlerBase` driving a `SocketAsyncEventArgs` receive loop
+(`GarnetSaeaBuffer`) that PUSHES bytes into the RESP parser (`IMessageConsumer`) — i.e. the same push
+shape as our `OnReceive → Feed`, and the same SAEA baseline the proxy beat by 15-28%. A
+`SocketSetGarnetServer` maps naturally: `OnAccept` → session, `OnReceive` → the handler's receive push,
+`INetworkSender` → `Connection` writer surface with CALLBACK-GRANULARITY flushing (the deferred-flush
+lesson applies verbatim — Garnet replies per command too).
+
+**Why this one is special among the consumers:**
+- **It is a SERVER — the many-connections/accept shape SocketSet's shard design was originally built
+  for**, before the client-mode work bent it the other way. The proxy tested both halves; this tests the
+  original thesis at full scale.
+- **Garnet is the `direct` ceiling in every proxy table from 2026-08-02.** Hosting it on SocketSet means
+  raising our own rigs' reference line — the fourth application-held-constant A/B (proxy, client
+  prototype, benchmark tool, now a full server), stock-SAEA-Garnet vs SocketSet-Garnet, same
+  `redis-benchmark` methodology.
+- **Garnet's TLS is stream-layer/userspace, so the server-side TLS story lands on their hottest path**:
+  in-transport OpenSSL/SChannel (+13-35% over `SslStream`, our one broad structural win) and eventually
+  kTLS. A TLS-enabled Garnet A/B is where that number stops being an HTTP-demo result.
+- Windows matters to Garnet (Microsoft project) — IOCP/RIO become load-bearing, aligned with the
+  client-core direction that already re-elevated them.
+
+**Scope sketch:** implement `GarnetServerBase` subclass + `NetworkHandler`/`INetworkSender` pair over
+SocketSet in a spike branch of the garnet checkout (their `Register`/`AddSession` machinery is reused
+untouched, same discipline as `ProxyClient`); gate with our `verify-proxy.cs` pointed at it (it is a
+RESP server) plus Garnet's own test suite; A/B with `run-proxy-ab.sh`'s `direct` leg pointed at each.
+**Politics note, stated once:** as a TESTBED this is unimpeachable regardless of destination — whether
+anything is offered upstream to a Microsoft Redis-alternative is Marc's call entirely, given where he
+works.
+
 ### UDS / ABSTRACT-SOCKET BENCHMARKING (Marc's item, built 2026-08-02; push blocked on SAML)
 
 **Premise corrected then built:** redis-benchmark already has `-s <socket>` (pathname UDS) — what was
