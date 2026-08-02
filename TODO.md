@@ -359,6 +359,28 @@ know whether we closed the gap or just hit the generator.
 ping` sends literal `PING\r\n`; `RespReader` rejects the `P`). Redis and Garnet accept them. Decision
 taken: leave inline on the backlog, but a fault must FAIL LOUDLY rather than hang — that is now fixed.
 
+### BACKLOG: tune the frame scanner (raised by Marc 2026-08-02)
+
+`RespReader`'s frame scanning is worth a pass — plausibly a few more percent. **Aim it correctly, because
+the two pipeline regimes load it completely differently:**
+
+- **At `-P 16` the scanner is on the critical path.** Many commands arrive per read, so per-byte scan cost
+  dominates and per-request overhead has amortised away. This is where scanner work will show up — and it
+  is where we already BEAT Envoy by ~50%, so this is extending a lead rather than closing a gap.
+- **At `-P 1` it is nearly irrelevant.** One 32-byte command per read: the scan is rounding error against
+  the per-request costs that actually decide that regime. Do NOT expect scanner work to move the Envoy
+  deficit, which lives entirely at `-P 1`.
+
+**The strategic reason it is worth more than the percentage suggests: `RespReader` is RESPite's, so it is
+SHARED WITH SE.Redis.** Every gain lands in the client library as well as the proxy — and SE.Redis
+pipelines heavily, i.e. it lives in exactly the `-P 16` regime where the scanner dominates. That makes
+this the rare item that pays on both consumers at once, and it is aligned with the funded work.
+
+**Measure it in isolation first.** The proxy A/B cannot attribute a scanner change: too much else is in
+the path. A micro-benchmark over representative RESP frames (mixed inline-array commands, varied bulk
+sizes, the multi-segment boundary case) is the right instrument, with the proxy A/B only as confirmation
+that a micro win survives integration. `experiments/BufferBench` is the precedent for that shape.
+
 ## READ FIRST IF YOU ARE ON LINUX (2026-08-01 addendum — SHARED CODE CHANGED UNDER YOU AGAIN)
 
 > **Written at the end of the 2026-08-01 Windows session. Linux has not run since 2026-08-01 morning and

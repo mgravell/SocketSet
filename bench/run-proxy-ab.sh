@@ -36,7 +36,7 @@ REPS=${REPS:-6}                       # scored passes; pass 1 is NOT discarded h
                                       # its own process and redis-benchmark does its own ramp), but the
                                       # leg ORDER is reshuffled every pass, which is what matters
 DEPTHS=${DEPTHS:-"1 16"}
-LEGS=${LEGS:-"direct envoy worker socketset-iouring socketset-epoll"}
+LEGS=${LEGS:-"direct envoy worker socketset-iouring socketset-epoll socketset-l2"}
 # Requests per test, SCALED BY PIPELINE DEPTH below. This must be large enough that each test runs for
 # ~10s: at -n 50000 and ~200k ops/s a test lasts 0.25s and redis-benchmark reports QUANTISED rps -- the
 # shakeout produced exactly 200000, 100000 and 99800 ops/s, and the same leg read 200k on GET and 99.8k on
@@ -50,6 +50,12 @@ PROXY_PORT=${PROXY_PORT:-7380}
 ENVOY_PORT=${ENVOY_PORT:-7381}      # Envoy listens on its own port; its config is bench/envoy-redis.yaml
 ENVOY_ADMIN=${ENVOY_ADMIN:-9901}
 SHARDS=${SHARDS:-8}
+# Upstream connections ("legs"). NOT a neutral default: clients are round-robined onto these sticky legs,
+# and FEWER legs means MORE client commands coalesce into each upstream write. Measured 2026-08-02, level 2
+# unpinned: 1->333k, 2->375k, 3->353k, 5->316k, 16->207k, 32->167k, 64->143k. Monotonic above 2 and a clear
+# optimum AT 2 -- so the shipped default of 5 is leaving ~19% on the table, and the intuition that more
+# upstream connections means more parallelism is exactly backwards here.
+UPSTREAM_CONNS=${UPSTREAM_CONNS:-5}
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH="$REPO/bench/.tools/redis-benchmark"
@@ -133,6 +139,10 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
     worker)             args="--transport worker" ;;
     socketset-iouring)  args="--transport socketset --backend io-uring --shards $SHARDS" ;;
     socketset-epoll)    args="--transport socketset --backend epoll --shards $SHARDS" ;;
+    # LEVEL 2: RESP framing on the loop thread -- no pipes, no pump, no ThreadPool hop.
+    socketset-l2)       args="--transport socketset --backend io-uring --l2 --shards $SHARDS" ;;
+    socketset-l2-u2)    args="--transport socketset --backend io-uring --l2 --shards $SHARDS --upstream-connections 2" ;;
+    socketset-l2-epoll) args="--transport socketset --backend epoll --l2 --shards $SHARDS" ;;
     *) echo "unknown leg '$leg'"; return 1 ;;
   esac
   taskset -c "$PROXY_CPUS" "$PROXY" $args --port "$PROXY_PORT" --upstream-port "$BACKEND_PORT" \
@@ -151,6 +161,14 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
     worker)            [[ "$banner" == *"transport=worker-saea"* ]] || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
     socketset-iouring) [[ "$banner" == *"transport=socketset/io-uring"* ]] || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
     socketset-epoll)   [[ "$banner" == *"transport=socketset/epoll"* ]] || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
+    # Gate on bridge=direct too: a level-2 leg that silently ran the pipe bridge would measure as a
+    # perfectly plausible level-1 result and the whole experiment would report nothing.
+    socketset-l2)      [[ "$banner" == *"transport=socketset/io-uring"* && "$banner" == *"bridge=direct"* ]] \
+                         || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
+    socketset-l2-u2)   [[ "$banner" == *"bridge=direct"* && "$banner" == *"legs=2"* ]] \
+                         || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
+    socketset-l2-epoll) [[ "$banner" == *"transport=socketset/epoll"* && "$banner" == *"bridge=direct"* ]] \
+                         || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
   esac
   return 0
 }

@@ -49,6 +49,56 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### LEVEL 2 (framing on the loop thread): the Envoy deficit goes −48% → −22%, and it UNLOCKS a second lever (2026-08-02)
+
+Level 2 replaces level 1's transport → `PipeIoBridge` → two `Pipe`s → `pipeReader.AsStream()` path with
+`RespReader` framing directly off the span `OnReceive` hands you ON THE LOOP THREAD, replying via
+`Connection.Send`. No pipe, no pump, no ThreadPool hop, no `Stream` wrapper. Built in
+`toys/RESPite.Proxy/SocketSetProxyClient.cs`; **12/12 on `verify-proxy.cs` first run**, including 1 MB
+values spanning many receive callbacks, a 512-deep in-order pipeline, and the mixed local/forwarded
+ordering cell. It came together because `RespStream` already exposes a PUSH seam
+(`GetReceiveBuffer()`/`OnAfterReceive()`) that `SocketProxyClient` drives from SAEA completions — so this
+is a transport adapter, not a new parser, and all partial-frame/CycleBuffer handling is reused.
+
+`-P 1`, pinned, 5 passes, quantisation audit clean, same session:
+
+| leg | GET | % of ceiling | vs Envoy |
+|---|---:|---:|---|
+| direct *(ceiling, NOT a peer)* | 509,017 | 100% | — |
+| **envoy** | 451,613 | 89% | — |
+| socketset L1 (pipe bridge) | 239,292 | 47% | **−47.0%** |
+| socketset **L2** | 269,200 | 53% | −40.4% |
+| socketset **L2 + 2 upstream legs** | **349,965** | **69%** | **−22.5%** |
+
+SET tracks it: L2-u2 354,412 vs Envoy 451,584, **−21.5%**, from −48.3% at L1.
+
+**MY PREDICTION WAS WRONG AND THE CORRECTION IS THE INTERESTING PART.** I expected the pipe bridge to BE
+the per-request cost we lose to Envoy on. It is not: removing pipes, pump, hop and stream wrapper entirely
+buys **+12.5%**, against a ~2x gap. The larger lever was somewhere nobody had swept — the number of sticky
+UPSTREAM legs, where the intuition is backwards: more legs is monotonically WORSE (level 2, unpinned:
+1→333k, 2→375k, 3→353k, 5→316k, 16→207k, 32→167k, 64→143k), because fewer legs means more client commands
+coalesce into each upstream write. Batching, not parallelism.
+
+**AND THE TWO ARE NOT INDEPENDENT — which is the actual finding.** Measured directly, `upstream=2` against
+the default `upstream=5`:
+
+| leg | upstream=5 | upstream=2 | effect |
+|---|---:|---:|---|
+| worker-saea | 195,771 | 197,155 | **none** — ranges overlap |
+| socketset L1 | 239,292 | 241,368 | **none** — ranges overlap |
+| socketset **L2** | 269,200 | **349,965** | **+30%** |
+
+**The upstream lever is worth NOTHING on level 1 or on the hand-rolled SAEA path, and +30% on level 2.**
+So it is not a free config default that any implementation collects — it is a SECOND bottleneck that only
+becomes reachable once the pipe bridge stops being the first. The full +46% over level 1 REQUIRES level 2;
+the config change alone is inert. That also means the transport work owns the win rather than sharing it
+with a knob — the opposite of what was predicted an hour earlier, and it is why the decomposition was run
+instead of quoting the combined number.
+
+**Still −22% to Envoy at `-P 1`, and we remain ~+50% ahead at `-P 16`.** The remaining `-P 1` gap is
+unexplained and is the open question; note also that Envoy sits at 89% of a CLIENT-LIMITED ceiling there,
+so its true figure may be higher and −22% is a floor. Give the generator more cores before chasing it.
+
 ### RESP PROXY vs ENVOY: we LOSE 2x unpipelined and WIN 1.5x pipelined — a crossover, pre-registered (2026-08-02)
 
 **Read this before the SAEA comparison below it.** That section reports beating our own hand-rolled
