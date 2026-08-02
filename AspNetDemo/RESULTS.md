@@ -49,6 +49,34 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### THE UDS SIDECAR HOP: +30% THROUGHPUT AND NEARLY HALF THE TAIL vs the TCP hop (2026-08-02 evening)
+
+Marc's premise — a proxy hosted on a Unix socket is the SIDECAR deployment shape, and the local hop
+should be cheaper over UDS than TCP-loopback. Measured: same proxy (L3 affine + deferred flush), same
+session, only the LISTEN differing (`--listen-uds /tmp/... `vs TCP), `CORES=6:3:3`, 5 passes:
+
+| `-P 1` GET | ops/s | % of ceiling | p99 |
+|---|---:|---:|---:|
+| direct *(no proxy)* | 548,977 | 100% | 0.191 ms |
+| **proxy over UDS** | **491,194** (491,159-499,964) | **89%** | **0.591 ms** |
+| proxy over TCP | 378,358 (358,956-378,358) | 69% | 0.943 ms |
+
+SET matches (491,159 vs 368,402). At `-P 16`: GET 4,363,108 vs 3,692,118 (**+18%**), SET 3,944,557 vs
+3,469,545 (+14%), tails lower throughout. **The UDS hop is +30% throughput at `-P 1` with p99 nearly
+halved — the sidecar shape is the RIGHT deployment for this proxy, and it also retires the whole
+ephemeral-port/TIME_WAIT confounder class for local benching.** A same-session Envoy-over-UDS leg (its
+listener supports `pipe:` addresses) is the follow-up before claiming anything Envoy-relative here;
+cross-session subtraction stays forbidden.
+
+**The @abstract leg silently VANISHED from this run, and the cause chain is confounder material:** the
+`BENCH_EXE` override pointing the rig at the patched benchmark had been "applied" by a command that
+self-terminated on its own `pkill -f` (the command line matched itself) BEFORE the patch line ran — so
+the run used the STOCK binary, which cannot dial `@` (that is what the fork patch adds). The probe
+failed, the measurement produced EMPTY output, and the rig's parse loop wrote NO row at all — the leg
+read as "not run" rather than "failed". Two fixes: the override is now real (verified with `bash -x`,
+not memory), and an empty measurement now writes a NORESULT row. The pathname/TCP/direct numbers above
+are unaffected (stock handles all three); the abs-vs-uds comparison is re-running on the patched binary.
+
 ### THE CLIENT SHAPE, MEASURED FOR THE FIRST TIME (2026-08-02 evening) — and the scanner baseline
 
 **`bench/run-client-shape.sh`** — one connection, deep multiplex, tail-scored: the SE.Redis regime,

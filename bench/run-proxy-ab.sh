@@ -58,7 +58,11 @@ SHARDS=${SHARDS:-8}
 UPSTREAM_CONNS=${UPSTREAM_CONNS:-5}
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BENCH="$REPO/bench/.tools/redis-benchmark"
+# BENCH_EXE override matters for the @abstract leg: stock redis-benchmark cannot dial an abstract
+# socket (that is what the fork patch adds), so point this at ~/code/redis/src/redis-benchmark when
+# running socketset-l3-abs. NOTE: this override was "applied" once before inside a command that
+# self-terminated on its own pkill before reaching the patch -- verify with bash -x, not memory.
+BENCH="${BENCH_EXE:-$REPO/bench/.tools/redis-benchmark}"
 PROXY="${PROXY_EXE:-/home/marc/code/StackExchange.Redis/toys/RESPite.Proxy/bin/Release/net10.0/RESPite.Proxy}"
 GARNET="${GARNET_EXE:-$HOME/.dotnet/tools/garnet-server}"
 ENVOY="${ENVOY_EXE:-$REPO/bench/.tools/envoy}"
@@ -102,13 +106,16 @@ echo
 # -x matches the process NAME, not the full command line. `pkill -f garnet-server` also matches any SHELL
 # whose command line happens to contain that string -- including the one invoking this script, which kills
 # the run with SIGTERM and looks like a rig crash. Cost two runs before it was obvious.
-pkill -x garnet-server 2>/dev/null; sleep 1
+pkill -x garnet-server 2>/dev/null; pkill -x RESPite.Proxy 2>/dev/null; pkill -x envoy 2>/dev/null
+rm -f /tmp/resp-proxy-ab.sock; sleep 1
 taskset -c "$SERVER_CPUS" "$GARNET" --port "$BACKEND_PORT" --bind 127.0.0.1 >"$OUT/garnet.log" 2>&1 &
 GARNET_PID=$!
 cleanup() {
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null
   kill "$GARNET_PID" 2>/dev/null
-  wait 2>/dev/null
+  # Wait ONLY for known pids: a bare `wait` blocks forever on any child a bug leaked, turning a bad run
+  # into a hung one (observed: ~90 minutes stalled between phases on three leaked proxies).
+  wait "$GARNET_PID" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 for i in {1..40}; do
@@ -199,7 +206,11 @@ measure() { # $1=leg $2=depth $3=rep
   [[ "$leg" == "socketset-l3-uds" ]] && sockarg="/tmp/resp-proxy-ab.sock"
   [[ "$leg" == "socketset-l3-abs" ]] && sockarg="@resp-proxy-ab"
   if ! start_proxy "$leg"; then
-    echo "$depth,$leg,$rep,,,,,,,STARTFAIL" >>"$CSV"; return
+    echo "$depth,$leg,$rep,,,,,,,STARTFAIL" >>"$CSV"
+    # Kill whatever start_proxy managed to spawn, or it holds the port/socket and every later leg
+    # cascades into STARTFAIL -- and cleanup()'s wait then hangs on the orphan at exit.
+    [[ -n "${PROXY_PID:-}" ]] && { kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null; PROXY_PID=""; }
+    return
   fi
   local csv
   # Pipelining multiplies achievable rate roughly with depth, so scale the request count with it or the
@@ -209,6 +220,13 @@ measure() { # $1=leg $2=depth $3=rep
   [[ -n "$sockarg" ]] && target=(-s "$sockarg")
   csv=$(taskset -c "$CLIENT_CPUS" "$BENCH" "${target[@]}" -c "$CLIENTS" -n "$nreq" \
         -d "$DATASIZE" -t "$TESTS" -P "$depth" --threads 6 --csv 2>/dev/null)
+  # A COMPLETELY failed measurement produces empty output, and a loop over empty input writes NOTHING --
+  # the leg simply vanishes from the summary, which reads as "not run" rather than "failed". Write the
+  # failure down. (Found via the @abstract leg silently disappearing under a stock benchmark binary.)
+  if [[ -z "$csv" ]]; then
+    echo "$depth,$leg,$rep,,,,,,,NORESULT" >>"$CSV"
+    echo "    $leg: EMPTY measurement output"
+  fi
   # redis-benchmark --csv: "test","rps","avg","min","p50","p95","p99","max"
   while IFS= read -r line; do
     [[ "$line" == '"test"'* ]] && continue

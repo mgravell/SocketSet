@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <Description>Hosts Garnet on the SocketSet transport: an IGarnetServer whose connections are
+served by SocketSet's shard loops (io_uring / epoll / IOCP / RIO / managed) instead of the built-in
+SocketAsyncEventArgs layer.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../SocketSet/SocketSet.csproj" />
+    <!-- The embeddable Garnet server. Its ctor takes IGarnetServer[] explicitly ("If none is provided,
+         will use a GarnetServerTcp"), which is what makes this library possible without forking Garnet.
+         If the package turns out not to expose Garnet.common's networking types, the fallback is a
+         sibling-checkout ProjectReference in the RESPite.Proxy pattern; prefer the package. -->
+    <PackageReference Include="Microsoft.Garnet" Version="2.1.1" />
+  </ItemGroup>
+
+</Project>
