@@ -49,6 +49,34 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### THE TAIL, INVESTIGATED (2026-08-02 evening): it is an SMT TRADE plus a rig artifact, not a defect
+
+The definitive run left "our p99 is ~3x Envoy's" open. Bisected in three steps, each pre-registered:
+
+1. **GC: exonerated.** `DOTNET_gcServer=1` vs default, interleaved: p99 ranges overlap (0.42-0.56 vs
+   0.46-0.50). Not the tail.
+2. **A rig artifact owned a third of it: loop-thread OVERSUBSCRIPTION.** The "3.1x" run had `--shards 8`
+   pinned onto 6 logical CPUs — two CPUs hosted two loop threads each, and their clients ate the queueing
+   delay. 6-on-6 alone took p99 0.871 → ~0.50 ms. Rigs now guard against shards > proxy CPUs.
+3. **The remainder is SMT sibling contention, and it is a genuine TRADE** (same session, 3 passes each):
+
+| leg | rps | p50 | p99 |
+|---|---:|---:|---:|
+| envoy (6 workers, same 3 physical cores) | 388,867 | 0.151 | **0.263-0.271** |
+| l3, 6 shards (both SMT siblings) | **405,774** | **0.135** | 0.503-0.583 |
+| l3, 3 shards (one per PHYSICAL core) | 301,062 | 0.199 | **0.279-0.335** |
+
+One shard per physical core MATCHES Envoy's tail at −22% throughput; using both siblings buys +30%
+throughput and the best p50 at ~2x the tail. **Pinning is exonerated too**: `--no-pin` at 6 shards leaves
+p99 unmoved (0.56-0.61 vs 0.48-0.54, if anything worse), so it is the sibling contention itself, not the
+inability to migrate off a busy core. For the SE.Redis client shape, where the tail IS the product, the
+guidance is shards ≤ physical cores.
+
+**The honest residual, recorded rather than hand-waved: Envoy runs 6 workers on the SAME 3 physical
+cores and keeps its 0.27 ms p99.** Why its event loops tolerate sibling sharing and ours do not is
+UNEXPLAINED — that is a profiling question (suspects: wait/wake shape under partial idleness, io_uring
+submission timing under SMT), and no further config sweeps will answer it.
+
 ### FINAL (2026-08-02): ONE configuration — Envoy PARITY unpipelined, 2.7x Envoy pipelined, CONFIRMED
 
 The capstone, 5 passes, pinned, quantisation audit flagging only ceiling-pegged cells. The configuration

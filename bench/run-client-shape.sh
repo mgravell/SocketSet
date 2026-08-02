@@ -28,7 +28,11 @@ REQUESTS=${REQUESTS:-2000000}       # scaled by depth below, same reasoning as r
 DATASIZE=${DATASIZE:-32}
 BACKEND_PORT=${BACKEND_PORT:-7379}
 PROXY_PORT=${PROXY_PORT:-7380}
-SHARDS=${SHARDS:-8}
+# SHARDS must not exceed the proxy's LOGICAL CPUs (6 here: quarter of the cores, both siblings), or loop
+# threads share CPUs and their clients eat the queueing delay as tail. Measured 2026-08-02: 8 shards on 6
+# logical CPUs nearly DOUBLED p99 (0.49 -> 0.87 ms) versus 6-on-6 -- an oversubscription artifact that
+# was briefly mistaken for a product property.
+SHARDS=${SHARDS:-6}
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH="$REPO/bench/.tools/redis-benchmark"
