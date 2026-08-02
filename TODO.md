@@ -304,8 +304,16 @@ then decide. Do not merge it as-is.
 > at any size** — it is positive throughout on today's defaults, so it can no longer be quoted as current;
 > (b) **`inline-both` is worse than either knob alone at every size**, because both readers serialise on
 > the io_uring loop thread — so "off the ThreadPool" is not monotonically good.
-> **STILL TO DO: the same run on epoll.** io_uring and epoll have different loop models and epoll is the
-> backend that reaches `OutboundConnection`, so it is not safe to read this across.
+> ~~**STILL TO DO: the same run on epoll.**~~ **DONE the same day, AND IT FALSIFIED THE GENERALISATION.**
+> Not reading it across was the right call: on epoll `inline-read` gains **+0.9% / −1.4% / −11.5% / +0.9%**
+> at 512 B / 4 KB / 16 KB / 256 KB — it never meaningfully helps and at 16 KB it is a disjoint −11.5%
+> catastrophe. **The read hop owns the small-payload deficit on Windows/IOCP and io_uring; it does NOT own
+> it on epoll**, where `off` trails Kestrel −4.8% at 512 B and no scheduler mode recovers it.
+> *Hypothesis, not result:* the two backends where it matters are the ones whose completion model hands
+> you finished work; epoll's readiness loop must do the `recv` itself.
+> **Consequence for the inbound half-pipe: the case SURVIVES but NARROWS** — io_uring is the Linux default
+> so ~4.5% at 512 B is on the default path, but it is one backend at one size, not a general bridge win,
+> and epoll would gain nothing. Cost it at ~4% at the smallest payload on io_uring only.
 >
 > **Also still open from the morning:** `Verify-AspNet.ps1` has no Linux equivalent, so the
 > `SocketSet.AspNetCore` extraction is runtime-verified on IOCP/RIO/managed but NOT on io_uring/epoll.

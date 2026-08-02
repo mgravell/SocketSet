@@ -154,6 +154,49 @@ worse than one that inlines neither.
 12,237-12,796) and the scheduler knob does nothing there — every mode is within noise of every other. The
 knob's entire effect lives at small payloads, which is the same null the Windows run reported at 256 KB.
 
+#### THEN EPOLL FALSIFIED THE GENERALISATION (same rig, same session, same day)
+
+The io_uring result above was written up as "the small-payload deficit IS the read hop, replicated on a
+second OS". **Running the identical rig on epoll shows that is a property of io_uring, not of the bridge.**
+`inline-read`'s gain over `off`, both backends:
+
+| payload | io_uring | epoll |
+|---|---:|---:|
+| 512 B | **+4.5%** (reaches PARITY with Kestrel) | +0.9% (median stays −3.9% behind) |
+| 4 KB | +0.7% | −1.4% |
+| 16 KB | −1.5% | **−11.5%** |
+| 256 KB | −0.1% | +0.9% |
+
+**On epoll the read hop is NOT the small-payload deficit.** `off` trails Kestrel −4.8% at 512 B and no
+scheduler mode recovers it; at 16 KB inlining the inbound reader is a −11.5% catastrophe (6,278-6,676 vs
+6,984-7,515, disjoint). The epoll 512 B "overlapping — parity" verdict is an artifact of a WIDE range
+(339.1-355.7), not of approaching the control, which is exactly why this rig prints ranges next to the
+verdict rather than the verdict alone.
+
+**So the honest scope of the finding is: the read-side hop owns the small-payload deficit on
+Windows/IOCP and on io_uring — the two backends whose completion model is "the kernel hands you finished
+work" — and does NOT own it on epoll, whose loop is readiness-driven and must do the `recv` itself.** That
+is a plausible mechanism rather than a proven one, and it is written here as a hypothesis, not a result.
+
+**What this does to the inbound half-pipe:** the case SURVIVES but narrows. io_uring is the auto-detected
+default on Linux, so the ~4.5% at 512 B is on the default path — but it is one backend at one payload
+size, not a general bridge win, and epoll would gain nothing. Anyone costing that work should use ~4% at
+the smallest payload on io_uring only.
+
+**And the OTHER unexplained epoll result now has company.** epoll pays a 40.3% bridge cost at 256 KB
+against io_uring's 23.9%, at equal copy counts, while being the FASTER backend bare (12,971 vs 10,352).
+That has been unexplained since 2026-07-31. Now a second, independent measurement says epoll pays
+something at the bridge boundary that io_uring does not, and neither is copies and neither is scheduling.
+The remaining named suspect is the per-flush marshalling/wake shape (epoll's `SubmitFlush` enqueues a
+`byte[]` and pokes an eventfd; io_uring enqueues an `OutChain` and pokes an eventfd). **Two independent
+symptoms with one unexplained cause is the most concrete open question on the Linux bridge path.**
+
+Consistent across BOTH backends, and therefore the one safe generalisation here: **`inline-both` is worse
+than either knob alone at every size on both** (io_uring −4.0/−4.4/−2.8/−0.2%; epoll −7.3/−6.5/−8.7/+0.6%
+against `off`), and **`inline` (outbound) is mildly POSITIVE at every size on both** (io_uring
++1.8/+1.7/+2.5/+0.6%; epoll +0.8/+1.9/+0.6/+1.1%) — so the recorded −28% for `inline` fails to reproduce
+on two backends, not one.
+
 ### Stability soak (2026-08-01, before switching OS)
 
 `bench/run-smoke-matrix.sh` with `CHURN_REPS=15` (vs the usual 5): **60/60 cells PASS, every churn cell
