@@ -295,6 +295,70 @@ proxy gets by construction, and now measured at ~4% on io_uring ONLY — see the
 "beat Kestrel" as a scoreboard; and RIO performance work. **What it does NOT demote:** the Windows
 CORRECTNESS gates, which are now more important, not less.
 
+## THE RESP PROXY WORK — STATE, AND THE LEVEL-2 CLIENT (2026-08-02; READ IF THE SESSION DIED)
+
+**Where it lives.** `StackExchange/StackExchange.Redis`, branch **`marc/proxy-socketset`** (pushed),
+based on `marc/proxy-spike2`. Three files under `toys/RESPite.Proxy/`: `SocketSetProxyServer.cs` (new),
+`Program.cs` (transport switch + banner), `RESPite.Proxy.csproj` (conditional ProjectReference to a
+SIBLING SocketSet checkout at `../../../SocketSet`, guarded by `Exists()` so CI without it still builds).
+Nothing outside `toys/` is touched; the full solution builds.
+
+**Rigs in THIS repo:** `bench/verify-proxy.cs` (correctness gate, `dotnet run --file` — plain
+`dotnet run <file>` from inside another repo resolves THAT repo's project and fails confusingly),
+`bench/run-proxy-ab.sh` (the A/B, incl. Envoy), `bench/envoy-redis.yaml`. Tools fetched into
+`bench/.tools/`: `redis-benchmark` (built from source, no sudo), `envoy` (static binary, no sudo).
+Backend is `garnet-server` (a dotnet tool, multi-threaded — chosen because single-threaded Redis would
+saturate one core and make every proxy leg report the same number).
+
+**What is measured (full tables in `AspNetDemo/RESULTS.md`):** vs the hand-rolled SAEA `WorkerPool` we
+are +15-28% at both depths. **vs ENVOY we LOSE ~2x at `-P 1` and WIN ~1.5x at `-P 16`.** The
+`% of ceiling` column localises it: Envoy is at 90% of the no-proxy ceiling unpipelined (we are at 46%),
+and drops to 23% pipelined (we reach 35%). **Our per-request overhead is poor; our parse throughput is
+good.** The SAEA path shows the same shape, so both halves belong to the .NET path, not to SocketSet.
+
+### LEVEL 2 — the next piece of work, and it is aimed at a measured defect
+
+**Definition.** Level 1 (built) bridges SocketSet through `PipeIoBridge` into two `Pipe`s, into
+`PipeProxyClient`, which reads via `pipeReader.AsStream()`. Per request that is: a pipe write, a
+ThreadPool hop to wake the reader, a `Stream` wrapper, the reply into a second pipe, another hop, and a
+pump task. **Level 2 replaces all of it**: frame with `RespReader` directly off the span
+`OnReceive(ref ReceiveContext ctx)` hands you ON THE LOOP THREAD, and reply via `Connection.Send`. No
+pipe, no pump, no hop, no stream. That is the shape SocketSet was designed for, and it is legal here —
+unlike in Kestrel — because we own the handler and RESP framing is bounded, non-blocking work.
+
+**Why it is not speculative:** it attacks precisely the per-request cost that `-P 1` isolates, which is
+where we lose to Envoy. `level2 - level1` is also the pipe-bridge tax measured somewhere nobody can blame
+Kestrel for it.
+
+**The structure already exists to copy.** `SocketProxyClient` (the hand-rolled leg) is ALREADY a push
+model — `WorkerSocketAsyncEventArgs` callbacks plus `ICycleBufferCallback` — rather than the pull model
+`PipeProxyClient` uses. So level 2 is "drive that same push structure from `OnReceive` instead of from
+SAEA completions", not a new framing engine.
+
+**Four hazards, each with an existing guard:**
+1. **Partial frames** — a command can span reads; bytes must carry over between callbacks. RESPite's
+   `CycleBuffer` is built for exactly this. **Use RESPite's real one** (the proxy already references
+   RESPite), NOT SocketSet's `vendor/` copy — that copy exists only so SocketSet's own half-pipe can work
+   standalone, and it is currently byte-identical, which is worth keeping true.
+2. **`ctx.Payload` is transport-owned** and valid only for the callback. Anything retained must be copied.
+3. **Reply ordering.** Locally-answered commands (PING/SELECT/ECHO) must sequence BEHIND in-flight
+   upstream replies or they land in the wrong slot. The proxy already fixed the general form of this
+   (`dbd4ad4d`, "fix local responses being out-of-band"), and `verify-proxy.cs`'s **mixed-pipeline** cell
+   is the standing guard. This is also why the transport's instant-reply path (`SendBuffer`/`SendBytes`)
+   is only safe when the connection has NO queued work.
+4. **Never block the loop thread on upstream I/O.** Clients are round-robined onto 5 STICKY upstream legs,
+   so one stall blocks that leg's whole cohort. Thread-theft is gone (we own the handler); self-inflicted
+   head-of-line blocking is not. Expect it to show in p99 before throughput.
+
+**Measurement plan when it exists:** re-run `bench/run-proxy-ab.sh` with a `socketset-l2` leg. **Get more
+client capacity first** for the `-P 1` half — Envoy currently sits at 90% of a client-limited ceiling
+there, so that gap is a FLOOR and we could otherwise "improve" into a ceiling we cannot see past and not
+know whether we closed the gap or just hit the generator.
+
+**Known gap, unrelated but found here:** the proxy does not accept INLINE commands (`redis-benchmark -t
+ping` sends literal `PING\r\n`; `RespReader` rejects the `P`). Redis and Garnet accept them. Decision
+taken: leave inline on the backlog, but a fault must FAIL LOUDLY rather than hang — that is now fixed.
+
 ## READ FIRST IF YOU ARE ON LINUX (2026-08-01 addendum — SHARED CODE CHANGED UNDER YOU AGAIN)
 
 > **Written at the end of the 2026-08-01 Windows session. Linux has not run since 2026-08-01 morning and
