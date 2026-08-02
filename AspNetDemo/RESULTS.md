@@ -109,6 +109,51 @@ Fixed by moving the base below the ephemeral range, randomising it per run, warn
 retrying once on a clear port. **The results above survive it** — every cell kept 5-6 scored passes
 against a floor of 3, and a NOSTART yields no number, so it cannot shift the values that were recorded.
 
+### The read-side thread hop on Linux/io_uring: CONFIRMED per-request, and it retires two other claims (2026-08-02)
+
+`bench/run-pipesched.sh` (new; the Linux port of `Run-PipeSched.ps1`), io_uring, `--byo`, 12 shards, c64,
+6 scored passes, mode order reshuffled every pass, **vanilla Kestrel control in the same passes**,
+governor=`performance`. Gate: `off` is refused unless the banner LACKS `pipesched=`, so a leaked env var
+cannot silently make `off` be `inline-both`.
+
+| payload | `off` vs kestrel | `inline-read` vs kestrel | `inline` vs kestrel | `inline-both` vs kestrel |
+|---|---|---|---|---|
+| 512 B | −5.5% *disjoint* | **−1.2% — PARITY** | −3.8% *disjoint* | −9.3% *disjoint* |
+| 4 KB | −3.5% *disjoint* | −2.8% overlapping | −1.8% *disjoint* | −7.7% *disjoint* |
+| 16 KB | −5.5% *disjoint* | −7.0% *disjoint* | −3.2% *disjoint* | −8.2% *disjoint* |
+| 256 KB | **+1.8% AHEAD** *disjoint* | +1.7% parity | +2.4% parity | +1.6% ahead *disjoint* |
+
+**THE PRE-REGISTERED PREDICTION HELD.** The read hop is a per-REQUEST cost, so the gain had to be largest
+where request rate is highest and had to vanish at large payloads; growth WITH payload would have
+falsified it. `inline-read`'s gain over `off` runs **+4.5% → +0.7% → −1.5% → −0.1%** across
+512 B / 4 KB / 16 KB / 256 KB — monotonic to nothing. At 512 B it converts a disjoint −5.5% deficit into
+statistical parity with Kestrel. **This replicates the Windows finding on a different OS and a different
+backend**, which is much stronger than either result alone: the small-payload deficit to Kestrel is the
+read-side thread hop, and the case for an inbound half-pipe now rests on two independent measurements.
+
+Calibrate it honestly: the Linux effect is NARROWER than the Windows one. Windows reached parity at 512 B
+AND 4 KB and went disjointly AHEAD at 16 KB; Linux/io_uring reaches parity at 512 B only, and 4 KB
+"overlaps" on a wide range (2366-2559) rather than convincingly. The ceiling here is ~4% at the smallest
+payload, not 2-4% across the small range.
+
+**RETRACTION CANDIDATE: the recorded `inline` −28% does not reproduce at any size.** That figure
+(2026-07-31) reads in `TODO.md` as having "killed the pump-hop hypothesis" and is load-bearing for
+treating the OUTBOUND hop as settled. Measured now, `inline` is **positive at every payload** — +1.8% /
++1.7% / +2.5% / +0.6% over `off`, disjoint at 16 KB. The conditions differed (pre-flush-fix, and before
+the pinned-pool default landed), so this does not prove the old number wrong — but **it cannot be quoted
+as current**, and "the outbound hop costs you" is now the better-supported reading on today's defaults.
+
+**NEW, and it constrains the half-pipe design: `inline-both` is worse than EITHER knob alone**, at every
+size — −4.0% / −4.4% / −2.8% / −0.2% against `off`, disjoint at three of four. Two individually-positive
+changes composing into a net loss is an interaction, not noise: both readers resume on the io_uring loop
+thread and serialise against each other. So "move work off the ThreadPool" is not monotonically good; the
+loop thread is a shared resource with its own contention, and a design that inlines both directions is
+worse than one that inlines neither.
+
+**Also worth recording: at 256 KB we are DISJOINTLY AHEAD of Kestrel** (`off` 12,831-13,013 vs Kestrel
+12,237-12,796) and the scheduler knob does nothing there — every mode is within noise of every other. The
+knob's entire effect lives at small payloads, which is the same null the Windows run reported at 256 KB.
+
 ### Stability soak (2026-08-01, before switching OS)
 
 `bench/run-smoke-matrix.sh` with `CHURN_REPS=15` (vs the usual 5): **60/60 cells PASS, every churn cell

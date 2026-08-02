@@ -294,9 +294,18 @@ then decide. Do not merge it as-is.
 > **3. `SS_PIPE_SCHED` gained `inline-read` / `inline-both`** (the INBOUND reader; the old `inline` only
 > ever moved the outbound one). Off by default, reported in `/config` as `pipesched=`. On Windows this
 > found that **the ~3% small-payload deficit to vanilla Kestrel IS the thread hops** — see item 9 and
-> RESULTS. **Re-running `bench/Run-PipeSched.ps1`'s equivalent on io_uring/epoll is high value**, because
-> the old Linux `inline` result (−28%) measured the *other* half and reads as though the question were
-> settled. It is not.
+> RESULTS. ~~**Re-running `bench/Run-PipeSched.ps1`'s equivalent on io_uring/epoll is high value**~~
+> **DONE 2026-08-02 on io_uring** (`bench/run-pipesched.sh`, new): **the prediction HELD and the Windows
+> finding REPLICATED.** `inline-read`'s gain over `off` is +4.5% / +0.7% / −1.5% / −0.1% at
+> 512 B / 4 KB / 16 KB / 256 KB — monotonic to nothing, i.e. per-REQUEST exactly as registered — and at
+> 512 B it converts a disjoint −5.5% deficit into PARITY with Kestrel. Narrower than Windows (parity at
+> 512 B only, not through 16 KB), so the Linux ceiling is ~4% at the smallest payload.
+> **Two claims fell out, both recorded in RESULTS:** (a) the old Linux `inline` **−28% does NOT reproduce
+> at any size** — it is positive throughout on today's defaults, so it can no longer be quoted as current;
+> (b) **`inline-both` is worse than either knob alone at every size**, because both readers serialise on
+> the io_uring loop thread — so "off the ThreadPool" is not monotonically good.
+> **STILL TO DO: the same run on epoll.** io_uring and epoll have different loop models and epoll is the
+> backend that reaches `OutboundConnection`, so it is not safe to read this across.
 >
 > **Also still open from the morning:** `Verify-AspNet.ps1` has no Linux equivalent, so the
 > `SocketSet.AspNetCore` extraction is runtime-verified on IOCP/RIO/managed but NOT on io_uring/epoll.
