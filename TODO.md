@@ -441,6 +441,9 @@ regresses, the batching is wrong; if depth does not recover, the collapse is not
 
 ### GARNET AS THE FOURTH CONSUMER — BUILT, GATED 13/13 BOTH LEGS, AND MEASURED (2026-08-02, same day)
 
+**TLS A/B DONE TOO (same day): in-transport OpenSSL beats Garnet's SslStream path in ALL FOUR cells,
+disjoint — +9.5% to +24.2%, p99 halved-to-thirded; TLS costs ours ~17% off plaintext vs stock's ~27%.**
+The HTTP-era TLS advantage transfers to small-record RESP. Full table in RESULTS.
 **Done: `src/SocketSet.Garnet` + `GarnetDemo` (with `--stock` for the one-flag A/B). Result:
 parity-to-ahead on day one — never behind on throughput, +7.7% DISJOINT on `-P 16` SET, and p99 LOWER in
 every cell (depth-SET tail nearly halved) — despite a v1 extra receive copy.** Full table in RESULTS.

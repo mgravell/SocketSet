@@ -5,14 +5,20 @@
 //   --stock hosts Garnet's OWN GarnetServerTcp instead (the SAEA layer) on the same options, so a
 //   stock-vs-socketset A/B is one flag on one binary — the application-held-constant discipline again.
 using System.Net;
+using System.Security.Cryptography.X509Certificates;
 using Garnet;
 using Garnet.server;
+using Garnet.server.TLS;
 using SocketSets;
 using SocketSets.Garnet;
 
 int port = 6390, shards = 8;
 string backend = "io-uring";
-bool stock = false;
+bool stock = false, tls = false;
+// Both legs use the SAME key material (bench/.tools/tls-demo): stock consumes the pfx via Garnet's
+// SslStream-based path, ours consumes the pem pair in-transport. Identical cert = identical handshake
+// work, so a TLS A/B compares the STACKS, not the certificates.
+string tlsDir = "/home/marc/code/SocketSet/bench/.tools/tls-demo";
 for (int i = 0; i < args.Length; i++)
 {
     switch (args[i])
@@ -21,12 +27,22 @@ for (int i = 0; i < args.Length; i++)
         case "--shards" when i + 1 < args.Length && int.TryParse(args[i + 1], out var s): shards = s; i++; break;
         case "--backend" when i + 1 < args.Length: backend = args[++i]; break;
         case "--stock": stock = true; break;
+        case "--tls": tls = true; break;
+        case "--tls-dir" when i + 1 < args.Length: tlsDir = args[++i]; break;
         default: Console.Error.WriteLine($"unknown argument: {args[i]}"); return 1;
     }
 }
 
 var endpoint = new IPEndPoint(IPAddress.Loopback, port);
 var garnetOpts = new GarnetServerOptions { EndPoints = [endpoint] };
+if (tls && stock)
+{
+    garnetOpts.TlsOptions = new GarnetTlsOptions(
+        certFileName: Path.Combine(tlsDir, "cert.pfx"), certPassword: "",
+        clientCertificateRequired: false, certificateRevocationCheckMode: X509RevocationMode.NoCheck,
+        issuerCertificatePath: null, certSubjectName: null, certificateRefreshFrequency: 0,
+        enableCluster: false, clientTargetHost: null);
+}
 
 IGarnetServer[]? servers = null;
 if (!stock)
@@ -38,14 +54,24 @@ if (!stock)
         "managed" => SocketSetFactory.Managed,
         _ => throw new ArgumentException($"unknown backend '{backend}'"),
     };
-    servers = [new SocketSetGarnetServer(endpoint, new SocketSetOptions { Factory = factory, Shards = shards })];
+    var ssOptions = new SocketSetOptions { Factory = factory, Shards = shards };
+    if (tls)
+    {
+        // In-transport TLS: the handler and Garnet's whole session stack see plaintext, and Garnet's own
+        // TLS machinery stays idle -- which is what makes the A/B purely their-TLS-vs-ours.
+        ssOptions.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(
+            File.ReadAllText(Path.Combine(tlsDir, "cert.pem")),
+            File.ReadAllText(Path.Combine(tlsDir, "key.pem")));
+    }
+    servers = [new SocketSetGarnetServer(endpoint, ssOptions)];
 }
 
 using var server = new GarnetServer(garnetOpts, loggerFactory: null, servers: servers);
 server.Start();
 
 // TRUST THE BANNER: the rigs gate on this line, not on the flags they passed.
-Console.WriteLine($"[garnet-demo] transport={(stock ? "garnet-saea" : $"socketset/{backend} shards={shards}")} port={port}");
+Console.WriteLine($"[garnet-demo] transport={(stock ? "garnet-saea" : $"socketset/{backend} shards={shards}")} " +
+                  $"tls={(tls ? (stock ? "sslstream" : "openssl") : "off")} port={port}");
 Console.WriteLine("ready");
 Thread.Sleep(Timeout.Infinite);
 return 0;

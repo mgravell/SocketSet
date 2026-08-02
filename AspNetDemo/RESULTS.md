@@ -69,6 +69,31 @@ nearly halved) — from a v1 that still pays an extra receive copy the SAEA path
 receives directly into the handler buffer; we copy from the transport-owned span). The copy is the known
 first lever if this ever needs more; the tails suggest the loop-thread model is already paying for it.
 
+### GARNET TLS A/B (2026-08-02, info-grade): in-transport OpenSSL beats SslStream in ALL FOUR cells, disjoint
+
+The differential the plaintext A/B could not show. Same shared cert (pfx for stock, PEM for ours —
+identical key material, so the comparison is stacks not certificates), interleaved, banner-gated
+(`tls=sslstream` vs `tls=openssl`), 5 passes, TLS-capable `redis-benchmark` (fork build against a
+user-prefix OpenSSL 3.5.4 — no system ssl headers on this box).
+
+| cell | SslStream | in-transport OpenSSL | Δ | p99 |
+|---|---:|---:|---:|---|
+| `-P 1` GET | 397,772 · 0.439 | **444,247 · 0.247** | **+11.7% DISJOINT** | −44% |
+| `-P 1` SET | 377,858 · 0.663 | **443,115 · 0.239** | **+17.3% DISJOINT** | −64% |
+| `-P 16` GET | 5,213,764 · 0.687 | **5,707,762 · 0.319** | **+9.5% DISJOINT** | −54% |
+| `-P 16` SET | 3,557,453 · 0.967 | **4,417,937 · 0.583** | **+24.2% DISJOINT** | −40% |
+
+**The HTTP-era precedent (+13-35% over `SslStream`) TRANSFERS to the small-record RESP regime** at
++9.5-24.2%, every cell disjoint, tails halved-to-thirded. The relative framing is the sharp one: TLS
+costs stock ~27% off its own plaintext; it costs ours ~17% — the OpenSSL leg runs at ~83% of our
+plaintext numbers. Structurally this is the purest venue the claim has ever had: Garnet's TLS machinery
+is IDLE by construction on our leg (the transport hands the session plaintext), so nothing differs but
+the TLS stack.
+
+**Info-grade caveats, pre-stated:** no kTLS leg (loopback cannot show its NIC half and the record-path
+cost would misrepresent it — the lab question stands); one cert, one negotiated suite (TLS 1.3 both);
+handshake/churn cost out of scope (keep-alive throughout, the repo's standing gap).
+
 ### THE UDS SIDECAR HOP: +30% THROUGHPUT AND NEARLY HALF THE TAIL vs the TCP hop (2026-08-02 evening)
 
 Marc's premise — a proxy hosted on a Unix socket is the SIDECAR deployment shape, and the local hop
