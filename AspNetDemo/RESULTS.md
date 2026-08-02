@@ -49,7 +49,30 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
-### LEVEL 3 (shard-affine upstream legs): ENVOY PARITY at `-P 1` — and a pre-registered COLLAPSE at `-P 16` (2026-08-02, definitive)
+### FINAL (2026-08-02): ONE configuration — Envoy PARITY unpipelined, 2.7x Envoy pipelined, CONFIRMED
+
+The capstone, 5 passes, pinned, quantisation audit flagging only ceiling-pegged cells. The configuration
+is L3 (shard-affine upstream legs) + CALLBACK-GRANULARITY FLUSHING (stage during the receive callback,
+one flush per registrant on the way out — the same event-loop-iteration batching Envoy does; both halves
+of its pre-registration held: `-P 1` unmoved, depth recovered and then some):
+
+| depth | test | envoy | socketset L3+deferred | verdict |
+|---|---|---:|---:|---|
+| `-P 1` | GET | 451,584 (444,416-466,636) | **451,584** (444,416-451,584) | identical medians — PARITY |
+| `-P 1` | SET | 451,584 (437,445-458,986) | 437,473 (430,743-444,416) | overlapping — parity |
+| `-P 16` | GET | 1,599,502 (1,599,289-1,608,435) | **4,430,496** (4,430,496-4,499,719) | **2.77x, DISJOINT** |
+| `-P 16` | SET | 1,531,361 (1,515,183-1,539,547) | **4,055,881** (3,999,556-4,113,815) | **2.65x, DISJOINT — 83% of the NO-PROXY ceiling** |
+
+L1 (the pipe bridge) for scale: 243,453 / 2,482,245 GET at the two depths. The full arc in one line:
+**vs Envoy at `-P 1`, −48% → −22% → parity; at `-P 16`, +49% → −29% (the collapse) → +177%.**
+
+Standing caveats, unchanged: the `-P 1` cells are CLIENT-LIMITED (both proxies at ~90% of the generator's
+ceiling), so "at least parity" is the strongest supportable claim there and separation needs more client
+capacity; Envoy 1.39.0 is RESP2-only as shipped (`protocol_version` is 1.40-track), so it never pays the
+RESP3 prefix space `RespReader` scans; and the p99 TAIL question is still open — the depth win is
+throughput-shaped, and a client library cares about the other end of the distribution.
+
+### LEVEL 3 (shard-affine upstream legs): ENVOY PARITY at `-P 1` — and a pre-registered COLLAPSE at `-P 16` (2026-08-02, superseded by FINAL above)
 
 One upstream leg PER SHARD, placed on that shard (`SocketSet.ConnectShard`, new), each client routed to
 the leg sharing its loop thread (`SocketSetShard.CurrentShardIndex`, new; captured in `OnAccept`, which
