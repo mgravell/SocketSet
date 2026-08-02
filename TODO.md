@@ -388,10 +388,14 @@ downstream-socket → kTLS-upstream-socket without entering userspace, kernel-en
 userspace TLS stack can do that. Unbuilt, unmeasured, and the framing/streaming complexity is real — but
 it is the kind of mechanism that makes the lab session worth scheduling.
 
-**Integration scoping item, check before any of the above:** can ONE SocketSet instance carry plaintext
-DOWNSTREAM accepts and TLS UPSTREAM connects? `TlsProvider` hangs off the options today; the client half
-exists (`SmokeTest --resp --tls-trust` connects TLS out), but per-connection asymmetry on a single
-instance may need an API knob. Scope it first; it may be the actual blocker.
+**Integration scoping item — SCOPED 2026-08-02, and it is small:** TLS engages at exactly two sites per
+backend (`opts.Tls is not null` at the accept path → `CreateServerFilter`, and at the connect path →
+`CreateClientFilter`; see `IoUringShard.StartTls` and its callers at accept/connect). So the right knob is
+**per-DIRECTION, not per-connection**: a `TlsMode { Accept, Connect, Both }` (default `Both`) on
+`SocketSetOptions`, gating each site. That covers BOTH proxy shapes — TLS-terminating (TLS accepts +
+plaintext connects) and TLS-originating (plaintext accepts + TLS connects) — with ~5 backends x 2 sites
+of mechanical change and no behavioural change at the default. Not built; build it when the TLS upstream
+A/B is next.
 
 ### PROXY CORRECTNESS: HELLO must be intercepted, never forwarded (found 2026-08-02, empirically)
 
@@ -449,6 +453,32 @@ that is FAIR TO US to state: per Marc (client libraries team at Redis), real cli
 the path. A micro-benchmark over representative RESP frames (mixed inline-array commands, varied bulk
 sizes, the multi-segment boundary case) is the right instrument, with the proxy A/B only as confirmation
 that a micro win survives integration. `experiments/BufferBench` is the precedent for that shape.
+
+## API-SURFACE FREEZE PROPOSAL (drafted 2026-08-02; decide BEFORE SE.Redis takes the dependency)
+
+`AGENTS.md`'s "public API and defaults can change freely" expires the moment SE.Redis references this.
+Proposal, based on what the proxy integration ACTUALLY consumed — which is a good proxy (sorry) for what
+SE.Redis client mode will consume:
+
+**Freeze candidates (the surface the level-2/3 work used, all of it):**
+- `SocketSet`: `Listen`, `Connect`, `ConnectShard`, `Dispose`; the callback set `OnAccept` / `OnConnect` /
+  `OnReceive` / `OnClosed` and their contexts (`ReceiveContext.Payload` span semantics — transport-owned,
+  callback-scoped — are a CONTRACT, not an implementation detail).
+- `Connection`: `Send(span/sequence)`, the `IBufferWriter` surface (`GetSpan`/`GetMemory`/`Advance`/
+  `Flush`) **with the single-writer-until-Flush rule stated in doc-comments as normative**, `Close()`
+  (documented abortive), `UserToken`.
+- `SocketSetShard.CurrentShardIndex` (with its -1-off-loop semantics).
+- `SocketSetOptions`: `Factory`, `Shards`, `Tls`/`TlsClient`/`TlsServer`, `PinWorkerThreads` — plus
+  `TlsMode` when built.
+
+**Stays experimental (mark or hide):** `UsePipe`/the pipe bridge (ASP.NET-specific; level 2 proved the
+callback path is the product), buffer-geometry knobs (`BufferPageSize` etc — backend-chooses sentinels are
+still evolving), every `SS_*` env var (rig instrumentation, never API), `SendBuffer`/`SendBytes`
+instant-reply (correct only with an empty queue; the proxy deliberately does not use it).
+
+**Process:** on the first SE.Redis `ProjectReference`, changes to the freeze list get a deprecation note
+in TODO rather than silent change; everything else stays pre-alpha. Revisit the list when the client-mode
+prototype (single-connection rig) has run — it may consume surface the proxy did not.
 
 ## READ FIRST IF YOU ARE ON LINUX (2026-08-01 addendum — SHARED CODE CHANGED UNDER YOU AGAIN)
 

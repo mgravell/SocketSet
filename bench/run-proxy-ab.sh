@@ -71,11 +71,13 @@ command -v taskset >/dev/null || { echo "missing taskset"; exit 1; }
 
 # Three-way split by physical core. lscpu -p gives CPU,CORE; take the cores in thirds and hand each third
 # every logical CPU belonging to it.
-read -r CLIENT_CPUS PROXY_CPUS SERVER_CPUS <<<"$(lscpu -p=CPU,CORE | grep -v '^#' | awk -F, '
+CORES=${CORES:-}   # "client:proxy:server" PHYSICAL core counts, e.g. CORES=6:3:3 on a 12-core box
+read -r CLIENT_CPUS PROXY_CPUS SERVER_CPUS <<<"$(lscpu -p=CPU,CORE | grep -v '^#' | awk -F, -v spec="$CORES" '
   { cpu[NR]=$1; core[NR]=$2; if (!($2 in seen)) { seen[$2]=1; order[++n]=$2 } }
   END {
-    third = int(n/3); if (third < 1) third = 1
-    for (i=1;i<=n;i++) { c=order[i]; grp[c] = (i<=third) ? 1 : (i<=2*third ? 2 : 3) }
+    if (spec != "") { split(spec, w, ":"); c1=w[1]+0; c2=w[2]+0 } else { c1=int(n/3); c2=int(n/3) }
+    if (c1<1) c1=1; if (c2<1) c2=1
+    for (i=1;i<=n;i++) { c=order[i]; grp[c] = (i<=c1) ? 1 : (i<=c1+c2 ? 2 : 3) }
     for (i=1;i<=NR;i++) { g=grp[core[i]]; s[g] = (s[g]=="" ? cpu[i] : s[g] "," cpu[i]) }
     print s[1], s[2], s[3]
   }')"
@@ -85,7 +87,7 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 OUT="$REPO/bench/results/proxy-ab-$STAMP"
 mkdir -p "$OUT"
 CSV="$OUT/results.csv"
-echo "depth,leg,rep,test,rps,p50_ms,status" > "$CSV"
+echo "depth,leg,rep,test,rps,p50_ms,p95_ms,p99_ms,max_ms,status" > "$CSV"
 
 echo "proxy transport A/B -- $(wc -w <<<"$LEGS") legs x $(wc -w <<<"$DEPTHS") depths x $REPS passes"
 echo "  governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)/$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
@@ -183,7 +185,7 @@ measure() { # $1=leg $2=depth $3=rep
   [[ "$leg" == "direct" ]] && port="$BACKEND_PORT"
   [[ "$leg" == "envoy" ]] && port="$ENVOY_PORT"
   if ! start_proxy "$leg"; then
-    echo "$depth,$leg,$rep,,,,STARTFAIL" >>"$CSV"; return
+    echo "$depth,$leg,$rep,,,,,,,STARTFAIL" >>"$CSV"; return
   fi
   local csv
   # Pipelining multiplies achievable rate roughly with depth, so scale the request count with it or the
@@ -195,13 +197,16 @@ measure() { # $1=leg $2=depth $3=rep
   while IFS= read -r line; do
     [[ "$line" == '"test"'* ]] && continue
     [[ -z "$line" ]] && continue
-    local t r p50
+    local t r p50 p95 p99 pmax
     t=$(cut -d, -f1 <<<"$line" | tr -d '"')
     r=$(cut -d, -f2 <<<"$line" | tr -d '"')
     p50=$(cut -d, -f5 <<<"$line" | tr -d '"')
+    p95=$(cut -d, -f6 <<<"$line" | tr -d '"')
+    p99=$(cut -d, -f7 <<<"$line" | tr -d '"')
+    pmax=$(cut -d, -f8 <<<"$line" | tr -d '"')
     [[ -z "$r" ]] && continue
-    echo "$depth,$leg,$rep,$t,$r,$p50,OK" >>"$CSV"
-    printf '    %-20s %-4s %12.0f ops/s  p50 %sms\n' "$leg" "$t" "$r" "$p50"
+    echo "$depth,$leg,$rep,$t,$r,$p50,$p95,$p99,$pmax,OK" >>"$CSV"
+    printf '    %-20s %-4s %12.0f ops/s  p50 %s p99 %s max %sms\n' "$leg" "$t" "$r" "$p50" "$p99" "$pmax"
   done <<<"$csv"
   [[ -n "${PROXY_PID:-}" ]] && { kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null; }
   PROXY_PID=""
@@ -223,7 +228,7 @@ done
 echo
 echo "=== ops/s, $REPS passes, min-max ranges ==="
 awk -F, '
-  NR>1 && $7=="OK" { k=$1 SUBSEP $2 SUBSEP $4; v[k][++n[k]]=$5+0; d[$1]=1; legs[$2]=1; tests[$4]=1
+  NR>1 && $10=="OK" { k=$1 SUBSEP $2 SUBSEP $4; v[k][++n[k]]=$5+0; p99[k][n[k]]=$8+0; d[$1]=1; legs[$2]=1; tests[$4]=1
                      if (!((k SUBSEP $5) in seenval)) { seenval[k SUBSEP $5]=1; distinct[k]++ } }
   function stats(a,c,  i,j,t,tmp){for(i=1;i<=c;i++)tmp[i]=a[i];for(i=1;i<c;i++)for(j=i+1;j<=c;j++)if(tmp[j]<tmp[i]){t=tmp[i];tmp[i]=tmp[j];tmp[j]=t}lo=tmp[1];hi=tmp[c];med=(c%2)?tmp[int(c/2)+1]:(tmp[c/2]+tmp[c/2+1])/2}
   END {
@@ -253,6 +258,21 @@ awk -F, '
         printf "\n"
       }
     }
+    printf "=== TAIL: p99 ms, median (min-max) of scored passes ===\n"
+    for (a=1;a<=nd;a++) { dd=do_[a]
+      for (b=1;b<=nt;b++) { tt=to_[b]
+        printf "--- -P %s  %s ---\n", dd, tt
+        for (c=1;c<=nl;c++) { ll=lo_[c]
+          k=dd SUBSEP ll SUBSEP tt; if (!(k in n)) continue
+          m=n[k]
+          for (i=1;i<=m;i++) tp[i]=p99[k][i]
+          for (i=1;i<m;i++) for (j=i+1;j<=m;j++) if (tp[j]<tp[i]) { tq=tp[i]; tp[i]=tp[j]; tp[j]=tq }
+          tmed=(m%2)?tp[int(m/2)+1]:(tp[m/2]+tp[m/2+1])/2
+          printf "  %-20s p99 %8.3f  (%.3f-%.3f)\n", ll, tmed, tp[1], tp[m]
+        }
+      }
+    }
+    printf "\n"
     # QUANTISATION AUDIT. redis-benchmark resolves elapsed time to ~250 ms, so a short test yields only a
     # handful of possible rps values and every pass snaps to one of them. The min-max range then looks
     # TIGHT -- which reads as reproducibility and is really the opposite: the rig cannot see any variation
