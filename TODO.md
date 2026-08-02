@@ -508,12 +508,14 @@ patched connects and runs (abstract: 680k PING / 515k GET, p50 47µs through the
 TCP-loopback hop — a real UDS-vs-TCP A/B (add a uds leg to `run-proxy-ab.sh`) is now unlocked and also
 retires the ephemeral-port/TIME_WAIT confounder class for local benches.
 
-**BLOCKED ON ONE CLICK: pushing the fork.** `gh repo fork redis/redis` is refused — the redis org is
-under Redis Ltd SAML and the token needs enterprise SSO authorization (the fork API is gated by the
-SOURCE org). Marc: authorize at the link gh printed (`gh repo fork redis/redis --clone=false` will
-re-print it), then `cd ~/code/redis && git remote add fork git@github.com:mgravell/redis.git && git push
-fork marc/uds-abstract-sockets`. Upstream pitch when ready: "support the established @ convention for
-abstract sockets in -s" — small, one function, benefits cli and benchmark alike.
+**BLOCKED ON THE FORK EXISTING.** `gh repo fork redis/redis` is refused (the redis org is SAML-gated and
+the fork API is gated by the SOURCE org) — and per Marc, org-level policy disables tokens, so SSO-
+authorizing the token is NOT a route. **Fork old-school via the GitHub web UI** (his account carries the
+org binding, but a web fork into the personal namespace sidesteps the API gate). Once
+`mgravell/redis` exists: `cd ~/code/redis && git remote add fork git@github.com:mgravell/redis.git &&
+git push fork marc/uds-abstract-sockets` — pushing to the personal fork needs no org SSO. The branch is
+one commit, PR-shaped. Upstream pitch when ready: "support the established @ convention for abstract
+sockets in -s" — small, one function, benefits cli and benchmark alike.
 
 ### BACKLOG: tune the frame scanner (raised by Marc 2026-08-02)
 

@@ -147,6 +147,10 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
     # LEVEL 3: affinity -- one upstream leg PER SHARD, placed ON that shard, clients routed to their own
     # shard's leg. Forward and reply never cross threads: the Envoy architecture on our transport.
     socketset-l3)       args="--transport socketset --backend io-uring --l2 --affinity --shards $SHARDS" ;;
+    # Same config as socketset-l3 but over a Unix socket (pathname / abstract) -- the sidecar hop shape.
+    # Needs BENCH pointed at the patched redis-benchmark for the @abstract leg; pathname works on stock.
+    socketset-l3-uds)   args="--transport socketset --backend io-uring --l2 --affinity --shards $SHARDS --listen-uds /tmp/resp-proxy-ab.sock" ;;
+    socketset-l3-abs)   args="--transport socketset --backend io-uring --l2 --affinity --shards $SHARDS --listen-uds @resp-proxy-ab" ;;
     socketset-l2-epoll) args="--transport socketset --backend epoll --l2 --shards $SHARDS" ;;
     *) echo "unknown leg '$leg'"; return 1 ;;
   esac
@@ -155,9 +159,13 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
   PROXY_PID=$!
   # Wait for it to actually serve, then TRUST THE BANNER: a leg whose transport silently fell back would
   # measure as a perfectly plausible result for the wrong thing.
-  local i
+  local i probe=(-h 127.0.0.1 -p "$PROXY_PORT")
+  case "$leg" in
+    socketset-l3-uds) probe=(-s /tmp/resp-proxy-ab.sock) ;;
+    socketset-l3-abs) probe=(-s @resp-proxy-ab) ;;
+  esac
   for ((i=0;i<60;i++)); do
-    timeout 5 "$BENCH" -h 127.0.0.1 -p "$PROXY_PORT" -n 1 -c 1 -t ping_mbulk --csv >/dev/null 2>&1 && break
+    timeout 5 "$BENCH" "${probe[@]}" -n 1 -c 1 -t ping_mbulk --csv >/dev/null 2>&1 && break
     sleep 0.5
   done
   local banner
@@ -174,6 +182,10 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
                          || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
     socketset-l3)      [[ "$banner" == *"bridge=direct"* && "$banner" == *"upstream=socketset-affine"* ]] \
                          || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
+    socketset-l3-uds)  [[ "$banner" == *"upstream=socketset-affine"* && "$banner" == *"listen=/tmp/resp-proxy-ab.sock"* ]] \
+                         || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
+    socketset-l3-abs)  [[ "$banner" == *"upstream=socketset-affine"* && "$banner" == *"listen=@resp-proxy-ab"* ]] \
+                         || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
     socketset-l2-epoll) [[ "$banner" == *"transport=socketset/epoll"* && "$banner" == *"bridge=direct"* ]] \
                          || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
   esac
@@ -181,9 +193,11 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
 }
 
 measure() { # $1=leg $2=depth $3=rep
-  local leg="$1" depth="$2" rep="$3" port="$PROXY_PORT"
+  local leg="$1" depth="$2" rep="$3" port="$PROXY_PORT" sockarg=""
   [[ "$leg" == "direct" ]] && port="$BACKEND_PORT"
   [[ "$leg" == "envoy" ]] && port="$ENVOY_PORT"
+  [[ "$leg" == "socketset-l3-uds" ]] && sockarg="/tmp/resp-proxy-ab.sock"
+  [[ "$leg" == "socketset-l3-abs" ]] && sockarg="@resp-proxy-ab"
   if ! start_proxy "$leg"; then
     echo "$depth,$leg,$rep,,,,,,,STARTFAIL" >>"$CSV"; return
   fi
@@ -191,7 +205,9 @@ measure() { # $1=leg $2=depth $3=rep
   # Pipelining multiplies achievable rate roughly with depth, so scale the request count with it or the
   # -P 16 legs finish in a fraction of the time and are measured at a coarser effective resolution.
   local nreq=$(( REQUESTS * depth ))
-  csv=$(taskset -c "$CLIENT_CPUS" "$BENCH" -h 127.0.0.1 -p "$port" -c "$CLIENTS" -n "$nreq" \
+  local target=(-h 127.0.0.1 -p "$port")
+  [[ -n "$sockarg" ]] && target=(-s "$sockarg")
+  csv=$(taskset -c "$CLIENT_CPUS" "$BENCH" "${target[@]}" -c "$CLIENTS" -n "$nreq" \
         -d "$DATASIZE" -t "$TESTS" -P "$depth" --threads 6 --csv 2>/dev/null)
   # redis-benchmark --csv: "test","rps","avg","min","p50","p95","p99","max"
   while IFS= read -r line; do
