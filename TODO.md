@@ -245,8 +245,8 @@ then decide. Do not merge it as-is.
 **Read this before planning work.** It reorders the backlog more than any measurement in this file, and it
 reverses one conclusion reached earlier the same day.
 
-**The context that decides priority:** Marc is *paid* for Redis work. He was on the ASP.NET Core team
-until ~2025 and is not any more. So "can we beat Kestrel" is unfunded, competes with a team he has left,
+**The context that decides priority:** Marc is *paid* for Redis work; he previously worked on ASP.NET
+Core and does not any more. So "can we beat Kestrel" is unfunded, competes with a team he has left,
 and is structurally confounded anyway — the Kestrel bridge costs 24-40%, so every bridged number measures
 the bridge as much as the transport, and the "control" leg is a different APPLICATION path rather than
 just a different transport.
@@ -377,7 +377,7 @@ loopback structurally cannot show `TlsTxDevice` — there is no NIC. A losing kT
 the KNOWN regime, not a finding, and must not be written up as "kTLS is bad". Gate the leg on
 `/proc/net/tls_stat` movement as always.
 
-**What needs the lab (the ex-team's hardware — see the handover-note idea):** whether `TlsTxDevice`
+**What needs a lab (external peers with appropriate hardware — see the handover-note idea):** whether `TlsTxDevice`
 engages on a TLS-offload NIC, and what inline offload does to proxy CPU-per-byte at line rate. That is
 where "Envoy pays AES per forwarded byte on its worker thread; our upstream leg sends at plaintext cost"
 becomes testable. It is also the first scenario where the kTLS investment is visible AT ALL.
@@ -424,7 +424,7 @@ adaptation on a multiplexed leg is the thing nobody has built and the real diffe
 ships, a RESP3-negotiated A/B (`redis-benchmark -3`) is possible — blocked on our fix first. Ours needs
 to intercept HELLO like SELECT: answer locally (RESP2 downstream at minimum, translation later) and keep
 the upstream leg's protocol fixed. `verify-proxy.cs` should gain a HELLO cell once the intended behaviour
-is decided. Relevant context from Marc (client libraries team at Redis): real clients DEFAULT to RESP3
+is decided. Relevant context from Marc (whose day job is Redis client libraries): real clients DEFAULT to RESP3
 now, for smart-handoff and client-side-caching — so "reject HELLO" is a real compatibility cost, and
 handling it properly is a differentiator Envoy has declined to build.
 
@@ -478,9 +478,11 @@ deferred-flush lesson verbatim) and a `GarnetServerBase` subclass for lifecycle.
 IS the TLS experiment: a TLS-enabled Garnet A/B becomes purely their-TLS-vs-ours on identical server
 logic. Gate with `verify-proxy.cs` pointed at it (it is a RESP server) plus Garnet's own tests; A/B via
 `run-proxy-ab.sh`'s `direct` leg pointed at each build.
-**Politics note, stated once:** as a TESTBED this is unimpeachable regardless of destination — whether
-anything is offered upstream to a Microsoft Redis-alternative is Marc's call entirely, given where he
-works.
+**Relationship note (corrected from an earlier over-cautious framing):** Marc has friends and long-time
+peers in this project's community and likes helping them — so upstream contribution here is a POSITIVE
+motivation, not a hazard to manage; any employment nuance is ordinary professional judgment and his to
+exercise. Even short of code landing, the A/B DATA is itself a gift: "here is what your network layer
+costs against a measured alternative, with the rig to reproduce it" is exactly what peers value.
 
 ### UDS / ABSTRACT-SOCKET BENCHMARKING (Marc's item, built 2026-08-02; push blocked on SAML)
 
@@ -525,7 +527,7 @@ this the rare item that pays on both consumers at once, and it is aligned with t
 **Fairness note for any Envoy comparison (empirical, 2026-08-02):** `RespReader` carries the full RESP3
 prefix space on every scan; Envoy cannot even negotiate RESP3 (`HELLO 3` through it gets NO reply, while
 Garnet direct answers a `%8` map). So the parse-cost comparison is structurally tilted toward Envoy, and
-that is FAIR TO US to state: per Marc (client libraries team at Redis), real clients default to RESP3.
+that is FAIR TO US to state: per Marc (whose day job is Redis client libraries), real clients default to RESP3.
 
 **Measure it in isolation first.** The proxy A/B cannot attribute a scanner change: too much else is in
 the path. A micro-benchmark over representative RESP frames (mixed inline-array commands, varied bulk
