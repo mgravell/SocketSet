@@ -472,7 +472,15 @@ full set is `IGarnetServer`, `INetworkHandler`, `INetworkSender`, `IMessageConsu
 `OnAccept` → hold; first `OnReceive` → `TryCreateMessageConsumer(payload, ourSender, out session)`;
 subsequent `OnReceive` → push into the `IMessageConsumer` (the same push shape as `Feed`). Implement
 `INetworkSender` over `Connection` (GetSpan/Advance/Flush, callback-granularity batching — the
-deferred-flush lesson verbatim) and a `GarnetServerBase` subclass for lifecycle. **Their abstract
+deferred-flush lesson verbatim) and a `GarnetServerBase` subclass for lifecycle.
+**PACKAGING (Marc's call, 2026-08-02): an IN-REPO `src/SocketSet.Garnet` library, the
+`SocketSet.AspNetCore` pattern — NOT a spike branch in the garnet checkout.** Verified viable against
+the tree: the embedding ctor is `GarnetServer(GarnetServerOptions, ILoggerFactory, IGarnetServer[]
+servers = null, ...)`, documented "If none is provided, will use a GarnetServerTcp" — custom servers are
+a first-class parameter, so this is a pure `PackageReference` to `Microsoft.Garnet` with no fork of
+their repo. A small demo host (embedded Garnet + our transport) plays the role AspNetDemo plays for
+Kestrel, and the same public interfaces (`IGarnetServer`/`INetworkSender`/`IServerHook`) are the entire
+surface consumed — which also feeds the API-freeze list. **Their abstract
 `NetworkHandler` is NOT needed and is deliberately bypassed** — it is receive-buffer plumbing plus
 `SslStream` TLS, and SocketSet terminates TLS in-transport, handing the consumer plaintext. That bypass
 IS the TLS experiment: a TLS-enabled Garnet A/B becomes purely their-TLS-vs-ours on identical server
