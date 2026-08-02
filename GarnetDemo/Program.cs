@@ -19,6 +19,7 @@ bool stock = false, tls = false;
 // SslStream-based path, ours consumes the pem pair in-transport. Identical cert = identical handshake
 // work, so a TLS A/B compares the STACKS, not the certificates.
 string tlsDir = "/home/marc/code/SocketSet/bench/.tools/tls-demo";
+string? listenUds = null; // /path or @abstract; stock and socketset legs both support either
 for (int i = 0; i < args.Length; i++)
 {
     switch (args[i])
@@ -29,11 +30,30 @@ for (int i = 0; i < args.Length; i++)
         case "--stock": stock = true; break;
         case "--tls": tls = true; break;
         case "--tls-dir" when i + 1 < args.Length: tlsDir = args[++i]; break;
+        case "--listen-uds" when i + 1 < args.Length: listenUds = args[++i]; break;
         default: Console.Error.WriteLine($"unknown argument: {args[i]}"); return 1;
     }
 }
 
-var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+// The abstract form differs per stack: .NET's UnixDomainSocketEndPoint wants a leading NUL byte for the
+// abstract namespace, while SocketSet maps a leading '@' itself. One user-facing spelling (@name), two
+// internal spellings — the kernel-side name is identical, which is what the benchmark dials.
+EndPoint endpoint;
+if (listenUds is null)
+{
+    endpoint = new IPEndPoint(IPAddress.Loopback, port);
+}
+else if (listenUds.StartsWith('@'))
+{
+    endpoint = stock
+        ? new System.Net.Sockets.UnixDomainSocketEndPoint("\0" + listenUds[1..])
+        : new System.Net.Sockets.UnixDomainSocketEndPoint(listenUds);
+}
+else
+{
+    if (File.Exists(listenUds)) File.Delete(listenUds); // stale pathname socket refuses the bind
+    endpoint = new System.Net.Sockets.UnixDomainSocketEndPoint(listenUds);
+}
 var garnetOpts = new GarnetServerOptions { EndPoints = [endpoint] };
 if (tls && stock)
 {
@@ -45,7 +65,17 @@ if (tls && stock)
 }
 
 IGarnetServer[]? servers = null;
-if (!stock)
+if (stock && listenUds is not null)
+{
+    // The embedding path (servers == null) unconditionally File.Delete's opts.UnixSocketPath for UDS
+    // endpoints, which is IMPOSSIBLE for an abstract name (a NUL byte cannot appear in a filesystem
+    // path) -- a small upstream gap: embedded UDS assumes pathname. GarnetServerTcp itself is fine with
+    // an abstract endpoint (it only touches the path for chmod, guarded on a permission being set), so
+    // construct it directly. Pathnames get their stale-file delete above either way.
+    servers = [new GarnetServerTcp(endpoint, 0, tls ? garnetOpts.TlsOptions : null,
+                                   garnetOpts.NetworkSendThrottleMax, garnetOpts.NetworkConnectionLimit)];
+}
+else if (!stock)
 {
     var factory = backend switch
     {
@@ -71,7 +101,8 @@ server.Start();
 
 // TRUST THE BANNER: the rigs gate on this line, not on the flags they passed.
 Console.WriteLine($"[garnet-demo] transport={(stock ? "garnet-saea" : $"socketset/{backend} shards={shards}")} " +
-                  $"tls={(tls ? (stock ? "sslstream" : "openssl") : "off")} port={port}");
+                  $"tls={(tls ? (stock ? "sslstream" : "openssl") : "off")} " +
+                  $"listen={listenUds ?? port.ToString()}");
 Console.WriteLine("ready");
 Thread.Sleep(Timeout.Infinite);
 return 0;

@@ -69,6 +69,29 @@ nearly halved) — from a v1 that still pays an extra receive copy the SAEA path
 receives directly into the handler buffer; we copy from the transport-owned span). The copy is the known
 first lever if this ever needs more; the tails suggest the loop-thread model is already paying for it.
 
+### GARNET OVER ABSTRACT UDS (2026-08-02, last run of the day): the TCP pattern repeats, elevated
+
+Both legs on the IDENTICAL abstract name (`@gd-abs`), plaintext, interleaved, 5 passes. Getting stock
+there needed a workaround worth recording: **Garnet's embedding path (`servers == null`) demands
+`UnixSocketPath` and unconditionally `File.Delete`s it — impossible for an abstract name (NUL byte), so
+embedded-abstract is an upstream gap**; `GarnetServerTcp` itself is abstract-clean (path only used for a
+guarded chmod), so the demo constructs it directly. Also note the spelling split: .NET's
+`UnixDomainSocketEndPoint` wants `"\0name"` for abstract while SocketSet maps `"@name"` itself — same
+kernel name either way, which is what the (patched) benchmark dials.
+
+| cell | SAEA | SocketSet/io_uring | Δ | verdict |
+|---|---:|---:|---:|---|
+| `-P 1` GET | 777,605 · p99 0.143 | 799,726 · p99 **0.111** | +2.8% | overlapping |
+| `-P 1` SET | 717,875 · p99 0.247 | **799,726** · p99 **0.103** | **+11.4%** | **DISJOINT** |
+| `-P 16` GET | 9,227,930 · p99 0.239 | 9,227,930 · p99 **0.167** | 0.0% | IDENTICAL values — generator ceiling (its UDS ceiling is 9.2M vs 7.2M over TCP) |
+| `-P 16` SET | 4,443,128 · p99 0.807 | **4,997,502** · p99 **0.319** | **+12.5%** | **DISJOINT** |
+
+The TCP A/B's shape repeats but stronger: SET now disjointly ahead at BOTH depths (TCP showed it at
+depth only), p99 lower in all four cells (−58%/−60% on the SETs). UDS itself lifted stock +42% and ours
++49% over their own TCP numbers — and **800k `-P 1` ops/s at ~0.10 ms p99 through a full Garnet server on
+an abstract socket is the best small-op figure of the day.** First real load on SocketSet's io_uring UDS
+path (previously smoke-only): clean.
+
 ### GARNET TLS A/B (2026-08-02, info-grade): in-transport OpenSSL beats SslStream in ALL FOUR cells, disjoint
 
 The differential the plaintext A/B could not show. Same shared cert (pfx for stock, PEM for ours —
