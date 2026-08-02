@@ -12,10 +12,12 @@ public abstract class SocketSetShard
     /// thread at <see cref="Run"/> entry. Exists so a callback (OnAccept/OnReceive fire ON the loop
     /// thread for the loop-driven backends) can discover its own shard and keep related work
     /// shard-AFFINE — e.g. a proxy routing a client to an upstream connection on the SAME loop, so
-    /// forward and reply never cross threads. NOTE: callback-driven backends (IOCP) and the managed
-    /// fallback dispatch callbacks from completion/pool threads, not from <see cref="Run"/> — there this
-    /// stays null and <see cref="CurrentShardIndex"/> reports -1, so affinity consumers must treat -1 as
-    /// "no affinity available" rather than an error.</summary>
+    /// forward and reply never cross threads. NOTE: every backend with UsesWorkerThreads (io_uring,
+    /// epoll, IOCP, RIO) dispatches callbacks from its own <see cref="Run"/> loop thread — IOCP dequeues
+    /// completions on that thread via GetQueuedCompletionStatusEx, it is NOT ThreadPool-dispatched (an
+    /// earlier version of this comment claimed otherwise). Only the MANAGED fallback
+    /// (UsesWorkerThreads=false; SAEA completion threads) reports -1 here, and affinity consumers must
+    /// treat -1 as "no affinity available" rather than an error.</summary>
     [ThreadStatic]
     private static SocketSetShard? t_current;
 
