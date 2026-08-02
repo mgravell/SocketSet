@@ -464,10 +464,20 @@ lesson applies verbatim — Garnet replies per command too).
 - Windows matters to Garnet (Microsoft project) — IOCP/RIO become load-bearing, aligned with the
   client-core direction that already re-elevated them.
 
-**Scope sketch:** implement `GarnetServerBase` subclass + `NetworkHandler`/`INetworkSender` pair over
-SocketSet in a spike branch of the garnet checkout (their `Register`/`AddSession` machinery is reused
-untouched, same discipline as `ProxyClient`); gate with our `verify-proxy.cs` pointed at it (it is a
-RESP server) plus Garnet's own test suite; A/B with `run-proxy-ab.sh`'s `direct` leg pointed at each.
+**Scope sketch (refined 2026-08-02 against the tree — do not trust interface names from memory; the
+full set is `IGarnetServer`, `INetworkHandler`, `INetworkSender`, `IMessageConsumer`, `IServerHook`, and
+`INetworkServer` does NOT exist):** the real seam is
+**`IServerHook.TryCreateMessageConsumer(Span<byte> bytesReceived, INetworkSender, out IMessageConsumer)`**
+— it takes the FIRST received bytes because Garnet sniffs the wire format from the opening packet. So:
+`OnAccept` → hold; first `OnReceive` → `TryCreateMessageConsumer(payload, ourSender, out session)`;
+subsequent `OnReceive` → push into the `IMessageConsumer` (the same push shape as `Feed`). Implement
+`INetworkSender` over `Connection` (GetSpan/Advance/Flush, callback-granularity batching — the
+deferred-flush lesson verbatim) and a `GarnetServerBase` subclass for lifecycle. **Their abstract
+`NetworkHandler` is NOT needed and is deliberately bypassed** — it is receive-buffer plumbing plus
+`SslStream` TLS, and SocketSet terminates TLS in-transport, handing the consumer plaintext. That bypass
+IS the TLS experiment: a TLS-enabled Garnet A/B becomes purely their-TLS-vs-ours on identical server
+logic. Gate with `verify-proxy.cs` pointed at it (it is a RESP server) plus Garnet's own tests; A/B via
+`run-proxy-ab.sh`'s `direct` leg pointed at each build.
 **Politics note, stated once:** as a TESTBED this is unimpeachable regardless of destination — whether
 anything is offered upstream to a Microsoft Redis-alternative is Marc's call entirely, given where he
 works.
