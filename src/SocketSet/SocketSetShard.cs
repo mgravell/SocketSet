@@ -8,6 +8,20 @@ namespace SocketSets;
 
 public abstract class SocketSetShard
 {
+    /// <summary>The shard whose loop thread we are currently on, or null off-loop. Set once per worker
+    /// thread at <see cref="Run"/> entry. Exists so a callback (OnAccept/OnReceive fire ON the loop
+    /// thread for the loop-driven backends) can discover its own shard and keep related work
+    /// shard-AFFINE — e.g. a proxy routing a client to an upstream connection on the SAME loop, so
+    /// forward and reply never cross threads. NOTE: callback-driven backends (IOCP) and the managed
+    /// fallback dispatch callbacks from completion/pool threads, not from <see cref="Run"/> — there this
+    /// stays null and <see cref="CurrentShardIndex"/> reports -1, so affinity consumers must treat -1 as
+    /// "no affinity available" rather than an error.</summary>
+    [ThreadStatic]
+    private static SocketSetShard? t_current;
+
+    /// <summary>Index of the shard owning the current thread, or -1 when not on a shard loop thread.</summary>
+    public static int CurrentShardIndex => t_current?._shard ?? -1;
+
     private volatile bool _isActive = true;
     private SocketSet _parent = null!; // set via init
     private int _shard;
@@ -77,6 +91,7 @@ public abstract class SocketSetShard
 
     internal void Run()
     {
+        t_current = this; // this thread IS the shard's loop from here on
 #if NET
         // Thread pinning is Linux-only (sched_setaffinity) and lives in the io_uring
         // side of the build; the netfx fallback doesn't pin.

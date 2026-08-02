@@ -142,6 +142,9 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
     # LEVEL 2: RESP framing on the loop thread -- no pipes, no pump, no ThreadPool hop.
     socketset-l2)       args="--transport socketset --backend io-uring --l2 --shards $SHARDS" ;;
     socketset-l2-u2)    args="--transport socketset --backend io-uring --l2 --shards $SHARDS --upstream-connections 2" ;;
+    # LEVEL 3: affinity -- one upstream leg PER SHARD, placed ON that shard, clients routed to their own
+    # shard's leg. Forward and reply never cross threads: the Envoy architecture on our transport.
+    socketset-l3)       args="--transport socketset --backend io-uring --l2 --affinity --shards $SHARDS" ;;
     socketset-l2-epoll) args="--transport socketset --backend epoll --l2 --shards $SHARDS" ;;
     *) echo "unknown leg '$leg'"; return 1 ;;
   esac
@@ -166,6 +169,8 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
     socketset-l2)      [[ "$banner" == *"transport=socketset/io-uring"* && "$banner" == *"bridge=direct"* ]] \
                          || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
     socketset-l2-u2)   [[ "$banner" == *"bridge=direct"* && "$banner" == *"legs=2"* ]] \
+                         || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
+    socketset-l3)      [[ "$banner" == *"bridge=direct"* && "$banner" == *"upstream=socketset-affine"* ]] \
                          || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;
     socketset-l2-epoll) [[ "$banner" == *"transport=socketset/epoll"* && "$banner" == *"bridge=direct"* ]] \
                          || { echo "    BANNER MISMATCH: $banner"; return 1; } ;;

@@ -316,6 +316,25 @@ public abstract partial class SocketSet : IDisposable
         }
     }
 
+    /// <summary>
+    /// <see cref="Connect"/>, but placed on a SPECIFIC shard instead of walking for a free slot. The use
+    /// case is shard-affinity: callback code on a loop thread (see
+    /// <see cref="SocketSetShard.CurrentShardIndex"/>) connecting an outbound peer onto its OWN loop, so
+    /// traffic between the two never crosses threads. Throws if that shard is at capacity — the caller
+    /// asked for a specific placement, so falling back to another shard would silently defeat the point;
+    /// degrade explicitly at the call site instead.
+    /// </summary>
+    public void ConnectShard(int shardIndex, EndPoint endpoint, object? userToken = null)
+    {
+        ValidateEndpoint(endpoint);
+        var arr = _shards;
+        if ((uint)shardIndex >= (uint)arr.Length) throw new ArgumentOutOfRangeException(nameof(shardIndex));
+        var shard = arr[shardIndex];
+        if (!shard.TryReserve())
+            throw new InvalidOperationException($"Shard {shardIndex} is at capacity; cannot place the connection.");
+        shard.Connect(endpoint, userToken);
+    }
+
     public void Connect(EndPoint endpoint, object? userToken = null)
     {
         ValidateEndpoint(endpoint);
