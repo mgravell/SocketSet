@@ -36,7 +36,7 @@ REPS=${REPS:-6}                       # scored passes; pass 1 is NOT discarded h
                                       # its own process and redis-benchmark does its own ramp), but the
                                       # leg ORDER is reshuffled every pass, which is what matters
 DEPTHS=${DEPTHS:-"1 16"}
-LEGS=${LEGS:-"direct worker socketset-iouring socketset-epoll"}
+LEGS=${LEGS:-"direct envoy worker socketset-iouring socketset-epoll"}
 # Requests per test, SCALED BY PIPELINE DEPTH below. This must be large enough that each test runs for
 # ~10s: at -n 50000 and ~200k ops/s a test lasts 0.25s and redis-benchmark reports QUANTISED rps -- the
 # shakeout produced exactly 200000, 100000 and 99800 ops/s, and the same leg read 200k on GET and 99.8k on
@@ -47,12 +47,16 @@ DATASIZE=${DATASIZE:-32}
 TESTS=${TESTS:-get,set}
 BACKEND_PORT=${BACKEND_PORT:-7379}
 PROXY_PORT=${PROXY_PORT:-7380}
+ENVOY_PORT=${ENVOY_PORT:-7381}      # Envoy listens on its own port; its config is bench/envoy-redis.yaml
+ENVOY_ADMIN=${ENVOY_ADMIN:-9901}
 SHARDS=${SHARDS:-8}
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH="$REPO/bench/.tools/redis-benchmark"
 PROXY="${PROXY_EXE:-/home/marc/code/StackExchange.Redis/toys/RESPite.Proxy/bin/Release/net10.0/RESPite.Proxy}"
 GARNET="${GARNET_EXE:-$HOME/.dotnet/tools/garnet-server}"
+ENVOY="${ENVOY_EXE:-$REPO/bench/.tools/envoy}"
+ENVOY_CFG="${ENVOY_CFG:-$REPO/bench/envoy-redis.yaml}"
 
 for f in "$BENCH" "$PROXY" "$GARNET"; do
   [[ -x "$f" ]] || { echo "missing/not executable: $f"; exit 1; }
@@ -108,6 +112,24 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
   local leg="$1" args=""
   case "$leg" in
     direct) PROXY_PID=""; return 0 ;;
+    envoy)
+      # Give Envoy the SAME core budget as our proxy, or this is a core-count comparison wearing a
+      # throughput costume. --concurrency is worker threads; count the logical CPUs in PROXY_CPUS.
+      local nworkers; nworkers=$(tr ',' '\n' <<<"$PROXY_CPUS" | grep -c .)
+      taskset -c "$PROXY_CPUS" "$ENVOY" -c "$ENVOY_CFG" --concurrency "$nworkers" --log-level warn \
+          >"$OUT/proxy-envoy.log" 2>&1 &
+      PROXY_PID=$!
+      local j
+      for ((j=0;j<60;j++)); do
+        timeout 5 "$BENCH" -h 127.0.0.1 -p "$ENVOY_PORT" -n 1 -c 1 -t ping_mbulk --csv >/dev/null 2>&1 && break
+        sleep 0.5
+      done
+      # Envoy prints no banner, so gate on its admin endpoint instead -- the equivalent evidence that it
+      # is really serving rather than merely spawned.
+      local state
+      state=$(timeout 5 curl -s "http://127.0.0.1:$ENVOY_ADMIN/server_info" 2>/dev/null | grep -o '"state": *"[A-Z]*"' | head -1)
+      [[ "$state" == *LIVE* ]] || { echo "    ENVOY NOT LIVE: ${state:-(no admin response)}"; return 1; }
+      return 0 ;;
     worker)             args="--transport worker" ;;
     socketset-iouring)  args="--transport socketset --backend io-uring --shards $SHARDS" ;;
     socketset-epoll)    args="--transport socketset --backend epoll --shards $SHARDS" ;;
@@ -136,6 +158,7 @@ start_proxy() { # $1=leg -> sets PROXY_PID, echoes the banner; empty return mean
 measure() { # $1=leg $2=depth $3=rep
   local leg="$1" depth="$2" rep="$3" port="$PROXY_PORT"
   [[ "$leg" == "direct" ]] && port="$BACKEND_PORT"
+  [[ "$leg" == "envoy" ]] && port="$ENVOY_PORT"
   if ! start_proxy "$leg"; then
     echo "$depth,$leg,$rep,,,,STARTFAIL" >>"$CSV"; return
   fi
@@ -185,7 +208,8 @@ awk -F, '
     for (a=1;a<=nd;a++) { dd=do_[a]
       for (b=1;b<=nt;b++) { tt=to_[b]
         printf "--- -P %s  %s ---\n", dd, tt
-        # direct is a CEILING REFERENCE, not a peer: print it first and label it.
+        # direct is a CEILING REFERENCE, not a peer: print it first and label it. envoy IS a peer -- it is
+        # the external bar that makes this comparison mean something outside this repo.
         kk=dd SUBSEP "direct" SUBSEP tt
         if (kk in n) { stats(v[kk],n[kk]); printf "  %-20s %12.0f  (%.0f-%.0f)   <- CEILING (no proxy; one fewer hop, NOT a peer)\n", "direct", med, lo, hi
                        cmed=med; clo=lo; chi=hi } else cmed=0
@@ -216,8 +240,12 @@ awk -F, '
     bad = 0
     for (k in distinct) {
       split(k, parts, SUBSEP)
-      if (distinct[k] * 2 <= n[k]) {
-        printf "  WARNING -P %-3s %-18s %-4s  only %d distinct value(s) of %d passes -- range is\n", \
+      # n < 3 can never support a range claim at all -- and the naive ratio test PASSES a single-pass cell
+      # (1 distinct > 0.5 of 1), reporting "clean" for a cell that resolved nothing. Caught on the Envoy
+      # shakeout for this very rig. NOTE: no apostrophes in this awk block -- it is single-quoted in shell,
+      # so one silently truncates the program.
+      if (n[k] < 3 || distinct[k] * 2 <= n[k]) {
+        printf "  WARNING -P %-3s %-18s %-4s  %d distinct value(s) of %d passes -- range is\n", \
                parts[1], parts[2], parts[3], distinct[k], n[k]
         printf "           TIMER-QUANTISED, not measured. Do not quote its range or any DISJOINT verdict\n"
         printf "           derived from it; raise -n until each test runs long enough to resolve.\n"

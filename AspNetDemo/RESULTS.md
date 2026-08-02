@@ -49,6 +49,51 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### RESP PROXY vs ENVOY: we LOSE 2x unpipelined and WIN 1.5x pipelined — a crossover, pre-registered (2026-08-02)
+
+**Read this before the SAEA comparison below it.** That section reports beating our own hand-rolled
+transport by 15-28%, which is true and was measured against the wrong bar. Envoy is the bar that travels,
+and against Envoy the answer depends entirely on pipelining depth — which the rig header pre-registered as
+"a win at one depth can be a loss at the other; that would be a finding, not noise". It is the finding.
+
+Envoy 1.39.0 (static binary, `bench/envoy-redis.yaml`, `redis_proxy` filter, catch-all route, MAGLEV,
+`--concurrency` = the same logical-CPU count our proxy gets, pinned to the same cores). Same generator,
+same backend, same 5 passes, same reshuffled leg order. **Envoy passes the identical 12-cell
+`verify-proxy.cs` gate**, including 1 MB values and the interleaved local/forwarded pipeline, so this is
+like-for-like rather than a comparison against something doing less work.
+
+| depth | test | envoy | socketset/io_uring | socketset/epoll | worker-saea |
+|---|---|---:|---:|---:|---:|
+| `-P 1` | GET | **451,613** (90% of ceiling) | 231,374 **−48.8%** | 227,620 −49.6% | 195,771 −56.7% |
+| `-P 1` | SET | **451,584** (92%) | 227,613 **−49.6%** | 223,971 −50.4% | 202,869 −55.1% |
+| `-P 16` | GET | 1,635,732 (23%) | 2,419,762 **+47.9%** | **2,440,182 +49.2%** | 1,932,419 +18.1% |
+| `-P 16` | SET | 1,523,262 (33%) | 2,303,558 **+51.2%** | 2,303,632 +51.2% | 1,985,659 +30.4% |
+
+**THE MECHANISM IS LEGIBLE FROM THE "% OF CEILING" COLUMN, which is why that column exists.** At `-P 1`
+every command is its own round trip, so PER-REQUEST cost dominates: Envoy runs at 90-92% of the no-proxy
+ceiling; we run at 46%. At `-P 16` many commands arrive per read, so PER-BYTE / parse throughput dominates:
+Envoy falls to 23-33% of ceiling while we reach 34-50%. **So our per-request overhead is poor and our
+parsing throughput is good** — exactly the signature of LEVEL-1's two `Pipe`s plus thread hops, a fixed
+cost per request that amortises away under depth. Note the hand-rolled SAEA path ALSO beats Envoy at depth
+(+18-30%), so the pipelined win is a property of the .NET path generally, not of SocketSet specifically;
+the unpipelined loss is likewise shared (worker is −55 to −57%).
+
+**This makes the level-2 client (RespReader inline in `OnReceive`, no pipe, no pump, no hop) aimed at a
+MEASURED defect rather than at a hypothesis.** It targets precisely the per-request cost that `-P 1`
+isolates. Whether it closes a 2x gap is open, and should be measured rather than assumed.
+
+**Caveat, and it runs in our disfavour: at `-P 1` Envoy sits at 90% of a CLIENT-LIMITED ceiling** (the
+generator is pinned to a third of the box and tops out near 500k), so Envoy's true unpipelined capability
+may be higher and the gap is a FLOOR, not an estimate. At `-P 16` Envoy is at 23% of ceiling — genuinely
+proxy-limited — so that half of the table is clean. Fixing the `-P 1` half needs more client capacity, and
+until then no upper bound on Envoy should be quoted from it.
+
+**Rig bug found here, worth recording because it made the audit lie:** the quantisation audit passed a
+single-pass cell as "clean" (1 distinct value > half of 1 pass), i.e. it certified a cell that resolved
+nothing. Now requires n>=3 before a range can be claimed at all. Separately, a patch inserting an
+apostrophe (`rig's`) into the single-quoted awk block silently TRUNCATED the program — the summary died
+while the measurements themselves completed, so the data survived and only the report was lost.
+
 ### RESP PROXY: SocketSet beats a hand-tuned SAEA WorkerPool by 15-28% on a real workload (2026-08-02)
 
 **This is the first number in this file measured with the APPLICATION HELD CONSTANT and the transport as

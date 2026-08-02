@@ -1,0 +1,49 @@
+# Envoy as a RESP proxy, for the peer comparison in bench/run-proxy-ab.sh.
+#
+# WHY THIS CONFIG MATTERS AS MUCH AS THE CODE. An untuned Envoy is a strawman, and a benchmark against a
+# strawman is worse than no benchmark: it produces a confident number that means nothing. The two settings
+# that decide the result are the WORKER COUNT (set via --concurrency on the command line, NOT here) and
+# the connection pool. The rig gives Envoy the SAME core budget it gives our proxy and pins it to the same
+# cores, or the comparison is about core count wearing a throughput costume.
+#
+# Kept deliberately minimal and like-for-like with RESPite.Proxy: a single upstream, catch-all routing, no
+# TLS, no mirroring, no fault injection. Anything else would be measuring a feature we do not implement.
+#
+# Ports: listen 7381 (the proxy legs use 7380), upstream 7379, admin 9901.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+  - name: redis_listener
+    address:
+      socket_address: { address: 127.0.0.1, port_value: 7381 }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.redis_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.redis_proxy.v3.RedisProxy
+          stat_prefix: egress_redis
+          settings:
+            # Generous on purpose: a timeout firing under load would show up as errors and the rig would
+            # (correctly) refuse the leg, but it would look like an Envoy defect rather than a config one.
+            op_timeout: 5s
+          prefix_routes:
+            catch_all_route:
+              cluster: redis_cluster
+
+  clusters:
+  - name: redis_cluster
+    connect_timeout: 1s
+    type: STATIC
+    # MAGLEV is what the Redis filter expects for hash-based routing. With a single upstream it degenerates
+    # to "always this one", which is exactly the like-for-like case against our single-backend proxy.
+    lb_policy: MAGLEV
+    load_assignment:
+      cluster_name: redis_cluster
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: 7379 }
