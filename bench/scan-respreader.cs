@@ -1,6 +1,9 @@
 #:property TargetFramework=net10.0
 #:property PublishAot=false
 #:property IsPackable=false
+#:property NoWarn=SER004
+// ^ RespReader is marked evaluation-only (SER004, raised as an error); this bench exists precisely to
+// evaluate it.
 #:project ../../StackExchange.Redis/src/RESPite/RESPite.csproj
 // ^ Directory.Build.props overrides as per verify-proxy.cs; sibling-checkout reference as per the proxy.
 //
@@ -21,7 +24,7 @@ const int WarmupIters = 3, Iters = 10;
 
 var mixes = new (string Name, byte[] Payload, int Frames)[]
 {
-    Build("small-replies (+OK/:int/$5)", 200_000, i => i % 3 switch
+    Build("small-replies (+OK/:int/$5)", 200_000, i => (i % 3) switch
     {
         0 => "+OK\r\n",
         1 => $":{i}\r\n",
@@ -30,7 +33,7 @@ var mixes = new (string Name, byte[] Payload, int Frames)[]
     Build("get-commands (*2 $3 GET $16)", 100_000, i => $"*2\r\n$3\r\nGET\r\n$16\r\nkey:{i:d12}\r\n"),
     Build("bulk-1k", 20_000, i => $"${1024}\r\n{new string('x', 1024)}\r\n"),
     Build("bulk-16k", 2_000, i => $"${16384}\r\n{new string('x', 16384)}\r\n"),
-    Build("mixed-pipeline (proxy shape)", 60_000, i => i % 4 switch
+    Build("mixed-pipeline (proxy shape)", 60_000, i => (i % 4) switch
     {
         0 => "+PONG\r\n",
         1 => "$32\r\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n",

@@ -49,6 +49,41 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### THE CLIENT SHAPE, MEASURED FOR THE FIRST TIME (2026-08-02 evening) — and the scanner baseline
+
+**`bench/run-client-shape.sh`** — one connection, deep multiplex, tail-scored: the SE.Redis regime,
+which no rig had ever measured. `-c 1`, GET 32 B, 4 passes, direct vs one affine-SocketSet hop:
+
+| depth | direct | + the hop | reading |
+|---|---:|---:|---|
+| `-P 1` | 49,963 (p99 23µs) | 25,377 (p99 47µs) | hop adds ~20µs/op — exactly one extra RTT |
+| `-P 16` | 755,683 | 367,952 (p99 63µs) | ~0.5x: the latency CHAIN doubled; structural to any proxy |
+| `-P 64` | 2,586,490 | 1,175,478 (p99 95µs) | same |
+| `-P 256` | 6,736,842 | **1,149,958 — PLATEAU** (p99 103µs) | **one loop thread saturates at ~1.15M ops/s** |
+
+The plateau is the finding: with affinity, a single connection's whole chain (frame → forward → reply
+route) lives on ONE shard thread, and that thread caps at ~1.15M ops/s while direct scales to 6.7M. For
+the SE.Redis IO-core question this reads WELL: a real client does roughly half the proxy's per-op work
+(it is the endpoint — nothing is re-forwarded), so the per-connection ceiling extrapolates to ~2M+ ops/s
+at double-digit-µs p99 — comfortably above what a multiplexed client connection carries. The tail column
+is the headline: **47-103 µs p99 through a full extra network hop, flat across passes.**
+
+**`bench/scan-respreader.cs`** — the frame-scanner ISOLATION baseline (single thread, best-of-10):
+
+| mix | Mframes/s | ns/frame |
+|---|---:|---:|
+| small replies (`+OK`/`:int`/`$5`) | 20.07 | **49.8** |
+| GET commands (`*2 $3 $16`) | 7.05 | **141.9** |
+| bulk-1k / bulk-16k | 12.1 / 12.3 | ~82 |
+| mixed proxy shape | 11.18 | 89.4 |
+
+Two shapes worth knowing before tuning: **the array-of-bulks COMMAND path costs ~3x a simple reply**
+(141.9 vs 49.8 ns — element walking, not byte scanning; the bulk mixes confirm payload bytes are
+length-skipped, never touched, hence bulk-16k's nominal 200 GB/s). And the budget arithmetic: at the
+proxy's 4.4M ops/s across 6 shards, ~200 ns of scan per op is roughly **15% of a shard's budget — so a
+2x scanner win is worth ~+7% at depth**, consistent with the "a few %" framing. At client-mode reply
+rates the scanner is ~5% of one core: NOT a client bottleneck.
+
 ### THE TAIL, INVESTIGATED (2026-08-02 evening): it is an SMT TRADE plus a rig artifact, not a defect
 
 The definitive run left "our p99 is ~3x Envoy's" open. Bisected in three steps, each pre-registered:
