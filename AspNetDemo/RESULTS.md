@@ -75,7 +75,13 @@ the run used the STOCK binary, which cannot dial `@` (that is what the fork patc
 failed, the measurement produced EMPTY output, and the rig's parse loop wrote NO row at all — the leg
 read as "not run" rather than "failed". Two fixes: the override is now real (verified with `bash -x`,
 not memory), and an empty measurement now writes a NORESULT row. The pathname/TCP/direct numbers above
-are unaffected (stock handles all three); the abs-vs-uds comparison is re-running on the patched binary.
+are unaffected (stock handles all three).
+
+**Re-run on the genuinely-patched binary, and it completes the picture cleanly: ABSTRACT == PATHNAME, to
+the microsecond.** Same medians (`-P 1` GET 491,194 both; SET 482,692 both; `-P 16` ~4.3M both) and the
+same p99 (0.591 ms both). Exactly as the kernel model predicts — the data path is identical, abstract
+merely skips the filesystem — so the recommendation is unhedged: **use `@abstract` for the sidecar hop;
+it costs nothing and removes the socket file, its cleanup, and its permissions entirely.**
 
 ### THE CLIENT SHAPE, MEASURED FOR THE FIRST TIME (2026-08-02 evening) — and the scanner baseline
 
