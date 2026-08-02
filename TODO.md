@@ -240,6 +240,33 @@ then decide. Do not merge it as-is.
 
 ---
 
+## SESSION CLOSE 2026-08-02 (READ FIRST NEXT SESSION — one very long Linux day, everything below is current)
+
+**Where everything landed, in one block.** Four consumers measured, all same-day where new:
+- **RESP proxy** (SE.Redis `marc/proxy-socketset`): Envoy PARITY at `-P 1`, **2.7x Envoy at `-P 16`**
+  (L3 shard-affine + callback-granularity flushing); UDS sidecar hop **+30% / ~half the tail** vs TCP;
+  abstract==pathname free. Tail bisected: GC exonerated, shard-oversubscription was rig config, the
+  remainder is an SMT trade (shards ≤ physical cores → Envoy-level p99 at −22% throughput).
+- **Client shape** (`bench/run-client-shape.sh`): one loop thread carries ~1.15M ops/s per connection at
+  47-103µs p99 THROUGH a full proxy hop; extrapolates ~2M+ for real client mode.
+- **Garnet** (`src/SocketSet.Garnet` + `GarnetDemo`, PackageReference, no fork): plaintext
+  parity-with-better-tails (one +7.7% disjoint win, p99 lower all cells); **TLS A/B all four cells
+  DISJOINT ahead, +9.5% to +24.2%, p99 halved-to-thirded — TLS costs ours ~17% off plaintext vs stock's
+  ~27%.** Gates 13/13 both legs.
+- **redis fork** (`mgravell/redis`): `marc/uds-abstract-sockets` (hiredis @abstract for cli+benchmark) and
+  `marc/uds-abstract-server` (server-side @abstract, `unit/networking` green incl. two new tests) — the
+  server PR is DRAFT at Marc's choice; client-side PR not yet opened.
+
+**Tooling debts paid:** confounder ledger at #14 (all structurally fixed in rigs); `verify-proxy.cs` is
+13 cells and RESP3-literate; TLS-capable `redis-benchmark` exists (fork + `~/.local/openssl`, note the
+lib→lib64 symlink); shared TLS certs in `bench/.tools/tls-demo`.
+
+**Next, by who:** Marc — un-draft/open the redis PRs, lab note, API-freeze sign-off. Windows session —
+smoke matrix + first IOCP run of the affine design (doc-comment fixed: IOCP loop threads DO support it).
+Design steer needed — SE.Redis client-mode integration point (`PhysicalConnection` vs RESPite layer).
+Parked with baselines: scanner tune, Envoy-over-UDS leg, `TlsMode` build, Envoy-SMT profiling,
+per-client RESP3, receive-copy removal in SocketSet.Garnet.
+
 ## DIRECTION CHANGE (2026-08-02): the consumers are RESP, not ASP.NET — and one of them is SE.Redis itself
 
 **Read this before planning work.** It reorders the backlog more than any measurement in this file, and it
