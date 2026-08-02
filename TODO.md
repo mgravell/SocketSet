@@ -397,6 +397,18 @@ plaintext connects) and TLS-originating (plaintext accepts + TLS connects) — w
 of mechanical change and no behavioural change at the default. Not built; build it when the TLS upstream
 A/B is next.
 
+### ~~PROXY CORRECTNESS: HELLO must be intercepted~~ RETRACTED — it always was; item closed with -NOPROTO (2026-08-02)
+
+**The "poisoning" was confounder #13** (a `timeout`+`head -c` harness that prints nothing for any reply
+shorter than requested — see RESULTS), compounded by a dead backend in the original run. Re-measured with
+a fixed harness: HELLO was ALWAYS intercepted locally (`-ERR unknown command`), and is now answered with
+the protocol-correct **`-NOPROTO`** (matching Envoy 1.39 and RESP2-era Redis; clients downgrade
+gracefully on it). Gate cell `hello-local-error` added to `verify-proxy.cs`; 13/13. What REMAINS open
+here is only the differentiator: per-client RESP3 (answer `HELLO 3` locally, translate on the shared
+leg), which nobody has built — Envoy 1.40's `protocol_version` is all-or-nothing per listener. AUTH is
+still unimplemented and must likewise be per-client when built (forwarding it would authenticate the
+shared leg). The original item text follows for the record.
+
 ### PROXY CORRECTNESS: HELLO must be intercepted, never forwarded (found 2026-08-02, empirically)
 
 `HELLO 3` through the proxy is FORWARDED to the shared upstream leg, which then flips to RESP3 (or

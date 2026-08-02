@@ -125,6 +125,24 @@ try
 }
 catch (Exception ex) { Report("mixed-pipeline", false, ex.Message); }
 
+// --- 4b: HELLO must be answered LOCALLY with an error, and must not disturb the connection -------
+// A multiplexed proxy cannot forward HELLO (it would flip the shared upstream leg's protocol for every
+// client on it). The compatible behaviour is a local -NOPROTO: clients treat any HELLO error as "RESP2
+// server" and downgrade. This cell also guards the regression where HELLO handling breaks the SAME
+// connection for subsequent commands.
+try
+{
+    using var c = new RespConn(host, port);
+    c.Send(["HELLO", "3"]);
+    var r = c.Read();
+    bool isErr = r is not null && r.StartsWith('-');
+    c.Send(["PING"]);
+    var after = c.Read();
+    Report("hello-local-error", isErr && after is "+PONG",
+        $"hello={r ?? "(null)"} then ping={after ?? "(null)"}");
+}
+catch (Exception ex) { Report("hello-local-error", false, ex.Message); }
+
 // --- 5: concurrent connections -----------------------------------------------------------------
 try
 {

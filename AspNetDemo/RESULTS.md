@@ -111,18 +111,29 @@ parallelise parsing across the ThreadPool and coalesce replies per send; L2/L3 s
 granularity for the same reason. Pre-registered in TODO: it should restore most of the depth loss and
 move `-P 1` not at all; either failure falsifies the mechanism.
 
-**RESP3/HELLO, tested empirically the same day (Marc's question, and he would know — client libraries
-team at Redis):** Garnet direct answers `HELLO 3` with a `%8` map; **Envoy swallows it — no reply — so
-Envoy is RESP2-only AS SHIPPED (1.39.0)** and never pays RESP3 parse complexity, while `RespReader`
-carries the full RESP3 prefix space on every scan.
-**CORRECTED same day, on a reliable tip from Marc: `RedisProxy.protocol_version` (RESP2 default / RESP3)
-EXISTS — on main/1.40-track.** Verified both ways: `--mode validate` rejects the field on our 1.39.0
-binary ("no such field", all three plausible placements), and the latest docs describe it, including a
-`-NOPROTO` reply for `HELLO 3` in RESP2 mode that 1.39 demonstrably lacks (it answers with silence).
-Notably, Envoy's design is ALL-OR-NOTHING PER LISTENER — RESP3 mode requires downstream `HELLO 3` before
-any data command — i.e. they sidestepped mixed-protocol multiplexing rather than solving it. A
-RESP3-negotiated A/B (`redis-benchmark -3`) becomes possible when 1.40 ships, and is blocked on OUR
-HELLO fix first. A structural parse-cost tilt toward Envoy that is fair to us to state, since
+**RESP3/HELLO — RETRACTED AND RE-MEASURED (same day), and the retraction carries confounder #13.** Two
+"measured" claims here were BOTH artifacts of one broken harness: (a) "our proxy forwards HELLO and
+poisons the shared leg" — FALSE; (b) "Envoy swallows HELLO with no reply" — FALSE. The harness read
+replies with `timeout N head -c BIG`: `head -c` blocks until it has ALL requested bytes, and when
+`timeout` kills it first it exits WITHOUT printing the partial read — so every reply SHORTER than the
+requested count printed as nothing, indistinguishable from silence. `+PONG` (7 bytes) against `head -c
+40` "measured" as a swallowed reply. Compounding it, the original "poisoning" run also had a DEAD
+backend (the preceding Envoy dead-upstream control had killed Garnet, and that test lacked a restart
+guard). **Confounder #13: a read harness that cannot print a partial read converts every short reply
+into "no reply". Use `timeout N cat`, which writes bytes as they arrive.** Diagnosed via controls (PING
+and FOOBAR through the same harness also "vanished", which is what implicated the harness).
+
+**What is actually true, re-measured with the fixed harness and locked by a new gate cell:**
+- **Our proxy ALREADY intercepts HELLO locally** — it always did (`KnownCommands.Hello` → local error);
+  answered `-ERR unknown command`, now improved to **`-NOPROTO unsupported protocol version`**, the
+  protocol-correct refusal that clients treat as "RESP2 server, downgrade gracefully". Never forwarded;
+  no leg poisoning; subsequent commands unaffected. `verify-proxy.cs` gains a `hello-local-error` cell
+  (HELLO → leading `-`, then PING → `+PONG` on the same connection): 13/13 PASS.
+- **Envoy 1.39 replies `-NOPROTO` too** (not silence). So both proxies refuse RESP3 identically today.
+- **Still true and schema-validated: `protocol_version` (RESP2/RESP3 negotiation) is 1.40-track** — the
+  field does not exist in 1.39.0 — and Envoy's RESP3 design is all-or-nothing per listener. The parse
+  asymmetry also stands: `RespReader` scans the full RESP3 prefix space; Envoy 1.39 parses RESP2 only.
+  Per-client RESP3 on a multiplexed leg remains unbuilt by anyone. A structural parse-cost tilt toward Envoy that is fair to us to state, since
 real clients now default to RESP3. **And our proxy is WORSE than Envoy here today: it FORWARDS the HELLO,
 poisoning the shared leg** — after one client's `HELLO 3`, a plain RESP2 GET on a different connection
 gets no reply. Same bug class as the fixed SELECT issue; recorded in TODO as a correctness item (intercept
