@@ -359,6 +359,40 @@ know whether we closed the gap or just hit the generator.
 ping` sends literal `PING\r\n`; `RespReader` rejects the `P`). Redis and Garnet accept them. Decision
 taken: leave inline on the backlog, but a fault must FAIL LOUDLY rather than hang — that is now fixed.
 
+### BACKLOG: TLS upstream legs — where kTLS might actually pay (raised by Marc 2026-08-02)
+
+In most real deployments the proxy's UPSTREAM leg is TLS. **We support kTLS; Envoy terminates TLS in
+userspace BoringSSL.** So there is a *possibility* (his word, and the right one — not a guarantee) of a
+structural advantage on exactly the leg the affinity work just made hop-free. Split it by what each
+environment can actually answer:
+
+**Measurable on THIS box, today:** our in-transport OpenSSL upstream TLS vs Envoy's BoringSSL upstream
+TLS — both userspace, so loopback is fair. Garnet does TLS, both proxies can originate it, and we already
+beat `SslStream` broadly (+13-35%); vs BoringSSL is genuinely unknown. This is the groundwork for the
+"TLS-originating RESP proxy" claim, and it needs no new hardware.
+
+**PRE-REGISTERED for any single-box kTLS leg: expect kTLS to LOSE to our own userspace TLS here.** The
+record path costs ~9-20% on this box at small messages (measured twice, both directions offloaded), and
+loopback structurally cannot show `TlsTxDevice` — there is no NIC. A losing kTLS number on this box is
+the KNOWN regime, not a finding, and must not be written up as "kTLS is bad". Gate the leg on
+`/proc/net/tls_stat` movement as always.
+
+**What needs the lab (the ex-team's hardware — see the handover-note idea):** whether `TlsTxDevice`
+engages on a TLS-offload NIC, and what inline offload does to proxy CPU-per-byte at line rate. That is
+where "Envoy pays AES per forwarded byte on its worker thread; our upstream leg sends at plaintext cost"
+becomes testable. It is also the first scenario where the kTLS investment is visible AT ALL.
+
+**Speculative but worth one line: bulk-payload splice.** A RESP proxy must parse frames, so full-stream
+`splice()` is off the table — but large bulk-string BODIES are opaque bytes, and in principle could move
+downstream-socket → kTLS-upstream-socket without entering userspace, kernel-encrypting on the way. No
+userspace TLS stack can do that. Unbuilt, unmeasured, and the framing/streaming complexity is real — but
+it is the kind of mechanism that makes the lab session worth scheduling.
+
+**Integration scoping item, check before any of the above:** can ONE SocketSet instance carry plaintext
+DOWNSTREAM accepts and TLS UPSTREAM connects? `TlsProvider` hangs off the options today; the client half
+exists (`SmokeTest --resp --tls-trust` connects TLS out), but per-connection asymmetry on a single
+instance may need an API knob. Scope it first; it may be the actual blocker.
+
 ### BACKLOG: tune the frame scanner (raised by Marc 2026-08-02)
 
 `RespReader`'s frame scanning is worth a pass — plausibly a few more percent. **Aim it correctly, because
