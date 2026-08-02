@@ -49,6 +49,78 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### RESP PROXY: SocketSet beats a hand-tuned SAEA WorkerPool by 15-28% on a real workload (2026-08-02)
+
+**This is the first number in this file measured with the APPLICATION HELD CONSTANT and the transport as
+the only variable**, and it is therefore the first one that is straightforwardly about the transport.
+Every other table here is scored through Kestrel, whose bridge costs 24-40% and whose "control" leg is a
+different application path, so bridge cost and transport cost never separate.
+
+Rig: `bench/run-proxy-ab.sh`. The proxy is `toys/RESPite.Proxy` on `StackExchange/StackExchange.Redis`
+branch `marc/proxy-spike2`, hosted either on its own hand-rolled `WorkerPool`/`WorkerSocketAsyncEventArgs`
+layer or on SocketSet via the pre-existing `RunClientAsync(IDuplexPipe)` seam — `ProxyClient` and all RESP
+framing/routing are byte-for-byte identical between legs. Backend `garnet-server` 2.1.1, generator
+`redis-benchmark` 7.4.2, `-c 64 -d 32`, governor `performance`, THREE-way physical-core split (client /
+proxy / backend each get their own cores and both SMT siblings). 5 passes, leg order reshuffled per pass.
+
+| depth | test | worker-saea (peer baseline) | socketset/io_uring | socketset/epoll |
+|---|---|---:|---:|---:|
+| `-P 1` | GET | 194,412 (187,889-204,350) | **241,363 (239,292-245,597) +24.2%** | 235,270 (235,255-237,264) +21.0% |
+| `-P 1` | SET | 201,410 (199,971-202,869) | **233,302 (231,374-235,262) +15.8%** | 231,374 (229,486-231,382) +14.9% |
+| `-P 16` | GET | 1,932,471 (1,919,488-1,945,420) | 2,461,118 (2,440,264-2,482,416) +27.4% | **2,482,416 (2,461,118-2,504,000) +28.5%** |
+| `-P 16` | SET | 1,985,769 (1,985,604-1,999,556) | **2,360,269 (2,341,083-2,360,269) +18.9%** | 2,341,083 (2,322,131-2,379,850) +17.9% |
+
+**All eight comparisons are DISJOINT.** And the win is understated, because this is the **LEVEL-1**
+integration: it bridges through two `Pipe`s — the same shape that costs 24-40% in the ASP.NET bridge — and
+uses the default (unpinned) pool. The level-2 client (`RespReader` inline in `OnReceive`, no pipe, no
+hop) is the actual design SocketSet was shaped for and is not built yet.
+
+**io_uring and epoll are effectively tied** (each leads two of four cells, ranges overlapping), which is
+what a pipe-bridge-dominated path should look like: at level 1 the bridge, not the backend, is the cost.
+
+**The controls that make this readable.** `direct` (generator straight to Garnet, no proxy) is a CEILING
+REFERENCE, not a peer — one fewer process, one fewer hop. Its job is to prove the backend has headroom,
+and it does: proxy legs sit at **27-49% of it**, so the backend never limited anything. Had a proxy leg
+approached it, every column would have been measuring Garnet. Correctness first, too:
+`bench/verify-proxy.cs` is 12/12 on all three legs plus the direct control — byte-exact 1 B to 1 MB, a
+512-deep pipeline verified IN ORDER, local/forwarded commands interleaved in one burst, and 32 concurrent
+clients.
+
+**A RIG DEFECT THAT FAKED PRECISION, and the guard now in place — eleventh in this file's tradition.**
+`redis-benchmark` resolves elapsed time to ~250 ms. On a 6.5 s test that is a 3.8% quantum, so all six
+passes snapped to 2-3 distinct rps values and the min-max range came out TIGHT — which reads as
+reproducibility and is exactly the opposite: the rig could not see variation smaller than one tick. The
+implied elapsed times landed on 3.000 / 6.250 / 6.500 / 7.250 / 7.500 s, which is what gave it away. Fixed
+by running each test ~30 s (`-n` 7M at `-P 1`, 72M at `-P 16`), and the rig now performs a **quantisation
+audit**: it counts distinct values per cell and warns that a range is timer-quantised, and that no
+DISJOINT verdict from it is evidence, whenever a cell resolves half or fewer of its passes distinctly. In
+the table above the audit flags ONLY the `direct` ceiling cells (fastest legs, shortest tests); every
+compared cell resolves cleanly. **The first, discarded run of this A/B reported the same +15-20% direction
+from ranges that were pure quantisation** — right answer, worthless evidence.
+
+**Two bugs in the integration, found by the rig rather than by the tests, both fixed and re-verified
+(12/12 both backends after).** (a) `OnClosed` was not overridden, so a disconnected peer never had its
+inbound writer completed: `PipeIoBridge` does NOT do this for you — the ASP.NET bridge completes it
+explicitly — so the proxy's read loop never terminated and **every closed connection leaked a task and two
+pipes**. A keep-alive benchmark cannot surface that; connection churn would. (b) A protocol fault left the
+socket OPEN, so a malformed request presented as a client HANG rather than an error. Both now tear down,
+with abortive `Close()` on the fault path ONLY — matching the bridge's contract that `Close()` cancels
+queued sends and must not be used on a normal exit.
+
+**The table above was measured on the PRE-fix binary, so the fixes were re-measured rather than argued
+throughput-neutral.** The reasoning said neither path executes under steady-state load (no faults, no
+disconnects until teardown) — true, but reasoning is not measurement. Post-fix spot-check, `-P 1`,
+io_uring: **GET 241,354 vs 241,363; SET 233,310 vs 233,302** — within 0.01% of the definitive run, so the
+table stands. (`worker` read 186,637 vs 194,412 on GET, but its ranges overlap across the two runs and it
+is consistently the noisier leg.) Post-fix correctness re-verified 12/12 on both backends, and the inline
+`PING` probe now exits with an error instead of timing out.
+
+**Found on the way, and it is a real compatibility gap rather than a rig problem: the proxy does not
+accept INLINE commands.** `redis-benchmark -t ping` runs PING_INLINE first, sending literal `PING\r\n`
+rather than a RESP array; `RespReader` rejects the `'P'`. Redis and Garnet both accept inline. Worth
+knowing because stock `redis-benchmark` defaults hit it, and because it is what health checks and
+telnet-style debugging use. The rig now probes with `ping_mbulk`.
+
 ### The flush fix, VERIFIED ON LINUX (2026-08-02) — and it reaches ONE Linux backend, not three
 
 The `PooledBufferWriter` high-water fix (`a264998`) was measured on Windows/IOCP and landed as shared
