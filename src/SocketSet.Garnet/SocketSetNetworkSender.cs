@@ -100,5 +100,11 @@ internal sealed unsafe class SocketSetNetworkSender : NetworkSenderBase
 
     public override void Throttle() { }
 
+    public override bool TryClose()
+    {
+        try { _conn.Close(); return true; }
+        catch { return false; }
+    }
+
     public override void Dispose() => DisposeNetworkSender(waitForSendCompletion: false);
 }

@@ -77,11 +77,10 @@ public sealed class SocketSetGarnetServer : GarnetServerBase, IServerHook
 
     public override IEnumerable<IClusterSession> ActiveClusterSessions()
     {
-        foreach (var kvp in activeHandlers)
-        {
-            var consumer = kvp.Key.Session;
-            if (consumer != null) yield return ((RespServerSession)consumer).clusterSession;
-        }
+        // RespServerSession (and its clusterSession) is internal to Garnet.server, so the enumeration
+        // GarnetServerTcp does is unreachable from outside the assembly. The testbed does not run
+        // cluster mode; if this library ever hosts a cluster node, this needs an upstream accessor.
+        yield break;
     }
 
     // ---- IServerHook: mirrors GarnetServerTcp.TryCreateMessageConsumer, including the >=4-byte gate

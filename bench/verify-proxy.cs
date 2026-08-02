@@ -135,13 +135,16 @@ try
     using var c = new RespConn(host, port);
     c.Send(["HELLO", "3"]);
     var r = c.Read();
-    bool isErr = r is not null && r.StartsWith('-');
+    // Two legitimate outcomes: a RESP2-only endpoint refuses with an error (-NOPROTO; the multiplexing
+    // proxy MUST do this), while a RESP3-capable server (Garnet, Redis 6+) answers a map. Either way the
+    // REAL assertion is the connection still works afterwards -- HELLO handling must never wedge it.
+    bool sane = r is not null && (r.StartsWith('-') || r.StartsWith('%') || r.StartsWith('*'));
     c.Send(["PING"]);
     var after = c.Read();
-    Report("hello-local-error", isErr && after is "+PONG",
+    Report("hello-then-usable", sane && after is "+PONG",
         $"hello={r ?? "(null)"} then ping={after ?? "(null)"}");
 }
-catch (Exception ex) { Report("hello-local-error", false, ex.Message); }
+catch (Exception ex) { Report("hello-then-usable", false, ex.Message); }
 
 // --- 5: concurrent connections -----------------------------------------------------------------
 try
@@ -254,6 +257,24 @@ sealed class RespConn : IDisposable
                     for (int i = 0; i < count; i++) Read();
                     return $"*{count}";
                 }
+            // RESP3 replies -- a HELLO 3 against a RESP3-capable server (Garnet, Redis 6+) answers a map,
+            // and a harness that cannot read one reports a healthy server as a protocol error.
+            case '%':
+                {
+                    int pairs = int.Parse(ReadLine());
+                    for (int i = 0; i < 2 * pairs; i++) Read();
+                    return $"%{pairs}";
+                }
+            case '~':
+                {
+                    int count = int.Parse(ReadLine());
+                    for (int i = 0; i < count; i++) Read();
+                    return $"~{count}";
+                }
+            case ',': return "," + ReadLine();
+            case '#': return "#" + ReadLine();
+            case '(': return "(" + ReadLine();
+            case '_': ReadLine(); return "_";
             default: throw new InvalidDataException($"unexpected RESP prefix 0x{prefix:x2}");
         }
     }

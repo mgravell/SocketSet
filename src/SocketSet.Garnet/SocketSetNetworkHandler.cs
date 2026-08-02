@@ -19,10 +19,15 @@ namespace SocketSets.Garnet;
 /// </summary>
 internal sealed unsafe class SocketSetGarnetHandler : NetworkHandler<SocketSetGarnetServer, SocketSetNetworkSender>
 {
+    // The base holds its sender PRIVATELY, so the identity/lifecycle abstracts it delegates to us
+    // cannot be answered from it -- keep our own reference.
+    private readonly SocketSetNetworkSender _sender;
+
     public SocketSetGarnetHandler(SocketSetGarnetServer serverHook, SocketSetNetworkSender sender,
                                   NetworkBufferSettings settings, LimitedFixedBufferPool pool)
         : base(serverHook, sender, settings, pool, useTLS: false)
     {
+        _sender = sender;
     }
 
     /// <summary>Allocate the receive buffer the base's accumulation machinery works over — the part
@@ -56,6 +61,19 @@ internal sealed unsafe class SocketSetGarnetHandler : NetworkHandler<SocketSetGa
             payload = payload.Slice(take);
         }
         return true;
+    }
+
+    // NetworkHandler leaves the sender-identity and lifecycle abstracts to its subclass (the SAEA one
+    // answers them from its Socket); ours answers from the wrapped sender.
+    public override string RemoteEndpointName => _sender.RemoteEndpointName;
+    public override string LocalEndpointName => _sender.LocalEndpointName;
+    public override bool IsLocalConnection() => _sender.IsLocalConnection();
+    public override bool TryClose() => _sender.TryClose();
+
+    public override void Dispose()
+    {
+        networkReceiveBufferEntry?.Dispose();
+        _sender.Dispose();
     }
 
     public void CloseFromTransport()
