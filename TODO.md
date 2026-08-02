@@ -246,19 +246,45 @@ then decide. Do not merge it as-is.
 > two SHARED changes landed after that, one of them on the hottest path. Correctness first:
 > `bench/run-smoke-matrix.sh` (60 cells) before anything else.**
 >
-> **1. `PooledBufferWriter` hand-off pessimisation — FIXED, and this is the one that matters to you.**
+> **STATUS 2026-08-02 (Linux session): the gate is GREEN and item 1 is CLOSED.**
+> `bench/run-smoke-matrix.sh` **60/60 PASS** — the Windows session's shared changes are correctness-clean
+> on io_uring, epoll and managed, plaintext and TLS, including the kTLS and abstract-UDS cells. Item 1
+> (the flush fix) is now verified on Linux, and it corrected its own handover claim — see below.
+> **Item 3 (`SS_PIPE_SCHED=inline-read`/`inline-both` on io_uring/epoll) is the next high-value item and
+> is NOT done.** Item 4 (a Linux `Verify-AspNet.ps1` equivalent) also remains open.
+> **Bench-host note: the CPU governor is `performance` as of this session** (Marc set it; an agent cannot,
+> as `sudo` needs a password). The 2026-08-01 Linux headline table was measured under `powersave`, so do
+> not compare absolute MiB/s across that boundary.
+>
+> **1. `PooledBufferWriter` hand-off pessimisation — FIXED.** ~~and this is the one that matters to you~~
+> **VERIFIED ON LINUX 2026-08-02: the prediction HELD on epoll, and the claim about WHICH BACKENDS REACH IT
+> WAS WRONG.** See `RESULTS.md` "The flush fix, VERIFIED ON LINUX". Summary and correction inline below.
+>
 > `TakeArray()` left the writer empty, so the next use re-rented at the first size hint and grew by
 > DOUBLING, with a `Buffer.BlockCopy` per doubling. `OutboundConnection.Flush` calls `TakeArray` on EVERY
-> out-of-band flush on EVERY backend — **io_uring, epoll and managed all reach it** — so since the
-> hand-off landed, the per-connection accumulator has restarted from empty on every response and re-paid
-> that growth. Fixed by remembering high-water capacity.
+> out-of-band flush ~~on EVERY backend — **io_uring, epoll and managed all reach it**~~ — **CORRECTION: on
+> Linux ONLY EPOLL reaches it.** `OutboundConnection` is derived from by `WindowsConnection` (IOCP/RIO) and
+> `EpollConnection` alone; `IoUringConnection` and `ManagedConnection` derive from `Connection` directly
+> and have their own send paths, and `TakeArray` has exactly two call sites (`OutboundConnection.Flush`,
+> `WindowsShardBase`). io_uring's TLS writers are reusable scratch that never detach, so io_uring **never
+> paid this cost and had nothing to gain.** Fixed by remembering high-water capacity.
 > Measured on Windows/IOCP, interleaved, disjoint: **classic plaintext 1 MB +33.3%; TLS 256 KB +18.8%;
 > TLS 1 MB +58.6%.** Nothing at 16 KB (few doublings).
 > **PRE-REGISTERED FOR LINUX: expect the same shape — a win that GROWS with payload, largest on TLS and on
 > `--classic`, ~nothing at small payloads, and ~nothing on plaintext `--byo` (zero-copy send skips `Flush`
-> entirely).** If Linux shows a win at SMALL payloads, or on plaintext `--byo`, the mechanism is not the
-> one described here and that is a finding. Rig: `bench/run-tls-sizes.sh`, or port `Compare-Commits.ps1`'s
-> interleaved shape.
+> entirely).** ~~If Linux shows a win at SMALL payloads, or on plaintext `--byo`, the mechanism is not the
+> one described here and that is a finding.~~ **OBSERVED on epoll, exactly: 16 KB +2.0% overlapping,
+> 256 KB +17.4% DISJOINT, 1 MB +29.9% DISJOINT, and plaintext `--byo` flat at all three sizes.** The
+> falsifier did not fire. 256 KB matches Windows almost exactly; 1 MB is ~half the Windows figure.
+>
+> **THE COST OF THE WRONG CLAIM, recorded because it is the transferable part:** the first Linux run used
+> `BACKEND=io-uring` on the strength of the struck-through sentence above and produced a clean, tight,
+> entirely meaningless null (+0.4% at 1 MB, ranges too tight to hide a 58% effect). It reads precisely like
+> "the fix does nothing on Linux". **An identical-binary guard cannot catch this** — the binaries differ;
+> it is REACHABILITY that fails. House rule 2 ("confirm the fast path was TAKEN") applies to the BACKEND,
+> not only to the flag, and the way to confirm it is to read the type hierarchy before spending 20 minutes.
+> Rig: **`bench/compare-commits.sh`** — written for this, the Linux port of `Compare-Commits.ps1`'s
+> interleaved two-worktree shape. Its header now carries this trap.
 >
 > **2. IOCP-only "owned staging" for TLS ciphertext** (`StageOutboundOwned` / `SupportsOwnedStaging`).
 > Opt-in per backend and **false everywhere except IOCP**, so Linux behaviour is unchanged by construction.

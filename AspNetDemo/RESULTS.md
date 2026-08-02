@@ -49,6 +49,66 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### The flush fix, VERIFIED ON LINUX (2026-08-02) — and it reaches ONE Linux backend, not three
+
+The `PooledBufferWriter` high-water fix (`a264998`) was measured on Windows/IOCP and landed as shared
+code, so the Linux READ-FIRST carried a pre-registered expectation for this run. Rig: the new
+`bench/compare-commits.sh` (the Linux port of `Compare-Commits.ps1`), isolated worktrees, interleaved with
+the leading side alternating per pass, 7 passes with pass 1 discarded, min-max ranges.
+
+**Governor: `performance` (both `scaling_governor` and `energy_performance_preference`), for every leg.**
+That differs from the 2026-08-01 Linux headline table above, which was measured under `powersave` — so
+**do not compare absolute MiB/s between this section and that one.** The A/B is self-contained: both sides
+of every comparison ran in one session under one power state, which is the only claim being made.
+
+`a264998` is a four-piece squash, so it was checked to isolate cleanly here first: with `SS_PIPE_SCHED`
+unset both bridge changes are inert (both schedulers resolve to the same instance, banner suffix empty)
+and the owned-staging piece is IOCP-gated. On Linux the only live delta is the writer fix.
+
+**EPOLL, `--classic --tls` — the prediction held in full:**
+
+| payload | before | after | change | verdict |
+|---|---:|---:|---:|---|
+| 16 KB | 5947.1 (5914-6067) | 6065.4 (6015-6106) | +2.0% | *overlapping* |
+| 256 KB | 4132.6 (4094-4155) | 4851.4 (4694-5013) | **+17.4%** | **DISJOINT** |
+| 1 MB | 2319.8 (2316-2322) | 3012.9 (2995-3026) | **+29.9%** | **DISJOINT** |
+
+**EPOLL, plaintext `--byo` — the control, also as predicted:** nothing at any size (16 KB −1.0%,
+256 KB +0.4%, 1 MB −8.6%, all overlapping). Zero-copy send skips `Flush`, so there is no re-growth to pay.
+The 1 MB cell is the noisiest on the board (before 6622-7293) and its −8.6% is noise, not a regression.
+
+So the mechanism reproduces cross-platform: the win grows with payload, is confined to the out-of-band
+path, and vanishes at 16 KB. Windows/IOCP measured +18.8% at 256 KB and +58.6% at 1 MB; **256 KB agrees
+almost exactly, 1 MB is about half the Windows figure.** Shape is what is being compared here, not
+magnitude — these are different OSes and different send paths, and this file forbids subtracting across
+them.
+
+**THE CORRECTION, and it is the more transferable half.** `TODO.md`'s Linux READ-FIRST said "**io_uring,
+epoll and managed all reach it**". Only **epoll** does. `OutboundConnection` — the class holding the fixed
+writer — is derived from by `WindowsConnection` (IOCP/RIO) and `EpollConnection` only; `IoUringConnection`
+and `ManagedConnection` derive from `Connection` directly and have their own send paths. `TakeArray` has
+exactly two call sites (`OutboundConnection.Flush` and `WindowsShardBase`), so io_uring's TLS writers are
+reusable scratch that never detach, never re-rent from empty, and **never paid the pessimisation at all**.
+
+That was not free: a full interleaved run on `BACKEND=io-uring` returned a clean, tight, entirely
+meaningless null (`--classic --tls` at 1 MB: 1866.8 → 1874.2, +0.4%, ranges ~5% wide — far too tight to
+hide a 58% effect). It reads exactly like "the fix does nothing on Linux". **The identical-binary guard
+cannot catch this**: the binaries genuinely differ, it is REACHABILITY that does not hold. Rule 2 —
+confirm the path was TAKEN — has to be applied to the *backend*, not just the flag. The rig header now
+says so. The one useful thing that run does establish is that io_uring did not regress underneath the
+Windows fix.
+
+**A rig defect found the same way, making TEN in this file's tradition.** Three measurements died as
+`NOSTART`, all on the `before` side, from `bind()` errno 98 `EADDRINUSE`. Two independent causes, both
+mine and both inherited from porting: `PORT_BASE=41000` was carried over from `Compare-Commits.ps1`, and
+41000 sits INSIDE Linux's `ip_local_port_range` (32768-60999) where the load generator's own sockets can
+hold it — on Windows the same constant is safe, since the dynamic range there starts at 49152. And a
+*fixed* base makes back-to-back legs reuse ports still in `TIME_WAIT` from 64 keep-alive connections. A
+dropped measurement is not neutral: it silently lowers the scored-pass count for one cell on one side.
+Fixed by moving the base below the ephemeral range, randomising it per run, warning on overlap, and
+retrying once on a clear port. **The results above survive it** — every cell kept 5-6 scored passes
+against a floor of 3, and a NOSTART yields no number, so it cannot shift the values that were recorded.
+
 ### Stability soak (2026-08-01, before switching OS)
 
 `bench/run-smoke-matrix.sh` with `CHURN_REPS=15` (vs the usual 5): **60/60 cells PASS, every churn cell
