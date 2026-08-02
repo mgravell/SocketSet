@@ -49,6 +49,26 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### GARNET ON SOCKETSET (2026-08-02, late): parity-to-ahead on day one, better tails in every cell
+
+Consumer #4, suggestion-to-measurement in one day. `src/SocketSet.Garnet` hosts Garnet via the embedding
+ctor's `IGarnetServer[]` parameter (pure `PackageReference Microsoft.Garnet`, no fork); `GarnetDemo
+--stock` hosts their own `GarnetServerTcp` on identical options, so the A/B is one flag on one binary.
+Gate first: `verify-proxy.cs` **13/13 on BOTH legs**. Interleaved, banner-gated, 5 passes, server on 3
+physical cores with shards=6 matched to its logical CPUs (the SMT lesson applied):
+
+| cell | stock SAEA | on SocketSet | verdict |
+|---|---:|---:|---|
+| `-P 1` GET | 548,890 · p99 0.247 | 538,420 · p99 **0.199** | overlapping — parity |
+| `-P 1` SET | 518,480 · p99 0.311 | 538,379 · p99 **0.215** | +3.8% overlapping |
+| `-P 16` GET | 7,055,504 · p99 0.303 | 7,055,504 · p99 **0.263** | identical medians — parity, and both legs sit at the CLIENT ceiling (~7.06M vs direct's 7.2M), so this cell is ceiling-capped |
+| `-P 16` SET | 4,285,714 · p99 0.751 | **4,615,384** · p99 **0.439** | **+7.7% DISJOINT** |
+
+**Never behind on throughput, one disjoint win, and p99 LOWER in all four cells** (the depth-SET tail
+nearly halved) — from a v1 that still pays an extra receive copy the SAEA path does not (their SAEA
+receives directly into the handler buffer; we copy from the transport-owned span). The copy is the known
+first lever if this ever needs more; the tails suggest the loop-thread model is already paying for it.
+
 ### THE UDS SIDECAR HOP: +30% THROUGHPUT AND NEARLY HALF THE TAIL vs the TCP hop (2026-08-02 evening)
 
 Marc's premise — a proxy hosted on a Unix socket is the SIDECAR deployment shape, and the local hop

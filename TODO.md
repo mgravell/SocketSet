@@ -439,6 +439,15 @@ Envoy batches at event-loop-iteration granularity for the same reason. **Pre-reg
 the depth loss without moving `-P 1`** (a `-P 1` callback holds one command either way). If `-P 1`
 regresses, the batching is wrong; if depth does not recover, the collapse is not the flush count.
 
+### GARNET AS THE FOURTH CONSUMER — BUILT, GATED 13/13 BOTH LEGS, AND MEASURED (2026-08-02, same day)
+
+**Done: `src/SocketSet.Garnet` + `GarnetDemo` (with `--stock` for the one-flag A/B). Result:
+parity-to-ahead on day one — never behind on throughput, +7.7% DISJOINT on `-P 16` SET, and p99 LOWER in
+every cell (depth-SET tail nearly halved) — despite a v1 extra receive copy.** Full table in RESULTS.
+Remaining on this item: nothing blocking; known first lever if more is wanted is removing the receive
+copy; `ActiveClusterSessions` yields nothing (RespServerSession is internal — needs an upstream accessor
+if cluster mode is ever hosted). The original scoping follows.
+
 ### GARNET AS THE FOURTH CONSUMER (Marc's item, 2026-08-02): host Garnet on SocketSet
 
 Garnet has a pluggable network server API and runs on managed SAEA sockets. Scoped against a checkout
