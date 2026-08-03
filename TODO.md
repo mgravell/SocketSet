@@ -559,6 +559,13 @@ git push fork marc/uds-abstract-sockets` — pushing to the personal fork needs 
 one commit, PR-shaped. Upstream pitch when ready: "support the established @ convention for abstract
 sockets in -s" — small, one function, benefits cli and benchmark alike.
 
+### ~~THE DEPTH-TLS SEND AMPLIFICATION~~ FIXED same day: OnLoopDrain, tax 28% → 8.4% (see RESULTS)
+
+Built as pre-registered: `SocketSet.OnLoopDrain` (batch-end hook, io_uring + epoll; managed never fires
+it), proxy drains per batch instead of per callback. SQEs 3x → below plaintext; TLS depth tax −28% →
+−8.4% disjoint; TLS `-P 1` p99 improved ~25% as a bonus. The ~8% residue is the true encrypt-path cost —
+a future lead, much smaller than it looked. Original diagnosis follows.
+
 ### THE DEPTH-TLS SEND AMPLIFICATION (diagnosed 2026-08-03; the ~28% headroom has a mechanism)
 
 The TLS-origination showdown left a lead: depth TLS costs us ~28% off our own plaintext while Envoy's

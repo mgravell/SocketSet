@@ -1359,7 +1359,7 @@ internal sealed class IoUringShard : SocketSetShard
                 }
             }
 
-            ProcessAvailableCompletions();
+            if (ProcessAvailableCompletions() > 0) Parent.OnLoopDrain();
         }
     }
 
@@ -1383,8 +1383,9 @@ internal sealed class IoUringShard : SocketSetShard
     // Completion processing
     // =====================================================================
 
-    private unsafe void ProcessAvailableCompletions()
+    private unsafe int ProcessAvailableCompletions()
     {
+        int processed = 0;
         uint head = *_ring.CqHead;
         uint tail = Volatile.Read(ref *_ring.CqTail);
 
@@ -1395,6 +1396,7 @@ internal sealed class IoUringShard : SocketSetShard
             int res = cqe->res;
             uint flags = cqe->flags;
             head++; // advance our local view before dispatching (handlers may submit)
+            processed++;
 
             // Opt-in CQE trace (SS_URING_TRACE=1). io_uring reports operation failures as a NEGATIVE
             // cqe.res, not as a syscall error, so a mis-built SQE looks like a healthy submit followed by
@@ -1446,6 +1448,7 @@ internal sealed class IoUringShard : SocketSetShard
 
         // Release-store our consumed head so the kernel can reuse CQ slots.
         Volatile.Write(ref *_ring.CqHead, head);
+        return processed;
     }
 
     private void HandleAccept(int res, uint flags, int listenerFd, bool local)

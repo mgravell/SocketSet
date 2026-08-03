@@ -406,6 +406,20 @@ public abstract partial class SocketSet : IDisposable
         OnClosed(connection);
     }
 
+    /// <summary>
+    /// Fires on a shard's loop thread after each BATCH of I/O events has been dispatched, before the
+    /// loop waits again. The loop-thread backends (io_uring, epoll) call this when the batch contained
+    /// at least one event; callback-driven dispatch (the managed fallback) never does.
+    ///
+    /// WHY IT EXISTS: per-callback output flushing amplifies peer segmentation. A peer that writes one
+    /// logical burst as several segments produces several receive callbacks, and a consumer that
+    /// flushes per callback faithfully turns each into its own send — measured on the RESP proxy as 3x
+    /// the send submissions under a per-record-writing TLS peer. Deferring flushes to THIS hook batches
+    /// at loop-iteration granularity instead (what event-loop servers do), with an unchanged latency
+    /// envelope: a batch containing one event drains immediately after its callback.
+    /// </summary>
+    protected internal virtual void OnLoopDrain() { }
+
     protected internal virtual void OnClosed(Connection connection)
     {
     }

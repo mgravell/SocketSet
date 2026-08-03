@@ -165,6 +165,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
                     case KindConn: HandleConnection((int)(uint)data, events); break;
                 }
             }
+            if (n > 0) Parent.OnLoopDrain();
         }
     }
 

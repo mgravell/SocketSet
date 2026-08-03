@@ -69,6 +69,32 @@ nearly halved) — from a v1 that still pays an extra receive copy the SAEA path
 receives directly into the handler buffer; we copy from the transport-owned span). The copy is the known
 first lever if this ever needs more; the tails suggest the loop-thread model is already paying for it.
 
+### THE BATCH-END FLUSH HOOK (2026-08-03): the depth-TLS tax falls 28% → 8.4%, and every leg got faster
+
+The diagnosed send amplification (peer record-granular writes x per-callback flush = 3x send SQEs) is
+fixed by **`SocketSet.OnLoopDrain`** — a batch-end hook the loop backends fire once per event batch
+(io_uring after each CQE batch, epoll after each `epoll_wait` batch; managed never) — with the proxy's
+`DrainDeferred` moved from per-`OnReceive` to the hook. Gates first: smoke 60/60 (default no-op = the
+existing world), verify-proxy 13/13 on plaintext AND TLS-originating configs.
+
+**Every pre-registered prediction held, two over-delivered:**
+
+| metric | pre-hook | post-hook |
+|---|---:|---:|
+| TLS `-P 16` send SQEs / 10M ops | 1,226,824 (3x plaintext) | **~285k — below old plaintext's 406k** |
+| plaintext `-P 16` SQEs (control) | ~406k | ~300k (the hook helps the clean case too) |
+| TLS `-P 16` throughput (same-session vs plaintext) | **−28%** | **−8.4%** (4,443,786-4,527,960 vs 4,799,616-4,897,559, disjoint, n=60M) |
+| TLS `-P 1` p99 | 0.543-0.591 | **0.319-0.447** (~−25%; the "unchanged envelope" prediction over-delivered) |
+| TLS vs plaintext p99 at depth | — | **identical** (0.62-0.64 both) |
+
+**~70% of the depth-TLS tax was send amplification, not crypto.** The ~8% residue is the honest
+encrypt-path cost, now cleanly separated. A quantisation lesson re-learned on the way: the first
+post-hook run (n=10M ≈ 2.5s tests) showed TLS *equal* to plaintext — tick-pegged values; the n=60M
+confirm resolved the real −8.4%. The SQE counts, being exact, never needed the re-run.
+
+Note for any future Envoy TLS-origination rerun: this morning's +68-80% table was measured PRE-hook;
+the same comparison on this build should widen it.
+
 ### TLS-ORIGINATION SHOWDOWN (2026-08-03): BoringSSL is a real peer; the depth win is the TRANSPORT's
 
 The last quadrant: both sidecars plaintext-downstream, both dialing the SAME TLS-only Garnet with
