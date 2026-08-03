@@ -3,7 +3,12 @@
   <PropertyGroup>
     <TargetFrameworks>net10.0</TargetFrameworks>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <IsPackable>false</IsPackable>
+
+    <!-- Package metadata: alpha placeholder by design (pre-alpha project; APIs move freely). -->
+    <IsPackable>true</IsPackable>
+    <PackageId>SocketSet.Garnet</PackageId>
+    <PackageTags>garnet;transport;io_uring;epoll;iocp;rio;tls;ktls;sockets;redis;resp</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <Description>Hosts Garnet on the SocketSet transport: an IGarnetServer whose connections are
 served by SocketSet's shard loops (io_uring / epoll / IOCP / RIO / managed) instead of the built-in
 SocketAsyncEventArgs layer.</Description>
@@ -15,7 +20,7 @@ SocketAsyncEventArgs layer.</Description>
          will use a GarnetServerTcp"), which is what makes this library possible without forking Garnet.
          If the package turns out not to expose Garnet.common's networking types, the fallback is a
          sibling-checkout ProjectReference in the RESPite.Proxy pattern; prefer the package. -->
-    <PackageReference Include="Microsoft.Garnet" Version="2.1.1" />
+    <PackageReference Include="Microsoft.Garnet" Version="[2.1.1]" />
   </ItemGroup>
 
 </Project>

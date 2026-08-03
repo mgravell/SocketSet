@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net10.0</TargetFrameworks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -10,6 +10,7 @@
     <NoWarn>$(NoWarn);RESPITE001</NoWarn>
 
     <!-- Package metadata for external consumers. -->
+    <IsPackable>true</IsPackable>
     <PackageId>SocketSet.AspNetCore</PackageId>
     <Description>A Kestrel connection transport backed by SocketSet (io_uring / epoll / IOCP / RIO / managed), with optional transport-terminated TLS (OpenSSL/SChannel, plus kTLS on Linux). Add it with builder.WebHost.UseSocketSet(...).</Description>
     <Authors>Marc Gravell</Authors>
@@ -23,7 +24,19 @@
 
   <ItemGroup>
     <ProjectReference Include="../SocketSet/SocketSet.csproj" />
-    <ProjectReference Include="../../vendor/RESPite.Vendored.csproj" />
+    <!-- Vendored, not a package dependency: PrivateAssets removes it from the nuspec, and the
+         target below folds the DLL into lib/ so the package is self-contained. -->
+    <ProjectReference Include="../../vendor/RESPite.Vendored.csproj" PrivateAssets="all" />
   </ItemGroup>
+
+  <PropertyGroup>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);PackVendoredAssemblies</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <Target Name="PackVendoredAssemblies">
+    <ItemGroup>
+      <BuildOutputInPackage Include="$(OutputPath)RESPite.Vendored.dll" />
+    </ItemGroup>
+  </Target>
 
 </Project>

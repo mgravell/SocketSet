@@ -4,7 +4,7 @@
     "net10.0": {
       "Microsoft.Garnet": {
         "type": "Direct",
-        "requested": "[2.1.1, )",
+        "requested": "[2.1.1, 2.1.1]",
         "resolved": "2.1.1",
         "contentHash": "3KSmPd/19kY0+eHGB7lO8JO4Kw3B4G5Vqrx2St1SAzwTO0NOOT30WBbhgg9zPI04WOmgnpyMyCeiwKAyyq3PBA==",
         "dependencies": {
