@@ -137,6 +137,18 @@ receive-into-caller-buffer from "deferred" to the next transport lever. Depth-1 
 8-13% — the staged-send loop hop, real and recorded; the SE.Redis client regime is depth (a busy
 multiplexer), but sequential-await apps exist and would feel it.
 
+**"WHY ISN'T IT BETTER" — THE CEILING CONTROL THE RIG LACKED (same day, Marc's question):** raw
+`redis-benchmark -c 1 -P 64` against the same pinned stock Garnet: **2.2-2.4M ops/s at p50 0.023ms** —
+so BOTH SE.Redis legs sit at ~46% of the single-connection wire ceiling, and the missing ~34µs of
+average per-op latency (57µs vs 23µs) is SE.REDIS MACHINERY (encode/bridge/complete/continuation),
+identical on both legs. Amdahl: the IO engine is the minority term of this regime, and no transport
+can 2x a client whose bottleneck is above the transport. Two more probes the same hour: (a) per-core
+CPU is a WASH at d64 (~11 cores both legs — the 64 awaiting workers dominate; the thread-economics
+question needs the multi-mux fixed-core-budget test, queued); (b) **the EXTREME TAIL is the buried
+headline: classic p999 1.18-1.66ms vs tunnel 0.22-0.37ms — 3-5x better, every rep, pinned or not**
+(the rig's summary surfaced p99 only; p999 was in the CSV all along). For the client seat, where the
+tail is the product, that plus the SET-depth disjoint wins is the current honest value statement.
+
 **Epoll null result (same day):** the obvious follow-up — does epoll's send path have the same
 disease? — measured NO before any speculative fix: tunnel GET d64 epoll 707-714k vs io_uring 716-727k
 (3 interleaved unpinned probes, `MUXAB_BACKEND=epoll`, banner-reported; RELATIVE read only — unpinned
