@@ -168,8 +168,13 @@ OUR favour, and the 32-byte cell turns out to be the least favourable point in t
    lever" back to "later". The residual 32B-GET −5% is per-op overhead, mechanism still open (the
    SET-wins/GET-trails-at-32B asymmetry no longer fits the copy story; parked with the d1 wake
    accounting).
-3. Still queued from the program: wake accounting for d1's +2.7µs (doorbell coalescing candidate) and
-   the thread-theft audit (where do completions run in transport mode).
+3. **Thread-theft audit: CLOSED by inspection, no differential.** `ResultBox` creates completion
+   sources with `RunContinuationsAsynchronously` by default (`ResultBox.cs:154`; the inverse only under
+   the opt-in `PreventThreadTheft` feature flag), so transport-mode completions on the loop thread QUEUE
+   continuations to the pool exactly as classic's reader thread does — no inline theft, symmetric
+   dispatch cost, not a suspect for any observed delta.
+4. Still queued: wake accounting for d1's +2.7µs and the 32B-GET −5% (one instrumentation pass —
+   eventfd wakes/op — likely explains both; doorbell coalescing is the candidate fix).
 
 **Consolidated client-seat statement as of tonight: at realistic value sizes (512B-4KB) the tunnel is
 +22-82% ahead; at 32B it is -5% GET / +6% SET; p999 is 3-12x better in every single-mux comparison ever
