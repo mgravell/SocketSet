@@ -22,6 +22,9 @@
 #
 # usage: bench/run-mux-ab.sh
 #        REPS=6 DEPTHS="1 64" OPS="get set" LEGS="classic tunnel classic-tls tunnel-tls" bench/run-mux-ab.sh
+# MUXAB_MUXES / MUXAB_SHARDS / MUXAB_VALSIZE / MUXAB_BACKEND pass through to the harness (banner-reported):
+#        MUXAB_MUXES=8 MUXAB_SHARDS=3 DEPTHS=16 bench/run-mux-ab.sh   # the aggregate/anchor cells
+#        MUXAB_VALSIZE=4096 bench/run-mux-ab.sh                        # the value-size cells
 set -uo pipefail
 
 REPS=${REPS:-6}
@@ -95,13 +98,17 @@ awk -F, 'NR>1 && $5 != "NORESULT" {
   if (!(k in max) || $5+0 > max[k]) max[k]=$5+0
   if (!(k in p99min) || $7+0 < p99min[k]) p99min[k]=$7+0
   if (!(k in p99max) || $7+0 > p99max[k]) p99max[k]=$7+0
+  if (!(k in p999min) || $8+0 < p999min[k]) p999min[k]=$8+0
+  if (!(k in p999max) || $8+0 > p999max[k]) p999max[k]=$8+0
   n[k]++
 }
 END {
-  printf "%-14s %-4s %-6s %-26s %-20s %s\n", "leg", "op", "depth", "ops/s (min-max)", "p99 ms (min-max)", "n"
+  # p999 is a first-class column: the 2026-08-03 investigation found a 3-12x tunnel p999 win that sat
+  # invisible in the CSV because this summary only surfaced p99. The tail is the client-seat product.
+  printf "%-14s %-4s %-6s %-26s %-20s %-20s %s\n", "leg", "op", "depth", "ops/s (min-max)", "p99 ms (min-max)", "p999 ms (min-max)", "n"
   for (k in min) {
     split(k, a, ",")
-    printf "%-14s %-4s %-6s %12d - %-12d %8.3f - %-8.3f %d\n", a[1], a[2], a[3], min[k], max[k], p99min[k], p99max[k], n[k]
+    printf "%-14s %-4s %-6s %12d - %-12d %8.3f - %-8.3f %8.3f - %-8.3f %d\n", a[1], a[2], a[3], min[k], max[k], p99min[k], p99max[k], p999min[k], p999max[k], n[k]
   }
   print ""
   print "pairwise (tunnel vs classic, same op/depth/tls):"
