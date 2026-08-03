@@ -8,14 +8,15 @@ single API over all of them:
 
 | Backend | Platform | Notes |
 | --- | --- | --- |
-| `SocketSetFactory.IoUring` | Linux (5.x+, with the required features) | thread-per-shard, multishot accept, provided buffers, zero-copy echo |
+| `SocketSetFactory.IoUring` | Linux (5.x+, with the required features) | thread-per-shard, multishot accept, provided buffers, zero-copy send |
+| `SocketSetFactory.Epoll` | Linux | readiness-driven fallback for kernels without the io_uring features; zero-copy `writev` send, full TLS/kTLS support |
 | `SocketSetFactory.WindowsIocp` | Windows | raw Winsock + IOCP, bypassing managed sockets |
 | `SocketSetFactory.WindowsRio` | Windows | Registered I/O; TCP-only, opt-in, latency-focused |
 | `SocketSetFactory.Managed` | anywhere | portable `SocketAsyncEventArgs` fallback |
 
-`SocketSetFactory.Default` probes the host and chooses for you (IOCP on Windows, io_uring on a
-capable Linux kernel, otherwise the managed fallback), so the same binary runs everywhere and simply
-goes faster where the platform lets it.
+`SocketSetFactory.Default` probes the host and chooses for you (IOCP on Windows; io_uring on a
+capable Linux kernel, epoll otherwise; the managed fallback elsewhere), so the same binary runs
+everywhere and simply goes faster where the platform lets it.
 
 Supported frameworks: `net10.0` and `net472`. (The native backends are .NET-only; .NET Framework
 gets the managed fallback.)
@@ -81,6 +82,27 @@ incremental composition.
 Unix domain sockets are supported on all backends (`UnixDomainSocketEndPoint`, including the Linux
 abstract namespace via a leading `@`), and an already-bound listener can be adopted by handle with
 `ListenHandle` for socket-activation scenarios.
+
+## TLS
+
+TLS is terminated **in the transport**, not in a stream wrapper above it: set a `TlsProvider` on the
+options and the handshake, record framing and encrypt/decrypt happen on the engine's own buffers, with
+your callbacks seeing plaintext. OpenSSL backs Linux (and can hand the record layer to the kernel —
+**kTLS** — where the OpenSSL build and kernel support it, probed at runtime and reported rather than
+assumed); SChannel backs Windows. TLS 1.3 is the default floor on both, and servers refuse
+client-initiated renegotiation.
+
+```csharp
+var options = new SocketSetOptions
+{
+    Tls = new OpenSslTlsProvider(certPem, keyPem),   // or SChannelTlsProvider on Windows
+    TlsMode = TlsMode.Both,                          // or Accept / Connect for proxy shapes
+};
+```
+
+`TlsMode` makes the provider directional: `Accept` for a TLS-terminating proxy (TLS in, plaintext
+out), `Connect` for a TLS-originating one (plaintext in, TLS out) — a direction that is off behaves
+exactly as if no provider were configured.
 
 ## Configuration
 
