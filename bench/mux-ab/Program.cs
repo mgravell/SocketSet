@@ -25,7 +25,9 @@ int depth = int.Parse(args[4]);
 int seconds = int.Parse(args[5]);
 string trustPem = args.Length > 6 ? args[6] : "/home/marc/code/SocketSet/bench/.tools/tls-demo/cert.pem";
 
-ThreadPool.SetMinThreads(Math.Max(depth, 32), Math.Max(depth, 32));
+int muxes = int.Parse(Environment.GetEnvironmentVariable("MUXAB_MUXES") ?? "1");
+int valSize = int.Parse(Environment.GetEnvironmentVariable("MUXAB_VALSIZE") ?? "32");
+ThreadPool.SetMinThreads(Math.Max(depth * muxes, 32), Math.Max(depth * muxes, 32));
 
 bool tls = leg.EndsWith("-tls");
 bool tunnel = leg.StartsWith("tunnel");
@@ -45,7 +47,8 @@ if (tunnel)
         "managed" => SocketSetFactory.Managed,
         _ => SocketSetFactory.IoUring,
     };
-    var ss = new SocketSetOptions { Shards = 1, Factory = factory };
+    int shards = int.Parse(Environment.GetEnvironmentVariable("MUXAB_SHARDS") ?? "1");
+    var ss = new SocketSetOptions { Shards = shards, Factory = factory };
     if (tls)
     {
         ss.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
@@ -63,11 +66,19 @@ else if (tls)
         cert is not null && cert.GetCertHashString() == trusted.GetCertHashString();
 }
 
-await using var mux = await ConnectionMultiplexer.ConnectAsync(config);
-var db = mux.GetDatabase();
+var muxList = new ConnectionMultiplexer[muxes];
+var dbs = new IDatabase[muxes];
+for (int m = 0; m < muxes; m++)
+{
+    // fresh options per mux (ConnectAsync mutates), same Tunnel INSTANCE — the anchor is the point
+    var c = config.Clone();
+    muxList[m] = await ConnectionMultiplexer.ConnectAsync(c);
+    dbs[m] = muxList[m].GetDatabase();
+}
+var db = dbs[0];
 
 int tunnelConnects = counting?.Connects ?? 0;
-Console.WriteLine($"[mux-ab] backend={(tunnel ? (Environment.GetEnvironmentVariable("MUXAB_BACKEND") ?? "io-uring") : "n/a")} leg={leg} tls={(tls ? (tunnel ? "openssl-transport" : "sslstream") : "off")} tunnel_connects={tunnelConnects} target={host}:{port} depth={depth} op={op} window={seconds}s");
+Console.WriteLine($"[mux-ab] muxes={muxes} shards={Environment.GetEnvironmentVariable("MUXAB_SHARDS") ?? "1"} valsize={valSize} backend={(tunnel ? (Environment.GetEnvironmentVariable("MUXAB_BACKEND") ?? "io-uring") : "n/a")} leg={leg} tls={(tls ? (tunnel ? "openssl-transport" : "sslstream") : "off")} tunnel_connects={tunnelConnects} target={host}:{port} depth={depth} op={op} window={seconds}s");
 if (tunnel && tunnelConnects < 1)
 {
     Console.WriteLine("GATE-FAIL: tunnel leg but ConnectTransportAsync was never called (sibling checkout lacks transport mode?)");
@@ -75,7 +86,7 @@ if (tunnel && tunnelConnects < 1)
 }
 
 var key = (RedisKey)$"muxab:{op}";
-var value = (RedisValue)new byte[32];
+var value = (RedisValue)new byte[valSize];
 await db.StringSetAsync(key, value);
 
 long ops = 0;
@@ -83,7 +94,7 @@ var samples = new long[4_000_000];
 int sampleCount = 0;
 bool running = true, measuring = false;
 
-async Task Worker()
+async Task Worker(IDatabase db)
 {
     long localOps = 0;
     int stride = 0;
@@ -105,8 +116,12 @@ async Task Worker()
     Interlocked.Add(ref ops, localOps);
 }
 
-var workers = new Task[depth];
-for (int i = 0; i < depth; i++) workers[i] = Task.Run(Worker);
+var workers = new Task[depth * muxes];
+for (int i = 0; i < workers.Length; i++)
+{
+    var wdb = dbs[i % muxes];
+    workers[i] = Task.Run(() => Worker(wdb));
+}
 
 await Task.Delay(TimeSpan.FromSeconds(2)); // warmup
 Volatile.Write(ref measuring, true);
@@ -116,6 +131,7 @@ Volatile.Write(ref measuring, false);
 sw.Stop();
 Volatile.Write(ref running, false);
 await Task.WhenAll(workers);
+foreach (var m in muxList) await m.DisposeAsync();
 
 int n = Math.Min(sampleCount, samples.Length);
 Array.Sort(samples, 0, n);

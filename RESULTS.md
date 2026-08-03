@@ -149,6 +149,33 @@ headline: classic p999 1.18-1.66ms vs tunnel 0.22-0.37ms — 3-5x better, every 
 (the rig's summary surfaced p99 only; p999 was in the CSV all along). For the client seat, where the
 tail is the product, that plus the SET-depth disjoint wins is the current honest value statement.
 
+**THE INVESTIGATION CONTINUED (same day, Marc AFK): three more probes, two predictions falsified in
+OUR favour, and the 32-byte cell turns out to be the least favourable point in the whole space.**
+
+1. **Constrained-core aggregate (3 client cores, 16-deep per mux, `MUXAB_MUXES`/`MUXAB_SHARDS`):**
+   m=1: tunnel +13-14% disjoint with p999 **0.060 vs 0.29-0.75 ms** (5-12x). m=8 at the harness's
+   original shards=1 LOSES −36% (16 connections on one loop thread — the anchor fighting one-armed);
+   with shards matched to the budget it wins: **shards=3 → 1.51-1.60M vs classic 1.26M (+20-27%), p99
+   0.22 vs 0.29**. Honest inversions recorded: tunnel p999 at m=8 multi-shard degrades to 2.7-3.5 ms
+   (loop threads contending with 128 workers on 6 CPUs) vs classic 1.6; shards=2 gives the best tail
+   (0.14 ms) at classic-level throughput — the shards ≤ physical-cores trade, third appearance.
+   Guidance: size the engine to the core budget; the anchor thesis holds when you do.
+2. **Value-size sweep (GET d64, m=1, half-machine client): P-val FALSIFIED — the tunnel's 32B deficit
+   INVERTS with size.** v=32: classic +5% (the known cell). v=512: **tunnel +22-28%** (837-838k vs
+   656-686k, p99 0.096 vs 0.15-0.28). v=4096: **tunnel +77-82%** (418-428k vs 235-237k, p50 0.15 vs
+   0.26). The receive copy is EXONERATED at realistic sizes — provided-buffer receive + inline parse
+   beats the Stream read path harder as bytes grow, so receive-into-caller-buffer DEMOTES from "next
+   lever" back to "later". The residual 32B-GET −5% is per-op overhead, mechanism still open (the
+   SET-wins/GET-trails-at-32B asymmetry no longer fits the copy story; parked with the d1 wake
+   accounting).
+3. Still queued from the program: wake accounting for d1's +2.7µs (doorbell coalescing candidate) and
+   the thread-theft audit (where do completions run in transport mode).
+
+**Consolidated client-seat statement as of tonight: at realistic value sizes (512B-4KB) the tunnel is
++22-82% ahead; at 32B it is -5% GET / +6% SET; p999 is 3-12x better in every single-mux comparison ever
+run; aggregate wins +20-27% when shards match the core budget; and everything above the Tunnel seam is
+untouched SE.Redis machinery that caps ALL of it at ~46% of the wire.**
+
 **Epoll null result (same day):** the obvious follow-up — does epoll's send path have the same
 disease? — measured NO before any speculative fix: tunnel GET d64 epoll 707-714k vs io_uring 716-727k
 (3 interleaved unpinned probes, `MUXAB_BACKEND=epoll`, banner-reported; RELATIVE read only — unpinned
