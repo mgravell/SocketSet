@@ -22,6 +22,12 @@ project's guidepost changed from "beat Kestrel" to the RESP ecosystem (see TODO'
 section), and these are the numbers that era has produced. All same-session, interleaved, disjoint
 unless marked; one box, loopback, governor `performance`.
 
+**UNITS, ONCE (they apply to every RESP-era table below):** throughput numbers are **requests/second**
+as reported by `redis-benchmark` (a value like `548,890` is req/s; `4.43M` is 4,430,000 req/s), and all
+latency figures — `p50`/`p99`, and the second number in a `538,420 · 0.199` pair — are **milliseconds**
+(so `0.199` = 199µs). The HTTP-era tables further down use **goodput MiB/s** where their captions say
+so, and rps/µs where marked; when in doubt there, the caption above each table governs.
+
 **Four consumers, one transport:**
 
 | consumer | vs | headline |
@@ -90,7 +96,7 @@ ctor's `IGarnetServer[]` parameter (pure `PackageReference Microsoft.Garnet`, no
 Gate first: `verify-proxy.cs` **13/13 on BOTH legs**. Interleaved, banner-gated, 5 passes, server on 3
 physical cores with shards=6 matched to its logical CPUs (the SMT lesson applied):
 
-| cell | stock SAEA | on SocketSet | verdict |
+| cell | stock SAEA (req/s · p99 ms) | on SocketSet (req/s · p99 ms) | verdict |
 |---|---:|---:|---|
 | `-P 1` GET | 548,890 · p99 0.247 | 538,420 · p99 **0.199** | overlapping — parity |
 | `-P 1` SET | 518,480 · p99 0.311 | 538,379 · p99 **0.215** | +3.8% overlapping |
@@ -107,7 +113,7 @@ first lever if this ever needs more; the tails suggest the loop-thread model is 
 The pre-hook TLS-origination table carried a note that it should widen on the fixed build. Measured,
 same rig, same pinned trust, n=60M at depth:
 
-| cell | envoy (BoringSSL) | socketset post-hook | Δ (was, pre-hook) |
+| cell | envoy, BoringSSL (req/s · p99 ms) | socketset post-hook (req/s · p99 ms) | Δ (was, pre-hook) |
 |---|---:|---:|---|
 | `-P 1` GET | 372,058 · p99 **0.271** | **399,960** · p99 0.431 | **+7.5% DISJOINT** (was +4.8% overlapping) |
 | `-P 1` SET | 363,603 · p99 **0.279** | **390,206** · p99 0.463 | **+7.3% DISJOINT** (was +4.6%) |
@@ -134,9 +140,9 @@ existing world), verify-proxy 13/13 on plaintext AND TLS-originating configs.
 |---|---:|---:|
 | TLS `-P 16` send SQEs / 10M ops | 1,226,824 (3x plaintext) | **~285k — below old plaintext's 406k** |
 | plaintext `-P 16` SQEs (control) | ~406k | ~300k (the hook helps the clean case too) |
-| TLS `-P 16` throughput (same-session vs plaintext) | **−28%** | **−8.4%** (4,443,786-4,527,960 vs 4,799,616-4,897,559, disjoint, n=60M) |
-| TLS `-P 1` p99 | 0.543-0.591 | **0.319-0.447** (~−25%; the "unchanged envelope" prediction over-delivered) |
-| TLS vs plaintext p99 at depth | — | **identical** (0.62-0.64 both) |
+| TLS `-P 16` throughput, req/s (same-session vs plaintext) | **−28%** | **−8.4%** (4,443,786-4,527,960 vs 4,799,616-4,897,559, disjoint, n=60M) |
+| TLS `-P 1` p99 (ms) | 0.543-0.591 | **0.319-0.447** (~−25%; the "unchanged envelope" prediction over-delivered) |
+| TLS vs plaintext p99 at depth (ms) | — | **identical** (0.62-0.64 both) |
 
 **~70% of the depth-TLS tax was send amplification, not crypto.** The ~8% residue is the honest
 encrypt-path cost, now cleanly separated. A quantisation lesson re-learned on the way: the first
@@ -152,7 +158,7 @@ The last quadrant: both sidecars plaintext-downstream, both dialing the SAME TLS
 identical pinned trust and SNI — ours via `TlsMode.Connect`/OpenSSL, Envoy via
 `UpstreamTlsContext`/BoringSSL. Interleaved, 5 passes, banner-gated:
 
-| cell | envoy (BoringSSL) | socketset (OpenSSL) | Δ | verdict |
+| cell | envoy, BoringSSL (req/s · p99 ms) | socketset, OpenSSL (req/s · p99 ms) | Δ | verdict |
 |---|---:|---:|---:|---|
 | `-P 1` GET | 363,636 · p99 **0.295** | 380,916 · p99 0.543 | +4.8% | overlapping |
 | `-P 1` SET | 355,556 · p99 **0.303** | 372,058 · p99 0.583 | +4.6% | overlapping |
@@ -178,7 +184,7 @@ Envoy 1.39's pipe listener accepts `@`-abstract paths (validated, kernel-confirm
 their own abstract names, same session, interleaved, 5 passes, same 3-physical-core pinning,
 `--concurrency 6` matching our 6 shards, TCP upstream to the same Garnet:
 
-| cell | envoy | socketset (L3 affine) | Δ | verdict |
+| cell | envoy (req/s · p99 ms) | socketset, L3 affine (req/s · p99 ms) | Δ | verdict |
 |---|---:|---:|---:|---|
 | `-P 1` GET | 399,968 (298,454-416,597 — WIDE) · p99 0.351 | **512,715** · p99 0.399 | **+28.2%** | **DISJOINT** |
 | `-P 1` SET | 499,900 · p99 **0.175** | 499,850 · p99 0.415 | ±0 | tick-tied (50 rps = one timer quantum) |
@@ -205,7 +211,7 @@ guarded chmod), so the demo constructs it directly. Also note the spelling split
 `UnixDomainSocketEndPoint` wants `"\0name"` for abstract while SocketSet maps `"@name"` itself — same
 kernel name either way, which is what the (patched) benchmark dials.
 
-| cell | SAEA | SocketSet/io_uring | Δ | verdict |
+| cell | SAEA (req/s · p99 ms) | SocketSet/io_uring (req/s · p99 ms) | Δ | verdict |
 |---|---:|---:|---:|---|
 | `-P 1` GET | 777,605 · p99 0.143 | 799,726 · p99 **0.111** | +2.8% | overlapping |
 | `-P 1` SET | 717,875 · p99 0.247 | **799,726** · p99 **0.103** | **+11.4%** | **DISJOINT** |
@@ -225,7 +231,7 @@ identical key material, so the comparison is stacks not certificates), interleav
 (`tls=sslstream` vs `tls=openssl`), 5 passes, TLS-capable `redis-benchmark` (fork build against a
 user-prefix OpenSSL 3.5.4 — no system ssl headers on this box).
 
-| cell | SslStream | in-transport OpenSSL | Δ | p99 |
+| cell | SslStream (req/s · p99 ms) | in-transport OpenSSL (req/s · p99 ms) | Δ req/s | Δ p99 |
 |---|---:|---:|---:|---|
 | `-P 1` GET | 397,772 · 0.439 | **444,247 · 0.247** | **+11.7% DISJOINT** | −44% |
 | `-P 1` SET | 377,858 · 0.663 | **443,115 · 0.239** | **+17.3% DISJOINT** | −64% |
@@ -282,7 +288,7 @@ it costs nothing and removes the socket file, its cleanup, and its permissions e
 **`bench/run-client-shape.sh`** — one connection, deep multiplex, tail-scored: the SE.Redis regime,
 which no rig had ever measured. `-c 1`, GET 32 B, 4 passes, direct vs one affine-SocketSet hop:
 
-| depth | direct | + the hop | reading |
+| depth | direct (req/s · p99) | + the hop (req/s · p99) | reading |
 |---|---:|---:|---|
 | `-P 1` | 49,963 (p99 23µs) | 25,377 (p99 47µs) | hop adds ~20µs/op — exactly one extra RTT |
 | `-P 16` | 755,683 | 367,952 (p99 63µs) | ~0.5x: the latency CHAIN doubled; structural to any proxy |
@@ -332,7 +338,7 @@ The definitive run left "our p99 is ~3x Envoy's" open. Bisected in three steps, 
    delay. 6-on-6 alone took p99 0.871 → ~0.50 ms. Rigs now guard against shards > proxy CPUs.
 3. **The remainder is SMT sibling contention, and it is a genuine TRADE** (same session, 3 passes each):
 
-| leg | rps | p50 | p99 |
+| leg | req/s | p50 (ms) | p99 (ms) |
 |---|---:|---:|---:|
 | envoy (6 workers, same 3 physical cores) | 388,867 | 0.151 | **0.263-0.271** |
 | l3, 6 shards (both SMT siblings) | **405,774** | **0.135** | 0.503-0.583 |
@@ -356,7 +362,7 @@ is L3 (shard-affine upstream legs) + CALLBACK-GRANULARITY FLUSHING (stage during
 one flush per registrant on the way out — the same event-loop-iteration batching Envoy does; both halves
 of its pre-registration held: `-P 1` unmoved, depth recovered and then some):
 
-| depth | test | envoy | socketset L3+deferred | verdict |
+| depth | test | envoy (req/s) | socketset L3+deferred (req/s) | verdict |
 |---|---|---:|---:|---|
 | `-P 1` | GET | 451,584 (444,416-466,636) | **451,584** (444,416-451,584) | identical medians — PARITY |
 | `-P 1` | SET | 451,584 (437,445-458,986) | 437,473 (430,743-444,416) | overlapping — parity |
@@ -452,7 +458,7 @@ is a transport adapter, not a new parser, and all partial-frame/CycleBuffer hand
 
 `-P 1`, pinned, 5 passes, quantisation audit clean, same session:
 
-| leg | GET | % of ceiling | vs Envoy |
+| leg | GET (req/s) | % of ceiling | vs Envoy |
 |---|---:|---:|---|
 | direct *(ceiling, NOT a peer)* | 509,017 | 100% | — |
 | **envoy** | 451,613 | 89% | — |
@@ -472,7 +478,7 @@ coalesce into each upstream write. Batching, not parallelism.
 **AND THE TWO ARE NOT INDEPENDENT — which is the actual finding.** Measured directly, `upstream=2` against
 the default `upstream=5`:
 
-| leg | upstream=5 | upstream=2 | effect |
+| leg | upstream=5 (GET req/s) | upstream=2 (GET req/s) | effect |
 |---|---:|---:|---|
 | worker-saea | 195,771 | 197,155 | **none** — ranges overlap |
 | socketset L1 | 239,292 | 241,368 | **none** — ranges overlap |
@@ -502,7 +508,7 @@ same backend, same 5 passes, same reshuffled leg order. **Envoy passes the ident
 `verify-proxy.cs` gate**, including 1 MB values and the interleaved local/forwarded pipeline, so this is
 like-for-like rather than a comparison against something doing less work.
 
-| depth | test | envoy | socketset/io_uring | socketset/epoll | worker-saea |
+| depth | test | envoy (req/s) | socketset/io_uring (req/s) | socketset/epoll (req/s) | worker-saea (req/s) |
 |---|---|---:|---:|---:|---:|
 | `-P 1` | GET | **451,613** (90% of ceiling) | 231,374 **−48.8%** | 227,620 −49.6% | 195,771 −56.7% |
 | `-P 1` | SET | **451,584** (92%) | 227,613 **−49.6%** | 223,971 −50.4% | 202,869 −55.1% |
@@ -548,7 +554,7 @@ framing/routing are byte-for-byte identical between legs. Backend `garnet-server
 `redis-benchmark` 7.4.2, `-c 64 -d 32`, governor `performance`, THREE-way physical-core split (client /
 proxy / backend each get their own cores and both SMT siblings). 5 passes, leg order reshuffled per pass.
 
-| depth | test | worker-saea (peer baseline) | socketset/io_uring | socketset/epoll |
+| depth | test | worker-saea, peer baseline (req/s) | socketset/io_uring (req/s) | socketset/epoll (req/s) |
 |---|---|---:|---:|---:|
 | `-P 1` | GET | 194,412 (187,889-204,350) | **241,363 (239,292-245,597) +24.2%** | 235,270 (235,255-237,264) +21.0% |
 | `-P 1` | SET | 201,410 (199,971-202,869) | **233,302 (231,374-235,262) +15.8%** | 231,374 (229,486-231,382) +14.9% |
@@ -624,7 +630,7 @@ and the owned-staging piece is IOCP-gated. On Linux the only live delta is the w
 
 **EPOLL, `--classic --tls` — the prediction held in full:**
 
-| payload | before | after | change | verdict |
+| payload | before (MiB/s) | after (MiB/s) | change | verdict |
 |---|---:|---:|---:|---|
 | 16 KB | 5947.1 (5914-6067) | 6065.4 (6015-6106) | +2.0% | *overlapping* |
 | 256 KB | 4132.6 (4094-4155) | 4851.4 (4694-5013) | **+17.4%** | **DISJOINT** |
@@ -762,7 +768,7 @@ surfaced no intermittent lifetime fault (the item-0e shape). So the Linux backen
 
 ### Concurrency: we lead at c64 but degrade MORE than Kestrel above it (2026-08-01, 256 KB plaintext, 3 passes, ranges)
 
-| c | kestrel | io_uring | epoll |
+| c | kestrel (MiB/s) | io_uring (MiB/s) | epoll (MiB/s) |
 |---|---:|---:|---:|
 | 64 | 12,416-12,569 | 12,487-12,888 | 12,653-12,822 |
 | 128 | 9,941-10,111 | 9,511-9,686 | 9,684-9,798 |
@@ -869,7 +875,7 @@ So the fix helped precisely the legs that use the fixed path and left alone prec
 
 #### TODO item 7 (`rio+tls` beats `iocp+tls`) — RESOLVED, and the answer is "it depends on size now"
 
-| payload | `rio+tls` | `iocp+tls` | verdict |
+| payload | `rio+tls` (MiB/s) | `iocp+tls` (MiB/s) | verdict |
 |---|---:|---:|---|
 | 16 KB | 3541-3568 | 3314-3385 | **RIO still ahead, +6.6% disjoint** |
 | 256 KB | 4707-5811 | 4407-4753 | *overlapping* — **the gap is GONE** |
@@ -1158,7 +1164,7 @@ by remembering the high-water capacity and re-renting at it.
 
 Interleaved A/B (`Compare-Commits.ps1`, isolated worktrees, 4 scored passes), IOCP, bridged:
 
-| leg | payload | before | after | change |
+| leg | payload | before (MiB/s) | after (MiB/s) | change |
 |---|---|---:|---:|---|
 | `--classic` plaintext | 16 KB | 3,364.1 | 3,301.6 | −1.9% — *overlapping, noise* |
 | `--classic` plaintext | 256 KB | 4,567.2 | 4,968.3 | +8.8% — *overlapping, unproven* |
@@ -1674,7 +1680,7 @@ Re-measured 2026-07-29 at 12 shards, 6 scored passes. Both Kestrel controls repr
 figures within ~1%, so the two Windows tables *are* comparable with each other - unlike the Linux rows
 above, which are a different OS.
 
-| leg | 16 KB | 256 KB |
+| leg | 16 KB (MiB/s) | 256 KB (MiB/s) |
 |---|---:|---:|
 | kestrel (bridged) | 3,991.9 | 11,620.0 |
 | iocp (bridged) | 3,745.2 | 5,273.3 |
@@ -2155,7 +2161,7 @@ connection now allocates nothing at all instead of 768 bytes.
 
 Same rig, 6 scored passes, `--iocp`, 12 shards, `-c 64`. The two untouched legs are the controls:
 
-| leg | before the split | after the split | |
+| leg | before the split (MiB/s) | after the split (MiB/s) | |
 |---|---:|---:|---|
 | **byo** (default ~4KB pipe blocks, **no flag**) | 5,243.6 [5055-5507] | **8,447.9** [8228-8578] | **+61.1%, disjoint** |
 | byo-seg64k *(control)* | 11,393.3 [10878-11564] | 11,136.2 [11003-11230] | ranges overlap: unchanged |
@@ -2293,7 +2299,7 @@ of that sentence were true and the conclusion did not follow.
 `bench/Run-TlsSizes.ps1 -Shards 12 -Sizes 16384,262144 -Repetitions 7`, 6 scored passes, reshuffled leg
 order, zero errors across 84 cells. Goodput MiB/s, median [min-max]:
 
-| leg | 16 KB | 256 KB |
+| leg | 16 KB (MiB/s) | 256 KB (MiB/s) |
 |---|---:|---:|
 | kestrel | 3,991.9 [3990-4014] | 11,620.0 [10843-11779] |
 | kestrel+tls | 3,143.9 [3086-3171] | 7,096.6 [6999-7182] |
@@ -2445,7 +2451,7 @@ before any conclusion was drawn.
 
 **Throughput does not move with offered concurrency.** Each leg run alone, 3 scored passes:
 
-| leg | -c 64 | -c 128 | -c 256 |
+| leg | -c 64 (rps · p99) | -c 128 | -c 256 |
 |---|---:|---:|---:|
 | kestrel | 289,822 *(p99 1,005µs)* | 303,978 *(1,503µs)* | 299,225 *(2,000µs)* |
 | iocp-s12 | 301,051 *(1,188µs)* | 302,862 *(1,503µs)* | 303,441 *(2,000µs)* |
@@ -2596,7 +2602,7 @@ it does not, copies dominate"*. It moved throughput. **Allocation was the cost.*
 Bare SocketSet HTTP responder (`SmokeTest --http`, no Kestrel, no pipes) against the same transport
 behind the bridge, same client, pinning, payload and shard count:
 
-| backend | bare | bridged | bridge cost |
+| backend | bare (MiB/s) | bridged (MiB/s) | bridge cost |
 |---|---:|---:|---:|
 | iocp/s12 | 5,538.6 | 4,483.4 | **19.0%** |
 | rio/s12 | 2,387.2 | 2,051.6 | **14.1%** |
