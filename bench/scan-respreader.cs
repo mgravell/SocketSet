@@ -2,6 +2,11 @@
 #:property PublishAot=false
 #:property IsPackable=false
 #:property NoWarn=SER004
+#:property TieredCompilation=false
+// ^ Tiering off: this bench's 13 passes complete before tier-1 promotion, so with tiering on it measures
+// tier-0 code and reports ~2.5x reality. RUN WITH -c Release: `dotnet run -c Release --file ...` — the
+// default file-based build is Debug, worth another ~2x of nothing. Both were learned by profiling frames
+// tagged [MinOptJitted]/[QuickJitted] after the first "baseline" had already been written down.
 // ^ RespReader is marked evaluation-only (SER004, raised as an error); this bench exists precisely to
 // evaluate it.
 #:project ../../StackExchange.Redis/src/RESPite/RESPite.csproj

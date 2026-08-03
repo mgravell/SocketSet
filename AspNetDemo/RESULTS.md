@@ -247,6 +247,15 @@ is the headline: **47-103 µs p99 through a full extra network hop, flat across 
 
 **`bench/scan-respreader.cs`** — the frame-scanner ISOLATION baseline (single thread, best-of-10):
 
+> **SUPERSEDED 2026-08-03 — the table below measured DEBUG code running TIER-0 JIT (confounder #15,
+> two layers deep: `dotnet run --file` builds Debug by default, and the bench finishes before tiered
+> promotion; caught by `perf` frames tagged `[MinOptJitted]`/`[QuickJitted]`). The TRUE steady-state
+> numbers (`-c Release`, tiering off; the bench now pins both): small replies **9.5 ns/frame
+> (105 Mframes/s)**, GET commands **24.3 ns (~8 ns/element)**, mixed proxy shape **16.2 ns**, bulks
+> length-skipped at a nominal ~1 TB/s. The scanner is ~2.5% of a proxy shard's budget at post-hook
+> rates: it is NOT a lever, the timeboxed tuning attempt is closed as a measured null, and the real
+> finding is that `RespReader` is ~5x better than this file previously said.**
+
 | mix | Mframes/s | ns/frame |
 |---|---:|---:|
 | small replies (`+OK`/`:int`/`$5`) | 20.07 | **49.8** |
