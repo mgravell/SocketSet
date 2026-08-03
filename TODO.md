@@ -689,9 +689,12 @@ Marc's call: stabilise in-flight work (done — all repos clean, gates green), t
   TAKEN, not just referenced), and an embedded Garnet on `SocketSetGarnetServer` answers `+PONG`.
   Scratch-consumer gotchas worth remembering: /tmp has no `global.json` (a preview SDK 11 got picked
   up) and no implicit usings.
-- **Remaining, Marc-only**: nuget.org API key + `dotnet nuget push` of the six artifacts
-  (`/tmp/nupkg-alpha/*.nupkg` + `.snupkg` — regenerate any time with `dotnet pack -c Release`), and
-  optionally the `SocketSet.*` reserved-prefix application once live.
+- **PUBLISHED 2026-08-03 (Marc):** all three live on nuget.org at `0.1.196-alpha`, verified from the
+  public feed (flatcontainer lists them; a scratch consumer restored `SocketSet.AspNetCore` cold and
+  served HTTP with the transport banner). Remaining Marc-only: the `SocketSet.*` reserved-prefix
+  application, and (optional) delisting the ancient `SocketSet 0.1.1`/`0.1.3` versions the ID carries.
+  The garnet discussion's reproduction path can now be `dotnet add package SocketSet.Garnet
+  --prerelease` instead of clone-and-build — Marc's edit to make if wanted.
 - `SocketSet.StackExchange.Redis` is deliberately NOT packaged: welded to the cross-repo sibling
   checkout and the SER009 experimental contract.
 

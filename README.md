@@ -31,8 +31,10 @@ believe. **If you are picking this up on Windows, `TODO.md` opens with a section
 ## Installation
 
 ```
-dotnet add package SocketSet
+dotnet add package SocketSet --prerelease
 ```
+
+(`--prerelease` because current versions are `-alpha`; see below.)
 
 Two companion packages host existing servers on the transport, and ship alongside it:
 
