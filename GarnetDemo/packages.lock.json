@@ -310,7 +310,7 @@
       "socketset.garnet": {
         "type": "Project",
         "dependencies": {
-          "Microsoft.Garnet": "[2.1.1, )",
+          "Microsoft.Garnet": "[2.1.1, 2.1.1]",
           "SocketSet": "[1.0.0, )"
         }
       }
