@@ -466,6 +466,12 @@ Envoy batches at event-loop-iteration granularity for the same reason. **Pre-reg
 the depth loss without moving `-P 1`** (a `-P 1` callback holds one command either way). If `-P 1`
 regresses, the batching is wrong; if depth does not recover, the collapse is not the flush count.
 
+### GARNET RECEIVE-COPY: GREENLIT for exploration (Marc, 2026-08-03) — "may make it an easier sell"
+
+The v1 extra receive copy (transport span → handler buffer) is worth removing: needs a
+receive-into-caller-buffer shape on SocketSet. Explore alongside the Tunnel-shape design — the two want
+the same primitive (letting the consumer own the receive target), so one design should serve both.
+
 ### GARNET AS THE FOURTH CONSUMER — BUILT, GATED 13/13 BOTH LEGS, AND MEASURED (2026-08-02, same day)
 
 **TLS A/B DONE TOO (same day): in-transport OpenSSL beats Garnet's SslStream path in ALL FOUR cells,
@@ -630,7 +636,24 @@ the path. A micro-benchmark over representative RESP frames (mixed inline-array 
 sizes, the multi-segment boundary case) is the right instrument, with the proxy A/B only as confirmation
 that a micro win survives integration. `experiments/BufferBench` is the precedent for that shape.
 
-## API-SURFACE FREEZE PROPOSAL (drafted 2026-08-02; decide BEFORE SE.Redis takes the dependency)
+## THE SE.REDIS SEAM: DECIDED 2026-08-03 — via the Tunnel API (Marc's call)
+
+**The integration point for SocketSet as SE.Redis's IO core is the `Tunnel` API, not `PhysicalConnection`
+surgery.** Shape: add a new virtual to `Tunnel` that returns **null for every existing implementation**;
+the new API returns whatever shape suits OUR abstraction — deliberately NOT constrained to `Stream` or
+pipes — and SocketSet ships a `Tunnel` implementation. Consequences Marc called out explicitly:
+- Null-default virtual = zero behaviour change for every current caller; SE.Redis core barely moves.
+- **The concrete implementation of the new shape stays in SocketSet code** (as a Tunnel implementation),
+  which largely SIDESTEPS the API-freeze pressure — SE.Redis depends on the Tunnel contract, not on
+  SocketSet's evolving internals.
+- Design task therefore splits: (1) the new `Tunnel` virtual + the transport shape it returns (design it
+  from what the level-2/3 work actually needed: push receive with transport-owned spans, any-thread
+  copying send, batch-end flush point, completion-scoped lifetimes); (2) the SocketSet-side
+  implementation of that shape.
+
+## API-SURFACE FREEZE PROPOSAL (drafted 2026-08-02; decide BEFORE SE.Redis takes the dependency —
+**urgency REDUCED by the Tunnel-seam decision above**, which keeps SocketSet's surface private to its
+own Tunnel implementation)
 
 `AGENTS.md`'s "public API and defaults can change freely" expires the moment SE.Redis references this.
 Proposal, based on what the proxy integration ACTUALLY consumed — which is a good proxy (sorry) for what
