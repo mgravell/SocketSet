@@ -5,83 +5,150 @@ using SocketSets;
 namespace SocketSets.StackExchangeRedis;
 
 /// <summary>
-/// The SocketSet implementation of <see cref="DuplexTransport"/> — the piece <see cref="SocketSetTunnel"/>
-/// hands to SE.Redis. One outbound connection per instance (the client shape: SE.Redis multiplexes onto
-/// ~1-2 connections per endpoint), driven by the same mechanisms the proxy/Garnet work measured: receive
-/// callbacks feed the receiver on the loop thread with transport-owned spans; the transport IS the
-/// <see cref="System.Buffers.IBufferWriter{T}"/> (forwarding to the connection, which converged on the
-/// same shape independently); and <see cref="SocketSet.OnLoopDrain"/> surfaces as
-/// <see cref="TransportReceiver.OnBatchEnd"/>.
+/// The ANCHOR: one engine, N loop threads TOTAL, every transport's connection multiplexed across its
+/// shards — thread count is a configuration constant, not a function of topology. This is the shard
+/// hybrid between the classic sync-reader backend (thread per connection: best latency, worst scaling)
+/// and async workers (bounded threads, a hop per completion): receive, parse and completion run inline
+/// on the owning loop thread, and the thread count never moves.
 ///
-/// The engine is CONTAINED, not derived: <see cref="DuplexTransport"/> is an abstract class and so is
-/// <see cref="SocketSet"/>, and single inheritance makes the previous is-a-engine shape impossible — a
-/// consequence of the abstract-class contract decision, recorded in TODO. The nested engine forwards
-/// its callbacks to the owning transport.
+/// Callbacks are engine-wide, so this type is the per-connection ROUTER: <see cref="Connection.UserToken"/>
+/// carries the owning <see cref="SocketSetClientTransport"/>, and batch-end fans out only to transports
+/// that actually received in the batch (the touched-this-batch pattern, per loop thread — the same shape
+/// the proxy's deferred flush uses).
+/// </summary>
+public sealed class SocketSetClientEngine(SocketSetOptions options) : SocketSet(options)
+{
+    internal void Dial(EndPoint endpoint, SocketSetClientTransport transport)
+        => Connect(endpoint, userToken: transport);
+
+    protected override void OnConnect(ref ConnectContext ctx)
+    {
+        if (ctx.Connection.UserToken is SocketSetClientTransport t) t.OnEngineConnect(ctx.Connection);
+    }
+
+    protected override void OnReceive(ref ReceiveContext ctx)
+    {
+        if (ctx.Connection.UserToken is SocketSetClientTransport t)
+        {
+            // A false return is the receiver requesting close; abortive is correct (the receiver has
+            // decided the stream is over; there is no reply to preserve).
+            if (!t.OnEngineReceive(ctx.Payload))
+            {
+                ctx.Connection.Close();
+                return;
+            }
+            NoteTouched(t);
+        }
+    }
+
+    protected override void OnClosed(Connection connection)
+    {
+        if (connection.UserToken is SocketSetClientTransport t) t.OnEngineClosed();
+    }
+
+    // Batch-end routing: a connection's receives all happen on its own shard's loop thread, so the
+    // touched list is thread-static per loop thread and the per-transport flag needs no interlocking.
+    [ThreadStatic]
+    private static List<SocketSetClientTransport>? t_touched;
+
+    private static void NoteTouched(SocketSetClientTransport t)
+    {
+        if (!t.PendingBatchEnd)
+        {
+            t.PendingBatchEnd = true;
+            (t_touched ??= new()).Add(t);
+        }
+    }
+
+    protected override void OnLoopDrain()
+    {
+        var list = t_touched;
+        if (list is { Count: > 0 })
+        {
+            foreach (var t in list)
+            {
+                t.PendingBatchEnd = false;
+                t.OnEngineBatchEnd();
+            }
+            list.Clear();
+        }
+    }
+}
+
+/// <summary>
+/// The SocketSet implementation of <see cref="DuplexTransport"/>: a thin per-connection router over a
+/// shared <see cref="SocketSetClientEngine"/>. The transport IS the <see cref="System.Buffers.IBufferWriter{T}"/>
+/// (forwarding to the connection, which converged on the same shape independently); inbound is fed by
+/// the engine's callbacks; <see cref="SocketSet.OnLoopDrain"/> surfaces as
+/// <see cref="TransportReceiver.OnBatchEnd"/> for exactly the transports touched in the batch.
 /// </summary>
 public sealed class SocketSetClientTransport : DuplexTransport
 {
     private readonly TaskCompletionSource<bool> _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly Engine _engine;
+    private readonly SocketSetClientEngine? _ownedEngine; // only when the convenience overload built it
     private Connection? _conn;
     private TransportReceiver? _receiver;
+    internal bool PendingBatchEnd; // loop-thread-local via the engine's touched list
 
-    private SocketSetClientTransport(SocketSetOptions options) => _engine = new Engine(this, options);
+    private SocketSetClientTransport(SocketSetClientEngine? ownedEngine) => _ownedEngine = ownedEngine;
 
-    /// <summary>Dial <paramref name="endpoint"/> (TCP or UDS incl. @abstract; TLS per options + TlsMode)
-    /// and complete when the connection — including any TLS handshake — is established.</summary>
+    /// <summary>Dial <paramref name="endpoint"/> on a SHARED <paramref name="engine"/> (TCP or UDS incl.
+    /// @abstract; TLS per the engine's options + TlsMode) and complete when the connection — including
+    /// any TLS handshake — is established.</summary>
+    public static async Task<SocketSetClientTransport> ConnectAsync(
+        EndPoint endpoint, SocketSetClientEngine engine, CancellationToken cancellationToken = default)
+    {
+        var transport = new SocketSetClientTransport(ownedEngine: null);
+        engine.Dial(endpoint, transport);
+        using var reg = cancellationToken.Register(static s => ((SocketSetClientTransport)s!)._connected.TrySetCanceled(), transport);
+        await transport._connected.Task.ConfigureAwait(false);
+        return transport;
+    }
+
+    /// <summary>Convenience: dial with a PRIVATE single-purpose engine built from <paramref name="options"/>
+    /// and owned (and disposed) by the transport. One engine per connection is the wrong shape at scale —
+    /// prefer the shared-engine overload (or <see cref="SocketSetTunnel"/>, which anchors one engine for
+    /// all its dials); this exists for single-connection tools and tests.</summary>
     public static async Task<SocketSetClientTransport> ConnectAsync(
         EndPoint endpoint, SocketSetOptions options, CancellationToken cancellationToken = default)
     {
-        var transport = new SocketSetClientTransport(options);
+        var engine = new SocketSetClientEngine(options);
         try
         {
-            transport._engine.Connect(endpoint);
+            var transport = new SocketSetClientTransport(ownedEngine: engine);
+            engine.Dial(endpoint, transport);
             using var reg = cancellationToken.Register(static s => ((SocketSetClientTransport)s!)._connected.TrySetCanceled(), transport);
             await transport._connected.Task.ConfigureAwait(false);
             return transport;
         }
         catch
         {
-            await transport.DisposeAsync().ConfigureAwait(false);
+            engine.Dispose();
             throw;
         }
     }
 
-    private sealed class Engine(SocketSetClientTransport owner, SocketSetOptions options) : SocketSet(options)
+    internal void OnEngineConnect(Connection connection)
     {
-        protected override void OnConnect(ref ConnectContext ctx)
-        {
-            owner._conn = ctx.Connection;
-            owner._connected.TrySetResult(true);
-        }
+        _conn = connection;
+        _connected.TrySetResult(true);
+    }
 
-        protected override void OnReceive(ref ReceiveContext ctx)
-        {
-            // Push with the transport-owned span, on the loop thread — the level-2 contract verbatim. A
-            // false return is the receiver requesting close; abortive is correct (the receiver has
-            // decided the stream is over; there is no reply to preserve).
-            if (owner._receiver is { } r && !r.OnReceived(ctx.Payload)) ctx.Connection.Close();
-        }
+    internal bool OnEngineReceive(ReadOnlySpan<byte> payload)
+        => _receiver is not { } r || r.OnReceived(payload); // no receiver yet: pre-Start data is dropped
 
-        protected override void OnLoopDrain()
-        {
-            owner._receiver?.OnBatchEnd();
-        }
+    internal void OnEngineBatchEnd() => _receiver?.OnBatchEnd();
 
-        protected override void OnClosed(Connection connection)
-        {
-            // Peer closed (or teardown). Fires once per connection; the receiver learns exactly once.
-            // SocketSet's OnClosed carries no fault detail today; a faulted-close reason is a shape
-            // question for the real contract (recorded in the TODO proposal's open questions).
-            Interlocked.Exchange(ref owner._receiver, null)?.OnClosed(null);
-            owner._connected.TrySetException(new IOException("connection closed before establishment"));
-        }
+    internal void OnEngineClosed()
+    {
+        // Fires once per connection (peer close, failed connect, or teardown); the receiver learns
+        // exactly once. SocketSet's OnClosed carries no fault detail today; a faulted-close reason is a
+        // shape question for the contract (recorded in the TODO proposal's open questions).
+        Interlocked.Exchange(ref _receiver, null)?.OnClosed(null);
+        _connected.TrySetException(new IOException("connection closed before establishment"));
     }
 
     // ---- DuplexTransport ----
-
-    // The transport is the writer: forward the IBufferWriter face to the connection. One null-check +
-    // delegation per call, replacing the pre-revision zero-forwarding `Output => _conn` hand-out.
 
     public override Memory<byte> GetMemory(int sizeHint = 0) => ConnectedOrThrow().GetMemory(sizeHint);
 
@@ -100,7 +167,7 @@ public sealed class SocketSetClientTransport : DuplexTransport
     public override ValueTask DisposeAsync()
     {
         try { _conn?.Close(); } catch { }
-        _engine.Dispose();
+        _ownedEngine?.Dispose(); // shared engines belong to their owner; only the convenience path disposes
         return default;
     }
 
