@@ -734,8 +734,17 @@ contains a nested `Engine : SocketSet`; single inheritance forbids the old is-a)
 being a file-based app (`dotnet run --file` leaks `#:property` TFM overrides as globals into the
 cross-repo restore graph → NETSDK1005 in the sibling's eng/ project) — it is now
 `bench/tunnel-selftest/`, a real csproj, re-gated **ALL PASS × plaintext/TLS/@abstract** against the
-real types. (2) the `PhysicalConnection.Read` push-feed integration, where Marc granted latitude;
-(3) end-to-end: SE.Redis multiplexer over the tunnel against real Garnet, gated then measured.
+real types. (2) ~~the `PhysicalConnection.Read` push-feed integration~~ **DONE 2026-08-03** with (3)'s gate in the
+same stroke: SE.Redis branch `marc/transport-push-feed` (5324d703, off main, pushed) adds a transport
+MODE to PhysicalConnection — transport acquired BEFORE socket creation, no socket/Stream/SslStream/
+reader thread; outbound via `TransportWriter : BufferedStreamWriter` (every `_output` call site
+untouched); inbound PUSH into the existing `CycleBuffer`+`CommitAndParseFrames` on the transport's
+threads (one copy, zero hops). `config.Ssl` + transport tunnel throws (tunnel owns TLS). Gate:
+`bench/tunnel-selftest` grew `mux` and `mux-tls` cells — a REAL ConnectionMultiplexer over
+`SocketSetTunnel` against Garnet: connect/PING/SET/GET/500-op burst, plaintext AND transport-TLS,
+**ALL PASS first run**; 129-test SE.Redis battery still green. Sibling checkout sits on this branch.
+(3) remaining half: MEASURE it — SE.Redis-over-SocketSet vs SE.Redis-classic A/B (rig exists in
+run-client-shape.sh's pattern; needs the interleaved-legs discipline and a control).
 
 The original proposal follows for the record (it shows the pre-revision shape with `Output`).
 

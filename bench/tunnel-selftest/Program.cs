@@ -22,6 +22,44 @@ void Report(string name, bool ok, string detail = "")
 }
 
 var options = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring };
+
+if (surface is "mux" or "mux-tls")
+{
+    if (surface is "mux-tls")
+    {
+        // TLS lives in the TRANSPORT (SocketSet's OpenSSL, pinned trust, verification on); config.Ssl
+        // stays false by contract -- the connect path throws if both are set.
+        options.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
+    }
+    // The END-TO-END cell: a real ConnectionMultiplexer whose IO core is SocketSet, via
+    // Tunnel.ConnectTransportAsync -> SocketSetTunnel -> PhysicalConnection transport mode (push-feed).
+    // No socket, no Stream, no SslStream and no reader thread exist on the SE.Redis side; if these
+    // pass, the whole chain (handshake HELLO/AUTH included) ran through the transport.
+    Console.WriteLine($"=== tunnel-selftest: surface={surface} target={target} ===");
+    var muxCfg = new StackExchange.Redis.ConfigurationOptions
+    {
+        EndPoints = { new IPEndPoint(IPAddress.Parse(target), port) },
+        AbortOnConnectFail = true,
+        Tunnel = new SocketSetTunnel(options),
+    };
+    await using var mux = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(muxCfg);
+    Report("mux-connect", mux.IsConnected);
+    var db = mux.GetDatabase();
+    var rtt = await db.PingAsync();
+    Report("mux-ping", rtt < TimeSpan.FromSeconds(1), $"rtt={rtt.TotalMilliseconds:f2}ms");
+    var key = $"tt:mux:{Guid.NewGuid():N}";
+    var value = Guid.NewGuid().ToString("N");
+    Report("mux-set", await db.StringSetAsync(key, value));
+    Report("mux-get", await db.StringGetAsync(key) == value);
+    var tasks = new Task<bool>[500];
+    for (int i = 0; i < tasks.Length; i++) tasks[i] = db.StringSetAsync($"{key}:{i}", i.ToString());
+    await Task.WhenAll(tasks);
+    Report("mux-burst x500", Array.TrueForAll(tasks, t => t.Result));
+    Report("mux-burst-verify", await db.StringGetAsync($"{key}:499") == "499");
+    Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
+    return failures == 0 ? 0 : 1;
+}
+
 EndPoint endpoint;
 switch (surface)
 {
