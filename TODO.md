@@ -713,9 +713,13 @@ public interface ITransportReceiver
    Sketch: `bool TryGetReceiveBuffer(int sizeHint, out Memory<byte>)` on the receiver, letting the
    transport land bytes directly in consumer memory. Cheap to add behind [Experimental] later; including
    it now serves both consumers from one design.
-4. Naming, and where the shape LIVES: `StackExchange.Redis` (next to Tunnel), or RESPite (SocketSet
-   references RESPite already; SE.Redis too) — RESPite placement lets the Garnet/proxy consumers share
-   it without an SE.Redis reference.
+4. ~~Naming, and where the concrete implementation lives~~ **DECIDED (Marc, 2026-08-03): the concrete
+   Tunnel implementation ships as `SocketSet.StackExchange.Redis`** — an in-repo library in the
+   `.AspNetCore`/`.Garnet` pattern, the fifth consumer — **with an acknowledged corresponding SE.Redis
+   rev adding the `[Experimental]` virtual + shape.** Still open within this: whether the SHAPE type
+   itself sits beside `Tunnel` in `StackExchange.Redis` or in RESPite (RESPite placement lets
+   Garnet/proxy share it without an SE.Redis reference; SE.Redis placement keeps the rev
+   self-contained).
 
 **What is deliberately absent:** backpressure signalling (SE.Redis reads never pause in practice; add
 later behind [Experimental] if real), sync Read anything (push only), Stream/pipe compatibility members
