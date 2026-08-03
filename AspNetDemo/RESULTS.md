@@ -206,7 +206,8 @@ same shape through Envoy at every depth measured, with no filesystem footprint.*
 Both legs on the IDENTICAL abstract name (`@gd-abs`), plaintext, interleaved, 5 passes. Getting stock
 there needed a workaround worth recording: **Garnet's embedding path (`servers == null`) demands
 `UnixSocketPath` and unconditionally `File.Delete`s it — impossible for an abstract name (NUL byte), so
-embedded-abstract is an upstream gap**; `GarnetServerTcp` itself is abstract-clean (path only used for a
+embedded-abstract is an upstream gap** (reported upstream 2026-08-03: garnet discussion #2012, alongside
+the A/B numbers from this file); `GarnetServerTcp` itself is abstract-clean (path only used for a
 guarded chmod), so the demo constructs it directly. Also note the spelling split: .NET's
 `UnixDomainSocketEndPoint` wants `"\0name"` for abstract while SocketSet maps `"@name"` itself — same
 kernel name either way, which is what the (patched) benchmark dials.
