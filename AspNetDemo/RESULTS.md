@@ -69,6 +69,24 @@ nearly halved) — from a v1 that still pays an extra receive copy the SAEA path
 receives directly into the handler buffer; we copy from the transport-owned span). The copy is the known
 first lever if this ever needs more; the tails suggest the loop-thread model is already paying for it.
 
+### TLS-ORIGINATION, POST-HOOK RERUN (2026-08-03): the Envoy gap widens to +139-151%, and `-P 1` goes DISJOINT
+
+The pre-hook TLS-origination table carried a note that it should widen on the fixed build. Measured,
+same rig, same pinned trust, n=60M at depth:
+
+| cell | envoy (BoringSSL) | socketset post-hook | Δ (was, pre-hook) |
+|---|---:|---:|---|
+| `-P 1` GET | 372,058 · p99 **0.271** | **399,960** · p99 0.431 | **+7.5% DISJOINT** (was +4.8% overlapping) |
+| `-P 1` SET | 363,603 · p99 **0.279** | **390,206** · p99 0.463 | **+7.3% DISJOINT** (was +4.6%) |
+| `-P 16` GET | 1,803,969 · p99 0.831 | **4,527,618** · p99 **0.527** | **+151.0%** (was +80.0%) |
+| `-P 16` SET | 1,701,548 · p99 0.895 | **4,067,521** · p99 **0.559** | **+139.0%** (was +67.9%) |
+
+Both pre-registered predictions held: the depth gap moved into the plaintext-shaped band once our TLS
+leg stopped throttling itself on send amplification, and `-P 1` flipped from crypto-parity-overlap to a
+disjoint lead (fewer syscalls pay at every depth). The BoringSSL-parity conclusion therefore narrows to:
+**parity in crypto cost, behind in transport efficiency** — and Envoy's one surviving cell is its `-P 1`
+TLS tail (0.27 vs 0.43 ms), unchanged and kept honest.
+
 ### THE BATCH-END FLUSH HOOK (2026-08-03): the depth-TLS tax falls 28% → 8.4%, and every leg got faster
 
 The diagnosed send amplification (peer record-granular writes x per-callback flush = 3x send SQEs) is
