@@ -652,8 +652,9 @@ that a micro win survives integration. `experiments/BufferBench` is the preceden
   `(WriteMode, Stream, MemoryPool<byte>?, ct)` with the pub/sub-never-sync POLICY moved to the one call
   site in `PhysicalConnection.InitOutput`; RESPite gains the conditional System.IO.Pipelines reference
   (in-box net10.0+) so PipeStreamWriter stays with its family. Solution 0 errors, 129 writer/round-trip/
-  in-proc tests pass. `marc/proxy-socketset` deletes its drifted `src/RESPite/Streams/` copies on next
-  rebase. Awaiting Marc's merge.
+  in-proc tests pass. **Merged to main as #3153 (2026-08-03)**; `marc/proxy-socketset` has main merged
+  in and its drifted copies deleted (49125952) — the duplication is dead everywhere. Sibling checkout
+  back on main; tunnel gate re-smoked ALL PASS against the merge.
 
 ## THE SE.REDIS SEAM: DECIDED 2026-08-03 — via the Tunnel API (Marc's call)
 
