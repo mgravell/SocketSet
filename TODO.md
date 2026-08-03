@@ -646,6 +646,8 @@ pipes — and SocketSet ships a `Tunnel` implementation. Consequences Marc calle
 - **The concrete implementation of the new shape stays in SocketSet code** (as a Tunnel implementation),
   which largely SIDESTEPS the API-freeze pressure — SE.Redis depends on the Tunnel contract, not on
   SocketSet's evolving internals.
+- **The SE.Redis-side surface is ONLY the new Tunnel virtual, and it ships `[Experimental]`** (Marc,
+  same day) — consumption of the new API is free to evolve; no freeze anywhere.
 - Design task therefore splits: (1) the new `Tunnel` virtual + the transport shape it returns (design it
   from what the level-2/3 work actually needed: push receive with transport-owned spans, any-thread
   copying send, batch-end flush point, completion-scoped lifetimes); (2) the SocketSet-side
