@@ -636,6 +636,25 @@ the path. A micro-benchmark over representative RESP frames (mixed inline-array 
 sizes, the multi-segment boundary case) is the right instrument, with the proxy A/B only as confirmation
 that a micro win survives integration. `experiments/BufferBench` is the precedent for that shape.
 
+## SE.REDIS SIDE-QUESTS (2026-08-03, from Marc)
+
+- **UDS incl. @abstract in SE.Redis itself** — "we should stop being hypocritical": we are shipping
+  abstract-socket support to redis-server/redis-cli (PRs against upstream) while SE.Redis, from memory,
+  supports `!foo.sock` UDS config syntax but almost certainly not `!@foo` abstract names. Verify what
+  `!` parsing produces today, then support `@` → abstract (`\0`-prefixed) on Linux in BOTH paths: the
+  classic managed-socket connect AND the SocketSet tunnel (the tunnel side already maps `@`; the config
+  parse and `UnixDomainSocketEndPoint` construction are the likely gaps). Same `@` convention as
+  socat/systemd and our upstream PRs. Test cell: in-proc or real server on an abstract name, connect via
+  config string.
+- **BufferedStreamWriter unification: DONE 2026-08-03** (Marc's go: "duplicated code is asking for
+  trouble") — branch `marc/respite-buffered-stream-writer` (f1965d12, pushed): the trio moved to
+  `RESPite.Streams` as the single copy (replace/move; SE.Redis files gone), factory decoupled to
+  `(WriteMode, Stream, MemoryPool<byte>?, ct)` with the pub/sub-never-sync POLICY moved to the one call
+  site in `PhysicalConnection.InitOutput`; RESPite gains the conditional System.IO.Pipelines reference
+  (in-box net10.0+) so PipeStreamWriter stays with its family. Solution 0 errors, 129 writer/round-trip/
+  in-proc tests pass. `marc/proxy-socketset` deletes its drifted `src/RESPite/Streams/` copies on next
+  rebase. Awaiting Marc's merge.
+
 ## THE SE.REDIS SEAM: DECIDED 2026-08-03 — via the Tunnel API (Marc's call)
 
 **The integration point for SocketSet as SE.Redis's IO core is the `Tunnel` API, not `PhysicalConnection`
