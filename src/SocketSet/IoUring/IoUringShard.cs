@@ -900,7 +900,33 @@ internal sealed class IoUringShard : SocketSetShard
         if (conn.Pending is { Count: > 0 } pending)
         {
             if (ReportStats) Interlocked.Increment(ref s_pendDrain);
-            SubmitPendingJob(conn, slot, fd, pending.Dequeue());
+            var job = pending.Dequeue();
+
+            // Coalesce the run of queued flushed chains into ONE writev (FIFO order preserved — the
+            // queue IS the byte-stream order). Without this, deep client multiplexing degenerates into
+            // one tiny writev per command, each waiting out the previous completion: measured on the
+            // SE.Redis transport-mode A/B as SQEs ≈ ops, one ~40B segment per send, 99.8% of sends
+            // queued-behind-inflight, and a ~7x throughput loss to the classic backend. The pending
+            // queue is itself the natural batch boundary — the same lesson as OnLoopDrain, one layer
+            // down. Zc/Seg jobs and appData transitions end the run (their completion semantics are
+            // per-job); IovMax bounds the merged chain because writev rejects more.
+            if (job.Zc is null && job.Chain.Count > 0)
+            {
+                while (pending.Count > 0 && job.Chain.Count < IovMax)
+                {
+                    var next = pending.Peek();
+                    if (next.Zc is not null || next.Chain.Count == 0 || next.AppData != job.AppData
+                        || job.Chain.Count + next.Chain.Count > IovMax)
+                    {
+                        break;
+                    }
+                    next = pending.Dequeue();
+                    job.Chain.Add(in next.Chain, 0, next.Chain.Count);
+                    if (ReportStats) Interlocked.Increment(ref s_pendDrain);
+                }
+            }
+
+            SubmitPendingJob(conn, slot, fd, job);
         }
         else conn.SendBusy = false;
     }
