@@ -50,8 +50,8 @@ var rx = new Receiver();
 transport.Start(rx);
 
 // 1: single round trip — push delivery, staged write + flush
-"*1\r\n$4\r\nPING\r\n"u8.ToArray().AsSpan().CopyTo(transport.Output.GetSpan(32));
-transport.Output.Advance(14);
+"*1\r\n$4\r\nPING\r\n"u8.ToArray().AsSpan().CopyTo(transport.GetSpan(32));
+transport.Advance(14);
 Report("flush", transport.Flush());
 Report("ping-roundtrip", await rx.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
 
@@ -61,9 +61,9 @@ const int N = 1000;
 for (int i = 0; i < N; i++)
 {
     var cmd = Encoding.ASCII.GetBytes($"*3\r\n$3\r\nSET\r\n$6\r\ntt:{i:d3}\r\n$2\r\nok\r\n");
-    var span = transport.Output.GetSpan(cmd.Length);
+    var span = transport.GetSpan(cmd.Length);
     cmd.CopyTo(span);
-    transport.Output.Advance(cmd.Length);
+    transport.Advance(cmd.Length);
 }
 Report("burst-flush", transport.Flush());
 Report($"burst x{N}", await rx.WaitForCount("+OK\r\n"u8.ToArray(), N, TimeSpan.FromSeconds(10)),

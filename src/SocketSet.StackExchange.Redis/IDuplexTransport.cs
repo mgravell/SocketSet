@@ -9,10 +9,11 @@ namespace SocketSets.StackExchangeRedis;
 /// built and measured NOW, and becomes a using-alias/delete when the real type lands. Every member is
 /// derived from a measured lesson; do not add members here without adding the lesson.
 /// </summary>
-public interface IDuplexTransport : IAsyncDisposable
+public interface IDuplexTransport : IBufferWriter<byte>, IAsyncDisposable
 {
-    /// <summary>Stage outbound bytes: callable from any thread; bytes are copied during the call.</summary>
-    IBufferWriter<byte> Output { get; }
+    // The transport IS the outbound IBufferWriter — no separate Output object (2026-08-03 revision:
+    // Flush lives on the transport, so a detached "Output" was a lie; passing the transport AS
+    // IBufferWriter grants stage-only access, and the owner flushes at its batch boundary).
 
     /// <summary>Hand everything staged since the last flush to the wire as one send. False = closed.
     /// Batching at the caller's natural boundaries is the single biggest lever this project measured.</summary>

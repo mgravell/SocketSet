@@ -71,7 +71,17 @@ public sealed class SocketSetClientTransport : SocketSet, IDuplexTransport
 
     // ---- IDuplexTransport ----
 
-    public System.Buffers.IBufferWriter<byte> Output => _conn
+    // The transport is the writer: forward the IBufferWriter face to the connection (which is itself
+    // an IBufferWriter — the shape SocketSet converged on independently). This replaces the previous
+    // zero-forwarding `Output => _conn` hand-out; the per-call cost is one null-check + delegation.
+
+    public System.Memory<byte> GetMemory(int sizeHint = 0) => ConnectedOrThrow().GetMemory(sizeHint);
+
+    public System.Span<byte> GetSpan(int sizeHint = 0) => ConnectedOrThrow().GetSpan(sizeHint);
+
+    public void Advance(int count) => ConnectedOrThrow().Advance(count);
+
+    private Connection ConnectedOrThrow() => _conn
         ?? throw new InvalidOperationException("not connected");
 
     public bool Flush() => _conn is { } c && c.Flush();

@@ -669,12 +669,26 @@ projects) plus `Tunnel.ConnectTransportAsync` (null-default virtual). SocketSet 
 **gated ALL PASS across plaintext/TLS/@abstract** (`bench/tunnel-selftest.cs` — the 1000-command burst
 lands in six batch-end callbacks, the coalescing visible in the gate).
 
+**SHAPE REVISION (2026-08-03, Marc's call after the collapse thought-experiment):** the separate
+`Output` property was a lie — `Flush` lived on the transport, so the "output object" never truly
+described output. Resolution: **the transport IS the writer** (`DuplexTransport : IBufferWriter<byte>`,
+abstract `GetMemory`/`GetSpan`/`Advance` directly on it; `Output` deleted), and **the receiver stays a
+separate abstract class** (consumer-implemented; abstract-class evolvability matters on RESPite's
+net461/netstandard2.0 targets, where interfaces cannot grow — no DIMs). Passing the transport *as*
+`IBufferWriter<byte>` deliberately grants stage-only access: the holder composes, the owner flushes at
+its batch boundary — the batching contract expressed in the type system. Costs accepted: writer can
+never differ from transport (framing multiplexers belong a layer up), and the SocketSet impl now
+forwards `GetSpan`/`Advance` to the `Connection` instead of handing it out (one null-check +
+delegation per call). Also settled permanently: a shared transport *interface* between SocketSet and
+RESPite is dead — no structural identity for interfaces, and a third both-agree assembly won't happen;
+containment (has-a) is the pattern. Revised on both sides, re-gated **ALL PASS × plaintext/TLS/@abstract**.
+
 **Next steps in order:** (1) retarget the SocketSet impl to the real RESPite types (sibling reference,
 delete the provisional copy — replace/move, not duplicate) + the actual Tunnel subclass; (2) the
 `PhysicalConnection.Read` push-feed integration, where Marc granted latitude; (3) end-to-end: SE.Redis
 multiplexer over the tunnel against real Garnet, gated then measured.
 
-The original proposal follows for the record.
+The original proposal follows for the record (it shows the pre-revision shape with `Output`).
 
 ## TUNNEL TRANSPORT SHAPE — DESIGN PROPOSAL (2026-08-03, for Marc's review before any code)
 
