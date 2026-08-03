@@ -4,6 +4,43 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## SESSION CLOSE 2026-08-03 (READ FIRST NEXT SESSION — the day SE.Redis ran on SocketSet)
+
+One very long day. The short version: **the multiplexer now runs on SocketSet end-to-end** (Tunnel →
+transport mode → push-feed, no socket/Stream/reader thread), it was measured honestly (falsified first,
+fixed, then won where it matters), and everything is pushed. The long version, in order:
+
+1. **The SER009 seam is merged upstream**: SE.Redis #3152 (Tunnel.ConnectTransportAsync + the
+   [Experimental] DuplexTransport/TransportReceiver contract — transport IS the IBufferWriter, GetSpan
+   virtual, receiver a separate abstract class) and #3153 (BufferedStreamWriter unified into
+   RESPite.Streams) are BOTH on SE.Redis main, merged by Marc. Branch rule stands: SE.Redis main is
+   NEVER pushed directly; marc/* branches only.
+2. **Transport mode** lives on SE.Redis `marc/transport-push-feed` (unmerged): PhysicalConnection grows
+   a transport path — no socket/SslStream/reader thread; TransportWriter : BufferedStreamWriter keeps
+   every _output call site; TransportFeed pushes into CycleBuffer+CommitAndParseFrames on the loop
+   thread; config.Ssl + transport tunnel throws. The SIBLING CHECKOUT must sit on this branch for
+   SocketSet.StackExchange.Redis to build.
+3. **The anchor shape** (SocketSet main): SocketSetTunnel holds ONE SocketSetClientEngine; transports
+   are thin per-connection routers (UserToken dispatch, touched-this-batch OnBatchEnd). Engine-per-
+   connection survives only as a documented convenience overload.
+4. **The A/B arc (root RESULTS.md, the whole story): falsified → fixed → reframed.** v1 lost ALL EIGHT
+   cells (~7x at depth). Counters located it (SQEs≈ops, 99.8% queued-behind-inflight) → io_uring
+   DrainNext now coalesces the queued-chain run into one writev (5ec2b65; smoke 60/60 first). Post-fix:
+   SET-depth disjoint wins, and the investigation Marc asked for ("why isn't it better") found: (a)
+   BOTH legs sit at ~46% of the wire ceiling — SE.Redis machinery above the seam is the cap; (b) p999
+   is 3-12x better on the tunnel in every single-mux run — the client-seat headline; (c) the 32B cell
+   was the LEAST favourable point: +22-28% at 512B, +77-82% at 4KB (receive copy EXONERATED, into-
+   caller-buffer demoted); (d) aggregate +20-27% at m=8 when MUXAB_SHARDS matches the core budget
+   (shards=1 loses — the anchor one-armed); (e) epoll null (no conveyor); (f) theft audit closed
+   (RunContinuationsAsynchronously default). Open: d1 +2.7µs and 32B-GET −5% — wake accounting next
+   (eventfd wakes/op; doorbell coalescing the candidate fix).
+5. **Also landed**: !@abstract in SE.Redis (`marc/uds-abstract-config`, tests + live pass, unmerged);
+   alpha packages 0.1.196-alpha in ~/code/packages (Marc's nuget push pending); RESULTS.md moved to
+   repo root; every table now states units; SocketSet.ToString diagnostic line (57ddaee); garnet
+   discussion #2012 posted by Marc (0 replies yet; embedded-abstract gap PR offered).
+6. **Marc-only pending**: nuget push; PR/merge calls on marc/transport-push-feed + marc/uds-abstract-
+   config; redis PRs #15572/#15575 shepherding (8.12 bucket, quiet); #2012 watch.
+
 ## READ FIRST IF YOU ARE ON WINDOWS (written 2026-08-01, switching back from Linux)
 
 > **THIS CATCH-UP IS DONE (2026-08-01 Windows session). Items 1-4 of the priority list below are all
