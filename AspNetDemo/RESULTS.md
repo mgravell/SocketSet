@@ -112,9 +112,30 @@ so the connection is a syscall-latency conveyor at ~6µs/op ≈ the observed ~17
 packs ~64 commands per write. This is the proxy's send-amplification lesson in its third costume
 (peer-granular TLS records, then per-callback flushes, now per-op client flushes) — and the natural
 batch boundary ALREADY EXISTS: the pending queue itself. The fix shape is drain-time coalescing
-(merge all consecutive queued chains into one writev, bounded by IovMax) — in progress; this entry
-gets its post-fix table when it lands. The depth-1 deficit (~2.7µs/op) is the loop-thread hop for
-staged sends and is NOT expected to move with this fix; that one is real v1 cost, honestly recorded.
+(merge all consecutive queued chains into one writev, bounded by IovMax). The depth-1 deficit
+(~2.7µs/op) is the loop-thread hop for staged sends and was NOT expected to move with this fix.
+
+**POST-FIX (same day, commit 5ec2b65 + the anchor rev 289c426; smoke 60/60 and tunnel-selftest 5/5
+before re-measuring; 6 passes, same rig):** the counters first — ~13 ops/SQE (was ~1), and a second
+LATENT coalescing layer surfaced: staging already shared pages across ops (~9 ops/segment), which the
+one-job drain had never let matter. Then the table:
+
+| cell (req/s · p99 ms) | classic | tunnel (post-fix) | verdict |
+|---|---:|---:|---|
+| GET d1 | 51,600-52,238 · 0.022-0.023 | 44,764-45,686 · 0.025-0.026 | classic +13% DISJOINT (unmoved, as predicted) |
+| SET d1 | 51,694-52,207 · 0.022 | 44,513-45,679 · 0.025-0.026 | classic +13% DISJOINT (unmoved) |
+| GET d64 | 1,063,051-1,108,720 · 0.091-0.099 | 1,028,455-1,047,990 · **0.080-0.093** | classic +4.4% disjoint on THROUGHPUT; tunnel p99 better |
+| SET d64 | 1,020,440-1,034,408 · 0.098-0.100 | **1,077,327-1,103,895** · **0.082-0.096** | **tunnel +6.2% DISJOINT** |
+| GET d64 TLS | 940,872-956,021 · 0.099-0.114 | 925,948-942,126 · **0.089-0.101** | −1.5% overlapping — parity, tunnel p99 better |
+| SET d64 TLS | 914,654-930,863 · 0.104-0.107 | **982,457-999,055** · **0.089-0.102** | **tunnel +7.4% DISJOINT** |
+
+**Reading:** the collapse was entirely the drain granularity. Post-fix, the tunnel DISJOINTLY WINS both
+SET depth cells and holds better p99 in all four depth cells; GET depth is −4.4%/parity. The SET-wins/
+GET-trails asymmetry is mechanism-consistent with the known receive copy (SET replies are tiny `+OK`,
+GET replies carry the value — the leg that receives more, pays more), which promotes
+receive-into-caller-buffer from "deferred" to the next transport lever. Depth-1 stays classic's by
+8-13% — the staged-send loop hop, real and recorded; the SE.Redis client regime is depth (a busy
+multiplexer), but sequential-await apps exist and would feel it.
 
 ### GARNET ON SOCKETSET (2026-08-02, late): parity-to-ahead on day one, better tails in every cell
 
