@@ -559,6 +559,28 @@ git push fork marc/uds-abstract-sockets` — pushing to the personal fork needs 
 one commit, PR-shaped. Upstream pitch when ready: "support the established @ convention for abstract
 sockets in -s" — small, one function, benefits cli and benchmark alike.
 
+### THE DEPTH-TLS SEND AMPLIFICATION (diagnosed 2026-08-03; the ~28% headroom has a mechanism)
+
+The TLS-origination showdown left a lead: depth TLS costs us ~28% off our own plaintext while Envoy's
+depth numbers barely move. Instrumented (`SS_URING_STATS`, same 10M-op depth workload, plaintext vs TLS
+upstream): **TLS issues 3x the send SQEs for identical work** (1,226,824 vs 406,135, ~1 iovec each).
+
+**Mechanism, read from the code rather than guessed:** our decrypt path is NOT per-record
+(`TlsData` decrypts the whole recv buffer, one `DispatchReceive`) — the fan-out is the PEER's write
+granularity. An SslStream-style upstream writes per TLS record, so one logical reply burst arrives as
+several TCP segments → several recv completions → and the proxy's CALLBACK-granularity deferred flush
+(the -P 16 fix) faithfully turns each completion into its own downstream/upstream send. Peer
+segmentation x per-callback drain = 3x sends. Envoy does not amplify because its event loop flushes per
+ITERATION, not per readiness event.
+
+**Candidate fix, well-scoped:** a LOOP-ITERATION flush point. io_uring already processes CQEs in
+batches; expose a transport callback at batch end (an `OnLoopDrain`/batch-end hook on SocketSet), and
+move the proxy's `DrainDeferred` from per-`OnReceive` to per-batch. Same latency envelope at -P 1 (a
+batch with one completion drains identically), collapses the amplification at depth. Pre-register: the
+send-SQE count under the TLS depth workload should fall from ~3x toward ~1x plaintext, recovering a
+meaningful slice of the 28%; if SQEs fall but throughput does not move, the syscall count was not the
+binding cost and the lead moves to the encrypt path itself.
+
 ### BACKLOG: tune the frame scanner (raised by Marc 2026-08-02)
 
 `RespReader`'s frame scanning is worth a pass — plausibly a few more percent. **Aim it correctly, because
