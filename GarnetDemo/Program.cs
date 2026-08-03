@@ -1,7 +1,7 @@
 // Embedded Garnet on the SocketSet transport — the GarnetDemo plays the role AspNetDemo plays for
 // Kestrel: the smallest host that lets the rigs point at a real server, with a banner they can gate on.
 //
-// usage: GarnetDemo [--port N] [--backend io-uring|epoll|managed] [--shards N] [--stock]
+// usage: GarnetDemo [--port N] [--backend io-uring|epoll|managed] [--shards N] [--stock] [--tls] [--ktls]
 //   --stock hosts Garnet's OWN GarnetServerTcp instead (the SAEA layer) on the same options, so a
 //   stock-vs-socketset A/B is one flag on one binary — the application-held-constant discipline again.
 using System.Net;
@@ -14,7 +14,7 @@ using SocketSets.Garnet;
 
 int port = 6390, shards = 8;
 string backend = "io-uring";
-bool stock = false, tls = false;
+bool stock = false, tls = false, ktls = false;
 // Both legs use the SAME key material (bench/.tools/tls-demo): stock consumes the pfx via Garnet's
 // SslStream-based path, ours consumes the pem pair in-transport. Identical cert = identical handshake
 // work, so a TLS A/B compares the STACKS, not the certificates.
@@ -29,6 +29,12 @@ for (int i = 0; i < args.Length; i++)
         case "--backend" when i + 1 < args.Length: backend = args[++i]; break;
         case "--stock": stock = true; break;
         case "--tls": tls = true; break;
+        // The visitor toggle: kTLS needs kernel + OpenSSL 3.0+/3.2+ (TX/RX) support, and its BIG win
+        // (NIC inline offload) needs hardware this loopback box does not have -- so if you have the
+        // right lab, this is the one flag to flip. Capability is DISCOVERED, not assumed: watch for the
+        // provider's [ktls] banner lines reporting what actually engaged (SS_KTLS_NO_RX=1 forces
+        // TX-only for A/Bs). Implies --tls; refused with --stock (SslStream has no kTLS path).
+        case "--ktls": ktls = tls = true; break;
         case "--tls-dir" when i + 1 < args.Length: tlsDir = args[++i]; break;
         case "--listen-uds" when i + 1 < args.Length: listenUds = args[++i]; break;
         default: Console.Error.WriteLine($"unknown argument: {args[i]}"); return 1;
@@ -55,6 +61,11 @@ else
     endpoint = new System.Net.Sockets.UnixDomainSocketEndPoint(listenUds);
 }
 var garnetOpts = new GarnetServerOptions { EndPoints = [endpoint] };
+if (ktls && stock)
+{
+    Console.Error.WriteLine("--ktls is the SocketSet/OpenSSL path; --stock uses SslStream, which has no kTLS. Drop one.");
+    return 1;
+}
 if (tls && stock)
 {
     garnetOpts.TlsOptions = new GarnetTlsOptions(
@@ -91,7 +102,8 @@ else if (!stock)
         // TLS machinery stays idle -- which is what makes the A/B purely their-TLS-vs-ours.
         ssOptions.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(
             File.ReadAllText(Path.Combine(tlsDir, "cert.pem")),
-            File.ReadAllText(Path.Combine(tlsDir, "key.pem")));
+            File.ReadAllText(Path.Combine(tlsDir, "key.pem")),
+            kernelOffload: ktls);
     }
     servers = [new SocketSetGarnetServer(endpoint, ssOptions)];
 }
@@ -101,7 +113,7 @@ server.Start();
 
 // TRUST THE BANNER: the rigs gate on this line, not on the flags they passed.
 Console.WriteLine($"[garnet-demo] transport={(stock ? "garnet-saea" : $"socketset/{backend} shards={shards}")} " +
-                  $"tls={(tls ? (stock ? "sslstream" : "openssl") : "off")} " +
+                  $"tls={(tls ? (stock ? "sslstream" : ktls ? "openssl+ktls" : "openssl") : "off")} " +
                   $"listen={listenUds ?? port.ToString()}");
 Console.WriteLine("ready");
 Thread.Sleep(Timeout.Infinite);
