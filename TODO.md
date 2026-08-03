@@ -655,6 +655,72 @@ pipes — and SocketSet ships a `Tunnel` implementation. Consequences Marc calle
   copying send, batch-end flush point, completion-scoped lifetimes); (2) the SocketSet-side
   implementation of that shape.
 
+## TUNNEL TRANSPORT SHAPE — DESIGN PROPOSAL (2026-08-03, for Marc's review before any code)
+
+**The virtual** (on `Tunnel`, `[Experimental]`, null-default — the same move as `BeforeAuthenticateAsync`
+one level deeper: instead of yielding a `Stream`, yield the transport itself):
+
+```csharp
+public virtual ValueTask<IDuplexTransport?> ConnectTransportAsync(
+    EndPoint endpoint, ConnectionType connectionType, CancellationToken cancellationToken) => default;
+// null → the existing socket/stream path, untouched, for every current Tunnel
+```
+
+**The shape — each member derived from a measured lesson, not taste:**
+
+```csharp
+[Experimental]
+public interface IDuplexTransport : IAsyncDisposable
+{
+    // OUTBOUND — "callable from any thread; bytes copied on the call" is the contract that made
+    // level-2/3 thread-safety tractable (local replies on the loop thread, upstream replies on another,
+    // one lock). Write/Flush split rather than Send-only: batching is the single biggest lever this
+    // project measured (callback- then batch-granularity flushing; the 3x amplification fix).
+    IBufferWriter<byte> Output { get; }      // stage: any thread, copies
+    bool Flush();                            // wire everything staged as one send; false = closed
+
+    // INBOUND — PUSH, because that is where the wins were: level 2's frame-on-the-loop beat the
+    // pipe-bridge pull by the whole -P 1 gap, and every pull adapter we measured (Level 1) cost 24-40%.
+    void Start(ITransportReceiver receiver); // begin delivery; exactly one receiver, set once
+}
+
+[Experimental]
+public interface ITransportReceiver
+{
+    // payload is TRANSPORT-OWNED, valid only for the call (the level-2 contract). Return false to
+    // request close. Runs on the transport's thread: the receiver must be bounded and non-blocking —
+    // acceptable for SE.Redis because response dispatch completes TCS's with RunContinuationsAsync.
+    bool OnReceived(ReadOnlySpan<byte> payload);
+
+    // batch-end (SocketSet's OnLoopDrain surfaced): flush replies staged during a burst ONCE. The 3x
+    // send-amplification fix depends on this existing in the contract.
+    void OnBatchEnd();
+
+    void OnClosed(Exception? fault);
+}
+```
+
+**Open questions needing Marc (ranked):**
+1. **Interface vs abstract class** for the shape — `[Experimental]` lets either evolve; abstract class
+   gives null-default member addition forever (the Tunnel precedent), interfaces need DIMs. Lean: match
+   the Tunnel house style (abstract class) unless double-inheritance at implementers matters.
+2. **Consumption side**: `PhysicalConnection.Read` today PULLS from `_ioStream` into a `CycleBuffer`
+   with `ReadStatus` phases — the machinery is already RESPite-cousin-shaped. Proposal: a push feed
+   path on the read side (the `Feed`-into-`CycleBuffer` move the proxy handler made), NOT a pull adapter
+   over the push shape (that is the pipe bridge again, the measured 24-40%). How invasive may the Read
+   partial's integration be?
+3. **Receive-into-caller-buffer** (the Garnet copy-removal want): v1 of the shape, or a v2 member?
+   Sketch: `bool TryGetReceiveBuffer(int sizeHint, out Memory<byte>)` on the receiver, letting the
+   transport land bytes directly in consumer memory. Cheap to add behind [Experimental] later; including
+   it now serves both consumers from one design.
+4. Naming, and where the shape LIVES: `StackExchange.Redis` (next to Tunnel), or RESPite (SocketSet
+   references RESPite already; SE.Redis too) — RESPite placement lets the Garnet/proxy consumers share
+   it without an SE.Redis reference.
+
+**What is deliberately absent:** backpressure signalling (SE.Redis reads never pause in practice; add
+later behind [Experimental] if real), sync Read anything (push only), Stream/pipe compatibility members
+(the point of the new shape is not being those).
+
 ## API-SURFACE FREEZE PROPOSAL (drafted 2026-08-02; decide BEFORE SE.Redis takes the dependency —
 **urgency REDUCED by the Tunnel-seam decision above**, which keeps SocketSet's surface private to its
 own Tunnel implementation)
