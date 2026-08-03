@@ -32,7 +32,7 @@ so, and rps/µs where marked; when in doubt there, the caption above each table 
 
 | consumer | vs | headline |
 |---|---|---|
-| **RESP proxy** (`RESPite.Proxy` on SocketSet L3) | Envoy 1.39 | TCP: parity `-P 1`, **+177%** `-P 16`. Abstract UDS: **+28% `-P 1` disjoint**, +94-141% depth. TLS-originating (post-hook): **+7.5% `-P 1` disjoint, +139-151% depth** |
+| **RESP proxy** (`RESPite.Proxy` on SocketSet L3) | Envoy 1.39 | TCP: parity `-P 1`, **+253%** `-P 16` GET (SET rides the generator CEILING — ≥+205%; post-drain-fix re-baseline 2026-08-03, was +177%). Abstract UDS: **+28% `-P 1` disjoint**, +94-141% depth. TLS-originating (post-hook): **+7.5% `-P 1` disjoint, +139-151% depth** |
 | same | hand-rolled SAEA `WorkerPool` | +15-28% both depths (level 1, before the fast path existed) |
 | **Garnet** (`SocketSet.Garnet`, embedded) | stock SAEA layer | plaintext: parity, p99 lower all cells; **TLS: +9.5-24.2% all four disjoint**; abstract UDS: SET +11-12.5% disjoint both depths |
 | **Client shape** (`run-client-shape.sh`) | direct | one loop thread ≈ 1.15M ops/s per connection at 47-103µs p99 through a full proxy hop; ~2M+ extrapolated for client mode |
@@ -87,6 +87,24 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
 - The 256 KB PLAINTEXT parity is real and is the pinned-pool fix; the old "−14 to −16%" there was the
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
+
+### PROXY RE-BASELINE POST-DRAIN-FIX (2026-08-03 evening): the headline moves +177% → +253%, and SET-depth hits the generator ceiling
+
+The drain-coalescing fix (5ec2b65) changed the send path every consumer shares, so the recorded proxy
+numbers were re-measured rather than assumed (proxy rebuilt against post-fix SocketSet; `direct envoy
+socketset-l3`, both depths, 5 passes, same session, quantisation-audited):
+
+| cell | envoy | socketset-l3 | verdict |
+|---|---:|---:|---|
+| `-P 16` GET (req/s) | 1,573,152-1,626,567 | **5,332,148-5,647,059** | **+253% DISJOINT** (was +177% pre-fix) |
+| `-P 16` SET (req/s) | 1,499,250-1,547,688 | 4,570,558-4,800,000 | **≥+205% — CEILING-CAPPED** (our leg reaches 100% of `direct`; the true delta is unmeasurable on this generator) |
+| `-P 16` p99 (ms) | 0.94-1.35 | **0.53-0.68** | ours, both ops |
+| `-P 1` (req/s) | ~428k (86% of ceiling) | ~428-462k (86-92%) | parity band (several cells tick-quantised — flagged by the audit, not quoted) |
+| `-P 1` GET p99 (ms) | 0.207-0.359 | 0.327-0.343 | **OVERLAPPING** — Envoy's one surviving cell is no longer clearly its |
+
+The queued-behind-inflight coalescing evidently had headroom in the proxy shape too (its loop-drain
+flush chains queue behind inflight sends exactly like the client's). Tables above this entry that quote
++177% describe the PRE-FIX build and are superseded by this one.
 
 ### SE.REDIS ON SOCKETSET, v1: BOTH PREDICTIONS FALSIFIED — classic ahead in ALL EIGHT CELLS, and the mechanism is already confirmed (2026-08-03)
 
