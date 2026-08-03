@@ -636,6 +636,28 @@ the path. A micro-benchmark over representative RESP frames (mixed inline-array 
 sizes, the multi-segment boundary case) is the right instrument, with the proxy A/B only as confirmation
 that a micro win survives integration. `experiments/BufferBench` is the precedent for that shape.
 
+## ALPHA PACKAGING: BUILT AND VALIDATED 2026-08-03 (Marc: all three together, alpha; publish pending)
+
+Marc's call: stabilise in-flight work (done — all repos clean, gates green), then package `SocketSet` +
+`SocketSet.AspNetCore` + `SocketSet.Garnet` **together, as alpha**. State:
+
+- `version.json` → `0.1-alpha`; NBGV keeps git height, so packs come out `0.1.195-alpha` etc.
+- Both satellites are now `IsPackable`. Garnet pins `Microsoft.Garnet [2.1.1]` EXACT (rides
+  public-but-obscure surface). AspNetCore folds the vendored `RESPite.Vendored.dll` into `lib/` via
+  `PrivateAssets="all"` + `TargetsForTfmSpecificBuildOutput` (no phantom package dependency), and pins
+  plural `TargetFrameworks=net10.0` (repo default `net10.0;net472` was overriding its singular form,
+  and net472 cannot reference the net10.0 vendored project).
+- **Validated from packages alone** (scratch consumers outside the repo, local feed): Kestrel app via
+  `builder.UseSocketSet()` serves HTTP with the `[socketset transport] resolved:` banner (fast path
+  TAKEN, not just referenced), and an embedded Garnet on `SocketSetGarnetServer` answers `+PONG`.
+  Scratch-consumer gotchas worth remembering: /tmp has no `global.json` (a preview SDK 11 got picked
+  up) and no implicit usings.
+- **Remaining, Marc-only**: nuget.org API key + `dotnet nuget push` of the six artifacts
+  (`/tmp/nupkg-alpha/*.nupkg` + `.snupkg` — regenerate any time with `dotnet pack -c Release`), and
+  optionally the `SocketSet.*` reserved-prefix application once live.
+- `SocketSet.StackExchange.Redis` is deliberately NOT packaged: welded to the cross-repo sibling
+  checkout and the SER009 experimental contract.
+
 ## SE.REDIS SIDE-QUESTS (2026-08-03, from Marc)
 
 - **UDS incl. @abstract in SE.Redis itself** — "we should stop being hypocritical": we are shipping

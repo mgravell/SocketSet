@@ -34,6 +34,15 @@ believe. **If you are picking this up on Windows, `TODO.md` opens with a section
 dotnet add package SocketSet
 ```
 
+Two companion packages host existing servers on the transport, and ship alongside it:
+
+- **`SocketSet.AspNetCore`** — a Kestrel connection transport: `builder.UseSocketSet(...)`, with
+  optional transport-terminated TLS (including kTLS on Linux).
+- **`SocketSet.Garnet`** — hosts [Garnet](https://github.com/microsoft/garnet) on the SocketSet
+  transport via its pluggable `IGarnetServer` seam.
+
+All three are currently published as `-alpha`: this is pre-alpha code and every API is free to change.
+
 ## Usage
 
 Derive from `SocketSet` and override the callbacks you care about. Buffers are handed to you as
