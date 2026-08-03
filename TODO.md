@@ -695,6 +695,27 @@ Marc's call: stabilise in-flight work (done — all repos clean, gates green), t
 - `SocketSet.StackExchange.Redis` is deliberately NOT packaged: welded to the cross-repo sibling
   checkout and the SER009 experimental contract.
 
+## TLS AT LISTEN/CONNECT GRANULARITY (2026-08-03, from Marc — design item, not started)
+
+**The ask:** TLS config should live at the listen/connect level, not (only) the engine level. Today one
+`TlsProvider` + one `TlsMode` per `SocketSetOptions` covers the whole engine; `TlsMode` gives
+directionality but both directions share ONE provider. Marc's example is the sharpest: the proxy has no
+structural need for separate SocketSets for upstream and downstream — it needs different TLS CONTEXTS
+(terminate with cert A downstream, originate with trust B upstream), and today that forces two engines.
+The tunnel documents the same wall ("one engine = one TLS posture; mixed targets want two tunnels") —
+this item dissolves both.
+
+**Sketch:** per-call optional TLS: `Listen(endpoint, tls: provider?)` / `Connect(endpoint, tls:
+provider?)`, engine options as the default. A listener carries its provider; accepted connections
+inherit it; outbound connections take the per-call one; `Connection` stores the resolved provider. The
+~11 `TlsEnabled(isClient)` engagement sites across the 5 backends become connection-level reads instead
+of `Parent.Options.Tls`. kTLS probes are already provider-scoped. `TlsMode` may collapse entirely —
+presence of a provider AT THE CALL is the direction signal, which is cleaner than the flags enum.
+Consequences to carry: `ToString`'s `tls=` becomes a per-listener summary; `SocketSetTunnel` can offer
+per-endpoint TLS selection; multi-cert listens (SNI-adjacent) become representable later. Pre-alpha:
+no compat constraint, but this touches every backend's accept/connect path — gate with the full smoke
+matrix AND both TLS narrow gates on both OSes.
+
 ## SE.REDIS SIDE-QUESTS (2026-08-03, from Marc)
 
 - **UDS incl. @abstract in SE.Redis itself** — "we should stop being hypocritical": we are shipping
