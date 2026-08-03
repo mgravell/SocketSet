@@ -69,6 +69,31 @@ nearly halved) — from a v1 that still pays an extra receive copy the SAEA path
 receives directly into the handler buffer; we copy from the transport-owned span). The copy is the known
 first lever if this ever needs more; the tails suggest the loop-thread model is already paying for it.
 
+### TLS-ORIGINATION SHOWDOWN (2026-08-03): BoringSSL is a real peer; the depth win is the TRANSPORT's
+
+The last quadrant: both sidecars plaintext-downstream, both dialing the SAME TLS-only Garnet with
+identical pinned trust and SNI — ours via `TlsMode.Connect`/OpenSSL, Envoy via
+`UpstreamTlsContext`/BoringSSL. Interleaved, 5 passes, banner-gated:
+
+| cell | envoy (BoringSSL) | socketset (OpenSSL) | Δ | verdict |
+|---|---:|---:|---:|---|
+| `-P 1` GET | 363,636 · p99 **0.295** | 380,916 · p99 0.543 | +4.8% | overlapping |
+| `-P 1` SET | 355,556 · p99 **0.303** | 372,058 · p99 0.583 | +4.6% | overlapping |
+| `-P 16` GET | 1,777,304 · p99 0.871 | **3,199,488** · p99 0.703 | **+80.0%** | **DISJOINT** |
+| `-P 16` SET | 1,701,548 · p99 0.903 | **2,856,735** · p99 0.959 | **+67.9%** | **DISJOINT** |
+
+**The pre-registered fork resolved to the informative branch: the TLS advantage is specifically over
+`SslStream`, not over userspace TLS at large.** BoringSSL holds crypto parity at `-P 1` (we lean +4.7%,
+overlapping — and Envoy's `-P 1` tails BEAT ours there, 0.30 vs 0.55 ms). The disjoint depth wins are
+the underlying transport advantage surviving TLS, not a crypto-stack win.
+
+**And a self-critical delta worth its own line:** at depth, TLS costs US ~28% off our own plaintext
+(4.43M → 3.20M GET) while Envoy's depth numbers barely move from its plaintext — its depth bottleneck is
+parse/dispatch, not crypto, whereas OUR out-of-band encrypt path at depth has measurable headroom. That
+is the same structural shape the HTTP-era work found on the TLS large-payload path, now visible in RESP —
+and it is the first concrete perf lead for the TLS side of the transport. (Cross-day plaintext references
+are qualitative only; the disjoint claims above are all same-session.)
+
 ### THE SIDECAR SHOWDOWN (2026-08-03): over abstract UDS, we beat Envoy at BOTH depths — the first `-P 1` disjoint win
 
 Yesterday's caveat ("no Envoy-relative UDS claim until a same-session Envoy-UDS leg runs") is retired.
