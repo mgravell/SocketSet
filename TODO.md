@@ -588,6 +588,21 @@ send-SQE count under the TLS depth workload should fall from ~3x toward ~1x plai
 meaningful slice of the 28%; if SQEs fall but throughput does not move, the syscall count was not the
 binding cost and the lead moves to the encrypt path itself.
 
+### THE ~8% TLS ENCRYPT RESIDUE, DECOMPOSED (2026-08-03): one avoidable ciphertext copy
+
+With send amplification gone, the remaining depth-TLS tax is −8.4% (disjoint, n=60M). Read from the
+io_uring path: `TlsEncryptSend` → `ProcessOutbound` writes ciphertext into `TlsOut` (inherent), then
+`TlsSend` **copies the ciphertext AGAIN** into OOB pool pages for the scatter-gather chain. TLS pays two
+post-encrypt copies where plaintext pays one, plus the crypto itself — so the honest split of the 8.4%
+is roughly {extra memcpy, AES-GCM, record overhead}, and only the first is avoidable.
+
+**Fix shape — the io_uring twin of the Windows "owned staging" idea** (`StageOutboundOwned`, built
+IOCP-only in the HTTP era): send FROM the encrypt scratch, holding the buffer until the send completes,
+instead of re-copying into pages. Needs a lifetime design (per-connection `TlsOut` is reusable scratch;
+sending from it means it cannot Reset until completion — double-buffer or hand-off), which is why this
+is recorded rather than rushed. Ceiling honestly stated: some fraction of 8.4%, likely half or less —
+worthwhile only bundled with other TLS-path work, not as a standalone session.
+
 ### BACKLOG: tune the frame scanner (raised by Marc 2026-08-02)
 
 `RespReader`'s frame scanning is worth a pass — plausibly a few more percent. **Aim it correctly, because
