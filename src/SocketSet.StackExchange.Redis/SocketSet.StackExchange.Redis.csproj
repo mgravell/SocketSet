@@ -8,23 +8,23 @@
     <NoWarn>$(NoWarn);SER009</NoWarn>
     <Description>SocketSet as SE.Redis's IO core, via the Tunnel seam: SocketSetClientTransport (the
 DuplexTransport implementation) and SocketSetTunnel (the Tunnel that returns it). Targets the real
-RESPite.Transports types via a SIBLING CHECKOUT of StackExchange.Redis on the marc/tunnel-transport
-branch (see references below) — the [Experimental] SER009 contract lives there, not here.
+RESPite.Transports types via a SIBLING CHECKOUT of StackExchange.Redis (main — SER009 merged in
+StackExchange.Redis#3152); the [Experimental] contract lives there, not here.
     </Description>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../SocketSet/SocketSet.csproj" />
-    <!-- Cross-repo sibling references: /home/marc/code/StackExchange.Redis must be checked out on
-         marc/tunnel-transport (the SER009 branch). Pre-alpha, single-machine arrangement; becomes a
-         package reference when SER009 ships in a preview. -->
+    <!-- Cross-repo sibling references: /home/marc/code/StackExchange.Redis at or after the SER009
+         merge (#3152, on main). Pre-alpha, single-machine arrangement; becomes a package reference
+         when SER009 ships in a preview. -->
     <ProjectReference Include="../../../StackExchange.Redis/src/RESPite/RESPite.csproj" />
     <ProjectReference Include="../../../StackExchange.Redis/src/StackExchange.Redis/StackExchange.Redis.csproj" />
   </ItemGroup>
 
   <Target Name="RequireSiblingCheckout" BeforeTargets="BeforeBuild"
           Condition="!Exists('../../../StackExchange.Redis/src/RESPite/RESPite.csproj')">
-    <Error Text="SocketSet.StackExchange.Redis needs a sibling StackExchange.Redis checkout on the marc/tunnel-transport branch (see csproj comments)." />
+    <Error Text="SocketSet.StackExchange.Redis needs a sibling StackExchange.Redis checkout with SER009 merged (see csproj comments)." />
   </Target>
 
 </Project>
