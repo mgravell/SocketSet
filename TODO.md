@@ -655,6 +655,27 @@ pipes — and SocketSet ships a `Tunnel` implementation. Consequences Marc calle
   copying send, batch-end flush point, completion-scoped lifetimes); (2) the SocketSet-side
   implementation of that shape.
 
+## TUNNEL TRANSPORT SHAPE — ANSWERED AND BUILT ON BOTH SIDES (2026-08-03)
+
+**Marc's answers:** abstract class ✓; free hand on `PhysicalConnection.Read` ("don't object to shaking
+things up") ✓; **shape lives in RESPite** ✓. Receive-into-caller-buffer defers to exactly the
+abstract-class mechanism (add later with a safe default).
+
+**Built:** SE.Redis branch **`marc/tunnel-transport`** (off main, pushed, solution 0 errors) —
+`RESPite.Transports.DuplexTransport`/`TransportReceiver` as `[Experimental]` **SER009** abstract classes
+(registered in Experiments, `docs/exp/SER009.md`, PublicAPI entries with the `[SER009]` prefix in both
+projects) plus `Tunnel.ConnectTransportAsync` (null-default virtual). SocketSet side:
+`src/SocketSet.StackExchange.Redis` holds `SocketSetClientTransport` over a provisional shape copy,
+**gated ALL PASS across plaintext/TLS/@abstract** (`bench/tunnel-selftest.cs` — the 1000-command burst
+lands in six batch-end callbacks, the coalescing visible in the gate).
+
+**Next steps in order:** (1) retarget the SocketSet impl to the real RESPite types (sibling reference,
+delete the provisional copy — replace/move, not duplicate) + the actual Tunnel subclass; (2) the
+`PhysicalConnection.Read` push-feed integration, where Marc granted latitude; (3) end-to-end: SE.Redis
+multiplexer over the tunnel against real Garnet, gated then measured.
+
+The original proposal follows for the record.
+
 ## TUNNEL TRANSPORT SHAPE — DESIGN PROPOSAL (2026-08-03, for Marc's review before any code)
 
 **The virtual** (on `Tunnel`, `[Experimental]`, null-default — the same move as `BeforeAuthenticateAsync`
