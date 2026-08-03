@@ -12,8 +12,11 @@ using System.Text;
 using SocketSets;
 using SocketSets.StackExchangeRedis;
 
-string host = args.Length > 0 ? args[0] : "127.0.0.1";
-int port = args.Length > 1 ? int.Parse(args[1]) : 7379;
+// usage: tunnel-selftest [plain|tls|uds] [host-or-@name] [port] [tls-trust-pem]
+string surface = args.Length > 0 ? args[0] : "plain";
+string target = args.Length > 1 ? args[1] : "127.0.0.1";
+int port = args.Length > 2 ? int.Parse(args[2]) : 7379;
+string trustPem = args.Length > 3 ? args[3] : "/home/marc/code/SocketSet/bench/.tools/tls-demo/cert.pem";
 
 int failures = 0;
 void Report(string name, bool ok, string detail = "")
@@ -22,9 +25,26 @@ void Report(string name, bool ok, string detail = "")
     if (!ok) failures++;
 }
 
-var transport = await SocketSetClientTransport.ConnectAsync(
-    new IPEndPoint(IPAddress.Parse(host), port),
-    new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring });
+var options = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring };
+EndPoint endpoint;
+switch (surface)
+{
+    case "tls":
+        // The SE.Redis-to-managed-Redis shape: TLS client dial, trust pinned to the server's cert,
+        // verification ON. ConnectAsync completes only after the handshake (the OnConnect contract).
+        options.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
+        endpoint = new IPEndPoint(IPAddress.Parse(target), port);
+        break;
+    case "uds":
+        // The sidecar shape: @abstract via SocketSet's own mapping.
+        endpoint = new System.Net.Sockets.UnixDomainSocketEndPoint(target);
+        break;
+    default:
+        endpoint = new IPEndPoint(IPAddress.Parse(target), port);
+        break;
+}
+Console.WriteLine($"=== tunnel-selftest: surface={surface} target={target} ===");
+var transport = await SocketSetClientTransport.ConnectAsync(endpoint, options);
 
 var rx = new Receiver();
 transport.Start(rx);

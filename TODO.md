@@ -721,6 +721,12 @@ public interface ITransportReceiver
    Garnet/proxy share it without an SE.Redis reference; SE.Redis placement keeps the rev
    self-contained).
 
+**Validated 2026-08-03: the shape needed NO surface-specific members across all three client-relevant
+surfaces** — `tunnel-selftest` runs the identical battery (push round-trip, 1000-command burst,
+batch-end coalescing, close-once) over plaintext TCP, TLS (real handshake, pinned trust, verification
+on — the SE.Redis-to-managed-Redis shape), and `@abstract` UDS (the sidecar shape). ALL PASS, all
+surfaces selected purely by `SocketSetOptions` + endpoint, invisible to the contract.
+
 **What is deliberately absent:** backpressure signalling (SE.Redis reads never pause in practice; add
 later behind [Experimental] if real), sync Read anything (push only), Stream/pipe compatibility members
 (the point of the new shape is not being those).
