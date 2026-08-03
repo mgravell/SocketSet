@@ -137,6 +137,13 @@ receive-into-caller-buffer from "deferred" to the next transport lever. Depth-1 
 8-13% — the staged-send loop hop, real and recorded; the SE.Redis client regime is depth (a busy
 multiplexer), but sequential-await apps exist and would feel it.
 
+**Epoll null result (same day):** the obvious follow-up — does epoll's send path have the same
+disease? — measured NO before any speculative fix: tunnel GET d64 epoll 707-714k vs io_uring 716-727k
+(3 interleaved unpinned probes, `MUXAB_BACKEND=epoll`, banner-reported; RELATIVE read only — unpinned
+probes run ~30% below the pinned rig). Epoll writes synchronously via `send()` and only queues on
+EAGAIN, so it never had the completion conveyor; its per-op syscall cost roughly washes with io_uring's
+submission batching at this depth. No fix warranted on this evidence.
+
 ### GARNET ON SOCKETSET (2026-08-02, late): parity-to-ahead on day one, better tails in every cell
 
 Consumer #4, suggestion-to-measurement in one day. `src/SocketSet.Garnet` hosts Garnet via the embedding

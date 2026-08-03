@@ -39,7 +39,13 @@ var config = new ConfigurationOptions
 CountingTunnel? counting = null;
 if (tunnel)
 {
-    var ss = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring };
+    var factory = Environment.GetEnvironmentVariable("MUXAB_BACKEND") switch
+    {
+        "epoll" => SocketSetFactory.Epoll,
+        "managed" => SocketSetFactory.Managed,
+        _ => SocketSetFactory.IoUring,
+    };
+    var ss = new SocketSetOptions { Shards = 1, Factory = factory };
     if (tls)
     {
         ss.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
@@ -61,7 +67,7 @@ await using var mux = await ConnectionMultiplexer.ConnectAsync(config);
 var db = mux.GetDatabase();
 
 int tunnelConnects = counting?.Connects ?? 0;
-Console.WriteLine($"[mux-ab] leg={leg} tls={(tls ? (tunnel ? "openssl-transport" : "sslstream") : "off")} tunnel_connects={tunnelConnects} target={host}:{port} depth={depth} op={op} window={seconds}s");
+Console.WriteLine($"[mux-ab] backend={(tunnel ? (Environment.GetEnvironmentVariable("MUXAB_BACKEND") ?? "io-uring") : "n/a")} leg={leg} tls={(tls ? (tunnel ? "openssl-transport" : "sslstream") : "off")} tunnel_connects={tunnelConnects} target={host}:{port} depth={depth} op={op} window={seconds}s");
 if (tunnel && tunnelConnects < 1)
 {
     Console.WriteLine("GATE-FAIL: tunnel leg but ConnectTransportAsync was never called (sibling checkout lacks transport mode?)");
