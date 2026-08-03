@@ -76,6 +76,7 @@ both have caused hesitation:
     `/config` banner, byte-exact `/payload` 1B-8MB and POST `/echo`, `/stats` counters. Run it on any
     bridge or `AspNetDemo` change. Run it on BOTH sides of a refactor — comparing two runs cell-by-cell
     is what turns "it works" into "it is behaviour-preserving".
-  - **`bench/Verify-TlsFloor.ps1`** — that the TLS min-version floor is APPLIED, not merely configured. The
-    discriminating cell is one that must be REFUSED; "TLS still works" cannot distinguish a floor that took
-    from one that did nothing.
+  - **`bench/Verify-TlsFloor.ps1`** (Windows) / **`bench/verify-tls-floor.sh`** (Linux, added
+    2026-08-03) — that the TLS min-version floor is APPLIED, not merely configured. The discriminating
+    cell is one that must be REFUSED; "TLS still works" cannot distinguish a floor that took from one
+    that did nothing. Both narrow gates now exist on both OSes.
