@@ -10,12 +10,6 @@
       },
       "socketset": {
         "type": "Project"
-      },
-      "socketset.stackexchange.redis": {
-        "type": "Project",
-        "dependencies": {
-          "SocketSet": "[1.0.0, )"
-        }
       }
     }
   }

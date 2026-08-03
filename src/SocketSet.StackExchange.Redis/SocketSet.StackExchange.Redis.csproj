@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <IsPackable>false</IsPackable>
+    <Description>SocketSet as SE.Redis's IO core, via the Tunnel seam: the transport shape and its
+SocketSet implementation. The thin Tunnel subclass arrives when the corresponding SE.Redis rev adds the
+[Experimental] ConnectTransportAsync virtual; until then the shape here is provisional-internal, and the
+public contract's final home (beside Tunnel vs RESPite) is an open design question recorded in TODO.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../SocketSet/SocketSet.csproj" />
+  </ItemGroup>
+
+</Project>
