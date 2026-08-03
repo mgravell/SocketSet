@@ -1,14 +1,10 @@
-#:property TargetFramework=net10.0
-#:property TargetFrameworks=net10.0
-#:property PublishAot=false
-#:property IsPackable=false
-#:project ../src/SocketSet.StackExchange.Redis/SocketSet.StackExchange.Redis.csproj
-// Functional gate for the provisional Tunnel transport shape: dial a real Garnet through
+// Functional gate for the Tunnel transport contract (RESPite.Transports, SER009): dial a real Garnet through
 // SocketSetClientTransport, exercise every member of the contract, and assert the semantics the design
 // doc claims — push receive, any-thread staged writes with explicit flush, batch-end firing, close
 // notification exactly once. Exit 0 = all pass.
 using System.Net;
 using System.Text;
+using RESPite.Transports;
 using SocketSets;
 using SocketSets.StackExchangeRedis;
 
@@ -78,7 +74,7 @@ Report("closed exactly once", await rx.WaitClosed(TimeSpan.FromSeconds(5)) && rx
 Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
 return failures == 0 ? 0 : 1;
 
-sealed class Receiver : ITransportReceiver
+sealed class Receiver : TransportReceiver
 {
     private readonly List<byte> _all = new();
     private readonly SemaphoreSlim _signal = new(0);
@@ -86,16 +82,16 @@ sealed class Receiver : ITransportReceiver
     public int BatchEnds;
     public int ClosedCount;
 
-    public bool OnReceived(ReadOnlySpan<byte> payload)
+    public override bool OnReceived(ReadOnlySpan<byte> payload)
     {
         lock (_all) { foreach (var b in payload) _all.Add(b); }
         _signal.Release();
         return true;
     }
 
-    public void OnBatchEnd() => Interlocked.Increment(ref BatchEnds);
+    public override void OnBatchEnd() => Interlocked.Increment(ref BatchEnds);
 
-    public void OnClosed(Exception? fault)
+    public override void OnClosed(Exception? fault)
     {
         Interlocked.Increment(ref ClosedCount);
         _closed.TrySetResult();

@@ -683,10 +683,17 @@ delegation per call). Also settled permanently: a shared transport *interface* b
 RESPite is dead — no structural identity for interfaces, and a third both-agree assembly won't happen;
 containment (has-a) is the pattern. Revised on both sides, re-gated **ALL PASS × plaintext/TLS/@abstract**.
 
-**Next steps in order:** (1) retarget the SocketSet impl to the real RESPite types (sibling reference,
-delete the provisional copy — replace/move, not duplicate) + the actual Tunnel subclass; (2) the
-`PhysicalConnection.Read` push-feed integration, where Marc granted latitude; (3) end-to-end: SE.Redis
-multiplexer over the tunnel against real Garnet, gated then measured.
+**Next steps in order:** (1) ~~retarget the SocketSet impl to the real RESPite types + the actual Tunnel
+subclass~~ **DONE 2026-08-03**: provisional copy deleted (replace/move, not duplicate), cross-repo
+sibling references to RESPite + StackExchange.Redis (marc/tunnel-transport checkout required — csproj
+errors clearly if absent), `SocketSetTunnel : Tunnel` overriding `ConnectTransportAsync`, and the
+has-a restructure the abstract-class decision forced (`SocketSetClientTransport : DuplexTransport`
+contains a nested `Engine : SocketSet`; single inheritance forbids the old is-a). The gate had to stop
+being a file-based app (`dotnet run --file` leaks `#:property` TFM overrides as globals into the
+cross-repo restore graph → NETSDK1005 in the sibling's eng/ project) — it is now
+`bench/tunnel-selftest/`, a real csproj, re-gated **ALL PASS × plaintext/TLS/@abstract** against the
+real types. (2) the `PhysicalConnection.Read` push-feed integration, where Marc granted latitude;
+(3) end-to-end: SE.Redis multiplexer over the tunnel against real Garnet, gated then measured.
 
 The original proposal follows for the record (it shows the pre-revision shape with `Output`).
 

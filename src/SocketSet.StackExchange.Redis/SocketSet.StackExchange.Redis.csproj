@@ -3,15 +3,28 @@
   <PropertyGroup>
     <TargetFrameworks>net10.0</TargetFrameworks>
     <IsPackable>false</IsPackable>
-    <Description>SocketSet as SE.Redis's IO core, via the Tunnel seam: the transport shape and its
-SocketSet implementation. The thin Tunnel subclass arrives when the corresponding SE.Redis rev adds the
-[Experimental] ConnectTransportAsync virtual; until then the shape here is provisional-internal, and the
-public contract's final home (beside Tunnel vs RESPite) is an open design question recorded in TODO.
+    <!-- SER009: the RESPite transport shape is [Experimental] by design; this project is its
+         implementation, so consuming it is the point. -->
+    <NoWarn>$(NoWarn);SER009</NoWarn>
+    <Description>SocketSet as SE.Redis's IO core, via the Tunnel seam: SocketSetClientTransport (the
+DuplexTransport implementation) and SocketSetTunnel (the Tunnel that returns it). Targets the real
+RESPite.Transports types via a SIBLING CHECKOUT of StackExchange.Redis on the marc/tunnel-transport
+branch (see references below) — the [Experimental] SER009 contract lives there, not here.
     </Description>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../SocketSet/SocketSet.csproj" />
+    <!-- Cross-repo sibling references: /home/marc/code/StackExchange.Redis must be checked out on
+         marc/tunnel-transport (the SER009 branch). Pre-alpha, single-machine arrangement; becomes a
+         package reference when SER009 ships in a preview. -->
+    <ProjectReference Include="../../../StackExchange.Redis/src/RESPite/RESPite.csproj" />
+    <ProjectReference Include="../../../StackExchange.Redis/src/StackExchange.Redis/StackExchange.Redis.csproj" />
   </ItemGroup>
+
+  <Target Name="RequireSiblingCheckout" BeforeTargets="BeforeBuild"
+          Condition="!Exists('../../../StackExchange.Redis/src/RESPite/RESPite.csproj')">
+    <Error Text="SocketSet.StackExchange.Redis needs a sibling StackExchange.Redis checkout on the marc/tunnel-transport branch (see csproj comments)." />
+  </Target>
 
 </Project>

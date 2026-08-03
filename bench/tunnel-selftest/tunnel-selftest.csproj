@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Was a file-based app; promoted to a real project when the transport retargeted onto the sibling
+       StackExchange.Redis checkout — `dotnet run -\-file` leaks its #:property TFM overrides as global
+       properties into the cross-repo restore graph, which poisons that repo's eng/ build-task project
+       (NETSDK1005). A real csproj restores the graph the same way the library build does. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);SER009</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/SocketSet.StackExchange.Redis/SocketSet.StackExchange.Redis.csproj" />
+  </ItemGroup>
+
+</Project>
