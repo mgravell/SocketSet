@@ -27,4 +27,8 @@ public abstract class TlsProvider
     /// when true, whether a given connection actually offloads is a per-connection, per-direction
     /// decision the filter makes at handshake completion (cipher support, options, socket capability).</summary>
     public virtual bool SupportsKernelOffload => false;
+
+    /// <summary>Short display name for banners and diagnostics ("openssl", "schannel"); defaults to the
+    /// type name for third-party providers.</summary>
+    public virtual string Name => GetType().Name;
 }

@@ -36,8 +36,20 @@ public abstract class SocketSetShard
     // — a later micro-opt; today it neighbours rarely-written init fields, not another hot counter.)
     private int _available = int.MaxValue;
 
+    private int _capacity; // 0 == untracked (unbounded backends never set it)
+
     /// <summary>Fixed-table backends set their reservation ceiling to the slot-table size (once, at init).</summary>
-    protected void SetShardCapacity(int slots) => _available = slots;
+    protected void SetShardCapacity(int slots)
+    {
+        _capacity = slots;
+        _available = slots;
+    }
+
+    /// <summary>Live connections on this shard (capacity minus free reservations), or -1 when the
+    /// backend does not track a capacity (the unbounded managed backend). Approximate under
+    /// concurrency — diagnostics, not accounting.</summary>
+    internal int ActiveConnections
+        => _capacity == 0 ? -1 : _capacity - Volatile.Read(ref _available);
 
     /// <summary>Reserve one slot on this shard. True == a slot is guaranteed available (go claim it);
     /// false == full (the decrement is undone). O(1). Callable from any thread. Overridden by unbounded

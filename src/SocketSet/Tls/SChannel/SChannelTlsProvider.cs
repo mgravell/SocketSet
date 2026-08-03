@@ -28,6 +28,8 @@ namespace SocketSets.Tls.SChannel;
 /// </summary>
 public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
 {
+    public override string Name => "schannel";
+
     private readonly SecHandle* _clientCred;
     private readonly SecHandle* _serverCred; // null for a client-only provider
     private readonly X509Certificate2? _serverCert; // must outlive the credential handle

@@ -16,6 +16,8 @@ namespace SocketSets.Tls.OpenSsl;
 /// </summary>
 public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
 {
+    public override string Name => "openssl";
+
     private readonly nint _clientCtx;
     private readonly nint _serverCtx; // 0 when no server certificate was configured (client-only)
     private readonly bool _verifyServer;

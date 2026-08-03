@@ -114,6 +114,54 @@ public abstract partial class SocketSet : IDisposable
 
     public virtual string Name => GetType().Name;
 
+    /// <summary>One diagnostic line: derived type, backend, shard count, live connections (when the
+    /// backend tracks them), and the TLS posture. TLS is per-SET (options-level): one provider and one
+    /// <see cref="TlsMode"/> for every connection this set makes or accepts.
+    /// e.g. <c>EchoServer [io_uring] shards=6 connections=42 tls=openssl (Both, ktls-capable)</c>.</summary>
+    public override string ToString()
+    {
+        var shards = _shards; // snapshot: growth publishes a longer array atomically
+        var sb = new System.Text.StringBuilder(Name)
+            .Append(" [").Append(BackendLabel(shards)).Append("] shards=").Append(shards.Length);
+
+        int conns = 0;
+        bool tracked = shards.Length > 0;
+        foreach (var s in shards)
+        {
+            int c = s.ActiveConnections;
+            if (c < 0) { tracked = false; break; }
+            conns += c;
+        }
+        if (tracked) sb.Append(" connections=").Append(conns);
+
+        if (Options.Tls is { } tls)
+        {
+            sb.Append(" tls=").Append(tls.Name).Append(" (").Append(Options.TlsMode);
+            if (tls.SupportsKernelOffload) sb.Append(", ktls-capable");
+            sb.Append(')');
+        }
+        else
+        {
+            sb.Append(" tls=off");
+        }
+        return sb.ToString();
+    }
+
+    private static string BackendLabel(SocketSetShard[] shards)
+    {
+        if (shards.Length == 0) return "none";
+        var t = shards[0].GetType().Name;
+        return t switch
+        {
+            "IoUringShard" => "io_uring",
+            "EpollShard" => "epoll",
+            "IocpShard" => "iocp",
+            "WindowsRioShard" => "rio",
+            "ManagedSocketShard" => "managed",
+            _ => t,
+        };
+    }
+
     public void Dispose()
     {
         GC.SuppressFinalize(this);
