@@ -14,7 +14,40 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > for the findings and the method, not as a baseline. **Never compare a number across the two.** Where an
 > older section's conclusion has been re-tested, that is stated inline.
 
-## WHERE THINGS STAND (2026-07-30, extended through 2026-07-31) — the consolidated view
+## WHERE THINGS STAND (2026-08-03) — the consolidated view, RESP era
+
+Everything below this block is a dated investigation; this is the summary they add up to. The 2026-07-30
+consolidated view (next section) is kept as the record of the HTTP/Kestrel era; on 2026-08-02 the
+project's guidepost changed from "beat Kestrel" to the RESP ecosystem (see TODO's direction-change
+section), and these are the numbers that era has produced. All same-session, interleaved, disjoint
+unless marked; one box, loopback, governor `performance`.
+
+**Four consumers, one transport:**
+
+| consumer | vs | headline |
+|---|---|---|
+| **RESP proxy** (`RESPite.Proxy` on SocketSet L3) | Envoy 1.39 | TCP: parity `-P 1`, **+177%** `-P 16`. Abstract UDS: **+28% `-P 1` disjoint**, +94-141% depth. TLS-originating (post-hook): **+7.5% `-P 1` disjoint, +139-151% depth** |
+| same | hand-rolled SAEA `WorkerPool` | +15-28% both depths (level 1, before the fast path existed) |
+| **Garnet** (`SocketSet.Garnet`, embedded) | stock SAEA layer | plaintext: parity, p99 lower all cells; **TLS: +9.5-24.2% all four disjoint**; abstract UDS: SET +11-12.5% disjoint both depths |
+| **Client shape** (`run-client-shape.sh`) | direct | one loop thread ≈ 1.15M ops/s per connection at 47-103µs p99 through a full proxy hop; ~2M+ extrapolated for client mode |
+| **redis-benchmark/redis-cli/redis-server** | upstream | `@abstract` UDS branches (issue #15577, PRs #15572/#15575); UDS = +80% over TCP loopback on redis-server itself, abstract ≡ pathname exactly |
+
+**The mechanisms that got it there, in order of discovery:** shard-affine upstream placement
+(`ConnectShard` + `CurrentShardIndex`; hop-free forward AND reply — v1 without affinity measured
+NEGATIVE, which located it), callback-granularity flushing (the `-P 16` collapse fix), then
+**batch-granularity flushing** (`OnLoopDrain`; killed a 3x send amplification, depth-TLS tax 28%→8.4%,
+`-P 1` TLS p99 −25%). In-transport TLS is now directional (`TlsMode`) for the proxy shapes, verified by
+refusal cell. The remaining known headrooms are small and recorded: ~8% TLS residue (one avoidable
+ciphertext copy, designed not built), the SMT tail trade (shards ≤ physical cores ≈ Envoy-level p99 at
+−22% throughput), and Envoy's one surviving cell (`-P 1` TLS tail).
+
+**Instruments and honesty:** the confounder ledger stands at **#15** (latest: a Debug×tier-0 scanner
+baseline that under-rated `RespReader` by ~5x — true steady state is ~9.5ns/frame, 105 Mframes/s, and
+the scanner is NOT a lever). `verify-proxy.cs` (13 cells, RESP3-literate) gates every leg incl. Envoy
+and Garnet; rigs quantisation-audit themselves; `TlsMode` has a refusal cell. What this box still
+cannot see: kTLS NIC offload, real-network behaviour, handshake/churn costs — the lab questions.
+
+## WHERE THINGS STAND (2026-07-30, extended through 2026-07-31) — the consolidated view of the HTTP/Kestrel era
 
 Everything below this section is a dated investigation; this is the summary they add up to. Cells are
 linked to the section that measured them. **Do not compare Linux and Windows rows** - same silicon, but
