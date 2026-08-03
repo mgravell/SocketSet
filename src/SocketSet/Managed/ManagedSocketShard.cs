@@ -67,7 +67,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Listen / accept
     // =====================================================================
 
-    public override void Listen(EndPoint endpoint, object? defaultToken, bool local)
+    public override void Listen(EndPoint endpoint, object? defaultToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
     {
         // MaxShards == 1, so there is only ever one shard here; a single listener binds
         // the endpoint directly — no reuse-port fan-out.
@@ -75,18 +75,18 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         listener.Listen(Parent.Options.ListenBacklog);
         lock (_listeners) _listeners.Add(listener);
 
-        StartAccept(new AcceptArgs(this, listener, defaultToken));
+        StartAccept(new AcceptArgs(this, listener, defaultToken, tls));
     }
 
 #if NET
-    public override void ListenHandle(nint handle, object? defaultToken)
+    public override void ListenHandle(nint handle, object? defaultToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         // Wrap the handed-over handle (must already be bound + listening); we own it now. The raw-handle
         // Socket ctor is .NET 5+, so netfx falls through to the base NotSupported — there's no clean
         // public way to wrap a bare handle on .NET Framework.
         var listener = new Socket(new SafeSocketHandle(handle, ownsHandle: true));
         lock (_listeners) _listeners.Add(listener);
-        StartAccept(new AcceptArgs(this, listener, defaultToken));
+        StartAccept(new AcceptArgs(this, listener, defaultToken, tls));
     }
 #endif
 
@@ -112,11 +112,12 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         {
             MaybeNoDelay(sock);
             var conn = Register(sock, args.DefaultToken);
+            conn.TlsOverride = args.Tls; // fresh connection object; seed the LISTENER's provider
 
-            if (Parent.Options.TlsEnabled(isClient: false))
+            if (Parent.Options.ResolveServerTls(conn.TlsOverride) is { } serverTls)
             {
                 // TLS: defer OnAccept until the handshake completes (see BeginTls / FireTlsOpen).
-                BeginTls(conn, isClient: false);
+                BeginTls(conn, isClient: false, serverTls);
                 return true;
             }
 
@@ -441,7 +442,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     {
         var opts = Parent.Options;
         conn.IsClient = isClient;
-        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : (provider ?? opts.Tls!).CreateServerFilter(opts.TlsServer);
         conn.Plain = new PooledBufferWriter(_bufferSize);  // decrypt target (data phase)
         conn.Cipher = new PooledBufferWriter(_bufferSize); // encrypt scratch
         conn.Ctrl = new PooledBufferWriter(64);            // handshake / control-record output
@@ -671,11 +672,12 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Strongly-typed SocketAsyncEventArgs subclasses (state as fields; direct dispatch).
     // ---------------------------------------------------------------------
 
-    private sealed class AcceptArgs(ManagedSocketShard shard, Socket listener, object? defaultToken) : SocketAsyncEventArgs
+    private sealed class AcceptArgs(ManagedSocketShard shard, Socket listener, object? defaultToken, SocketSets.Tls.TlsProvider? tls = null) : SocketAsyncEventArgs
     {
         public readonly ManagedSocketShard Shard = shard;
         public readonly Socket Listener = listener;
         public readonly object? DefaultToken = defaultToken;
+        public readonly SocketSets.Tls.TlsProvider? Tls = tls;
 
         protected override void OnCompleted(SocketAsyncEventArgs e)
         {

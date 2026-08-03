@@ -36,7 +36,7 @@ public abstract partial class SocketSet : IDisposable
     // exist is atomic against a concurrent growth: a shard created in between is bound by the replay, one
     // created after sees the completed record. Stays null on the single-listener path (Windows/UDS/
     // ListenHandle), where a grown shard already receives bounced connections with no listener changes.
-    private List<(EndPoint Endpoint, object? Token)>? _multiBindListens;
+    private List<(EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)>? _multiBindListens;
 
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(30);
 
@@ -282,9 +282,9 @@ public abstract partial class SocketSet : IDisposable
             // needs nothing here — a grown shard there already takes bounced connections.
             if (_multiBindListens is { } listens)
             {
-                foreach (var (endpoint, token) in listens)
+                foreach (var (endpoint, token, tls) in listens)
                 {
-                    shard.Listen(endpoint, token, local: true);
+                    shard.Listen(endpoint, token, local: true, tls);
                 }
             }
 
@@ -338,7 +338,14 @@ public abstract partial class SocketSet : IDisposable
 #endif
     }
 
-    public void Listen(EndPoint endpoint, object? userToken = null)
+    /// <summary>
+    /// <paramref name="tls"/>: per-LISTENER TLS provider — connections accepted on THIS listener use it,
+    /// overriding the engine-level options outright (an explicit provider IS the direction signal;
+    /// <see cref="TlsMode"/> does not gate it). Null = engine options decide, exactly as before. With
+    /// the per-connect twin on <see cref="Connect(EndPoint, object?, SocketSets.Tls.TlsProvider?)"/>,
+    /// one engine can serve many TLS contexts in both directions.
+    /// </summary>
+    public void Listen(EndPoint endpoint, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
     {
         ValidateEndpoint(endpoint);
         if (Options.Factory.CanMultiBind(endpoint))
@@ -348,10 +355,10 @@ public abstract partial class SocketSet : IDisposable
             // concurrent grow — a shard added in between is bound by TryGrow's replay, never left unbound.
             lock (_growLock)
             {
-                (_multiBindListens ??= []).Add((endpoint, userToken));
+                (_multiBindListens ??= []).Add((endpoint, userToken, tls));
                 foreach (var shard in _shards)
                 {
-                    shard.Listen(endpoint, userToken, local: true);
+                    shard.Listen(endpoint, userToken, local: true, tls);
                 }
             }
         }
@@ -360,7 +367,7 @@ public abstract partial class SocketSet : IDisposable
             // Single listener on one shard, which bounces accepted connections round-robin. Because the
             // shard is chosen round-robin, distinct listen endpoints land on different shards rather than
             // all piling their accept load onto shard 0.
-            RoundRobin().Listen(endpoint, userToken, local: false);
+            RoundRobin().Listen(endpoint, userToken, local: false, tls);
         }
     }
 
@@ -411,8 +418,8 @@ public abstract partial class SocketSet : IDisposable
     /// <paramref name="userToken"/> becomes the default <see cref="Connection.UserToken"/> for
     /// connections accepted on it. The set takes ownership of the handle and closes it on teardown.
     /// </summary>
-    public void ListenHandle(nint handle, object? userToken = null)
-        => RoundRobin().ListenHandle(handle, userToken);
+    public void ListenHandle(nint handle, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
+        => RoundRobin().ListenHandle(handle, userToken, tls);
 
     protected internal virtual void OnAccept(ref AcceptContext ctx)
     {

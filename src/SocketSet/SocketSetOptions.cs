@@ -20,6 +20,11 @@ public class SocketSetOptions
     internal SocketSets.Tls.TlsProvider? ResolveClientTls(SocketSets.Tls.TlsProvider? perConnect)
         => perConnect ?? (TlsEnabled(isClient: true) ? Tls : null);
 
+    /// <summary>Server-side twin of <see cref="ResolveClientTls"/>: an explicit per-LISTEN provider
+    /// wins outright; otherwise the engine-level provider under TlsMode rules.</summary>
+    internal SocketSets.Tls.TlsProvider? ResolveServerTls(SocketSets.Tls.TlsProvider? perListen)
+        => perListen ?? (TlsEnabled(isClient: false) ? Tls : null);
+
     internal bool TlsEnabled(bool isClient)
         => Tls is not null && (TlsMode & (isClient ? TlsMode.Connect : TlsMode.Accept)) != 0;
 

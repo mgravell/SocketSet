@@ -700,7 +700,20 @@ Marc's call: stabilise in-flight work (done — all repos clean, gates green), t
 
 ## TLS AT LISTEN/CONNECT GRANULARITY (2026-08-03, from Marc — CONNECT HALF BUILT same day)
 
-**Status: the per-CONNECT half is DONE and gated** (Marc's motivating example verbatim): `Connect(ep,
+**Status: BOTH HALVES DONE and gated (per-LISTEN completed 2026-08-04).** `Listen(ep, userToken,
+tls: provider)` / `ListenHandle(...)` across all five backends: the listener carries the provider,
+accepted connections inherit it (multi-bind growth replay and cross-shard accept bounce both carry it),
+`ResolveServerTls` mirrors the client rule (explicit provider wins outright), and server-side
+kTLS/StartTls/BeginTls take the resolved provider everywhere. Proof extended to the strong
+discriminator: ONE engine with NO engine-level TLS hosting cert-A, cert-B and plaintext listeners —
+a verify-ON trust-B client succeeds on B, is REFUSED on A, and plaintext stays plaintext. Full gate
+suite on the combined feature: smoke 60/60, verify-aspnet 18/18, verify-tls-floor 8/8, tunnel-selftest
+5/5. Remaining: TlsClient options (TargetHost) still engine-level; Windows both halves
+compile-only-unverified (first Windows session: smoke matrix + Verify-TlsFloor + Verify-AspNet).
+
+Original connect-half status note follows.
+
+**Status: the per-CONNECT half was DONE and gated** (Marc's motivating example verbatim): `Connect(ep,
 userToken, tls: provider)` / `ConnectShard(...)` across ALL FIVE backends — per-connection override on
 `Connection.TlsOverride` (nulled at every slot-recycle/init point, seeded only by an explicit connect),
 one resolution rule (`ResolveClientTls`: explicit provider WINS OUTRIGHT and is itself the direction

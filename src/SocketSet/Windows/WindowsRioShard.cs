@@ -120,6 +120,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         public nint Buf;      // (byte*) AcceptEx output buffer
         public nint Op;       // (AcceptOp*)
         public object? Token;
+        public SocketSets.Tls.TlsProvider? Tls;
         public int Af;
         public int Proto;
         public GCHandle Gc;
@@ -152,7 +153,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     private readonly List<AcceptState> _acceptStates = [];
     private readonly object _acceptGate = new();
 
-    private readonly ConcurrentQueue<(nint Socket, object? Token)> _incoming = [];
+    private readonly ConcurrentQueue<(nint Socket, object? Token, SocketSets.Tls.TlsProvider? Tls)> _incoming = [];
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
     // Out-of-band flushed writes (Connection.Flush, any thread): sent on the loop via the Pending path.
     private readonly ConcurrentQueue<(uint Slot, uint Generation, byte[] Data, int Len)> _flush = [];
@@ -417,7 +418,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         Win32.PostQueuedCompletionStatus(_port, 0, WakeKey, null);
     }
 
-    internal void EnqueueInbound(nint socket, object? token) { _incoming.Enqueue((socket, token)); Poke(); }
+    internal void EnqueueInbound(nint socket, object? token, SocketSets.Tls.TlsProvider? tls = null) { _incoming.Enqueue((socket, token, tls)); Poke(); }
     public override void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
     public override void SubmitFlush(uint slot, uint generation, byte[] data, int length)
     {
@@ -429,7 +430,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     private void DrainCrossThread()
     {
         DrainAwaitingPage(); // retry anyone who was waiting on a write page before taking on more work
-        while (_incoming.TryDequeue(out var inbound)) AdoptAccepted(inbound.Socket, inbound.Token);
+        while (_incoming.TryDequeue(out var inbound)) AdoptAccepted(inbound.Socket, inbound.Token, inbound.Tls);
         while (_pendingConnects.TryDequeue(out var pc)) StartConnect(pc.Socket, pc.Endpoint, pc.Token, pc.Tls);
         while (_closes.TryDequeue(out var c))
         {
@@ -544,7 +545,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     // Entry points
     // =====================================================================
 
-    public override void Listen(EndPoint endpoint, object? userToken, bool local)
+    public override void Listen(EndPoint endpoint, object? userToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
     {
         Win32.EnsureWinsock();
         if (endpoint is not IPEndPoint)
@@ -557,10 +558,10 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             Win32.closesocket(listener);
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(listener) failed");
         }
-        StartAccept(listener, af, proto, userToken);
+        StartAccept(listener, af, proto, userToken, tls);
     }
 
-    public override void ListenHandle(nint handle, object? userToken)
+    public override void ListenHandle(nint handle, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         Win32.EnsureWinsock();
         if (handle == 0 || handle == Win32.INVALID_SOCKET)
@@ -568,7 +569,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         Win32.LoadExtensions(handle);
         if (Win32.CreateIoCompletionPort(handle, _port, 0, 0) == 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(listener) failed");
-        StartAccept(handle, Win32.AF_INET, Win32.IPPROTO_TCP, userToken);
+        StartAccept(handle, Win32.AF_INET, Win32.IPPROTO_TCP, userToken, tls);
     }
 
     public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
@@ -662,14 +663,14 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     // Arm a pool of AcceptConcurrency outstanding AcceptEx on the listener (see the IocpShard note):
     // a backlog of accept consumers so connect bursts don't serialize, and a failed re-post on one
     // doesn't stall the listener. Each completion re-posts its own state (HandleAccept).
-    private void StartAccept(nint listener, int af, int proto, object? token)
+    private void StartAccept(nint listener, int af, int proto, object? token, SocketSets.Tls.TlsProvider? tls = null)
     {
         for (int i = 0; i < _acceptConcurrency; i++)
         {
             var st = new AcceptState
             {
                 Listener = listener,
-                Token = token,
+                Token = token, Tls = tls,
                 Af = af,
                 Proto = proto,
                 Buf = (nint)NativeMemory.AllocZeroed(AcceptBufSize),
@@ -725,7 +726,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         // Single acceptor → place on the first shard with a free slot (capacity-aware; drops only if
         // every shard is full).
         var target = (WindowsRioShard?)Parent.TryPlace();
-        if (target is not null) target.EnqueueInbound(acc, st.Token);
+        if (target is not null) target.EnqueueInbound(acc, st.Token, st.Tls);
         else Win32.closesocket(acc); // every shard full → drop (runtime shard growth would expand here)
         PostAccept(st);
     }
@@ -734,20 +735,21 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     // Adoption + data path (RIO)
     // =====================================================================
 
-    private void AdoptAccepted(nint socket, object? token)
+    private void AdoptAccepted(nint socket, object? token, SocketSets.Tls.TlsProvider? listenTls = null)
     {
         int one = 1;
         Win32.setsockopt(socket, Win32.IPPROTO_TCP, Win32.TCP_NODELAY, &one, sizeof(int));
 
         var conn = InitClient(socket, token, SocketSet.SocketFlags.None);
         if (conn is null) { Win32.closesocket(socket); ReleaseReservation(); return; }
+        conn.TlsOverride = listenTls; // InitClient nulled it; the LISTENER's provider re-seeds it
         uint slot = conn.Slot;
 
         if (!SetupConnection(conn)) { Win32.closesocket(socket); FreeSlot(conn); return; }
 
         // TLS: the app must not see this connection until the handshake completes, so OnAccept is deferred
         // to FireTlsOpen and everything below is skipped.
-        if (Parent.Options.TlsEnabled(isClient: false)) { BeginTls(conn, slot, isClient: false); return; }
+        if (Parent.Options.ResolveServerTls(conn.TlsOverride) is { } serverTls) { BeginTls(conn, slot, isClient: false, serverTls); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
@@ -1031,7 +1033,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     {
         var opts = Parent.Options;
         conn.IsClient = isClient;
-        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : (provider ?? opts.Tls!).CreateServerFilter(opts.TlsServer);
 
         // A client speaks first (ClientHello); a server emits nothing until it has seen one. Either way the
         // receive must be armed so the handshake can advance as bytes arrive.
