@@ -744,7 +744,20 @@ threads (one copy, zero hops). `config.Ssl` + transport tunnel throws (tunnel ow
 `SocketSetTunnel` against Garnet: connect/PING/SET/GET/500-op burst, plaintext AND transport-TLS,
 **ALL PASS first run**; 129-test SE.Redis battery still green. Sibling checkout sits on this branch.
 (3) remaining half: MEASURE it — SE.Redis-over-SocketSet vs SE.Redis-classic A/B (rig exists in
-run-client-shape.sh's pattern; needs the interleaved-legs discipline and a control).
+run-client-shape.sh's pattern; needs the interleaved-legs discipline and a control). **In progress
+2026-08-03: `bench/mux-ab` + `bench/run-mux-ab.sh`** (identical generator both legs, counting-tunnel
+engagement gate, stock-Garnet server, pre-registered P1/P2/P3 in the rig header).
+
+**(4) NEXT REV, from Marc's question 2026-08-03 ("does the Tunnel anchor the shared socket-set?"):
+today NO — v1 is deliberately engine-per-connection** (each ConnectTransportAsync builds a transport
+whose nested Engine is a private SocketSet; cheap and clean at SE.Redis's 1-2 connections/endpoint,
+wrong shape at cluster scale: 3 nodes x 2 connections = 6 engines). The intended end-state is Marc's
+assumption: **the Tunnel concrete lazily owns ONE SocketSet; ConnectTransportAsync dials a Connection
+on it; per-connection transports become thin routers.** Known work: per-connection dispatch for
+OnReceive/OnClosed (userToken plumbing exists), per-connection OnBatchEnd (batch-end is per shard
+loop — use the proxy's touched-this-batch t_pending pattern), and the payoffs are amortized pinned
+pools + the L3 shard-affinity games across a cluster's connections. Do AFTER the v1 A/B is recorded —
+the shared anchor changes engine COUNT, not single-connection mechanics.
 
 The original proposal follows for the record (it shows the pre-revision shape with `Output`).
 
