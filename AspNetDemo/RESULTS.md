@@ -88,6 +88,34 @@ comparisons here are sound, ABSOLUTE MiB/s may sit a few % under a `performance`
   unpinned-pool confounder. Bare epoll still hits 13,107 at 256 KB (above Kestrel) — the transport is not
   the limit; the bridge is, and only for plaintext where we're already at parity.
 
+### SE.REDIS ON SOCKETSET, v1: BOTH PREDICTIONS FALSIFIED — classic ahead in ALL EIGHT CELLS, and the mechanism is already confirmed (2026-08-03)
+
+The first client-seat A/B (`bench/mux-ab` + `bench/run-mux-ab.sh`: one ConnectionMultiplexer, D
+concurrent awaiting workers, identical generator both legs, only `ConfigurationOptions.Tunnel` differs;
+stock-Garnet server; counting-tunnel engagement gate; 6 passes interleaved, reshuffled). Pre-registered
+P1 (depth-1 parity ± 10%) and P2 (depth-64 tunnel ≥ +15%) both FALSIFIED — the falsification is the
+finding:
+
+| cell (req/s · p99 ms) | classic | tunnel (transport mode v1) | verdict |
+|---|---:|---:|---|
+| GET d1 | 51,463-52,506 · 0.022-0.023 | 43,061-45,985 · 0.025-0.027 | **classic +14% DISJOINT** |
+| SET d1 | 51,279-52,154 · 0.022-0.023 | 45,049-46,093 · 0.025-0.026 | **classic +12% DISJOINT** |
+| GET d64 | 1,081,983-1,104,296 · 0.090-0.100 | 147,148-157,891 · 0.462-0.564 | **classic ~7x DISJOINT** |
+| SET d64 | 1,021,738-1,026,719 · 0.099-0.104 | 144,167-156,416 · 0.460-0.569 | **classic ~6.8x DISJOINT** |
+| TLS legs | same shape | same shape | classic +8% d1, ~6.5x d64, all DISJOINT |
+
+**The mechanism, confirmed by counter before any fix (SS_URING_STATS on a tunnel d64 cell): send SQEs
+≈ ops (1.56M SQEs for ~1.5M ops), iov-segments == SQEs (ONE ~40-byte segment per send), and
+`queued-behind-inflight` = 99.8% of all sends.** Every command's flush queues behind the inflight send
+and is then drained ONE JOB PER COMPLETION (`IoUringShard.DrainNext` dequeues a single `PendingJob`) —
+so the connection is a syscall-latency conveyor at ~6µs/op ≈ the observed ~170k cap, while classic
+packs ~64 commands per write. This is the proxy's send-amplification lesson in its third costume
+(peer-granular TLS records, then per-callback flushes, now per-op client flushes) — and the natural
+batch boundary ALREADY EXISTS: the pending queue itself. The fix shape is drain-time coalescing
+(merge all consecutive queued chains into one writev, bounded by IovMax) — in progress; this entry
+gets its post-fix table when it lands. The depth-1 deficit (~2.7µs/op) is the loop-thread hop for
+staged sends and is NOT expected to move with this fix; that one is real v1 cost, honestly recorded.
+
 ### GARNET ON SOCKETSET (2026-08-02, late): parity-to-ahead on day one, better tails in every cell
 
 Consumer #4, suggestion-to-measurement in one day. `src/SocketSet.Garnet` hosts Garnet via the embedding
