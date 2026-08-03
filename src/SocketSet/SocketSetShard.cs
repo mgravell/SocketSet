@@ -178,7 +178,7 @@ public abstract class SocketSetShard
     public virtual void Listen(EndPoint endpoint, object? userToken, bool local) // local == keep on this shard
         => throw new NotSupportedException($"{nameof(Listen)} on {endpoint.GetType().Name} is not supported.");
 
-    public virtual void Connect(EndPoint endpoint, object? userToken)
+    public virtual void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
         => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported.");
 
     /// <summary>Accept on an already-listening socket handle on this shard (see

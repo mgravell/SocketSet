@@ -89,7 +89,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
     private readonly ConcurrentQueue<(int Fd, object? Token)> _incoming = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation)> _closes = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation, byte[] Data, int Len)> _flush = [];
-    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token)> _connects = [];
+    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)> _connects = [];
     private readonly ConcurrentQueue<(int Fd, object? Token)> _newListeners = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation, EpollZcSend Zc)> _zeroCopy = [];
 
@@ -263,7 +263,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
     private void DrainCrossThread()
     {
         while (_newListeners.TryDequeue(out var l)) StartListen(l.Fd, l.Token);
-        while (_connects.TryDequeue(out var c)) StartConnect(c.Fd, c.Endpoint, c.Token);
+        while (_connects.TryDequeue(out var c)) StartConnect(c.Fd, c.Endpoint, c.Token, c.Tls);
         while (_incoming.TryDequeue(out var a)) AdoptAccepted(a.Fd, a.Token);
         // f.Data is rented (see OutboundConnection.Flush) and owned by this loop now: return it however
         // PumpFlush exits, including the drop paths where the slot was re-tenanted.
@@ -286,6 +286,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         if (idx < 0) return null;
         var conn = _conns[idx];
         conn.UserToken = userToken;
+        conn.TlsOverride = null; // recycled slot must not inherit the last tenant's provider
         conn.Flags = flags;
         conn.Opened = false;
         conn.Closing = false;
@@ -448,7 +449,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // Connect
     // =====================================================================
 
-    public override void Connect(EndPoint endpoint, object? userToken)
+    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         // This shard already holds a reservation (TryPlace took it). Create the socket synchronously so
         // its failures stay on the caller's thread, then hand the claim + connect to the loop.
@@ -468,14 +469,15 @@ internal sealed unsafe class EpollShard : SocketSetShard
             LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
         }
 
-        _connects.Enqueue((fd, endpoint, userToken));
+        _connects.Enqueue((fd, endpoint, userToken, tls));
         Poke();
     }
 
-    private void StartConnect(int fd, EndPoint endpoint, object? token)
+    private void StartConnect(int fd, EndPoint endpoint, object? token, SocketSets.Tls.TlsProvider? tls = null)
     {
         var conn = InitClient(fd, token, SocketSet.SocketFlags.None);
         if (conn is null) { LibC.close(fd); ReleaseReservation(); return; }
+        conn.TlsOverride = tls; // InitClient nulled it (slot recycle); an explicit provider re-seeds it
 
         if (!_recvBuffer.TryLease(out int ri, out _)) { LibC.close(fd); FreeSlot(conn); return; }
         conn.RecvBuf = ri;
@@ -552,16 +554,19 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // kTLS (kernel offload) and userspace TLS are the two shapes; pick per provider capability + option.
         // A kTLS connection's open is deferred to KtlsComplete, a userspace one to DriveTlsHandshake's
         // FireOpen re-entry — so both branches return here without firing OnAccept/OnConnect.
-        if (Parent.Options.TlsEnabled(isClient) && conn.Tls is null && conn.KtlsSsl == 0)
+        var engagedTls = isClient
+            ? Parent.Options.ResolveClientTls(conn.TlsOverride)
+            : (Parent.Options.TlsEnabled(isClient: false) ? Parent.Options.Tls : null);
+        if (engagedTls is not null && conn.Tls is null && conn.KtlsSsl == 0)
         {
             // TlsClient/TlsServer are distinct types (no common base), so read the flag per side.
             bool allowKernel = isClient
                 ? Parent.Options.TlsClient.AllowKernelOffload
                 : Parent.Options.TlsServer.AllowKernelOffload;
-            if (allowKernel && Parent.Options.Tls is { SupportsKernelOffload: true } and OpenSslTlsProvider kop)
+            if (allowKernel && engagedTls is OpenSslTlsProvider { SupportsKernelOffload: true } kop)
                 StartKtls(conn, isClient, kop);   // OpenSSL owns the fd; readiness-driven; kernel does crypto
             else
-                BeginTls(conn, isClient);          // userspace TLS via memory BIOs
+                BeginTls(conn, isClient, engagedTls); // userspace TLS via memory BIOs
             return;
         }
 
@@ -860,10 +865,10 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // that ordering for every caller: it appends to Pending whenever anything is queued ahead of it.
     // =====================================================================
 
-    private void BeginTls(EpollConnection conn, bool isClient)
+    private void BeginTls(EpollConnection conn, bool isClient, SocketSets.Tls.TlsProvider? provider = null)
     {
         var opts = Parent.Options;
-        conn.Tls = isClient ? opts.Tls!.CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
         // A client speaks first (ClientHello); a server emits nothing until it has seen one. The receive
         // is already armed by the caller, so the handshake advances as bytes arrive.
         DriveTlsHandshake(conn, default);

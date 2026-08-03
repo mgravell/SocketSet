@@ -52,7 +52,7 @@ internal sealed class IoUringShard : SocketSetShard
                                   // it's a mutable struct, so a readonly field would mutate a throwaway copy.
     // Connect requests marshaled from the caller thread to the loop, which claims the slot + issues the
     // CONNECT SQE — so the slot table stays single-writer (only the loop claims). fd is created caller-side.
-    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token)> _pendingConnects = [];
+    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)> _pendingConnects = [];
 
     // --- options snapshot ---
     private readonly int _socketsPerShard;
@@ -205,6 +205,7 @@ internal sealed class IoUringShard : SocketSetShard
         if (idx < 0) return null;
         var conn = _conns[idx];
         conn.UserToken = userToken;
+        conn.TlsOverride = null; // recycled slot must not inherit the last tenant's provider
         conn.Flags = flags;
         conn.SendBusy = false;
         conn.TlsClient = false;  // Tls/KtlsSsl are nulled in TryFinalize; belt-and-suspenders for a fresh tenant
@@ -323,7 +324,7 @@ internal sealed class IoUringShard : SocketSetShard
         EnqueueAccept(fd, local: false);
     }
 
-    public override void Connect(EndPoint endpoint, object? userToken)
+    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         // This shard holds a reservation (TryPlace took it before dispatching here); release it on any
         // failure before the connect is handed to the loop, so a rejected connect doesn't leak capacity.
@@ -344,17 +345,18 @@ internal sealed class IoUringShard : SocketSetShard
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
         }
 
-        _pendingConnects.Enqueue((fd, endpoint, userToken));
+        _pendingConnects.Enqueue((fd, endpoint, userToken, tls));
         Poke();
     }
 
     // Loop thread: claim the reserved slot for a marshaled connect, build the target sockaddr into its
     // stable native storage, and issue the CONNECT SQE. The reservation is consumed by the claim, or
     // released here on the (should-not-happen) claim-failure backstop.
-    private unsafe void StartConnect(int fd, EndPoint endpoint, object? userToken)
+    private unsafe void StartConnect(int fd, EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         var conn = InitClient(fd, userToken, SocketSet.SocketFlags.None);
         if (conn is null) { LibC.close(fd); ReleaseReservation(); return; }
+        conn.TlsOverride = tls; // InitClient nulled it (slot recycle); an explicit provider re-seeds it
         uint slot = conn.Slot;
 
         byte* addrPtr = _connectAddrs + (nint)(slot - 1) * AddrStride;
@@ -946,11 +948,11 @@ internal sealed class IoUringShard : SocketSetShard
     // Stand up the per-connection engine at open, arm recv, and take the first handshake step (a client
     // emits its ClientHello; a server produces nothing until it sees one). OnConnect/OnAccept are deferred
     // to TlsFireOpen at handshake completion.
-    private unsafe void StartTls(IoUringConnection conn, uint slot, int fd, bool client)
+    private unsafe void StartTls(IoUringConnection conn, uint slot, int fd, bool client, SocketSets.Tls.TlsProvider? provider = null)
     {
         var opts = Parent.Options;
         conn.TlsClient = client;
-        conn.Tls = client ? opts.Tls!.CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.Tls = client ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
         conn.TlsPlain ??= new PooledBufferWriter(_readPageSize);
         conn.TlsOut ??= new PooledBufferWriter(_readPageSize);
 
@@ -1344,7 +1346,7 @@ internal sealed class IoUringShard : SocketSetShard
 
             // Start any connects marshaled in from caller threads (claim + CONNECT SQE on the loop).
             while (_pendingConnects.TryDequeue(out var pc))
-                StartConnect(pc.Fd, pc.Endpoint, pc.Token);
+                StartConnect(pc.Fd, pc.Endpoint, pc.Token, pc.Tls);
 
             // Issue any out-of-band writes flushed in from other threads.
             while (_flush.TryDequeue(out var f))
@@ -1583,18 +1585,18 @@ internal sealed class IoUringShard : SocketSetShard
         int fd = conn.Fd;
         if (res == 0 && fd != 0)
         {
-            if (Parent.Options.TlsEnabled(isClient: true)
-                && Parent.Options.Tls is { SupportsKernelOffload: true } kp and OpenSslTlsProvider kop
+            var clientTls = Parent.Options.ResolveClientTls(conn.TlsOverride);
+            if (clientTls is OpenSslTlsProvider { SupportsKernelOffload: true } kop
                 && Parent.Options.TlsClient.AllowKernelOffload)
             {
                 StartKtls(conn, slot, fd, client: true, kop); // kernel TLS: OpenSSL owns the fd, POLL-driven
                 return;
             }
-            if (Parent.Options.TlsEnabled(isClient: true))
+            if (clientTls is not null)
             {
                 // TLS: don't fire OnConnect yet — stand up the client engine, arm recv, send ClientHello.
                 // OnConnect fires from TlsFireOpen once the handshake completes.
-                StartTls(conn, slot, fd, client: true);
+                StartTls(conn, slot, fd, client: true, clientTls);
                 return;
             }
 

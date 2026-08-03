@@ -698,7 +698,24 @@ Marc's call: stabilise in-flight work (done — all repos clean, gates green), t
 - `SocketSet.StackExchange.Redis` is deliberately NOT packaged: welded to the cross-repo sibling
   checkout and the SER009 experimental contract.
 
-## TLS AT LISTEN/CONNECT GRANULARITY (2026-08-03, from Marc — design item, not started)
+## TLS AT LISTEN/CONNECT GRANULARITY (2026-08-03, from Marc — CONNECT HALF BUILT same day)
+
+**Status: the per-CONNECT half is DONE and gated** (Marc's motivating example verbatim): `Connect(ep,
+userToken, tls: provider)` / `ConnectShard(...)` across ALL FIVE backends — per-connection override on
+`Connection.TlsOverride` (nulled at every slot-recycle/init point, seeded only by an explicit connect),
+one resolution rule (`ResolveClientTls`: explicit provider WINS OUTRIGHT and is itself the direction
+signal — TlsMode does not gate it; null = engine options exactly as before), provider-parameterised
+StartTls/BeginTls everywhere, kTLS eligibility resolved from the per-connect provider on Linux. Gates:
+smoke 60/60, tunnel-selftest 5/5, verify-tls-floor 8/8, and a dedicated proof in the proxy shape — ONE
+engine terminating with cert A downstream (TlsMode.Accept) while originating with trust B upstream via
+the per-connect provider, with the no-override dial staying plaintext. **Windows backends compile and
+follow the identical pattern but are UNVERIFIED — first Windows session must run the smoke matrix +
+Verify-TlsFloor.** Remaining half: per-LISTEN granularity (listener carries provider, accepted conns
+inherit) — the same plumbing pattern, deferred; and TlsClient options (TargetHost etc.) are still
+engine-level, so per-connect providers to DIFFERENT hostnames share one TargetHost — recorded gap.
+
+The original design note follows.
+
 
 **The ask:** TLS config should live at the listen/connect level, not (only) the engine level. Today one
 `TlsProvider` + one `TlsMode` per `SocketSetOptions` covers the whole engine; `TlsMode` gives

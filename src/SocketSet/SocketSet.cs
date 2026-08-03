@@ -372,7 +372,7 @@ public abstract partial class SocketSet : IDisposable
     /// asked for a specific placement, so falling back to another shard would silently defeat the point;
     /// degrade explicitly at the call site instead.
     /// </summary>
-    public void ConnectShard(int shardIndex, EndPoint endpoint, object? userToken = null)
+    public void ConnectShard(int shardIndex, EndPoint endpoint, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
     {
         ValidateEndpoint(endpoint);
         var arr = _shards;
@@ -380,10 +380,18 @@ public abstract partial class SocketSet : IDisposable
         var shard = arr[shardIndex];
         if (!shard.TryReserve())
             throw new InvalidOperationException($"Shard {shardIndex} is at capacity; cannot place the connection.");
-        shard.Connect(endpoint, userToken);
+        shard.Connect(endpoint, userToken, tls);
     }
 
-    public void Connect(EndPoint endpoint, object? userToken = null)
+    /// <summary>
+    /// <paramref name="tls"/>: per-connection TLS provider for THIS dial, overriding the engine-level
+    /// options outright (an explicit provider IS the direction signal; <see cref="TlsMode"/> does not
+    /// gate it). Null = the engine options decide, exactly as before. This is the "one engine, many TLS
+    /// contexts" granularity: e.g. a proxy terminating with cert A downstream while originating with
+    /// trust B upstream, on a single SocketSet. Client-side only today; per-Listen granularity is a
+    /// recorded follow-up.
+    /// </summary>
+    public void Connect(EndPoint endpoint, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
     {
         ValidateEndpoint(endpoint);
         // Walk for a shard with a free slot rather than committing to one round-robin pick that might be
@@ -391,7 +399,7 @@ public abstract partial class SocketSet : IDisposable
         // claiming the slot, or releases it on a pre-claim failure.
         var shard = TryPlace()
             ?? throw new InvalidOperationException("All shards are at capacity; cannot place the connection.");
-        shard.Connect(endpoint, userToken);
+        shard.Connect(endpoint, userToken, tls);
     }
 
     /// <summary>

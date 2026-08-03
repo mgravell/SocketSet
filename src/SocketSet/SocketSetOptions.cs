@@ -14,6 +14,12 @@ public class SocketSetOptions
 
     /// <summary>The per-direction TLS gate every backend consults at its accept/connect engage site.
     /// One helper rather than nine hand-written conditions, so a backend cannot drift.</summary>
+    /// <summary>Resolve the CLIENT-side provider for one outbound connection: an explicit per-connect
+    /// provider wins outright (it IS the direction signal — TlsMode does not gate it); otherwise the
+    /// engine-level provider under the usual TlsMode rules.</summary>
+    internal SocketSets.Tls.TlsProvider? ResolveClientTls(SocketSets.Tls.TlsProvider? perConnect)
+        => perConnect ?? (TlsEnabled(isClient: true) ? Tls : null);
+
     internal bool TlsEnabled(bool isClient)
         => Tls is not null && (TlsMode & (isClient ? TlsMode.Connect : TlsMode.Accept)) != 0;
 

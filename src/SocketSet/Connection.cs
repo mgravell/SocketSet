@@ -27,6 +27,11 @@ public abstract class Connection : IBufferWriter<byte>
     /// OnAccept/OnConnect (or later) and read it from any callback; the library never touches it.</summary>
     public object? UserToken { get; set; }
 
+    /// <summary>Per-connection TLS provider override (set by the connect path when the caller passed
+    /// one; null = engine options decide). Seeded alongside <see cref="UserToken"/> at init/adopt so a
+    /// recycled slot never leaks the previous tenant's provider.</summary>
+    internal SocketSets.Tls.TlsProvider? TlsOverride;
+
     /// <summary>Send/receive-closed state, mutated through the context Close* methods.</summary>
     internal SocketSet.SocketFlags Flags;
 

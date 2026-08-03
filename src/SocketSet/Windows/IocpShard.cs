@@ -90,7 +90,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // ConnectEx — so the slot table stays single-writer. The socket is created caller-side (thread-agnostic
     // syscalls, sync failures stay synchronous); the port-assoc + ConnectEx run on the loop (their failures
     // become async, uniform with accept).
-    private readonly ConcurrentQueue<(nint Socket, EndPoint Endpoint, object? Token)> _pendingConnects = [];
+    private readonly ConcurrentQueue<(nint Socket, EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)> _pendingConnects = [];
 
     // --- options snapshot ---
     private readonly int _opCount;
@@ -264,7 +264,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             AdoptAccepted(inbound.Socket, inbound.Token);
 
         while (_pendingConnects.TryDequeue(out var pc))
-            StartConnect(pc.Socket, pc.Endpoint, pc.Token);
+            StartConnect(pc.Socket, pc.Endpoint, pc.Token, pc.Tls);
 
         while (_closes.TryDequeue(out var c))
         {
@@ -626,6 +626,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         if (idx < 0) return null;
         var conn = _conns[idx];
         conn.UserToken = userToken;
+        conn.TlsOverride = null; // recycled slot must not inherit the last tenant's provider
         conn.Flags = flags;
         conn.Opened = false;
         conn.Closing = false;
@@ -743,7 +744,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         StartAccept(handle, Win32.AF_INET, Win32.IPPROTO_TCP, userToken);
     }
 
-    public override void Connect(EndPoint endpoint, object? userToken)
+    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         EnsureWinsock();
         (int af, int proto) = endpoint switch
@@ -788,7 +789,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             }
         }
 
-        _pendingConnects.Enqueue((s, endpoint, userToken));
+        _pendingConnects.Enqueue((s, endpoint, userToken, tls));
         Poke();
     }
 
@@ -796,10 +797,11 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // build the target sockaddr into the slot's stable native storage, and post ConnectEx. The reservation
     // is consumed by the claim, or released here on any post-claim failure (which are now async, like
     // accept — the caller has already returned).
-    private void StartConnect(nint s, EndPoint endpoint, object? userToken)
+    private void StartConnect(nint s, EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         var conn = InitClient(s, userToken, SocketSet.SocketFlags.None);
         if (conn is null) { Win32.closesocket(s); ReleaseReservation(); return; }
+        conn.TlsOverride = tls; // InitClient nulled it (slot recycle); an explicit provider re-seeds it
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(s, _port, slot, 0) == 0)
@@ -1033,7 +1035,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         conn.RecvBuf = ri;
 
         // TLS: OnConnect is deferred to FireTlsOpen (the client speaks first — see BeginTls).
-        if (Parent.Options.TlsEnabled(isClient: true)) { BeginTls(conn, slot, isClient: true); return; }
+        if (Parent.Options.ResolveClientTls(conn.TlsOverride) is { } clientTls) { BeginTls(conn, slot, isClient: true, clientTls); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
@@ -1384,11 +1386,11 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
     // Attach a fresh engine to a just-adopted connection and start the handshake. OnAccept/OnConnect are
     // NOT fired here — they fire from FireTlsOpen once the handshake completes.
-    private void BeginTls(IocpConnection conn, uint slot, bool isClient)
+    private void BeginTls(IocpConnection conn, uint slot, bool isClient, SocketSets.Tls.TlsProvider? provider = null)
     {
         var opts = Parent.Options;
         conn.IsClient = isClient;
-        conn.Tls = isClient ? opts.Tls!.CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
 
         // A client speaks first (ClientHello); a server emits nothing until it has seen one. Either way the
         // receive must be armed so the handshake can advance as bytes arrive.

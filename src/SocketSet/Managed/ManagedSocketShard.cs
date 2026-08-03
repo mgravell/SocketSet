@@ -140,11 +140,11 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Connect
     // =====================================================================
 
-    public override void Connect(EndPoint endpoint, object? userToken)
+    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         var target = Normalize(endpoint);
         var socket = NewSocket(target);
-        var args = new ConnectArgs(this, userToken) { RemoteEndPoint = target };
+        var args = new ConnectArgs(this, userToken, tls) { RemoteEndPoint = target };
         try
         {
             if (!socket.ConnectAsync(args)) CompleteConnect(args);
@@ -169,12 +169,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         MaybeNoDelay(socket);
         var token = args.Token;
         var conn = Register(socket, token);
+        conn.TlsOverride = args.Tls; // fresh connection object (managed never recycles); seed the per-connect provider
         args.Dispose(); // connect SAEA no longer needed
 
-        if (Parent.Options.TlsEnabled(isClient: true))
+        if (Parent.Options.ResolveClientTls(conn.TlsOverride) is { } clientTls)
         {
             // TLS: defer OnConnect until the handshake completes; the client speaks first (ClientHello).
-            BeginTls(conn, isClient: true);
+            BeginTls(conn, isClient: true, clientTls);
             return;
         }
 
@@ -436,11 +437,11 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
     // Attach a fresh TLS engine to a just-registered connection and kick the handshake. OnConnect/OnAccept
     // are NOT fired here — they fire from FireTlsOpen once the handshake completes.
-    private void BeginTls(ManagedConnection conn, bool isClient)
+    private void BeginTls(ManagedConnection conn, bool isClient, SocketSets.Tls.TlsProvider? provider = null)
     {
         var opts = Parent.Options;
         conn.IsClient = isClient;
-        conn.Tls = isClient ? opts.Tls!.CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : opts.Tls!.CreateServerFilter(opts.TlsServer);
         conn.Plain = new PooledBufferWriter(_bufferSize);  // decrypt target (data phase)
         conn.Cipher = new PooledBufferWriter(_bufferSize); // encrypt scratch
         conn.Ctrl = new PooledBufferWriter(64);            // handshake / control-record output
@@ -682,10 +683,11 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         }
     }
 
-    private sealed class ConnectArgs(ManagedSocketShard shard, object? token) : SocketAsyncEventArgs
+    private sealed class ConnectArgs(ManagedSocketShard shard, object? token, SocketSets.Tls.TlsProvider? tls = null) : SocketAsyncEventArgs
     {
         public readonly ManagedSocketShard Shard = shard;
         public readonly object? Token = token;
+        public readonly SocketSets.Tls.TlsProvider? Tls = tls;
 
         protected override void OnCompleted(SocketAsyncEventArgs e) => Shard.CompleteConnect(this);
     }
