@@ -551,7 +551,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // kTLS (kernel offload) and userspace TLS are the two shapes; pick per provider capability + option.
         // A kTLS connection's open is deferred to KtlsComplete, a userspace one to DriveTlsHandshake's
         // FireOpen re-entry — so both branches return here without firing OnAccept/OnConnect.
-        if (Parent.Options.Tls is not null && conn.Tls is null && conn.KtlsSsl == 0)
+        if (Parent.Options.TlsEnabled(isClient) && conn.Tls is null && conn.KtlsSsl == 0)
         {
             // TlsClient/TlsServer are distinct types (no common base), so read the flag per side.
             bool allowKernel = isClient

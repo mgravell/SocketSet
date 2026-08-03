@@ -113,7 +113,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             MaybeNoDelay(sock);
             var conn = Register(sock, args.DefaultToken);
 
-            if (Parent.Options.Tls is not null)
+            if (Parent.Options.TlsEnabled(isClient: false))
             {
                 // TLS: defer OnAccept until the handshake completes (see BeginTls / FireTlsOpen).
                 BeginTls(conn, isClient: false);
@@ -171,7 +171,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         var conn = Register(socket, token);
         args.Dispose(); // connect SAEA no longer needed
 
-        if (Parent.Options.Tls is not null)
+        if (Parent.Options.TlsEnabled(isClient: true))
         {
             // TLS: defer OnConnect until the handshake completes; the client speaks first (ClientHello).
             BeginTls(conn, isClient: true);

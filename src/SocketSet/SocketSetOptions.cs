@@ -8,6 +8,15 @@ public class SocketSetOptions
     /// OnConnect/OnAccept fire only after the handshake completes. Null (default) = plaintext, as today.</summary>
     public TlsProvider? Tls { get; set; }
 
+    /// <summary>Which directions <see cref="Tls"/> applies to; see <see cref="SocketSets.TlsMode"/>.
+    /// Ignored when <see cref="Tls"/> is null.</summary>
+    public TlsMode TlsMode { get; set; } = TlsMode.Both;
+
+    /// <summary>The per-direction TLS gate every backend consults at its accept/connect engage site.
+    /// One helper rather than nine hand-written conditions, so a backend cannot drift.</summary>
+    internal bool TlsEnabled(bool isClient)
+        => Tls is not null && (TlsMode & (isClient ? TlsMode.Connect : TlsMode.Accept)) != 0;
+
     /// <summary>Client-handshake config used when <see cref="Tls"/> is set and this set dials out.</summary>
     public TlsClientOptions TlsClient { get; set; } = new();
 

@@ -69,6 +69,30 @@ nearly halved) — from a v1 that still pays an extra receive copy the SAEA path
 receives directly into the handler buffer; we copy from the transport-owned span). The copy is the known
 first lever if this ever needs more; the tails suggest the loop-thread model is already paying for it.
 
+### THE SIDECAR SHOWDOWN (2026-08-03): over abstract UDS, we beat Envoy at BOTH depths — the first `-P 1` disjoint win
+
+Yesterday's caveat ("no Envoy-relative UDS claim until a same-session Envoy-UDS leg runs") is retired.
+Envoy 1.39's pipe listener accepts `@`-abstract paths (validated, kernel-confirmed); both proxies ran on
+their own abstract names, same session, interleaved, 5 passes, same 3-physical-core pinning,
+`--concurrency 6` matching our 6 shards, TCP upstream to the same Garnet:
+
+| cell | envoy | socketset (L3 affine) | Δ | verdict |
+|---|---:|---:|---:|---|
+| `-P 1` GET | 399,968 (298,454-416,597 — WIDE) · p99 0.351 | **512,715** · p99 0.399 | **+28.2%** | **DISJOINT** |
+| `-P 1` SET | 499,900 · p99 **0.175** | 499,850 · p99 0.415 | ±0 | tick-tied (50 rps = one timer quantum) |
+| `-P 16` GET | 1,713,404 · p99 1.415 | **4,136,790** · p99 **0.623** | **+141%** | **DISJOINT** |
+| `-P 16` SET | 1,874,180 · p99 0.807 | **3,635,042** · p99 0.735 | **+94%** | **DISJOINT** |
+
+**The finding inside the finding: UDS is not neutral ground — Envoy REGRESSES on it** (`-P 1` GET 452k
+TCP → 400k UDS, with an unstable range) **while we improve** (491k → 513k). At depth we are 2.2-2.4x.
+This is the first DISJOINT `-P 1` throughput win over Envoy in any configuration — on TCP that cell was
+parity at the generator ceiling. Kept honest: Envoy's `-P 1` SET tail (0.175 ms) beats ours (0.415) in
+that one cell, and this ad-hoc run had no quantisation audit — but the claimed deltas (+28/+94/+141%)
+are an order of magnitude above the ~2.5% tick.
+
+So the sidecar story completes: **app → @abstract → this proxy → TCP/TLS upstream is faster than the
+same shape through Envoy at every depth measured, with no filesystem footprint.**
+
 ### GARNET OVER ABSTRACT UDS (2026-08-02, last run of the day): the TCP pattern repeats, elevated
 
 Both legs on the IDENTICAL abstract name (`@gd-abs`), plaintext, interleaved, 5 passes. Getting stock

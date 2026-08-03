@@ -1513,13 +1513,14 @@ internal sealed class IoUringShard : SocketSetShard
 
         uint slot = conn.Slot;
 
-        if (Parent.Options.Tls is { SupportsKernelOffload: true } and OpenSslTlsProvider kop
+        if (Parent.Options.TlsEnabled(isClient: false)
+            && Parent.Options.Tls is { SupportsKernelOffload: true } and OpenSslTlsProvider kop
             && Parent.Options.TlsServer.AllowKernelOffload)
         {
             StartKtls(conn, slot, newFd, client: false, kop); // kernel TLS
             return;
         }
-        if (Parent.Options.Tls is not null)
+        if (Parent.Options.TlsEnabled(isClient: false))
         {
             // TLS: don't fire OnAccept yet — stand up the server engine and arm recv to await the
             // ClientHello. OnAccept fires from TlsFireOpen once the handshake completes.
@@ -1550,13 +1551,14 @@ internal sealed class IoUringShard : SocketSetShard
         int fd = conn.Fd;
         if (res == 0 && fd != 0)
         {
-            if (Parent.Options.Tls is { SupportsKernelOffload: true } kp and OpenSslTlsProvider kop
+            if (Parent.Options.TlsEnabled(isClient: true)
+                && Parent.Options.Tls is { SupportsKernelOffload: true } kp and OpenSslTlsProvider kop
                 && Parent.Options.TlsClient.AllowKernelOffload)
             {
                 StartKtls(conn, slot, fd, client: true, kop); // kernel TLS: OpenSSL owns the fd, POLL-driven
                 return;
             }
-            if (Parent.Options.Tls is not null)
+            if (Parent.Options.TlsEnabled(isClient: true))
             {
                 // TLS: don't fire OnConnect yet — stand up the client engine, arm recv, send ClientHello.
                 // OnConnect fires from TlsFireOpen once the handshake completes.

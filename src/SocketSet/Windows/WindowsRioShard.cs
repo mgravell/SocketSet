@@ -745,7 +745,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
         // TLS: the app must not see this connection until the handshake completes, so OnAccept is deferred
         // to FireTlsOpen and everything below is skipped.
-        if (Parent.Options.Tls is not null) { BeginTls(conn, slot, isClient: false); return; }
+        if (Parent.Options.TlsEnabled(isClient: false)) { BeginTls(conn, slot, isClient: false); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
@@ -768,7 +768,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         if (!SetupConnection(conn)) { CloseClient(slot); return; }
 
         // TLS: OnConnect is deferred to FireTlsOpen (the client speaks first — see BeginTls).
-        if (Parent.Options.Tls is not null) { BeginTls(conn, slot, isClient: true); return; }
+        if (Parent.Options.TlsEnabled(isClient: true)) { BeginTls(conn, slot, isClient: true); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
