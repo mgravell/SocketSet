@@ -122,6 +122,7 @@ internal sealed class IoUringShard : SocketSetShard
     // behind the page-size cliff. s_sendSubmit counts every send SQE; the rest decompose it by cause.
     private static long s_opSend, s_opWriteV, s_pendEnqueue, s_pendDrain, s_partialResubmit;
     private static long s_segPooled, s_segManaged, s_segZeroCopy;
+    private static long s_pokes; // cross-thread doorbell writes (eventfd): wakes-per-op is the marshal cost
     private static long s_iovSegs; // total iovec segments across all writevs: segments/response is the
                                    // real independent variable, since sends/response is constant at 1.
     private static int s_statsReported;
@@ -135,7 +136,8 @@ internal sealed class IoUringShard : SocketSetShard
             $"(OP_SEND={snd:n0} OP_WRITEV={wv:n0} iov-segments={Interlocked.Read(ref s_iovSegs):n0} " +
             $"queued-behind-inflight={Interlocked.Read(ref s_pendEnqueue):n0} " +
             $"drained={Interlocked.Read(ref s_pendDrain):n0} " +
-            $"partial-write-resubmits={Interlocked.Read(ref s_partialResubmit):n0}) " +
+            $"partial-write-resubmits={Interlocked.Read(ref s_partialResubmit):n0} " +
+            $"pokes={Interlocked.Read(ref s_pokes):n0}) " +
             $"segs: pooled-page={Interlocked.Read(ref s_segPooled):n0} pinned-managed={Interlocked.Read(ref s_segManaged):n0} " +
             $"zero-copy={Interlocked.Read(ref s_segZeroCopy):n0}");
     }
@@ -457,6 +459,7 @@ internal sealed class IoUringShard : SocketSetShard
     private unsafe void Poke()
     {
         if (!_ringReady) return; // loop drains _pending on its first pass anyway
+        if (ReportStats) Interlocked.Increment(ref s_pokes);
         ulong one = 1;
         LibC.write(_eventFd, &one, sizeof(ulong));
     }

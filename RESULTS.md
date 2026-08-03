@@ -173,8 +173,16 @@ OUR favour, and the 32-byte cell turns out to be the least favourable point in t
    the opt-in `PreventThreadTheft` feature flag), so transport-mode completions on the loop thread QUEUE
    continuations to the pool exactly as classic's reader thread does — no inline theft, symmetric
    dispatch cost, not a suspect for any observed delta.
-4. Still queued: wake accounting for d1's +2.7µs and the 32B-GET −5% (one instrumentation pass —
-   eventfd wakes/op — likely explains both; doorbell coalescing is the candidate fix).
+4. **Wake accounting: measured, and DOORBELL COALESCING IS DECLINED on the evidence** (`pokes=` now in
+   `SS_URING_STATS`). d1: exactly 1.0 pokes/op — but the loop is IDLE between sequential ops, so every
+   wake is mandatory and coalescing can never help there. d64: 0.11 pokes/op — SE.Redis's own bridge
+   batching already amortizes the doorbell (~9 ops/flush), so the skip-when-busy optimisation would
+   save ~80k producer-side syscalls/s against eleven busy cores: noise. The d1 +2.7µs decomposition is
+   therefore STRUCTURAL to marshal-to-loop: eventfd write (producer) + io_uring_enter + eventfd-read
+   completion per op, vs classic's single send() straight from the writer thread. Candidate that could
+   change it: SQPOLL (kernel-side submission polling, no enter syscall) — a different experiment with
+   its own costs, recorded not planned. The 32B-GET −5% remains open and low-priority (not the
+   doorbell: the arithmetic doesn't reach).
 
 **Consolidated client-seat statement as of tonight: at realistic value sizes (512B-4KB) the tunnel is
 +22-82% ahead; at 32B it is -5% GET / +6% SET; p999 is 3-12x better in every single-mux comparison ever
