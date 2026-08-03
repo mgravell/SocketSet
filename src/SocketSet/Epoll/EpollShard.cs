@@ -59,7 +59,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // table, not by a pool depth: at a 64KB page that is 256MB per shard. It is the same per-socket
     // scaling that took a 12-shard RIO server from 283MB to 3,163MB on Windows, and it is why
     // SocketSetOptions.ReceiveBufferSize exists. epoll did not honour it until 2026-07-28; the reason the
-    // RSS table in AspNetDemo/RESULTS.md showed epoll "flat" across page sizes is that the slab is
+    // RSS table in RESULTS.md showed epoll "flat" across page sizes is that the slab is
     // calloc'd (lazily faulted) and -c 64 touches 64 of the 4096 buffers.
     private readonly int _recvBufSize;
     private readonly int _listenBacklog;

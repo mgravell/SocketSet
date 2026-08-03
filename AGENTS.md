@@ -8,7 +8,7 @@ exists because the important context is *not* in the code.
 | file | why |
 |---|---|
 | **`TODO.md`** | The backlog, the design calls, and **why** each was made. Starts with a "READ FIRST IF YOU ARE ON WINDOWS" section — read it if that is you, because shared code changed under Windows while it was not running. |
-| **`AspNetDemo/RESULTS.md`** | Every measurement of record, with its method and its caveats. Opens with "WHERE THINGS STAND" — the consolidated feature matrix and headline numbers. |
+| **`RESULTS.md`** | Every measurement of record, with its method and its caveats. Opens with "WHERE THINGS STAND" — the consolidated feature matrix and headline numbers. |
 | **`bench/README.md`** | How to get a number you can trust on this kind of machine. Written from a session where **eight** separate confounders each produced clean-looking wrong numbers. |
 
 `TODO.md` and `RESULTS.md` are long on purpose: they record retractions and falsified predictions as

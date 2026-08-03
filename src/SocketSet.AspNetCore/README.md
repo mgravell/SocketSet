@@ -55,7 +55,7 @@ How the outbound (application → socket) leg is driven. Pick per workload:
 | `HalfPipe` | Outbound is a `CycleBuffer`-backed `PipeWriter` that drains to `Connection.Send` on Kestrel's flush thread — no pump task, no thread hop. Copies on send. | **Small/mid responses** (roughly ≤ 16 KB); it wins there on cheaper machinery. |
 | `Classic` | Copy inbound into a `Pipe`; an outbound pump task hands buffers to `Connection.Send`. | The universal fallback, and the only mode on backends without zero-copy send (RIO, managed). |
 
-Measured tradeoffs (loopback, single box — see the repo's `AspNetDemo/RESULTS.md`): `HalfPipe` leads
+Measured tradeoffs (loopback, single box — see the repo's `RESULTS.md`): `HalfPipe` leads
 `Byo`/`Classic` by ~3–8% for 256 B–16 KB but is ~35% behind `Byo` at 256 KB, and costs ~12–18% more p99.
 
 ## Options

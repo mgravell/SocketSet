@@ -2,7 +2,7 @@
 # RESP proxy transport A/B: the SAME proxy core (StackExchange.Redis toys/RESPite.Proxy) hosted on the
 # hand-rolled WorkerPool/SAEA layer vs on SocketSet (io_uring / epoll), against a real backend.
 #
-# WHY THIS RIG AND NOT THE ASP.NET ONES. Every throughput number in AspNetDemo/RESULTS.md is scored
+# WHY THIS RIG AND NOT THE ASP.NET ONES. Every throughput number in RESULTS.md is scored
 # through Kestrel, whose bridge costs 24-40% at 256 KB -- and whose "control" leg is a different
 # APPLICATION path, not just a different transport, so bridge cost and transport cost stay fused. Here the
 # application is held constant and the transport is the only variable. That is the comparison the ASP.NET

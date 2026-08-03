@@ -393,7 +393,7 @@ internal sealed class DemoConfig
         Console.WriteLine("    --half-pipe      EXPERIMENTAL: replace the outbound leg with a CycleBuffer-backed");
         Console.WriteLine("                     PipeWriter that drains to Connection.Send on Kestrel's flush thread");
         Console.WriteLine("                     (no pump, no hop). Copies on send; wins small payloads, not 256KB.");
-        Console.WriteLine("                     Turns BYO off. See TODO 'Two half-pipes' + AspNetDemo/RESULTS.md.");
+        Console.WriteLine("                     Turns BYO off. See TODO 'Two half-pipes' + RESULTS.md.");
         Console.WriteLine();
         Console.WriteLine("  The TLS certificate is a throwaway self-signed one for localhost, so clients must");
         Console.WriteLine("  skip verification: curl -k https://127.0.0.1:5080/plaintext");

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The SE.Redis-over-SocketSet vs classic A/B harness. Same generator code for BOTH legs; the ONLY
+       difference is ConfigurationOptions (Tunnel set or not), which is the whole point: this measures
+       the multiplexer's IO core, not two different benchmarks. Needs the sibling StackExchange.Redis
+       checkout on marc/transport-push-feed (transport mode) — the counting-tunnel gate fails loudly on
+       a checkout without it. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);SER009</NoWarn>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <TieredPgo>true</TieredPgo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/SocketSet.StackExchange.Redis/SocketSet.StackExchange.Redis.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Linux counterpart to Run-Matrix.ps1: benchmark the AspNetDemo transports through bombardier.
 #
-# Same guards as the Windows harness, which were all learned the hard way (see AspNetDemo/RESULTS.md):
+# Same guards as the Windows harness, which were all learned the hard way (see RESULTS.md):
 #   * /config is checked before every measurement, and a leg whose reported backend or TLS mode is not
 #     what was asked for is recorded MISMATCH and excluded - silent fallback is the failure mode here.
 #   * server and load generator are pinned to disjoint CPU sets, with DOTNET_PROCESSOR_COUNT/GOMAXPROCS

@@ -129,7 +129,7 @@ doing more work. **Measure cost per request at saturation**, where there are no 
 
 - **Power state.** On a laptop, battery vs mains is a large and *variable* difference in sustained power
   limit, not a few percent - never compare across the two. The current host is a desktop on mains, so this
-  no longer applies here, but the older figures in `AspNetDemo/RESULTS.md` were taken on a laptop.
+  no longer applies here, but the older figures in `RESULTS.md` were taken on a laptop.
 - **Mismatched memory pools (an APPLES-TO-ORANGES default).** Comparing our ASP.NET path against vanilla
   Kestrel at 256KB looked like a clean −14 to −16% loss for weeks — but Kestrel backs its pipes with a
   `PinnedBlockMemoryPool` by default while AspNetDemo defaulted to `MemoryPool.Shared`, so OUR zero-copy

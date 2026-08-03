@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Does the RECEIVE slab scale with CONNECTIONS, and does a big page multiply it?
 #
-# WHY THIS EXISTS. AspNetDemo/RESULTS.md recorded "neither Linux backend has the Windows per-socket
+# WHY THIS EXISTS. RESULTS.md recorded "neither Linux backend has the Windows per-socket
 # receive slab", on the strength of an RSS table showing epoll flat (72 -> 73 MB) across a 4KB -> 64KB
 # page. Inspection says otherwise: EpollShard._recvBuffer is PinnedWriteBufferPool(_socketsPerShard,
 # _bufSize), commented "one per live connection", leased at accept and released at close - i.e. exactly
@@ -26,7 +26,7 @@
 #
 # Pools are pinned explicitly (AFTER --page, which would otherwise rescale them) so that what moves is
 # the page and the connection count, not pool depth. That control is why the previous page/memory
-# attribution had to be withdrawn once - see "The co-variation control" in AspNetDemo/RESULTS.md.
+# attribution had to be withdrawn once - see "The co-variation control" in RESULTS.md.
 #
 # Usage:  ./run-recv-slab.sh
 #         CONNS="64 512 2048" PAGES="4096 65536" ./run-recv-slab.sh

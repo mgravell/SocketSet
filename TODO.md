@@ -286,7 +286,7 @@ just a different transport.
    `RunClientAsync(IDuplexPipe)` — the seam SocketSet plugs into — and `ProxyClient` is untouched by the
    swap, so the transport is the only variable. **That is the comparison AspNetDemo structurally cannot
    make.** The real target is beating **Envoy** running adjacent, with `redis-benchmark` driving
-   {direct | Envoy | our proxy} against one backend. See `AspNetDemo/RESULTS.md` for first numbers.
+   {direct | Envoy | our proxy} against one backend. See `RESULTS.md` for first numbers.
 
 2. **SE.Redis itself, as its IO core, in ordinary CLIENT mode.** This is not academic and it changes the
    engineering constraints more than the proxy does:
@@ -337,7 +337,7 @@ Nothing outside `toys/` is touched; the full solution builds.
 Backend is `garnet-server` (a dotnet tool, multi-threaded — chosen because single-threaded Redis would
 saturate one core and make every proxy leg report the same number).
 
-**What is measured (full tables in `AspNetDemo/RESULTS.md`):** vs the hand-rolled SAEA `WorkerPool` we
+**What is measured (full tables in `RESULTS.md`):** vs the hand-rolled SAEA `WorkerPool` we
 are +15-28% at both depths. **vs ENVOY we LOSE ~2x at `-P 1` and WIN ~1.5x at `-P 16`.** The
 `% of ceiling` column localises it: Envoy is at 90% of the no-proxy ceiling unpipelined (we are at 46%),
 and drops to 23% pipelined (we reach 35%). **Our per-request overhead is poor; our parse throughput is
@@ -1040,7 +1040,7 @@ Ordered by how likely it is to bite. Everything here is unverified on Linux.
    zero-copy (confirmed taken: `zero-copy=2,602` segments, 0 pooled/managed; same-session A/B byo vs
    `--classic` = +71%). epoll is unchanged (no zero-copy send), which is why only io_uring moved. So the
    shared PipeIoBridge/Flush changes are throughput-neutral on Linux. Full write-up in
-   `AspNetDemo/RESULTS.md` "Linux flat-check".
+   `RESULTS.md` "Linux flat-check".
 
 ### 3. Then the Linux-only work, in priority order
 
@@ -1175,7 +1175,7 @@ truncates or over-sends, this is the first suspect.
 
 On Linux this was worth **+16.3%** at 256KB. The Windows path had *more* copies to start with
 (accumulator → `Flush` snapshot → `StageOutbound` staging → write pages, i.e. 3-4), so removing one should
-show at least as well. Compare against the 2026-07-27 numbers in `AspNetDemo/RESULTS.md`
+show at least as well. Compare against the 2026-07-27 numbers in `RESULTS.md`
 (`iocp/s12` 4,483.4 and `rio/s12` 2,051.6 at 256KB). Use `Compare-Commits.ps1` for any before/after claim.
 
 ### 3. The highest-value Windows experiment, and it may need NO code change
@@ -1230,7 +1230,7 @@ Also unswept: anything **above** 64KB, where RIO was still improving at the top 
   Linux-only and does not apply.
 - **Managed BYO send** (item 2e) — assessed and deliberately not built, for reasons that do not change
   by switching OS.
-- **Re-deriving the Linux numbers.** They are in `AspNetDemo/RESULTS.md` with their caveats, and the two
+- **Re-deriving the Linux numbers.** They are in `RESULTS.md` with their caveats, and the two
   hosts/OSes must never be subtracted from each other.
 
 **If you would rather stay on Linux instead of switching:** the honest alternative is zero-copy RECEIVE +
@@ -1343,7 +1343,7 @@ the same physical cores (fixed, `bench/cpu-split.sh`), and `perf` needs a non-ob
 (2026-07-27) and the OS change (2026-07-28), and was taken in a container on a WSL2 kernel. The tables
 below are kept for their reasoning, not their numbers. Nothing can be compared against them.
 
-**The baseline is DONE (2026-07-28)** — see `AspNetDemo/RESULTS.md`, "Linux baseline on bare metal", which
+**The baseline is DONE (2026-07-28)** — see `RESULTS.md`, "Linux baseline on bare metal", which
 is now THE Linux reference and the "before" for the catch-up work below. Four things from it that change
 what is worth doing:
 
@@ -1428,7 +1428,7 @@ that improves one at the expense of the other is a regression even if the benchm
 about it is settled.
 
 **1. Sweep page size on both Linux backends.** `bench/run-tls-sizes.sh` is the rig. Compare 4KB / 16KB /
-64KB at 512B / 16KB / 256KB payloads, exactly as the Windows matrix in `AspNetDemo/RESULTS.md` does.
+64KB at 512B / 16KB / 256KB payloads, exactly as the Windows matrix in `RESULTS.md` does.
 
 *Pre-registered expectation, so the result can falsify something:* **both should be roughly
 page-INSENSITIVE**, unlike RIO. io_uring already dispatches one writev over an `OutChain` of segments —
@@ -1465,7 +1465,7 @@ faulted on touch. Same structure, different residency policy.
 `connections x page` for large-request ones (uploads, proxies). Workload-dependent rather than
 unconditional - weaker than "epoll has the Windows problem", stronger than "Linux does not have it".
 `ReceiveBufferSize` makes it safe either way and both Linux backends now honour it. Full tables in
-`AspNetDemo/RESULTS.md`.
+`RESULTS.md`.
 
 **3. Pipe mode on Linux — CONFIRMED WORKING 2026-07-28, nothing to do.** `SmokeTest --verify-echo
 1048576 --pipe -z 65536` round-trips byte-exact on **both** epoll and io_uring through the universal
@@ -1494,7 +1494,7 @@ against the tuned one. Both statements hold; they are about different things.
 
 **The benchmark host changed on 2026-07-27** - from a laptop (16C/32T) to a desktop (Ryzen 9 7900X,
 12C/24T, mains). Every Windows number recorded before that date is from the old machine and **cannot be
-compared with anything measured since**. The current baseline is in `AspNetDemo/RESULTS.md` under the
+compared with anything measured since**. The current baseline is in `RESULTS.md` under the
 2026-07-27 headings. Two practical consequences: shard sweeps run at **4/8/12** here (12 = the server
 half's logical core count), not 4/8/16; and this host is roughly an order of magnitude more repeatable
 than the old one, with per-leg spreads of 0.2-2.4% rather than up to 6%.
@@ -1510,7 +1510,7 @@ the kernel rejects with `-EINVAL`, so *every* recv failed silently); scatter-gat
 
 **The one measured performance win:** IOCP sends were quantised to a single 4KB write page, so a 256KB
 response left as 64 sequential `WSASend`s. Issuing one call with up to 64 `WSABUF`s gave **+133% at 16KB
-and +162% at 256KB**, validated with `bench/Compare-Commits.ps1`. See `AspNetDemo/RESULTS.md`.
+and +162% at 256KB**, validated with `bench/Compare-Commits.ps1`. See `RESULTS.md`.
 
 **Confirmed end to end (2026-07-27):** through the Kestrel bridge, `--page 65536 --recv-buffer 4096` takes
 RIO from 2,023 to **6,348 MiB/s at 256KB (3.14x)** and 1,484 to **3,735 at 16KB (2.52x)**, closing the gap
@@ -2104,7 +2104,7 @@ that no other backend needs. That last part is the usually-underestimated bit.
 **Do first:** measure io_uring vs epoll vs managed with `--latency` and `--bandwidth`. If they land within
 a few percent, the performance case is dead and the decision is purely architectural. This IS measurable
 under Docker with `--security-opt seccomp=unconfined` (see below), though a loopback container shares all
-the caveats in `AspNetDemo/RESULTS.md`. Partly done: the small-message parity numbers are in the status
+the caveats in `RESULTS.md`. Partly done: the small-message parity numbers are in the status
 above; the `--latency`/`--bandwidth` comparison on real hardware is still outstanding (item 5).
 
 ---
@@ -2209,7 +2209,7 @@ plaintext epoll** — the original entry's framing as an io_uring+TLS peculiarit
 "could not reproduce" was a property of the container, not of the defect.
 
 **But the component is NOT identified, and the obvious inference does not hold.** The bare responder
-shows no collapse at all (see `AspNetDemo/RESULTS.md`), which looks like a clean indictment of the Kestrel
+shows no collapse at all (see `RESULTS.md`), which looks like a clean indictment of the Kestrel
 bridge — except that comparison is cross-run, cross-shard-count, and confounded by `HttpBench` funnelling
 all sends through two threads. Bridged io_uring at 16KB measures FASTER than bare io_uring at 16KB, and a
 bridge cannot cost negative time. **Next step is a clean bare-vs-bridged isolation in one session at a
@@ -2218,7 +2218,7 @@ matched shard count**, not another sweep.
 **RE-MEASURED 2026-07-28 AT SIX PASSES ON THE FIXED TRANSPORT: THE TABLE ABOVE STANDS, AND THE FIX IS
 IRRELEVANT TO IT.** 98 cells, zero errors. Every leg reproduces its pre-fix value within ~2%: epoll
 -36.8%, iouring -26.0%, epoll+tls -52.8%, iouring+tls -53.9%, against kestrel **+24.9%** and kestrel+tls
-**+20.2%**. Full table in `AspNetDemo/RESULTS.md`.
+**+20.2%**. Full table in `RESULTS.md`.
 
 *Why the fix could not move it, and this is a general point about which callers the defect could reach:*
 the allocating branch (`EnsureRoom`'s `want > pageSize`) needs a caller that writes **one large contiguous
@@ -2536,7 +2536,7 @@ defect. That was a harness artifact — see item 0b — and is not a reason for 
 
 **LINUX SWEPT 2026-07-28 — the memory objection is gone, and every backend now wants the same thing.**
 
-`bench/run-page-sizes.sh` on the bare responder (full tables in `AspNetDemo/RESULTS.md`):
+`bench/run-page-sizes.sh` on the bare responder (full tables in `RESULTS.md`):
 
 | backend | page sensitivity | RSS at 64KB page vs 4KB |
 |---|---|---|
@@ -2565,7 +2565,7 @@ much stronger than when this entry was written**, and what is left is mechanism,
   buys nothing (p64K/p256K/p512K overlap at 16KB); and at a fixed p64K, walking the payload across the
   ~65.4KB boundary makes goodput fall off a cliff - 60,000 bytes at 11,341.6 MiB/s against 70,000 bytes at
   7,610.6, i.e. **17% more data for 33% less goodput**, ranges hugely disjoint. Full tables in
-  `AspNetDemo/RESULTS.md`.
+  `RESULTS.md`.
 
   **The cause is a PER-RESPONSE PINNED ALLOCATION, measured 2026-07-28 with `SS_URING_STATS=1`.** An
   earlier entry blamed the `SendBusy` single-in-flight-send gate and a second completion round trip; that
@@ -2622,7 +2622,7 @@ much stronger than when this entry was written**, and what is left is mechanism,
   reads `BufferPageSize` and none of the pools, so `--page` moves one quantity for it.
 - **The memory claim needs rewording, not retracting.** "A 64KB page is 37% cheaper" is mostly the pool
   rescale: at matched depth the page itself saves ~9MB of ~41MB. True of what the default does; not a property of
-  the page. Reworded in `AspNetDemo/RESULTS.md`.
+  the page. Reworded in `RESULTS.md`.
 - Decide the mechanism for a per-backend default. The backends want opposite things (RIO large, IOCP
   small/indifferent) and `BufferPageSize` is one global constant with a real default of 4096, so there is
   no way to distinguish "user asked for 4096" from "user said nothing". Needs a sentinel (0 = backend
@@ -2838,7 +2838,7 @@ read off an error column without checking what the errors were. In isolation the
 serves 73,852 requests with **zero** errors. The counts came from `Run-PoolPressure.ps1`, a harness
 written the same day with **no ephemeral-port gate**, where `Run-Matrix.ps1` has three `Wait-Ports` calls
 precisely because Windows has ~16k ephemeral ports with a multi-minute TIME_WAIT — and that run opens
-about 74,000 connections. Client-side port pressure, i.e. confounder 2 of `AspNetDemo/RESULTS.md`,
+about 74,000 connections. Client-side port pressure, i.e. confounder 2 of `RESULTS.md`,
 reproduced by someone who had read the warning. **Any harness that opens thousands of connections per
 cell needs the port gate; copy it from `Run-Matrix.ps1`.**
 
@@ -3311,7 +3311,7 @@ becomes "build WSABUFs over the sequence's segments and issue one WSASend", with
 
 **Original reasoning, kept for the record.** The 2026-07-27 sweep puts IOCP at
 4,483 MiB/s against Kestrel's 11,489 at 256KB - a 61% gap, and the largest open number in
-`AspNetDemo/RESULTS.md`. The working hypothesis is that the three copies below dominate it. That is
+`RESULTS.md`. The working hypothesis is that the three copies below dominate it. That is
 plausible (the ratio, 2.56x, is about what 2-3 extra copies per byte would cost) but **not established**,
 and two things argue for checking before committing to a design change that ripples into every backend's
 send-completion path:

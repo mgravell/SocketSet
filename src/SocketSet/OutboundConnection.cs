@@ -63,7 +63,7 @@ internal abstract class OutboundConnection : Connection
         //
         // Measured on the ASP.NET bridge at 256KB, where the copy count correlated with the bridge's cost:
         // io_uring makes 1 copy and pays 24.5%, epoll made 2 and paid 41.8% - despite epoll being the
-        // FASTER of the two on the bare transport. See AspNetDemo/RESULTS.md.
+        // FASTER of the two on the bare transport. See RESULTS.md.
         //
         // The array handed over is the accumulator's own buffer, so it may be considerably longer than
         // `length` (it grows by doubling) where the old snapshot was Rent(length). Both consumers slice by
