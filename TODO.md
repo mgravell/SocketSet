@@ -1998,6 +1998,14 @@ was wrong (corrected in RESULTS.md).
   at all (even the proven plaintext form); `dotnet build` still worked. A fresh session clears it. Both (a)
   and (b) just need re-running there. Also: env-prefixed `bash run-*.sh` invocations were dropped by the
   harness intermittently — run the rigs plainly or `export` first.
+- **(e-answer, 2026-08-04) Upstream asked on #68148: "is the Advance bug specific to chunked
+  encoding?" — NO, verified against the source in the clone.** The violation is
+  `BufferWriter<T>.Commit()` retaining `_span` across the transport `Advance`; it is reachable from
+  (a) the **Content-Length** arm of `WriteDataWrittenBeforeHeaders` (`writer.Write(segment.Span);
+  writer.Commit();` on the writer that just committed the headers — the ordinary buffered `Results.Bytes`
+  shape, which is what the filed repro hits, no chunking involved) and (b) the chunked arm via
+  `CommitChunkInternal` (same mechanism, also exposed). Chunked is sufficient but not necessary. Reply
+  drafted for Marc to post.
 - **(e) aspnetcore fix — SPIKED.** [[aspnetcore-issue-68148]] root-caused to `BufferWriter<T>.Commit()`
   retaining `_span` (src/Shared/ServerInfrastructure/BufferWriter.cs) + `Http1OutputProducer` reusing the
   writer for headers-then-body. UNTESTED one-line candidate on branch `fix/bufferwriter-advance-contract`,
