@@ -294,7 +294,10 @@ if (bindProbe is not null)
     var probeEp = new IPEndPoint(IPAddress.Parse(bindProbe), port);
     using var probe = new EchoServer(options);
     probe.Listen(probeEp);
-    Console.WriteLine($"bind-probe: requested={probeEp} pid={Environment.ProcessId} backend={probe}");
+    // Process.GetCurrentProcess().Id, not Environment.ProcessId: the latter is net5+ and this project
+    // multi-targets net472. Caught by the FULL solution build; a `-f net10.0` build passes happily.
+    int probePid = System.Diagnostics.Process.GetCurrentProcess().Id;
+    Console.WriteLine($"bind-probe: requested={probeEp} pid={probePid} backend={probe}");
     Console.Out.Flush();
     using var probeStop = new ManualResetEventSlim(false);
     using (StopSignals.Install(probeStop)) probeStop.Wait();

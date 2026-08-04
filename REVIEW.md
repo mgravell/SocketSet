@@ -280,7 +280,91 @@ Both are commented as known ("demo backpressure", "advisory"), and the proper fi
 worth adding to that item: it is not only an architecture/perf item, it is currently the DoS. Note that
 `SocketSet.AspNetCore` is a published package, not the demo.
 
-### D4. `ReceiveContext.RawBuffer` exposes other connections' bytes past `PayloadBytes`, by design
+### D4. RESOLVED 2026-08-04 (same day): lazy tail wipe, with two triggers
+
+**Superseded by the implementation below.** The original writeup is kept underneath because the
+reasoning about *why* the buffer is shared still applies, and because one of the three options I
+proposed turned out not to be implementable.
+
+**Marc's proposal:** wipe the region past the payload lazily, the first time it is accessed. If it is
+never accessed, zero cost.
+
+**The hole he then found in my first implementation, which is the important part of this entry.** A
+wipe hung off `RawBuffer` alone looks complete and is not. `ResponseBytes` can be set above
+`PayloadBytes` **without ever touching `RawBuffer`**:
+
+```csharp
+protected override void OnReceive(ref ReceiveContext ctx) => ctx.ResponseBytes = frameLength;
+```
+
+That transmits the stale tail and sails straight past a wipe-on-first-access. It is also the *more*
+likely accident of the two: a miscomputed frame length, rather than a handler that writes and then
+over-reports. So there are two triggers, tracked through a single monotone `_wipedTo`:
+
+| trigger | wipes | why that much |
+|---|---|---|
+| `RawBuffer` / `SendBuffer` read | the whole tail | once the span is out we cannot distinguish handler-written bytes from stale ones, and we do not yet know the reply length |
+| `ResponseBytes` / `SendBytes` set | up to `value` only | clears exactly what is about to go on the wire, nothing more |
+
+**The echo path pays nothing, by construction rather than by luck.** `_wipedTo` starts at
+`PayloadBytes` and `WipeTo` early-returns on `end <= _wipedTo`, so `ctx.ResponseBytes =
+ctx.PayloadBytes` (and any reply *smaller* than the request) does one integer compare and a predictable
+not-taken branch. That answers "should a reply that does not exceed the payload pay the penalty?" with
+"it does not" for the length-setting route.
+
+**Trigger 1 was over-charging, and `GetWriteSpan(int sizeHint)` fixes it (Marc's second refinement).**
+The shape the README suggests, `ctx.RawBuffer[i] = ...; ctx.ResponseBytes = ctx.PayloadBytes;`, tripped
+trigger 1 and wiped the WHOLE tail even though the reply never exceeded the payload. Nothing can be
+deferred once the full span is out: a later wipe would erase the handler's own writes.
+
+The fix is not to defer the wipe but to stop handing out the whole buffer. `GetWriteSpan(sizeHint)`
+deliberately does NOT promise `sizeHint` bytes (it is clamped, so callers check `.Length`, the
+`IBufferWriter` convention and the same shape as `Connection.GetSpan`). That freedom is the entire
+point: we hand out only what was asked for, so we only ever have to zero what was asked for. Granting
+is a high-water mark on the same `_wipedTo`, so:
+
+> **received 20, want to reply 25: we wipe 5 bytes, not 4000-minus-25.**
+
+and asking twice never pays twice (`GetWriteSpan(22)` then `GetWriteSpan(25)` clears `[20,22)` then
+`[22,25)`). A reply no larger than the request clears nothing at all, because `_wipedTo` already starts
+at the payload end. `RawBuffer` survives as the "give me everything" form and keeps its pessimistic
+whole-tail wipe, which is now a documented price for asking for everything rather than the only option.
+
+This also removes the one case where the cost could have been ugly: on the TLS path the buffer is a
+`PooledBufferWriter` array grown to the connection's high-water mark and never shrunk, so a connection
+that once sent 4 MB had a 4 MB tail. Under `GetWriteSpan` that is irrelevant — the cost tracks the reply
+size, not the buffer size.
+
+**Measured (indicative, not a scored result).** `SmokeTest --io-uring -s -n 2 -c 8 -t 5 -z 512`, four
+passes each, one session, same host. This workload exercises both sides: the server takes the free echo
+path and the *client* pays both triggers against a 4 KB buffer with 512 B messages, ie. a ~3.5 KB memset
+per operation, which is the pessimal shape.
+
+| | round-trip bytes over 5s, four passes |
+|---|---|
+| without wipe (control) | 812.9M, 817.6M, 818.8M, 831.5M |
+| with wipe | 813.9M, 816.6M, 816.9M, 819.8M |
+
+The ranges overlap almost entirely, so per `bench/README.md` rule 5 **no delta is quoted**: even the
+pessimistic whole-tail form was not distinguishable from noise at this size. `GetWriteSpan` was
+therefore adopted on the strength of the argument rather than of a measured win, and that is worth
+stating plainly: it makes the cost proportional to the reply instead of to the buffer, which is the
+right shape whether or not this particular workload can see it.
+
+**Gated** by `bench/verify-tailwipe`, four cells per backend: three disclosure vectors plus a
+byte-for-byte assertion that a 20-byte request replying 25 clears exactly 5. It was falsified twice
+before being believed; see the gate section at the end.
+
+**Scope, deliberately.** This defends against accident, not against hostile in-process code. Anything
+running in this process can reach the stale bytes trivially (`Unsafe.Add` off a reference, its own
+pointer arithmetic, or the explicitly-named `RawBufferUnwiped` / `SendBufferUnwiped` accessors) and is
+already inside every boundary the library has. Pretending otherwise would buy false confidence. The
+thing worth stopping is an ordinary length bug quietly putting another connection's data on the wire.
+Marc's call, recorded here so nobody "hardens" it later on a misunderstanding.
+
+---
+
+### D4 (original). `ReceiveContext.RawBuffer` exposes other connections' bytes past `PayloadBytes`, by design
 
 `RawBuffer` spans the whole backing buffer and `ResponseBytes` may be set up to that full length
 (`SocketSet.cs:625`, `:640`). The backing buffer is shared, recycled and never cleared:
@@ -308,6 +392,12 @@ Options, increasing in cost:
 
 (b) looks like the right trade and is cheap on the response path, but it is a semantic change to a
 public contract, so it wants a decision rather than a guess.
+
+> **CORRECTION (same day).** Option (b) as written is NOT implementable. There is no way to track "what
+> the handler actually wrote": `RawBuffer` hands out a raw `Span<byte>` and writes through it are
+> invisible to the library. Only the *declared* length (`ResponseBytes`) is observable. Marc's lazy-wipe
+> is strictly better than what I proposed here, and is what shipped. Left in place because being wrong
+> about an option is worth recording alongside the option that worked.
 
 ### D5. `SocketSet.snk` is a full RSA private key, committed
 
@@ -380,10 +470,16 @@ Every Linux gate, run after all the fixes above were in:
 | gate | result |
 |---|---|
 | full solution build | 0 errors, no new warnings (one pre-existing doc warning fixed in passing) |
-| `bench/run-smoke-matrix.sh` | **60/60 PASS**, first run |
+| `bench/run-smoke-matrix.sh` | **60/60 PASS**, first run, and again with the tail wipe in |
+| `bench/verify-tailwipe` | **12/12 PASS** (new; 4 cells x 3 backends) |
 | `bench/verify-bind-address.sh` | **6/6 PASS** (new; see below) |
 | `bench/verify-tls-floor.sh` | **8/8 PASS**, including both refusal cells |
 | `bench/verify-aspnet.sh` | **18/18 PASS** |
+
+One real break was caught here and is worth recording: `--bind-probe` used `Environment.ProcessId`,
+which is net5+, and this repo multi-targets net472. A `-f net10.0` build passes happily; the FULL
+solution build is what failed. It went out in the first commit because I built only the one framework
+after adding the probe. Build the solution, not a target.
 
 ### The new gate was itself falsified before it was believed
 
@@ -404,6 +500,28 @@ failure": `io-uring/loopback` and `epoll/loopback` FAIL (epoll binds through the
 `IoUringFactory.Bind`), `managed/loopback` still passes (it always honoured the address, so it is the
 built-in cross-check), and both `any` controls are unaffected. A gate that has never been shown to fail
 is not a gate.
+
+### `verify-tailwipe` needed the same treatment, and needed it twice
+
+`bench/verify-tailwipe` (D4) went through two rounds of the same lesson, both worth recording because
+both produced a green run that meant nothing:
+
+1. **The first version passed against a knowingly-broken build.** It connected a fresh client per probe
+   and expected to see the previous tenant's bytes. io_uring hands out provided buffers by bid from a
+   per-shard ring, so a new connection rarely lands on the buffer that was dirtied. Fixed by forcing the
+   collision: one connection, a 16-entry pool, 64 rounds. Only then did removing the `ResponseBytes`
+   trigger produce the expected failure (B fails 64/64 on epoll and managed, 4/64 on io_uring, while A
+   still passes) — which is what established that the cell tests what it claims to.
+2. **The exact-delta cell then failed against CORRECT code**, reporting 4076 bytes cleared on io_uring.
+   Also the rig: that receive had landed on a fresh bid whose tail was already zero (the slab is
+   `MAP_ANONYMOUS`), so counting non-marker bytes counted the whole tail. The count is only meaningful
+   on a confirmed-dirty buffer, so the cell now checks the marker is still present immediately after the
+   growth region and reports "not measurable" otherwise. io_uring measures on ~4 of 64 rounds; epoll and
+   managed on all 64. All three then report `cleared=5` exactly.
+
+Both failures were rig defects presenting as code defects, which is the failure mode that costs the most
+time. Checking a gate in both directions, against a known-good and a known-broken build, is what
+separated them.
 - **The Windows half is UNRUN.** `IocpShard`, `WindowsRioShard` and `Win32.cs` were edited from Linux,
   which is exactly the situation `TODO.md`'s Windows catch-up section exists for. First thing on the
   next Windows session: `Run-SmokeMatrix.ps1` and `Verify-AspNet.ps1`, plus the discriminating check for

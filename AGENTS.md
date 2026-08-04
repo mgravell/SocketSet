@@ -81,6 +81,13 @@ both have caused hesitation:
     2026-08-03) — that the TLS min-version floor is APPLIED, not merely configured. The discriminating
     cell is one that must be REFUSED; "TLS still works" cannot distinguish a floor that took from one
     that did nothing. Both narrow gates now exist on both OSes.
+  - **`bench/verify-tailwipe`** (added 2026-08-04; cross-platform, `dotnet run --project`) — that the
+    recycled receive/send buffers cannot put a previous tenant's bytes (another client's decrypted
+    plaintext, under TLS) on the wire, AND that avoiding them is charged at cost: a 20-byte request
+    replying 25 must clear exactly 5, not 0 and not the whole tail. Three of its four cells are
+    disclosure vectors; the discriminating one is `ResponseBytes` set above `PayloadBytes` WITHOUT ever
+    touching `RawBuffer`, which a wipe-on-first-access sails straight past. Run it on any change to the
+    context types.
   - **`bench/verify-bind-address.sh`** (Linux, added 2026-08-04; **no Windows equivalent yet**) — that
     `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code
     INADDR_ANY, and nothing could see it: the smoke matrix binds `IPAddress.Any` and connects over

@@ -61,9 +61,18 @@ sealed class EchoServer(SocketSetOptions options) : SocketSet(options)
     {
         if (ctx.IsEof) return; // peer closed
 
-        // the payload is already sitting in RawBuffer; reply in-place by saying how much
-        // of that buffer to send back (mutate RawBuffer first if the response differs)
+        // the payload is already sitting in the buffer; reply in-place by saying how much
+        // of it to send back
         ctx.ResponseBytes = ctx.PayloadBytes;
+
+        // to reply with something DIFFERENT, ask for the room you need and write into it:
+        //   var reply = ctx.GetWriteSpan(ctx.PayloadBytes + 5); // may return less - check .Length
+        //   ...fill reply...
+        //   ctx.ResponseBytes = reply.Length;
+        // The buffer is shared and recycled across connections, so anything past PayloadBytes
+        // that you have not asked for is zeroed before you or the peer can see it. Asking for
+        // exactly what you need is what keeps that free: a reply no bigger than the request
+        // clears nothing, and growing by 5 bytes clears 5 bytes, not the whole buffer.
     }
 }
 

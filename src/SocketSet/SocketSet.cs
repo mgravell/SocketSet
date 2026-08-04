@@ -567,6 +567,36 @@ public abstract partial class SocketSet : IDisposable
     // backend-owned buffer (io_uring provided/write buffers, the managed scratch). The buffer is
     // surfaced as Span<byte> on demand. Because UserToken and Flags live on the Connection, the
     // handler mutates it directly — nothing is copied in or out across the callback.
+    //
+    // =====================================================================================
+    // THE TAIL WIPE, and what it is and is not for (added 2026-08-04; see REVIEW.md D4)
+    // -------------------------------------------------------------------------------------
+    // Those backend-owned buffers are SHARED AND RECYCLED — io_uring's provided-buffer ring is
+    // per-SHARD and cycles across every connection on it, and the TLS scratch buffers are per-slot
+    // and survive slot re-tenancy without being cleared. So the bytes past the current payload
+    // belong to whoever used the buffer last, which on a TLS connection is another client's
+    // DECRYPTED PLAINTEXT. The reply-in-place design is the whole point of this API, so the buffer
+    // has to stay shared; what must not happen is those bytes reaching the wire.
+    //
+    // Each context therefore zeroes lazily, with TWO triggers, and the second is the one that
+    // matters most because it is the one that is easy to miss:
+    //   1. handing out the buffer span   (RawBuffer / SendBuffer)  -> wipe the whole tail, since
+    //      once the span is out we cannot tell handler-written bytes from stale ones;
+    //   2. setting the length to send    (ResponseBytes / SendBytes) -> wipe only up to that
+    //      length. THIS is the vector a wipe-on-first-access alone would sail past: a handler can
+    //      set ResponseBytes above PayloadBytes without ever touching RawBuffer, and a miscomputed
+    //      frame length doing exactly that is the realistic accident.
+    // Both are monotone through _wipedTo, so they compose in any order and nothing is cleared
+    // twice, and a handler that reaches past nothing pays nothing — the instant-response idiom
+    // (ctx.ResponseBytes = ctx.PayloadBytes) trips neither.
+    //
+    // SCOPE: this defends against ACCIDENT, and that is a deliberate limit, not an oversight. Any
+    // handler that wants the stale bytes can have them — Unsafe.Add off a reference, its own
+    // pointer arithmetic, or the explicitly-named *Unwiped accessors. Code running in this process
+    // is already inside every boundary the library has, so there is nothing here to defend against
+    // it and pretending otherwise would only buy false confidence. The thing worth stopping is an
+    // ordinary length bug quietly putting another connection's data on the wire.
+    // =====================================================================================
 
     protected internal unsafe ref struct AcceptContext(Connection connection, byte* buffer, int bufferLength)
     {
@@ -612,16 +642,65 @@ public abstract partial class SocketSet : IDisposable
         /// <summary>
         /// A library-owned outbound buffer. Write an initial payload here and set
         /// <see cref="SendBytes"/> to have it sent as soon as the socket is accepted.
+        ///
+        /// ZEROED on first access, for the same reason as <c>ReceiveContext.RawBuffer</c>: this is a
+        /// recycled library buffer, so untouched bytes would otherwise be the previous tenant's. A
+        /// handler that never touches it pays nothing.
         /// </summary>
-        public readonly Span<byte> SendBuffer => new(_buffer, _bufferLength);
+        public Span<byte> SendBuffer
+        {
+            get
+            {
+                WipeTo(_bufferLength);
+                return new(_buffer, _bufferLength);
+            }
+        }
 
-        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send. 0 = send nothing.</summary>
+        /// <summary>Write access to the first <paramref name="sizeHint"/> bytes, and THE CHEAP WAY to
+        /// fill this buffer. Does not PROMISE that many (it is clamped to the buffer, so check
+        /// <c>.Length</c>); granting is tracked as a high-water mark, so each call zeroes only the delta
+        /// over what has already been granted, and asking twice never pays twice. Prefer this to
+        /// <see cref="SendBuffer"/>, which has to zero the WHOLE buffer because handing out everything
+        /// leaves us unable to tell written bytes from stale ones. See
+        /// <c>ReceiveContext.GetWriteSpan</c>.</summary>
+        public Span<byte> GetWriteSpan(int sizeHint)
+        {
+            int end = sizeHint <= 0 ? 0 : Math.Min(sizeHint, _bufferLength);
+            WipeTo(end);
+            return new(_buffer, end);
+        }
+
+        /// <summary><see cref="SendBuffer"/> without the wipe; also disclaims the <see cref="SendBytes"/>
+        /// trigger, i.e. the handler takes responsibility for the whole buffer. Bytes are undefined and
+        /// may belong to another connection. For measured use only.</summary>
+        public Span<byte> SendBufferUnwiped
+        {
+            get { _wipedTo = _bufferLength; return new(_buffer, _bufferLength); }
+        }
+
+        // Offset up to which the buffer is known-zeroed (or explicitly disclaimed). Unlike a receive
+        // there is no payload to preserve, so this starts at 0: the whole buffer is the previous
+        // tenant's. Monotone, so the two triggers compose in any order and nothing is cleared twice.
+        private int _wipedTo;
+
+        private void WipeTo(int end)
+        {
+            if (end <= _wipedTo) return;
+            new Span<byte>(_buffer + _wipedTo, end - _wipedTo).Clear();
+            _wipedTo = end;
+        }
+
+        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send. 0 = send nothing.
+        /// Setting this WIPES up to <c>value</c>: it is reachable without ever touching
+        /// <see cref="SendBuffer"/>, so it is the trigger a wipe-on-first-access alone would miss. See
+        /// <c>ReceiveContext.ResponseBytes</c> for the full reasoning.</summary>
         public int SendBytes
         {
             get => field;
             set
             {
                 if (value < 0 | value > _bufferLength) throw new ArgumentOutOfRangeException(nameof(SendBytes));
+                WipeTo(value); // clear only what is about to go on the wire
                 field = value;
             }
         }
@@ -659,16 +738,65 @@ public abstract partial class SocketSet : IDisposable
         /// <summary>
         /// A library-owned outbound buffer. Write an initial handshake/greeting here and set
         /// <see cref="SendBytes"/> to have it sent as soon as the connection completes.
+        ///
+        /// ZEROED on first access, for the same reason as <c>ReceiveContext.RawBuffer</c>: this is a
+        /// recycled library buffer, so untouched bytes would otherwise be the previous tenant's. A
+        /// handler that never touches it pays nothing.
         /// </summary>
-        public readonly Span<byte> SendBuffer => new(_buffer, _bufferLength);
+        public Span<byte> SendBuffer
+        {
+            get
+            {
+                WipeTo(_bufferLength);
+                return new(_buffer, _bufferLength);
+            }
+        }
 
-        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send. 0 = send nothing.</summary>
+        /// <summary>Write access to the first <paramref name="sizeHint"/> bytes, and THE CHEAP WAY to
+        /// fill this buffer. Does not PROMISE that many (it is clamped to the buffer, so check
+        /// <c>.Length</c>); granting is tracked as a high-water mark, so each call zeroes only the delta
+        /// over what has already been granted, and asking twice never pays twice. Prefer this to
+        /// <see cref="SendBuffer"/>, which has to zero the WHOLE buffer because handing out everything
+        /// leaves us unable to tell written bytes from stale ones. See
+        /// <c>ReceiveContext.GetWriteSpan</c>.</summary>
+        public Span<byte> GetWriteSpan(int sizeHint)
+        {
+            int end = sizeHint <= 0 ? 0 : Math.Min(sizeHint, _bufferLength);
+            WipeTo(end);
+            return new(_buffer, end);
+        }
+
+        /// <summary><see cref="SendBuffer"/> without the wipe; also disclaims the <see cref="SendBytes"/>
+        /// trigger, i.e. the handler takes responsibility for the whole buffer. Bytes are undefined and
+        /// may belong to another connection. For measured use only.</summary>
+        public Span<byte> SendBufferUnwiped
+        {
+            get { _wipedTo = _bufferLength; return new(_buffer, _bufferLength); }
+        }
+
+        // Offset up to which the buffer is known-zeroed (or explicitly disclaimed). Unlike a receive
+        // there is no payload to preserve, so this starts at 0: the whole buffer is the previous
+        // tenant's. Monotone, so the two triggers compose in any order and nothing is cleared twice.
+        private int _wipedTo;
+
+        private void WipeTo(int end)
+        {
+            if (end <= _wipedTo) return;
+            new Span<byte>(_buffer + _wipedTo, end - _wipedTo).Clear();
+            _wipedTo = end;
+        }
+
+        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send. 0 = send nothing.
+        /// Setting this WIPES up to <c>value</c>: it is reachable without ever touching
+        /// <see cref="SendBuffer"/>, so it is the trigger a wipe-on-first-access alone would miss. See
+        /// <c>ReceiveContext.ResponseBytes</c> for the full reasoning.</summary>
         public int SendBytes
         {
             get => field;
             set
             {
                 if (value < 0 | value > _bufferLength) throw new ArgumentOutOfRangeException(nameof(SendBytes));
+                WipeTo(value); // clear only what is about to go on the wire
                 field = value;
             }
         }
@@ -696,23 +824,119 @@ public abstract partial class SocketSet : IDisposable
         /// <summary>
         /// The buffer that holds the <see cref="PayloadBytes"/> of received payload, and can also be used
         /// to provide an immediate response by setting <see cref="ResponseBytes"/>.
+        ///
+        /// EVERYTHING PAST <see cref="PayloadBytes"/> IS ZEROED before you can see it or send it. The
+        /// backing buffer is shared and recycled (io_uring's per-shard provided-buffer ring, or a
+        /// per-slot TLS scratch that survives slot re-tenancy), so the tail would otherwise hold the
+        /// PREVIOUS tenant's bytes, which on a TLS connection is another client's decrypted plaintext.
+        ///
+        /// TWO TRIGGERS, because there are two ways to reach those bytes and only one of them comes
+        /// through this property (see <see cref="ResponseBytes"/> for the other, which is the one that is
+        /// easy to miss). Reading here wipes the whole tail, because once the span is handed out we can
+        /// no longer distinguish bytes the handler wrote from bytes it did not.
+        ///
+        /// The cost sits HERE rather than on buffer release so that a handler which never reaches past
+        /// its payload pays nothing at all: the instant-response idiom
+        /// (<c>ctx.ResponseBytes = ctx.PayloadBytes;</c>) trips neither trigger.
+        ///
+        /// SCOPE, deliberately: this defends against ACCIDENT, not against hostile in-process code. A
+        /// handler that wants the stale bytes can trivially have them (<c>Unsafe.Add</c> off any
+        /// reference, its own pointer arithmetic, <see cref="RawBufferUnwiped"/>). Anything running
+        /// inside this process is already past every boundary the library has; the thing worth stopping
+        /// is a length miscalculation quietly putting another connection's data on the wire.
         /// </summary>
-        public readonly Span<byte> RawBuffer => new(_buffer, _bufferLength);
+        public Span<byte> RawBuffer
+        {
+            get
+            {
+                WipeTo(_bufferLength);
+                return new(_buffer, _bufferLength);
+            }
+        }
+
+        /// <summary>
+        /// Write access to the first <paramref name="sizeHint"/> bytes of the same buffer, and THE CHEAP
+        /// WAY TO REPLY. Prefer this to <see cref="RawBuffer"/>.
+        ///
+        /// It does not PROMISE <paramref name="sizeHint"/> bytes: the span is clamped to the buffer, so
+        /// check <c>.Length</c> (the <see cref="System.Buffers.IBufferWriter{T}"/> convention, and the
+        /// same shape as <c>Connection.GetSpan</c>). That freedom is exactly what makes it cheap — we
+        /// hand out only what was asked for, so we only ever have to zero what was asked for.
+        ///
+        /// COST. Granting is tracked as a high-water mark, so each call clears only the DELTA over what
+        /// has already been granted, and the two paths that matter cost nothing at all:
+        ///   - a reply no larger than the request (<c>GetWriteSpan(ctx.PayloadBytes)</c>, ie. editing the
+        ///     received bytes in place) clears NOTHING — the payload region is the peer's own data;
+        ///   - growing in steps (<c>GetWriteSpan(600)</c> then <c>GetWriteSpan(900)</c>) clears
+        ///     [payload,600) then [600,900), never the same byte twice.
+        /// Contrast <see cref="RawBuffer"/>, which must clear the WHOLE tail: once the full span is out
+        /// we can no longer tell bytes the handler wrote from bytes it did not, and we do not yet know
+        /// how much will be sent. That pessimism is the price of asking for everything.
+        /// </summary>
+        public Span<byte> GetWriteSpan(int sizeHint)
+        {
+            int end = sizeHint <= 0 ? 0 : Math.Min(sizeHint, _bufferLength);
+            WipeTo(end);
+            return new(_buffer, end);
+        }
+
+        /// <summary>
+        /// <see cref="RawBuffer"/> WITHOUT the wipe, and it also suppresses the
+        /// <see cref="ResponseBytes"/> trigger for the rest of this call: taking this is a statement that
+        /// the handler is accounting for the whole tail itself. Bytes past <see cref="PayloadBytes"/> are
+        /// undefined and may belong to another connection. For a handler that has MEASURED the wipe to
+        /// matter; named to be hard to reach for by accident.
+        /// </summary>
+        public Span<byte> RawBufferUnwiped
+        {
+            get
+            {
+                _wipedTo = _bufferLength; // claim the tail without clearing it
+                return new(_buffer, _bufferLength);
+            }
+        }
+
+        // Offset up to which the tail is known-zeroed (or explicitly disclaimed). Starts at the payload
+        // end: everything below it is the peer's own bytes and is never wiped. Monotone, so the two
+        // triggers compose in any order and nothing is cleared twice.
+        private int _wipedTo = bytes;
+
+        private void WipeTo(int end)
+        {
+            if (end <= _wipedTo) return;
+            new Span<byte>(_buffer + _wipedTo, end - _wipedTo).Clear();
+            _wipedTo = end;
+        }
 
         /// <summary>
         /// Indicates the end of a receive stream.
         /// </summary>
         public readonly bool IsEof => bytes is 0;
 
-        /// <remarks>It is the implementation's responsibility to handle <see cref="ResponseBytes"/>
+        /// <remarks>
+        /// It is the implementation's responsibility to handle <see cref="ResponseBytes"/>
         /// appropriately, whether that means reusing an existing socket buffer efficiently,
-        /// or by copying the data into a new buffer.</remarks>
+        /// or by copying the data into a new buffer.
+        ///
+        /// THIS IS THE EASY-TO-MISS DISCLOSURE VECTOR, and it is why the wipe cannot live on
+        /// <see cref="RawBuffer"/> alone. Setting this ABOVE <see cref="PayloadBytes"/> transmits bytes
+        /// the handler never wrote, and it can be done without ever touching <see cref="RawBuffer"/> —
+        /// <c>ctx.ResponseBytes = frameLength;</c> on a miscomputed length is the whole bug, and a
+        /// wipe-on-first-access would sail straight past it. So the setter wipes up to
+        /// <paramref name="value"/> as well.
+        ///
+        /// Note this trigger is CHEAPER than the <see cref="RawBuffer"/> one, and exactly as cheap as it
+        /// can be: it clears only what is about to go on the wire, not the whole buffer.
+        /// </remarks>
         public int ResponseBytes
         {
             get => field;
             set
             {
                 if (value < 0 | value > _bufferLength) Throw();
+                // Zero anything between the payload and what we are about to send that the handler has
+                // not already been handed (and therefore cannot have written).
+                WipeTo(value);
                 field = value;
                 static void Throw() => throw new ArgumentOutOfRangeException(nameof(ResponseBytes));
             }
@@ -742,16 +966,66 @@ public abstract partial class SocketSet : IDisposable
         /// <summary>The connection whose write completed; carries <see cref="Connection.UserToken"/>.</summary>
         public readonly Connection Connection => connection;
 
-        /// <summary>The buffer just written, now free; write the next payload here to pipeline.</summary>
-        public readonly Span<byte> SendBuffer => new(_buffer, _bufferLength);
+        /// <summary>The buffer just written, now free; write the next payload here to pipeline.
+        ///
+        /// ZEROED on first access, for the same reason as <c>ReceiveContext.RawBuffer</c>. Note this one
+        /// holds the bytes THIS connection just sent (and, on the TLS path, its just-decrypted request
+        /// plaintext), so the wipe is as much about not re-sending our own stale tail as about the
+        /// previous tenant. A handler that never touches it pays nothing.</summary>
+        public Span<byte> SendBuffer
+        {
+            get
+            {
+                WipeTo(_bufferLength);
+                return new(_buffer, _bufferLength);
+            }
+        }
 
-        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send next. 0 = send nothing.</summary>
+        /// <summary>Write access to the first <paramref name="sizeHint"/> bytes, and THE CHEAP WAY to
+        /// fill this buffer. Does not PROMISE that many (it is clamped to the buffer, so check
+        /// <c>.Length</c>); granting is tracked as a high-water mark, so each call zeroes only the delta
+        /// over what has already been granted, and asking twice never pays twice. Prefer this to
+        /// <see cref="SendBuffer"/>, which has to zero the WHOLE buffer because handing out everything
+        /// leaves us unable to tell written bytes from stale ones. See
+        /// <c>ReceiveContext.GetWriteSpan</c>.</summary>
+        public Span<byte> GetWriteSpan(int sizeHint)
+        {
+            int end = sizeHint <= 0 ? 0 : Math.Min(sizeHint, _bufferLength);
+            WipeTo(end);
+            return new(_buffer, end);
+        }
+
+        /// <summary><see cref="SendBuffer"/> without the wipe; also disclaims the <see cref="SendBytes"/>
+        /// trigger, i.e. the handler takes responsibility for the whole buffer. Bytes are undefined and
+        /// may belong to another connection. For measured use only.</summary>
+        public Span<byte> SendBufferUnwiped
+        {
+            get { _wipedTo = _bufferLength; return new(_buffer, _bufferLength); }
+        }
+
+        // Offset up to which the buffer is known-zeroed (or explicitly disclaimed). Unlike a receive
+        // there is no payload to preserve, so this starts at 0: the whole buffer is the previous
+        // tenant's. Monotone, so the two triggers compose in any order and nothing is cleared twice.
+        private int _wipedTo;
+
+        private void WipeTo(int end)
+        {
+            if (end <= _wipedTo) return;
+            new Span<byte>(_buffer + _wipedTo, end - _wipedTo).Clear();
+            _wipedTo = end;
+        }
+
+        /// <summary>Number of leading bytes of <see cref="SendBuffer"/> to send next. 0 = send nothing.
+        /// Setting this WIPES up to <c>value</c>: it is reachable without ever touching
+        /// <see cref="SendBuffer"/>, so it is the trigger a wipe-on-first-access alone would miss. See
+        /// <c>ReceiveContext.ResponseBytes</c> for the full reasoning.</summary>
         public int SendBytes
         {
             get => field;
             set
             {
                 if (value < 0 | value > _bufferLength) throw new ArgumentOutOfRangeException(nameof(SendBytes));
+                WipeTo(value); // clear only what is about to go on the wire
                 field = value;
             }
         }

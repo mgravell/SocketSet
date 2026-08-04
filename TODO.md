@@ -45,12 +45,40 @@ equivalent.
 3. **Backpressure is advisory in both bridges, so inbound is unbounded.** Same fix as the recorded
    receive-PARKING item (7) — worth re-tagging that item as a robustness fix, not only an architecture
    one, because right now it is the DoS. Note `SocketSet.AspNetCore` is a published package.
-4. **`ReceiveContext.RawBuffer` past `PayloadBytes` is another connection's data** (decrypted plaintext
-   in the TLS path), and `ResponseBytes` may be set to the full buffer length. Unstated contract rather
-   than a bug; needs a decision between documenting it, validating `ResponseBytes` against a
-   written-high-water mark, or clearing on release.
+4. ~~**`ReceiveContext.RawBuffer` past `PayloadBytes` is another connection's data**~~ **RESOLVED
+   2026-08-04, same day** (Marc's design, two refinements): a lazy tail wipe with two triggers, plus
+   `GetWriteSpan(int sizeHint)` so the cost tracks the REPLY size rather than the buffer size —
+   receive 20, reply 25, and 5 bytes are cleared. The vector worth remembering is the one Marc caught in
+   my first cut: `ResponseBytes` above `PayloadBytes` without ever touching `RawBuffer` bypasses a
+   wipe-on-first-access entirely, and is the more likely accident. Gated by `bench/verify-tailwipe`.
+   Full writeup and the measurement in `REVIEW.md` D4.
 5. **`SocketSet.snk` is a full RSA private key, committed** (verified: PRIVATEKEYBLOB/`RSA2`), with
    `PublicSign=false`. Not an auth bypass on .NET Core, but it is our published packages' identity.
+
+6. **MAKE THE DEFENSIVE WIPES OPT-OUT** (Marc, 2026-08-04). What shipped is fair as a DEFAULT — on by
+   default is the right posture, and `GetWriteSpan` already makes the common cases free or
+   proportional. But it should be electively turn-off-able for someone who controls the entire
+   scenario: a closed system where every handler is known to write exactly what it reports, and where
+   the buffer is never shared with anything the operator does not own, is paying for a guarantee it
+   does not need.
+
+   Shape to decide:
+   - **Granularity.** A `SocketSetOptions` flag is the obvious one, but note the wipe lives on the
+     `ref struct` contexts, which do not currently see options — they get a pointer and a length from
+     the backend. Threading a bool in costs a field per context (cheap) or a sentinel in the length
+     (nasty). Per-connection would be finer but harder still; per-listener is probably the useful unit,
+     matching how TLS providers are already scoped.
+   - **It must be LOUD.** Same rule as the TLS `verifyServer` escape hatch: name it for what it gives
+     up, and surface it in the `ToString()` banner / `/config` line so a rig can gate on it. A silent
+     "wipes off" would be indistinguishable from the pre-2026-08-04 behaviour that the audit found, and
+     that is exactly the class of silent degradation `AGENTS.md` says to make say so.
+   - **The per-call `*Unwiped` accessors already exist** (`RawBufferUnwiped` / `SendBufferUnwiped`) and
+     cover the "one hot handler knows what it is doing" case today. The global switch is for "the whole
+     deployment is closed", which is a different and broader claim — worth keeping the two distinct
+     rather than collapsing them.
+   - **Gate it.** `bench/verify-tailwipe` currently asserts the wipes happen; with the option it needs a
+     control cell asserting they DO NOT when it is off, or the flag is untested in the direction that
+     matters (see the bind-address gate for why a control cell is not optional).
 
 ## SESSION CLOSE 2026-08-03 (READ FIRST NEXT SESSION — the day SE.Redis ran on SocketSet)
 
