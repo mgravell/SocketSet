@@ -659,6 +659,11 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         if (conn.Socket == 0 || conn.Closing) return; // free / already tearing down
         conn.Closing = true;
 
+        // Ungated: a failed handshake never set Opened, so this must not hang off DispatchClosed.
+
+        Parent.DispatchTlsFault(conn);
+
+
         if (conn.Opened)
         {
             conn.Opened = false;

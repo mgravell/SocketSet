@@ -351,6 +351,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         // (which rides this same machinery before the app has been told the connection is open). Gate on
         // Opened: false during the handshake, true once FireTlsOpen / the plaintext open path has run.
         int next = 0;
+        // Ungated: a failed handshake never set Opened, so this must not hang off DispatchClosed.
+        Parent.DispatchTlsFault(conn);
+
         if (conn.Opened)
         {
             fixed (byte* buf = conn.SendBuffer)
@@ -591,6 +594,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         conn.Closed = true; // out-of-band Send now returns false
 
         // Notify the app once, while the identity is valid, if it ever saw the connection open.
+        // Ungated: a failed handshake never set Opened, so this must not hang off DispatchClosed.
+        Parent.DispatchTlsFault(conn);
+
         if (conn.Opened)
         {
             conn.Opened = false;

@@ -51,6 +51,7 @@ foreach (var (host, mustConnect, expectSni, label) in new[]
     bool connected = false;
     string detail = "";
     Echo echo = null;
+    Dialer dialer = null;
     try
     {
         var serverOpts = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring, Tls = provider };
@@ -61,6 +62,7 @@ foreach (var (host, mustConnect, expectSni, label) in new[]
         var clientOpts = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring, Tls = provider };
         clientOpts.TlsClient.TargetHost = host;
         using var client = new Dialer(clientOpts);
+        dialer = client;
         client.Connect(new IPEndPoint(IPAddress.Loopback, Port));
         connected = client.Opened.Wait(TimeSpan.FromSeconds(5));
         // WAIT FOR THE SERVER TOO. Under TLS 1.3 the CLIENT considers the handshake done when it sends
@@ -83,7 +85,14 @@ foreach (var (host, mustConnect, expectSni, label) in new[]
     }
     if (!ok) failures++;
     string verdict = connected ? "CONNECTED" : "REFUSED";
-    string sniNote = mustConnect ? $" sni={sniSeen}" : "";
+    // A refused cell must ALSO have produced a reason, or the refusal is undiagnosable in production.
+    string fault = dialer?.Fault ?? "";
+    if (ok && !mustConnect && host.Length > 0 && fault.Length == 0)
+    {
+        ok = false; failures++;
+        detail = "refused with NO reason reported (OnTlsFault never fired)";
+    }
+    string sniNote = mustConnect ? $" sni={sniSeen}" : $" reason=\"{Trunc(fault)}\"";
     Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {("\"" + host + "\""),-16} {label,-34} {verdict}{sniNote} {detail}");
     Thread.Sleep(200);
 }
@@ -92,6 +101,8 @@ Console.WriteLine(failures == 0
     ? "\n=== verify-tlsname: ALL PASS (including the refusal cells) ==="
     : $"\n=== verify-tlsname: {failures} FAILURE(S) ===");
 return failures == 0 ? 0 : 1;
+
+static string Trunc(string s) => s.Length <= 58 ? s : s[..55] + "...";
 
 sealed class Echo(SocketSetOptions o) : SocketSet(o)
 {
@@ -118,5 +129,12 @@ sealed class Dialer(SocketSetOptions o) : SocketSet(o)
     // certificate the client rejects never gets here, and the wait times out.
     public readonly ManualResetEventSlim Opened = new(false);
 
+    // A refusal must come with a REASON. Before 2026-08-04 it did not: the reason went to
+    // Debug.WriteLine and so did not exist in a Release build, leaving "cannot connect" with no
+    // diagnostic at all. Asserting the reason is non-empty is what stops that regressing.
+    public volatile string Fault = "";
+
     protected override void OnConnect(ref ConnectContext ctx) => Opened.Set();
+
+    protected override void OnTlsFault(Connection connection, string reason) => Fault = reason;
 }

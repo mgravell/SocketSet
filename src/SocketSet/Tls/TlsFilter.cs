@@ -109,6 +109,21 @@ public abstract class TlsFilter : IDisposable
     public string? NegotiatedProtocol { get; protected set; }
 
     /// <summary>
+    /// Why this filter faulted, or null if it has not. Set alongside the Faulted status so the reason
+    /// survives long enough for the engine to report it.
+    ///
+    /// It exists because until 2026-08-04 the reason went to <c>Debug.WriteLine</c> and therefore did not
+    /// exist at all in a Release build: every handshake failure, certificate rejection and decrypt error
+    /// was completely silent, and "the client cannot connect" came with no diagnostic whatsoever. That is
+    /// a bad property for the one subsystem whose failures are both security-relevant and routinely
+    /// caused by misconfiguration.
+    /// </summary>
+    public string? FaultReason { get; protected set; }
+
+    /// <summary>Consume the reason so it is reported once even if teardown re-enters.</summary>
+    internal void ClearFaultReason() => FaultReason = null;
+
+    /// <summary>
     /// SERVER SIDE ONLY: the name the client asked for in its SNI extension, or null if it sent none
     /// (or this is a client filter). Set by the time <see cref="DriveHandshake"/> reports
     /// <see cref="TlsHandshakeStatus.Completed"/>, so it is readable from OnAccept onwards.

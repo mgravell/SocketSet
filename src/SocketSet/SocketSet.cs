@@ -646,6 +646,35 @@ public abstract partial class SocketSet : IDisposable
     }
 
     /// <summary>
+    /// Report a TLS engine fault, once, during teardown. Called by every backend UNCONDITIONALLY, which
+    /// is the whole point: <see cref="DispatchClosed"/> is gated on the app having seen the connection
+    /// open, and a failed handshake means it never did. Hanging the report off DispatchClosed therefore
+    /// reported nothing in exactly the case that matters -- caught by verify-tlsname asserting that a
+    /// refusal carries a reason, which is why that assertion is in the gate.
+    /// </summary>
+    internal void DispatchTlsFault(Connection connection)
+    {
+        if (connection.Tls is not { FaultReason: { } reason }) return;
+        connection.Tls.ClearFaultReason(); // fire once even if teardown is re-entered
+        OnTlsFault(connection, reason);
+    }
+
+    /// <summary>
+    /// A TLS connection was torn down because the engine faulted: a failed handshake, a rejected
+    /// certificate, a decrypt error. Fires before <see cref="OnClosed"/>, on the owning IO thread.
+    ///
+    /// The default routes to <see cref="OnWorkerFaulted"/>, which is at least SOMETHING; before
+    /// 2026-08-04 the reason went only to <c>Debug.WriteLine</c> and so did not exist in a Release
+    /// build. Override to log properly. Note this covers the userspace-filter path only: the kTLS path
+    /// has no filter to carry a reason, which is recorded as an inconsistency rather than fixed here.
+    /// </summary>
+    protected virtual void OnTlsFault(Connection connection, string reason)
+    {
+        try { OnWorkerFaulted(new InvalidOperationException("TLS: " + reason)); }
+        catch (Exception ex) { Debug.WriteLine(ex.Message); }
+    }
+
+    /// <summary>
     /// Fires on a shard's loop thread after each BATCH of I/O events has been dispatched, before the
     /// loop waits again. The loop-thread backends (io_uring, epoll) call this when the batch contained
     /// at least one event; callback-driven dispatch (the managed fallback) never does.

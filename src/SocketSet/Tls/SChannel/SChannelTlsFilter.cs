@@ -525,7 +525,9 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
     private TlsHandshakeStatus Fault(string where, int status)
     {
         _faulted = true;
-        Debug.WriteLine($"[SChannelTlsFilter] {where} failed: {Describe(status)}");
+        string reason = $"{where} failed: {Describe(status)}";
+        FaultReason ??= reason;
+        Debug.WriteLine($"[SChannelTlsFilter] {reason}");
         return TlsHandshakeStatus.Faulted;
     }
 
@@ -533,6 +535,7 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
     private TlsHandshakeStatus Reject(string reason)
     {
         _faulted = true;
+        FaultReason ??= "rejected peer: " + reason;
         Debug.WriteLine($"[SChannelTlsFilter] rejected peer: {reason}");
         return TlsHandshakeStatus.Faulted;
     }

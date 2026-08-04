@@ -151,7 +151,12 @@ internal sealed unsafe class OpenSslTlsFilter(nint ssl, nint rbio, nint wbio, bo
         }
     }
 
-    private static void Fault(string where)
-        => System.Diagnostics.Debug.WriteLine($"[OpenSslTlsFilter] {where} failed: {DrainErrors()}");
+    private void Fault(string where)
+    {
+        // DrainErrors empties OpenSSL's error queue, so it must be read exactly once and kept.
+        string reason = $"{where} failed: {DrainErrors()}";
+        FaultReason ??= reason; // first fault wins: later ones are usually consequences of it
+        System.Diagnostics.Debug.WriteLine($"[OpenSslTlsFilter] {reason}");
+    }
 }
 #endif

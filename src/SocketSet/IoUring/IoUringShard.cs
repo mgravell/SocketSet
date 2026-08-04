@@ -234,6 +234,9 @@ internal sealed class IoUringShard : SocketSetShard
         conn.Closing = true;
 
         // Notify the app once, while the identity is valid, if it saw the connection open.
+        // Ungated: a failed handshake never set Opened, so this must not hang off DispatchClosed.
+        Parent.DispatchTlsFault(conn);
+
         if (conn.Opened)
         {
             conn.Opened = false;

@@ -489,6 +489,11 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         if (conn.Socket == 0 || conn.Closing) return;
         conn.Closing = true;
 
+        // Ungated: a failed handshake never set Opened, so this must not hang off DispatchClosed.
+
+        Parent.DispatchTlsFault(conn);
+
+
         if (conn.Opened)
         {
             conn.Opened = false;
