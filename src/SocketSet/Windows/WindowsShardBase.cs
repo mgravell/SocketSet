@@ -37,6 +37,21 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
     // Allocated by the derived constructor, which is the only thing that knows how to build a TConn.
     protected TConn[] _conns = null!;
 
+    /// <summary>Drop connections past their deadline (REVIEW.md D2). Shared by IOCP and RIO: both keep a
+    /// flat slot table here, so the scan and the close hook are the only per-backend parts.
+    /// BLIND: written on Linux, unrun on Windows -- see TODO's Windows catch-up.</summary>
+    protected override void SweepTimeouts(long nowTicks)
+    {
+        for (int i = 0; i < _conns.Length; i++)
+        {
+            var conn = _conns[i];
+            if (conn is null || conn.Socket == 0 || conn.Closing) continue;
+            if (Parent.ExpiryReason(conn, nowTicks) is not { } reason) continue;
+            Parent.DispatchTimeout(conn, reason);
+            CloseClient((uint)(i + 1));
+        }
+    }
+
     // Loop-local free-slot allocator (claim/free, single-writer). NOT readonly: it is a mutable struct, so
     // a readonly field would mutate a throwaway copy.
     protected SlotAllocator _slots;

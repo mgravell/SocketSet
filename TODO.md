@@ -81,7 +81,13 @@ equivalent.
    `SSL_set1_host("127.0.0.1")` does not match `iPAddress` SANs, so a naive change fails against our own
    demo certificate. Proposed shape is in `REVIEW.md`; it is public API surface, so it wants deciding
    alongside the freeze proposal further down.
-2. **No handshake or idle timeout anywhere.** A peer that connects and sends nothing holds its slot
+2. ~~**No handshake or idle timeout anywhere.**~~ **RESOLVED 2026-08-04**: `HandshakeTimeout` (10s,
+   ON by default) and `IdleTimeout` (off by default — an idle established connection is normal for a
+   Redis link or an HTTP keep-alive; an unfinished handshake is not). One sweep timer per set wakes each
+   shard through its existing doorbell; a set with no deadline starts no timer. `SocketSet.Timeouts`
+   counts drops. Gated by `bench/verify-timeouts`, whose idle-off/idle-on pair is a controlled A/B.
+   Full writeup in `REVIEW.md` D2. ORIGINAL NOTE:
+   **No handshake or idle timeout anywhere.** A peer that connects and sends nothing holds its slot
    forever. This is a regression against what we replace on the ASP.NET bridge specifically, because TLS
    terminates below Kestrel and its `HandshakeTimeout`/`MaxConcurrentConnections` never see the
    connection. Wants a cost measurement on the sweep before it goes in the hot loop.

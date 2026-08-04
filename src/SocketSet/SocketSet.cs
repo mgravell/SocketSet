@@ -106,6 +106,28 @@ public abstract partial class SocketSet : IDisposable
             Dispose();
             throw new AggregateException($"{name}: one or more shards failed to initialize.", _startupFaults);
         }
+
+        StartSweepTimer(); // after the shards are live, so a tick can never race construction
+    }
+
+    // One timer per SET, not per shard. Interval is a quarter of the tightest deadline, clamped to
+    // [250ms, 5s]: fine enough that a 10s handshake budget is enforced to within ~2.5s, coarse enough
+    // that an idle 12-shard set is not being woken constantly.
+    private Timer? _sweepTimer;
+
+    private void StartSweepTimer()
+    {
+        if (!HasTimeouts) return; // no deadlines configured: no timer, no wakes, no cost
+        long tightest = long.MaxValue;
+        if (Options.HandshakeTimeout > TimeSpan.Zero) tightest = Math.Min(tightest, (long)Options.HandshakeTimeout.TotalMilliseconds);
+        if (Options.IdleTimeout > TimeSpan.Zero) tightest = Math.Min(tightest, (long)Options.IdleTimeout.TotalMilliseconds);
+        long step = tightest / 4;               // Math.Clamp is net5+; this multi-targets net472
+        int interval = (int)(step < 250 ? 250 : step > 5000 ? 5000 : step);
+        _sweepTimer = new Timer(static state =>
+        {
+            var set = (SocketSet)state!;
+            foreach (var shard in set._shards) shard.RequestSweep();
+        }, this, interval, interval);
     }
 
     internal void SignalStartupComplete() => _startupGate!.Signal();
@@ -172,12 +194,64 @@ public abstract partial class SocketSet : IDisposable
     {
         if (disposing)
         {
+            _sweepTimer?.Dispose();
+            _sweepTimer = null;
             foreach (var shard in _shards)
             {
                 shard.Stop();
             }
         }
     }
+
+    // Cached so the sweep does not re-read TimeSpan properties per connection per tick.
+    private long _handshakeMs = -1, _idleMs = -1;
+
+    /// <summary>
+    /// Has this connection outlived its deadline? THE single expiry decision, so all five backends share
+    /// one policy and none can drift. Returns the reason for the log, or null to keep it.
+    ///
+    /// Two different clocks on purpose: a connection the app has not yet SEEN is on the handshake budget,
+    /// and one it has is on the (opt-in) idle budget. See SocketSetOptions for why only the first is on
+    /// by default.
+    /// </summary>
+    internal string? ExpiryReason(Connection conn, long nowTicks)
+    {
+        if (_handshakeMs < 0)
+        {
+            _handshakeMs = (long)Options.HandshakeTimeout.TotalMilliseconds;
+            _idleMs = (long)Options.IdleTimeout.TotalMilliseconds;
+        }
+
+        if (!conn.Opened)
+        {
+            return _handshakeMs > 0 && nowTicks - conn.StartedTicks > _handshakeMs
+                ? $"handshake did not complete within {_handshakeMs}ms" : null;
+        }
+        return _idleMs > 0 && nowTicks - conn.LastActivityTicks > _idleMs
+            ? $"idle for more than {_idleMs}ms" : null;
+    }
+
+    /// <summary>True when any deadline is configured, so a set with both off starts no sweep timer and
+    /// pays literally nothing.</summary>
+    internal bool HasTimeouts => Options.HandshakeTimeout > TimeSpan.Zero || Options.IdleTimeout > TimeSpan.Zero;
+
+    /// <summary>A connection was dropped for outliving a deadline. Default reports through
+    /// <see cref="OnWorkerFaulted"/>; override to log or count. Runs on the owning loop thread.</summary>
+    protected virtual void OnTimeout(Connection connection, string reason)
+    {
+        Interlocked.Increment(ref _timeouts);
+        try { OnWorkerFaulted(new TimeoutException("connection dropped: " + reason)); }
+        catch (Exception ex) { Debug.WriteLine(ex.Message); }
+    }
+
+    internal void DispatchTimeout(Connection connection, string reason) => OnTimeout(connection, reason);
+
+    private long _timeouts;
+
+    /// <summary>Connections dropped for outliving <see cref="SocketSetOptions.HandshakeTimeout"/> or
+    /// <see cref="SocketSetOptions.IdleTimeout"/>. Non-zero under attack, and non-zero also if a deadline
+    /// is set too tight -- which is why it is a counter rather than only a log line.</summary>
+    public long Timeouts => Interlocked.Read(ref _timeouts);
 
     protected internal virtual void OnWorkerFaulted(Exception exception)
     {

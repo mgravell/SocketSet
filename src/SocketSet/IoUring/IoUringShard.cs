@@ -211,6 +211,7 @@ internal sealed class IoUringShard : SocketSetShard
         conn.TlsClient = false;  // Tls/KtlsSsl are nulled in TryFinalize; belt-and-suspenders for a fresh tenant
         conn.KtlsReady = false;
         conn.Pending?.Clear();
+        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis; // deadline clock starts here
         // Bump the generation before publishing Fd: any out-of-band send/close captured against the
         // previous tenant now mismatches and is dropped rather than misdelivered.
         Volatile.Write(ref conn.Generation, conn.Generation + 1);
@@ -477,6 +478,23 @@ internal sealed class IoUringShard : SocketSetShard
     }
 
     protected override void OnStop() => Poke(); // wake the loop so it observes !IsActive
+
+    protected override void Wake() => Poke(); // the sweep timer's doorbell (see SocketSetShard)
+
+    /// <summary>Drop connections past their deadline. Loop thread. The table is a flat array, so this is
+    /// a linear scan of SocketsPerShard entries per tick -- at the default 4096 and a 2.5s interval that
+    /// is ~1.6k checks/second/shard, which is nothing next to the syscall it rides along with.</summary>
+    protected override void SweepTimeouts(long nowTicks)
+    {
+        for (int i = 0; i < _conns.Length; i++)
+        {
+            var conn = _conns[i];
+            if (conn.Fd == 0 || conn.Closing) continue;
+            if (Parent.ExpiryReason(conn, nowTicks) is not { } reason) continue;
+            Parent.DispatchTimeout(conn, reason);
+            CloseClient(conn.Slot);
+        }
+    }
 
     // =====================================================================
     // Loop-thread submission helpers
@@ -1402,6 +1420,7 @@ internal sealed class IoUringShard : SocketSetShard
             }
 
             if (ProcessAvailableCompletions() > 0) Parent.OnLoopDrain();
+            MaybeSweep();
         }
     }
 
@@ -1642,6 +1661,7 @@ internal sealed class IoUringShard : SocketSetShard
     private unsafe void HandleRecv(int res, uint flags, uint slot)
     {
         var conn = _conns[slot - 1];
+        conn.LastActivityTicks = Clock.Millis;
         bool hasBuf = (flags & LibC.IORING_CQE_F_BUFFER) != 0;
         ushort bid = (ushort)(flags >> LibC.IORING_CQE_BUFFER_SHIFT);
         bool more = (flags & LibC.IORING_CQE_F_MORE) != 0;

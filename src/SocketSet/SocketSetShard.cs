@@ -92,6 +92,49 @@ public abstract class SocketSetShard
     {
     }
 
+    // =====================================================================
+    // Deadline sweep (REVIEW.md D2)
+    // ---------------------------------------------------------------------
+    // The loops BLOCK when idle -- io_uring in io_uring_enter, epoll in epoll_wait, IOCP in
+    // GetQueuedCompletionStatusEx -- which is exactly the state a half-open handshake leaves them in, so
+    // a deadline cannot be noticed by the loop unaided. One timer per SET therefore ticks and wakes each
+    // shard through the doorbell it already has; the shard notices the flag on its next pass and sweeps
+    // its own slot table on its own thread, so the single-writer discipline is untouched.
+    //
+    // A set with no deadline configured starts no timer and pays nothing.
+    // =====================================================================
+
+    private volatile bool _sweepDue;
+
+    /// <summary>Ask this shard to sweep on its next pass. Any thread (the set's timer).</summary>
+    internal void RequestSweep()
+    {
+        _sweepDue = true;
+        Wake();
+    }
+
+    /// <summary>True once per request; the loop calls this and sweeps if so.</summary>
+    protected bool TakeSweepRequest()
+    {
+        if (!_sweepDue) return false;
+        _sweepDue = false;
+        return true;
+    }
+
+    /// <summary>Wake a blocked loop. Backends already have a doorbell for Stop; this exposes it.</summary>
+    protected virtual void Wake() { }
+
+    /// <summary>Walk this shard's live connections and drop any past its deadline. Loop thread only.
+    /// Backends override because only they know the shape of their slot table; the POLICY is shared
+    /// (<c>SocketSet.ExpiryReason</c>) so the five cannot drift.</summary>
+    protected virtual void SweepTimeouts(long nowTicks) { }
+
+    /// <summary>Loop-side entry point: sweep iff one was requested.</summary>
+    protected void MaybeSweep()
+    {
+        if (TakeSweepRequest()) SweepTimeouts(Clock.Millis);
+    }
+
     internal void Init(SocketSet parent, int shard)
     {
         SocketSet? oldParent = Interlocked.CompareExchange(ref _parent, parent, null);

@@ -239,6 +239,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
         while (IsActive)
         {
+            MaybeSweep(); // top of the loop: `if (!ok) continue` below would skip a sweep placed after it
             DrainCrossThread();
             // Kick any deferred submissions (from AdoptAccepted this iteration, or a previous iteration's
             // HandleConnect) BEFORE blocking — else we'd wait on completions for ops never sent → deadlock.
@@ -368,6 +369,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     protected override void OnStop() => Poke();
 
+    protected override void Wake() => Poke(); // the sweep timer's doorbell (see SocketSetShard)
+
     protected override void OnShutdown()
     {
         if (ReportStats) DumpStats("shutdown");
@@ -474,6 +477,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         conn.Pending?.Clear();
         conn.Tls = null;      // disposed by TryFinalize; cleared here so a rolled-back claim starts clean
         conn.IsClient = false;
+        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis; // deadline clock
+
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
         Volatile.Write(ref conn.Generation, conn.Generation + 1);

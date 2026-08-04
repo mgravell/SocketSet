@@ -124,6 +124,35 @@ public class SocketSetOptions
     /// </summary>
     public int UnixSocketMode { get; set; } = 0b110_000_000; // 0600
 
+    /// <summary>
+    /// How long a connection may sit between accept/connect and the application SEEING it open, before
+    /// the engine drops it. Default 10s; <see cref="TimeSpan.Zero"/> disables.
+    ///
+    /// In practice this is the TLS HANDSHAKE budget, because a plaintext connection is open the moment it
+    /// is accepted. It exists because nothing reaped a peer that connected and then went quiet: at the
+    /// default 4096 slots x 4 shards, 16k half-open handshakes exhausted the set, after which accepts were
+    /// dropped with only <see cref="SocketSet.PlacementFailures"/> moving to say so (REVIEW.md D2).
+    ///
+    /// ON BY DEFAULT, deliberately. A handshake that has not finished in ten seconds is broken, so the
+    /// false-positive risk is near zero, and this is the actual denial-of-service vector. It matters most
+    /// under <c>SocketSet.AspNetCore</c>, where TLS terminates BELOW Kestrel and so Kestrel's own
+    /// <c>HandshakeTimeout</c> never sees the connection at all -- we removed that defence, and this
+    /// replaces it.
+    /// </summary>
+    public TimeSpan HandshakeTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// How long an ESTABLISHED connection may go without reading or writing a byte before the engine
+    /// drops it. <see cref="TimeSpan.Zero"/> (the default) disables it.
+    ///
+    /// OFF BY DEFAULT, and that asymmetry with <see cref="HandshakeTimeout"/> is the point: an idle
+    /// established connection is completely normal for the workloads this library targets. A SE.Redis
+    /// multiplexer link or an HTTP keep-alive socket can legitimately be quiet for minutes, and reaping
+    /// those would be a correctness bug dressed as a security feature. An unfinished HANDSHAKE has no such
+    /// legitimate case, which is why that one is on and this one is opt-in.
+    /// </summary>
+    public TimeSpan IdleTimeout { get; set; }
+
     /// <summary>Backlog passed to <c>listen()</c> on every backend — the kernel's queue of
     /// completed-handshake connections awaiting accept. Cheap; size it to absorb connection bursts.</summary>
     public int ListenBacklog { get; set; } = 512;

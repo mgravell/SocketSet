@@ -96,6 +96,10 @@ both have caused hesitation:
     as happily against the pre-fix code, where a null `TargetHost` silently skipped the name check. It
     also asserts what the SERVER was told via SNI, which is what proves `"*"` and IP literals really do
     suppress the extension on the wire rather than merely being documented to.
+  - **`bench/verify-timeouts`** (added 2026-08-04; cross-platform) — that a peer which connects and goes
+    quiet is actually reaped. Self-controlling rather than merely positive: a COMPLETED handshake must
+    survive the same budget (so "reaped" cannot mean "we drop everything"), and the idle-off/idle-on pair
+    is a controlled A/B proving both that the default is off and that the option is not inert.
   - **`bench/verify-bind-address.sh`** (Linux, added 2026-08-04; **no Windows equivalent yet**) — that
     `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code
     INADDR_ANY, and nothing could see it: the smoke matrix binds `IPAddress.Any` and connects over

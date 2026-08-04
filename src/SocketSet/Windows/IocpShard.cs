@@ -211,6 +211,11 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
         while (IsActive)
         {
+            // At the TOP, not after the completion batch: the loop has early `continue`s (WAIT_TIMEOUT,
+            // port closed) that would skip a sweep placed below, and the sweep timer's Poke is what
+            // brings us back round here in the first place.
+            MaybeSweep();
+
             // Honour marshaled cross-thread work before blocking for completions (a wake packet is what
             // unblocks GQCSEx when new work is enqueued).
             DrainCrossThread();
@@ -318,6 +323,8 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     }
 
     protected override void OnStop() => Poke(); // wake the loop so it observes !IsActive
+
+    protected override void Wake() => Poke(); // the sweep timer's doorbell (see SocketSetShard)
 
     protected override void OnShutdown()
     {
@@ -640,6 +647,8 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         DiscardPending(conn); // returns the buffers AND clears PendingHeadOffset (a stale one corrupts)
         conn.Tls = null;      // disposed by TryFinalize; cleared here so a rolled-back claim starts clean
         conn.IsClient = false;
+        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis; // deadline clock
+
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
         Volatile.Write(ref conn.Generation, conn.Generation + 1);

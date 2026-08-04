@@ -310,7 +310,55 @@ broken.
 This is public API surface, so it interacts with the freeze proposal in `TODO.md`. Worth deciding
 together.
 
-### D2. No handshake or idle timeout anywhere in the library
+### D2. RESOLVED 2026-08-04: handshake deadline on by default, idle deadline opt-in
+
+The last of the three high-severity findings. Original writeup below.
+
+**Two deadlines, and the asymmetry between them is the design.**
+`SocketSetOptions.HandshakeTimeout` (default **10s**, ON) covers accept/connect until the application
+SEES the connection open, which in practice is the TLS handshake budget. `IdleTimeout` (default **0**,
+OFF) covers an established connection going quiet.
+
+On by default for the first, off for the second, because a handshake that has not finished in ten
+seconds is broken and has no legitimate case, whereas an idle ESTABLISHED connection is completely
+normal for the workloads here: a SE.Redis multiplexer link or an HTTP keep-alive socket is legitimately
+quiet for minutes, and reaping those would be a correctness bug wearing a security hat. The unfinished
+handshake is also the actual DoS shape, and the one Kestrel used to defend against for us before
+`SocketSet.AspNetCore` moved TLS below it.
+
+**Mechanism.** The loops BLOCK when idle (`io_uring_enter`, `epoll_wait`, `GetQueuedCompletionStatusEx`)
+which is exactly the state a half-open handshake leaves them in, so a deadline cannot be noticed
+unaided. One timer per SET ticks at a quarter of the tightest deadline (clamped to 250ms..5s) and wakes
+each shard through the doorbell it already has for `Stop`; the shard sweeps its own slot table on its own
+thread, so the single-writer discipline is untouched. A set with no deadline configured starts no timer
+and pays nothing. `SocketSet.Timeouts` counts the drops, because a deadline set too tight and an attack
+look the same in a log but not in a counter.
+
+The scan is a linear walk of the slot table: at the default 4096 sockets and a 2.5s interval that is
+~1.6k checks/second/shard, riding along with a syscall the loop was making anyway. No measurable effect
+on the smoke matrix (60/60, unchanged timings).
+
+**Gated** by `bench/verify-timeouts`, 4 cells x 2 backends, and it is self-controlling rather than
+merely positive:
+- `handshake/reaped` — a TCP peer that connects to a TLS listener and says nothing IS dropped. The only
+  cell that fails against the pre-fix code.
+- `handshake/spared` — a peer that completes its handshake survives well past the same budget, so
+  "reaped" cannot just mean "we drop everything".
+- `idle/off-by-default` / `idle/reaped` — the same connection shape with `IdleTimeout` off and on. This
+  pair is a controlled A/B: it proves the default really is off AND that the option is not inert, which
+  neither cell could establish alone.
+
+**A self-inflicted failure worth recording**, because it is the second of its kind this session. Adding
+a net472-safe monotonic clock, I ran `sed` for `Environment.TickCount64` -> `Clock.Millis` across
+`src/SocketSet` — including the file that DEFINES `Clock.Millis`, which duly became
+`Millis => Clock.Millis`. Every backend stack-overflowed on the first accept. Same family as the
+`pgrep -f` watcher that matched its own command line earlier: a mechanical rewrite applied to its own
+definition. Caught immediately by the gates; the lesson is to exclude the definition site, or to write
+the shim after the rewrite rather than before.
+
+---
+
+### D2 (original). No handshake or idle timeout anywhere in the library
 
 Grepping `src/SocketSet` for timeouts returns `StartupTimeout` and P/Invoke signatures, nothing else. A
 peer that connects and then sends nothing holds its slot forever. Nothing reaps it. At the default 4096

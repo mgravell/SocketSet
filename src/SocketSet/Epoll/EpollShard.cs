@@ -166,10 +166,26 @@ internal sealed unsafe class EpollShard : SocketSetShard
                 }
             }
             if (n > 0) Parent.OnLoopDrain();
+            MaybeSweep();
         }
     }
 
     protected override void OnStop() => Poke();
+
+    protected override void Wake() => Poke(); // the sweep timer's doorbell (see SocketSetShard)
+
+    /// <summary>Drop connections past their deadline. Loop thread; see the io_uring twin for the cost.</summary>
+    protected override void SweepTimeouts(long nowTicks)
+    {
+        for (int i = 0; i < _conns.Length; i++)
+        {
+            var conn = _conns[i];
+            if (conn.Fd < 0 || conn.Closing) continue;
+            if (Parent.ExpiryReason(conn, nowTicks) is not { } reason) continue;
+            Parent.DispatchTimeout(conn, reason);
+            CloseClient(conn.Slot);
+        }
+    }
 
     protected override void OnShutdown()
     {
@@ -295,6 +311,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.RecvBuf = -1;
         conn.SendOffset = 0;
         conn.Pending?.Clear();
+        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis; // deadline clock starts here
         conn.Tls = null;
         conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
         conn.Zc = null;         // ditto — any in-flight zero-copy send was finished in CloseClient
@@ -657,6 +674,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
     private void PumpReceive(EpollConnection conn)
     {
+        conn.LastActivityTicks = Clock.Millis;
         // Zero-copy receive is available only for a NON-TLS pipe-mode connection: TLS inbound is ciphertext
         // that must land in the recv slab to be decrypted before any plaintext reaches the pipe, and the
         // callback path has no pipe to read into. (kTLS never reaches here — it routes to KtlsRead.)

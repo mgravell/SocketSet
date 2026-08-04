@@ -73,6 +73,12 @@ public abstract class Connection : IBufferWriter<byte>
     /// </summary>
     public string? RequestedServerName => Tls?.RequestedServerName ?? KernelServerName;
 
+    /// <summary>When this connection was created, and when it last carried a byte (Clock.Millis).
+    /// Written only by the owning loop thread; read by the sweep, which is also the loop thread, so no
+    /// synchronisation is needed. See <see cref="SocketSetOptions.HandshakeTimeout"/>.</summary>
+    internal long StartedTicks;
+    internal long LastActivityTicks;
+
     /// <summary>True once the app has seen this connection open (OnAccept/OnConnect fired); gates
     /// <see cref="SocketSet.OnClosed"/> so it pairs with an open and never fires for a connection the
     /// app never saw (e.g. a failed connect). Backend-managed on the owning IO thread.</summary>
