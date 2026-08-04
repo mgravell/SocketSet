@@ -2004,8 +2004,13 @@ was wrong (corrected in RESULTS.md).
   (a) the **Content-Length** arm of `WriteDataWrittenBeforeHeaders` (`writer.Write(segment.Span);
   writer.Commit();` on the writer that just committed the headers — the ordinary buffered `Results.Bytes`
   shape, which is what the filed repro hits, no chunking involved) and (b) the chunked arm via
-  `CommitChunkInternal` (same mechanism, also exposed). Chunked is sufficient but not necessary. Reply
-  drafted for Marc to post.
+  `CommitChunkInternal` (same mechanism, also exposed). Chunked is sufficient but not necessary. Marc POSTED the
+  answer on #68148 (2026-08-04). Context worth keeping: the question came from upstream maintenance
+  ("we know that type of bug exists there, just hasn't been prioritized since no-one was replacing the
+  backing PipeWriter... I think I have a branch with a possible fix somewhere"), so (a) the bug class
+  was already suspected upstream and our repro is the first consumer to be bitten, and (b) THEY may have
+  a fix branch; if theirs lands, our spike branch (fix/bufferwriter-advance-contract on the fork)
+  becomes reference material rather than a PR. Watch the issue for their branch.
 - **(e) aspnetcore fix — SPIKED.** [[aspnetcore-issue-68148]] root-caused to `BufferWriter<T>.Commit()`
   retaining `_span` (src/Shared/ServerInfrastructure/BufferWriter.cs) + `Http1OutputProducer` reusing the
   writer for headers-then-body. UNTESTED one-line candidate on branch `fix/bufferwriter-advance-contract`,
