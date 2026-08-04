@@ -155,6 +155,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     private readonly ConcurrentQueue<(nint Socket, object? Token, SocketSets.Tls.TlsProvider? Tls)> _incoming = [];
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
+    // Parked receives to re-arm (Connection.ResumeReceive, from the consumer's flush continuation).
+    private readonly ConcurrentQueue<(uint Slot, uint Generation)> _resumes = [];
     // Out-of-band flushed writes (Connection.Flush, any thread): sent on the loop via the Pending path.
     private readonly ConcurrentQueue<(uint Slot, uint Generation, byte[] Data, int Len)> _flush = [];
 
@@ -423,6 +425,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     internal void EnqueueInbound(nint socket, object? token, SocketSets.Tls.TlsProvider? tls = null) { _incoming.Enqueue((socket, token, tls)); Poke(); }
     public override void SubmitClose(uint slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
+    public override void SubmitResumeReceive(uint slot, uint generation) { _resumes.Enqueue((slot, generation)); Poke(); }
     public override void SubmitFlush(uint slot, uint generation, byte[] data, int length)
     {
         if (ReportStats) { Interlocked.Increment(ref s_pumpFlush); Interlocked.Add(ref s_stagedBytes, length); }
@@ -440,6 +443,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             var conn = _conns[c.Slot - 1];
             if (conn.Generation == c.Generation && conn.Socket != 0) CloseClient(c.Slot);
         }
+        // After the closes, so a close and a resume landing in the same pass resolve as "closed".
+        while (_resumes.TryDequeue(out var r)) ResumeReceive(r.Slot, r.Generation);
         // f.Data is rented (see OutboundConnection.Flush) and owned by this loop now: return it however
         // PumpFlush exits, including the drop paths where the slot was re-tenanted.
         while (_flush.TryDequeue(out var f))
@@ -479,6 +484,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         conn.IsClient = false;
         conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock
+        conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
+        conn.ResetReceiveParking();
 
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
@@ -773,7 +780,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         conn.Opened = true;
         Parent.DispatchAccept(ref ctx);
 
-        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmReceive(conn);
+        ArmReceiveIfWanted(conn);
 
         int sb = ctx.SendBytes;
         if (leased && sb > 0 && conn.Socket != 0 && !conn.Closing) SubmitSendBuffer(conn, slot, wi, sb);
@@ -798,7 +805,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         conn.Opened = true;
         Parent.DispatchConnect(ref ctx);
 
-        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmReceive(conn);
+        ArmReceiveIfWanted(conn);
 
         int sb = ctx.SendBytes;
         if (leased && sb > 0 && conn.Socket != 0 && !conn.Closing) SubmitSendBuffer(conn, slot, wi, sb);
@@ -819,6 +826,27 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         if (!_recvBuffer.TryLease(out int ri, out _)) { System.Diagnostics.Debug.WriteLine("recv-buffer pool exhausted"); return false; }
         conn.RecvBuf = ri;
         return true;
+    }
+
+    /// <summary>Arm the receive unless the input half is shut, or the consumer has asked us to park
+    /// (REVIEW.md D3). Every open-a-connection path goes through here so a <c>TryPauseReceive</c> issued
+    /// from OnAccept/OnConnect is honoured rather than overrun.</summary>
+    private void ArmReceiveIfWanted(RioConnection conn)
+    {
+        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+        if (conn.TryParkReceive()) { conn.RecvArmed = false; return; }
+        ArmReceive(conn);
+    }
+
+    /// <summary>A parked receive was resumed from off-loop; re-arm it here, on the loop thread. Gated on
+    /// <c>RecvArmed</c> — the loop's own record of whether an operation is outstanding — so a duplicate or
+    /// late resume is a no-op rather than a second RIOReceive against one buffer.</summary>
+    private void ResumeReceive(uint slot, uint generation)
+    {
+        var conn = _conns[slot - 1];
+        if (conn.Generation != generation || conn.Socket == 0 || conn.Closing || conn.RecvArmed) return;
+        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+        ArmReceive(conn);
     }
 
     private void ArmReceive(RioConnection conn)
@@ -887,7 +915,14 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         bool keep = DeliverReceive(conn, slot, (int)bytes);
 
         if (keep && conn.Socket != 0 && !conn.Closing && (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
+        {
+            // PARKING (REVIEW.md D3): the consumer is behind and asked us to stop. Post no further
+            // RIOReceive; the window closes and the peer slows down instead of being dropped at a cap.
+            // RecvArmed must clear even though nothing failed — it is what defer-recycle waits on, and a
+            // parked slot has no completion coming to clear it later.
+            if (conn.TryParkReceive()) { conn.RecvArmed = false; return; }
             ArmReceive(conn);
+        }
         else { conn.RecvArmed = false; TryFinalize(conn, slot); }
     }
 
@@ -1056,7 +1091,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         // A client speaks first (ClientHello); a server emits nothing until it has seen one. Either way the
         // receive must be armed so the handshake can advance as bytes arrive.
         if (!DriveTlsHandshake(conn, slot, default)) return;
-        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmReceive(conn);
+        ArmReceiveIfWanted(conn);
     }
 
 

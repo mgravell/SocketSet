@@ -104,6 +104,7 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
     // queues and wake mechanism.
     public abstract void SubmitClose(uint slot, uint generation);
     public abstract void SubmitFlush(uint slot, uint generation, byte[] data, int length);
+    public abstract void SubmitResumeReceive(uint slot, uint generation);
 
     // --- write-page backpressure ---
     // Connections that wanted a write page while the pool was dry. Their bytes are staged in Pending and

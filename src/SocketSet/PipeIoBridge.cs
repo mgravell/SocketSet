@@ -25,10 +25,13 @@ namespace SocketSets;
 /// reference to be measured against rather than being designed blind.
 ///
 /// KNOWN LIMITATIONS of this fallback, all of which the per-backend paths are expected to fix:
-///  - Inbound backpressure is advisory. The receive callback runs on the loop thread and cannot block, so
-///    a flush that does not complete synchronously is observed asynchronously and writing continues into
-///    the PipeWriter's own buffer. Honouring it properly means PARKING the receive, which needs backend
-///    cooperation (do not re-arm until the flush completes).
+///  - Inbound backpressure is REAL where the backend can park, and advisory where it cannot. The receive
+///    callback runs on the loop thread and cannot block, so a flush that does not complete synchronously
+///    is observed asynchronously. Since 2026-08-04 that also PARKS the receive (IOCP, RIO, managed, epoll:
+///    <c>Connection.TryPauseReceive</c>), so the socket buffer fills, the window closes, and the peer is
+///    slowed rather than dropped. io_uring cannot park (multishot receive) and reports so, and there the
+///    old behaviour stands: stage behind the flush, bounded by <c>MaxInboundBufferBytes</c>, and drop at
+///    the cap.
 ///  - <paramref name="pinned"/> is recorded and not yet acted on. It exists so a caller whose pipe is
 ///    backed by pinned memory (Kestrel's PinnedBlockMemoryPool, or a pool over the pinned object heap)
 ///    can tell the backend that per-operation pinning is unnecessary. Nothing in this fallback pins
@@ -176,8 +179,34 @@ internal sealed class PipeIoBridge
             }
             if (ReportStats) Interlocked.Increment(ref s_flushAsync);
             _flushPending = true;
+            ParkIfPossible();
         }
         _ = DrainFlushesAsync(flush);
+    }
+
+    // ---- receive parking (REVIEW.md D3) -----------------------------------------------------------
+    //
+    // The flush went async, which is the pipe telling us the application is behind. Stop reading: the
+    // socket's receive queue fills, the advertised window closes, and the PEER is slowed instead of being
+    // staged in our memory and eventually dropped at MaxInboundBufferBytes.
+    //
+    // Called on the receive thread with _inGate held, which is where the decision belongs -- it must be
+    // ordered with _flushPending so that "a flush is outstanding" and "we asked to stop reading" cannot
+    // disagree. The RESUME is deliberately NOT symmetric: it is raised outside the lock (see
+    // DrainFlushesAsync), because on the managed backend ResumeReceive starts the next receive INLINE on
+    // the calling thread, and doing that under _inGate would run the socket read and the whole application
+    // callback inside the bridge's own lock.
+    private bool _parked;   // guarded by _inGate; false also when the backend cannot park at all
+
+    private void ParkIfPossible() => _parked = _conn.TryPauseReceive();
+
+    /// <summary>Whether the flush that just drained had parked the receive; clears the flag under the
+    /// lock so the resume happens exactly once, then the caller raises it outside the lock.</summary>
+    private bool TakeParked()
+    {
+        if (!_parked) return false;
+        _parked = false;
+        return true;
     }
 
     /// <summary>Inbound data, on the loop thread, in place of <c>OnReceive</c>.</summary>
@@ -187,41 +216,61 @@ internal sealed class PipeIoBridge
 
         if (ReportStats) { Interlocked.Increment(ref s_recv); Interlocked.Add(ref s_recvBytes, data.Length); }
 
-        bool overflowed = false;
-        ValueTask<FlushResult> flush;
+        // BUG FIXED 2026-08-04, found while wiring parking in. `overflowed` used to be set and then
+        // `return`ed from INSIDE the lock, which returns from the METHOD -- so the `if (overflowed)` below
+        // was unreachable and the cap did not do what it says. It dropped the BYTES and left the
+        // connection open and un-counted, i.e. a silent hole in the stream where the intent was a loud
+        // close. Neither the bound's own gate nor the smoke matrix could see it (nothing reached the cap).
+        // The staged/overflow decision is now taken under the lock and ACTED ON after it.
+        bool overflowed = false, handled = false;
+        ValueTask<FlushResult> flush = default;
         lock (_inGate)
         {
             if (_flushPending)
             {
+                handled = true;
                 // A flush is outstanding: touching the writer now would throw. Stage instead -- but
                 // BOUNDED. This queue had no limit until 2026-08-04, so a peer uploading faster than the
                 // application drained grew it without end (REVIEW.md D3).
+                //
+                // Reaching here at all is now the OVERSHOOT rather than the steady state on a backend that
+                // parks: the park is requested the moment a flush goes async, so what still lands here is
+                // what was already in flight or already in the socket buffer. On io_uring, which cannot
+                // park, this remains the whole mechanism and the cap remains the only bound.
                 if (_maxStaged > 0 && _stagedBytes + data.Length > _maxStaged)
                 {
                     overflowed = true;
-                    return;
                 }
-                var buf = ArrayPool<byte>.Shared.Rent(data.Length);
-                data.CopyTo(buf);
-                _stagedBytes += data.Length;
-                _staged.Enqueue(new ArraySegment<byte>(buf, 0, data.Length));
-                if (ReportStats) { Interlocked.Increment(ref s_staged); Interlocked.Add(ref s_stagedBytes, data.Length); }
-                return;
+                else
+                {
+                    var buf = ArrayPool<byte>.Shared.Rent(data.Length);
+                    data.CopyTo(buf);
+                    _stagedBytes += data.Length;
+                    _staged.Enqueue(new ArraySegment<byte>(buf, 0, data.Length));
+                    if (ReportStats) { Interlocked.Increment(ref s_staged); Interlocked.Add(ref s_stagedBytes, data.Length); }
+                }
             }
-
-            _pipe.Output.Write(data);
-            flush = _pipe.Output.FlushAsync();
-            if (flush.IsCompletedSuccessfully)
+            else
             {
-                if (ReportStats) Interlocked.Increment(ref s_flushSync);
-                var r = flush.Result;
-                if (r.IsCompleted || r.IsCanceled) _conn.Close(); // reader is gone
-                return;
+                _pipe.Output.Write(data);
+                flush = _pipe.Output.FlushAsync();
+                if (flush.IsCompletedSuccessfully)
+                {
+                    handled = true;
+                    if (ReportStats) Interlocked.Increment(ref s_flushSync);
+                    var r = flush.Result;
+                    if (r.IsCompleted || r.IsCanceled) _conn.Close(); // reader is gone
+                }
+                else
+                {
+                    if (ReportStats) Interlocked.Increment(ref s_flushAsync);
+                    _flushPending = true;
+                    ParkIfPossible();
+                }
             }
-            if (ReportStats) Interlocked.Increment(ref s_flushAsync);
-            _flushPending = true;
         }
         if (overflowed) { Overflow(); return; }
+        if (handled) return;
         _ = DrainFlushesAsync(flush);
     }
 
@@ -243,44 +292,70 @@ internal sealed class PipeIoBridge
     /// nothing is left. Runs off the loop thread; the lock only ever guards short bookkeeping.</summary>
     private async Task DrainFlushesAsync(ValueTask<FlushResult> flush)
     {
+        // A ValueTask may be consumed ONCE. The loop used to `continue` back to the await after having
+        // already read `flush.Result` on the synchronous path, i.e. consume it twice; this flag is the
+        // fix, and it keeps that iteration awaiting nothing rather than awaiting a spent task.
+        bool haveFresh = true;
+
         while (true)
         {
-            try
+            if (haveFresh)
             {
-                var r = await flush.ConfigureAwait(false);
-                if (r.IsCompleted || r.IsCanceled) { Fail(); return; }
+                try
+                {
+                    var r = await flush.ConfigureAwait(false);
+                    if (r.IsCompleted || r.IsCanceled) { Fail(); return; }
+                }
+                catch { Fail(); return; }
             }
-            catch { Fail(); return; }
 
+            bool resume = false, done = false;
+            haveFresh = true;
             lock (_inGate)
             {
-                if (_staged.Count == 0) { _flushPending = false; return; } // caught up; loop may write again
-                while (_staged.Count > 0)
+                if (_staged.Count == 0) { _flushPending = false; resume = TakeParked(); done = true; } // caught up
+                else
                 {
-                    var seg = _staged.Dequeue();
-                    _stagedBytes -= seg.Count;
-                    _pipe.Output.Write(seg.AsSpan());
-                    PooledBuffers.ReturnCleared(in seg); // staged bytes are received plaintext
-                }
-                flush = _pipe.Output.FlushAsync();
-                if (flush.IsCompletedSuccessfully)
-                {
-                    var r2 = flush.Result;
-                    if (r2.IsCompleted || r2.IsCanceled) { Fail(); return; }
-                    if (_staged.Count == 0) { _flushPending = false; return; }
-                    continue; // more arrived while we were writing; go round without awaiting
+                    while (_staged.Count > 0)
+                    {
+                        var seg = _staged.Dequeue();
+                        _stagedBytes -= seg.Count;
+                        _pipe.Output.Write(seg.AsSpan());
+                        PooledBuffers.ReturnCleared(in seg); // staged bytes are received plaintext
+                    }
+                    flush = _pipe.Output.FlushAsync();
+                    if (flush.IsCompletedSuccessfully)
+                    {
+                        var r2 = flush.Result;                       // consumed here...
+                        haveFresh = false;                           // ...so do NOT await it again
+                        if (r2.IsCompleted || r2.IsCanceled) { Fail(); return; }
+                        if (_staged.Count == 0) { _flushPending = false; resume = TakeParked(); done = true; }
+                        // else: more arrived while we were writing; go round without awaiting
+                    }
+                    // else: a fresh async flush to await next time round; still behind, so stay parked
                 }
             }
+
+            // OUTSIDE the lock, deliberately: on the managed backend ResumeReceive starts the next receive
+            // INLINE on this thread, so doing it under _inGate would run the socket read and the whole
+            // application receive callback inside the bridge's own inbound lock.
+            if (resume) _conn.ResumeReceive();
+            if (done) return;
         }
 
         void Fail()
         {
+            bool resume;
             lock (_inGate)
             {
                 _flushPending = false;
+                resume = TakeParked();
                 while (_staged.Count > 0) PooledBuffers.ReturnCleared(_staged.Dequeue());
                 _stagedBytes = 0;
             }
+            // The connection is going away, so this is not about reading more -- it is about not leaving a
+            // parked receive behind if Close races a slot that survives. Cheap, and idempotent.
+            if (resume) _conn.ResumeReceive();
             _conn.Close();
         }
     }

@@ -114,17 +114,64 @@ equivalent.
    CURED.** Both inbound paths now track how far ahead of the application they run and drop a connection
    past `MaxInboundBufferBytes` (4 MiB default), with counters. That removes the unbounded case.
 
-   **STILL WANTED: receive PARKING**, which is the actual fix — stop re-arming the receive until the
-   flush completes, so the TCP window slows the peer instead of the peer being killed. Deferred, with the
-   difficulty stated: it needs per-backend pause/resume, with resume marshalled from a thread-pool
-   continuation back onto the loop thread, and io_uring is the awkward one because its receive is
-   MULTISHOT — pausing means cancelling an armed op and re-arming later, sharing the cancel path with
-   teardown, where a race produces a HANG rather than a leak. epoll (drop EPOLLIN via EPOLL_CTL_MOD),
-   managed, IOCP and RIO are all easy by comparison, since their receives are one-shot: parking there is
-   simply "do not post the next one". This supersedes the old receive-parking item (7). ORIGINAL NOTE:
+   ~~**STILL WANTED: receive PARKING**~~ **DONE 2026-08-04 ON FOUR OF FIVE BACKENDS** (Marc: "can we do
+   1 but shelving io_uring for now"). IOCP, RIO, managed and epoll now stop reading when the consumer's
+   inbound flush goes async, so the TCP window slows the peer instead of the peer being dropped at the
+   cap. Both bridges drive it; the cap survives as the backstop for the overshoot. Full writeup, the
+   three-state CAS and why it is not a bool, and the two pre-existing bugs the work surfaced, are in
+   `REVIEW.md` D3. Gated by `bench/verify-parking` (12/12 on Windows; falsified first — a stubbed
+   `TryPauseReceive` fails 8 of 12).
+
+   **WHAT IS LEFT ON THIS ITEM:**
+   - **io_uring parking**, deliberately shelved. `IoUringConnection.SupportsReceiveParking` returns false
+     and both bridges honour it by keeping the bound, so io_uring is *bounded, not cured* — the state D3
+     described for everything. The difficulty is unchanged and is the reason: its receive is MULTISHOT,
+     so pausing means `IORING_OP_ASYNC_CANCEL` and a later re-arm, sharing the cancel path with teardown,
+     where a race produces a HANG rather than a leak.
+   - **The Linux half is UNRUN.** epoll's parking (and io_uring's declining to park) exist only as code
+     written on Windows. This is the same shape of debt the Windows catch-up cleared earlier today, in
+     the other direction. `dotnet run --project bench/verify-parking` is the whole invocation.
+   - **Pre-registered fragile spots**, so the next session can score them: (a) epoll's `EPOLL_CTL_MOD`
+     mask arithmetic — `InterestFor` is now the only place the mask is computed and `ArmWrite`/
+     `DisarmWrite` were rewritten to use it; (b) the HUP-while-parked close, which exists because
+     `EPOLLERR`/`EPOLLHUP` cannot be masked off and a level-triggered one would spin a core — if that
+     rule is wrong the symptom is a truncated upload, not a hang.
+
+   ORIGINAL NOTE:
    **Backpressure is advisory in both bridges, so inbound is unbounded.** Same fix as the recorded
    receive-PARKING item (7) — worth re-tagging that item as a robustness fix, not only an architecture
    one, because right now it is the DoS. Note `SocketSet.AspNetCore` is a published package.
+
+   **FUTURE (raised by Marc 2026-08-04): measure what io_uring would actually pay for SINGLE-SHOT
+   receives.** The argument above treats multishot as fixed and parking as the thing that has to bend
+   around it. The other framing is the cheaper one to *build*: if io_uring armed one receive at a time
+   like the other four backends, parking collapses to "do not post the next one" — no
+   `IORING_OP_ASYNC_CANCEL`, no shared cancel path with teardown, no window where the kernel owns an op we
+   have stopped tracking, and no hang-shaped race. That trade is only worth taking if the throughput cost
+   is small, and **nobody here has ever measured it**; multishot was adopted because it is the documented
+   fast path, not because single-shot was benchmarked and lost.
+
+   What is already known, and cuts both ways:
+   - The cost is one SQE per receive instead of one arm covering many completions. With `SQPOLL` off that
+     is submission-side work in our loop, not a syscall each (we batch), so the honest prior is "cheaper
+     than it sounds".
+   - We ALREADY run one-op-per-message on the OpenSSL non-kTLS TLS path (POLL+`SSL_read`, see
+     `IoUringShard.cs:1228`), so a rough upper bound may be extractable from existing plaintext-vs-TLS
+     numbers — heavily confounded by crypto cost, so treat it as a hint for sizing the experiment, not as
+     the answer.
+   - Item 1c ("the re-arm window is real: up to 9.5 messages coalesce into one receive") says the
+     re-arm gap is NOT obviously a cost — coalescing cuts both ways. Single-shot widens that window, so
+     this experiment and 1c are the same question asked from opposite ends; read 1c before designing it.
+   - `-ENOBUFS` / re-arm thrash on the provided-buffer ring is a multishot failure mode that single-shot
+     simply does not have. If the delta is near zero, single-shot is the SIMPLER code, not a concession.
+
+   **Pre-register before running** (house rule 3): my prediction is a per-MESSAGE cost, so a loss
+   concentrated at 512 B and vanishing by 256 KB, of the order of the pipesched deltas (single digits at
+   the small end). **Falsified if** the deficit is flat across sizes (then it is not per-message and the
+   mechanism is wrong), or if it is worse than ~5% at 4 KB (then multishot is load-bearing and parking
+   must pay the cancel-path complexity after all). Method: six scored passes at each size, ranges quoted,
+   plaintext AND TLS, control in the same session, and gate on the banner reporting which mode ran — a
+   single-shot toggle that silently keeps arming multishot measures identically to one that works.
 4. ~~**`ReceiveContext.RawBuffer` past `PayloadBytes` is another connection's data**~~ **RESOLVED
    2026-08-04, same day** (Marc's design, two refinements): a lazy tail wipe with two triggers, plus
    `GetWriteSpan(int sizeHint)` so the cost tracks the REPLY size rather than the buffer size —
@@ -142,7 +189,27 @@ equivalent.
    carry plaintext. Details in `REVIEW.md` D6. STILL OPEN from it: `PrepareForBind`'s unconditional
    delete + TOCTOU, and no `SO_PEERCRED` peer check on UDS.
 
-6. **MAKE THE DEFENSIVE WIPES OPT-OUT** (Marc, 2026-08-04). What shipped is fair as a DEFAULT — on by
+6. ~~**MAKE THE DEFENSIVE WIPES OPT-OUT**~~ **DONE 2026-08-04** as
+   `SocketSetOptions.DangerousDisableBufferWipe` (default false, i.e. wipes ON). Granularity is
+   **per-SET**, Marc's call: *"it seems a binary 'I care about this' decision"* — the claim being made is
+   about a whole deployment, so the per-listener idea below was dropped rather than deferred. Full
+   writeup in `REVIEW.md` D4.
+
+   Three notes worth keeping, because two of them answer worries recorded below that turned out not to
+   bite:
+   - **Threading the flag into the `ref struct` contexts cost nothing.** The worry below was a field per
+     context or a sentinel in the length. Neither was needed: the contexts already carry the
+     `Connection`, and every trigger is monotone through `_wipedTo` — so seeding `_wipedTo` to the buffer
+     END disables the lot. The whole implementation is one changed field initializer per context, with no
+     branch anywhere on the hot path.
+   - **It is loud, unconditionally.** `SocketSet.ToString()` prints `wipe=on` / `wipe=off` every time,
+     including when it says the boring thing, so "off" and "an old build without the option" cannot
+     print the same.
+   - **Gated in both directions.** `verify-tailwipe` runs every cell twice; the off-half asserts the
+     INVERSE (marker bytes MUST come back, `cleared` must be exactly 0) plus a banner cell. 30/30 on
+     Windows. ORIGINAL NOTE:
+
+   What shipped is fair as a DEFAULT — on by
    default is the right posture, and `GetWriteSpan` already makes the common cases free or
    proportional. But it should be electively turn-off-able for someone who controls the entire
    scenario: a closed system where every handler is known to write exactly what it reports, and where

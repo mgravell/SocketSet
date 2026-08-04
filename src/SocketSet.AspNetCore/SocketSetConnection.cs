@@ -181,10 +181,11 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     /// needing no protocol trickery (REVIEW.md D3). It is now tracked, and a connection that runs more
     /// than <c>MaxInboundBufferBytes</c> ahead of Kestrel is ABORTED.
     ///
-    /// Aborting is the blunt half of the fix and is labelled as such: the right answer is receive PARKING
-    /// (stop reading until the flush completes, so the TCP window slows the peer instead of the peer
-    /// being dropped), which needs per-backend cooperation and is recorded in TODO. This bounds the
-    /// damage in the meantime, with a cap generous enough that only a real mismatch reaches it.
+    /// RECEIVE PARKING landed 2026-08-04 and is now the primary mechanism: an async flush means Kestrel is
+    /// behind, so the transport stops reading (<c>Connection.TryPauseReceive</c>) and the TCP window slows
+    /// the CLIENT instead of us buffering on its behalf. The abort above survives as the backstop for the
+    /// overshoot, and as the whole mechanism on io_uring, whose multishot receive cannot park and which
+    /// says so through <c>SupportsReceiveParking</c>.
     /// </summary>
     public void WriteInbound(ReadOnlySpan<byte> data)
     {
@@ -202,6 +203,12 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
             return;
         }
 
+        // ORDER MATTERS: park BEFORE publishing the outstanding byte count. TrackFlush's completion is the
+        // thing that resumes, and it can only run once _unflushed has been incremented — so parking first
+        // guarantees the resumer sees the park. Parking after would race a fast flush into a connection
+        // that is parked with nobody left to wake it, which is a silent hang rather than a visible fault.
+        if (_conn.TryPauseReceive()) { Volatile.Write(ref _parked, 1); _metrics.OnReceivePark(); }
+
         long pending = Interlocked.Add(ref _unflushed, n);
         if (_maxUnflushed > 0 && pending > _maxUnflushed)
         {
@@ -213,11 +220,21 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         TrackFlush(flush, n);
     }
 
+    /// <summary>1 while this connection's receive is parked behind an outstanding inbound flush.</summary>
+    private int _parked;
+
     private async void TrackFlush(ValueTask<FlushResult> flush, int bytes)
     {
         try { await flush; }
         catch { /* the pipe is done; teardown runs elsewhere */ }
-        finally { Interlocked.Add(ref _unflushed, -bytes); }
+        finally
+        {
+            // Resume only when the LAST outstanding flush drains. Several can overlap on a backend that
+            // could not park (or during the overshoot before a park takes effect), and resuming on the
+            // first would start reading again while Kestrel is still behind.
+            if (Interlocked.Add(ref _unflushed, -bytes) == 0 && Interlocked.Exchange(ref _parked, 0) == 1)
+                _conn.ResumeReceive();
+        }
     }
 
     /// <summary>Loop thread: the peer closed / the socket errored. EOF the inbound pipe so Kestrel finishes

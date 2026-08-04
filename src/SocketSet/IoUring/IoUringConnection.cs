@@ -189,6 +189,21 @@ internal sealed unsafe class IoUringConnection : Connection
         Slot = slot;
     }
 
+    /// <summary>
+    /// FALSE, deliberately, and this is the one backend where receive parking was NOT built (TODO item 1,
+    /// 2026-08-04). The other four arm ONE receive at a time, so parking is "do not post the next one" —
+    /// nothing has to be cancelled and there is no window in which the kernel owns an operation we have
+    /// stopped tracking. io_uring's receive is MULTISHOT: an armed operation keeps completing until the
+    /// kernel retires it, so parking means IORING_OP_ASYNC_CANCEL and a later re-arm, sharing the cancel
+    /// path with teardown. Getting that race wrong does not leak — it HANGS, with the connection alive and
+    /// no receive outstanding, which is the failure mode hardest to see and hardest to reproduce.
+    ///
+    /// Reporting false rather than silently doing nothing is the point: both bridges read this and keep
+    /// their MaxInboundBufferBytes bound as the (blunt) mechanism here, instead of waiting for
+    /// backpressure that would never arrive.
+    /// </summary>
+    public override bool SupportsReceiveParking => false;
+
     public override void Close()
     {
         // Marshal onto the loop thread (generation-guarded there) — safe from any thread, including

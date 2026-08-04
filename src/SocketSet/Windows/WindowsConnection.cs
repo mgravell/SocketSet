@@ -14,6 +14,7 @@ internal interface IWindowsShard
 {
     void SubmitClose(uint slot, uint generation);
     void SubmitFlush(uint slot, uint generation, byte[] data, int length);
+    void SubmitResumeReceive(uint slot, uint generation);
 }
 
 /// <summary>
@@ -99,6 +100,18 @@ internal abstract class WindowsConnection : OutboundConnection
         // Marshal onto the loop thread (generation-guarded there) - safe from any thread, including from
         // inside a callback (honoured on the next loop pass).
         if (Volatile.Read(ref Socket) != 0) _shard.SubmitClose(Slot, Volatile.Read(ref Generation));
+    }
+
+    /// <summary>Both Windows backends arm ONE receive at a time (WSARecv / RIOReceive), so parking is
+    /// simply "do not post the next one" — no armed operation has to be cancelled. See
+    /// <see cref="Connection.SupportsReceiveParking"/> for why io_uring is not in this club.</summary>
+    public override bool SupportsReceiveParking => true;
+
+    private protected override void SubmitResumeReceive()
+    {
+        // Same generation-captured marshal as Close/Flush: a resume for a since-closed and re-tenanted
+        // slot is dropped on the loop thread rather than arming a receive on someone else's connection.
+        if (Volatile.Read(ref Socket) != 0) _shard.SubmitResumeReceive(Slot, Volatile.Read(ref Generation));
     }
 
     // --- out-of-band IBufferWriter path (accumulator in OutboundConnection) ---

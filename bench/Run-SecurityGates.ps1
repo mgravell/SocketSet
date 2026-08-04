@@ -51,6 +51,9 @@ Invoke-Gate 'verify-bind-reachability' { & (Join-Path $PSScriptRoot 'Verify-Bind
 Invoke-Gate 'verify-tailwipe'     { & dotnet run --project (Join-Path $repo 'bench\verify-tailwipe') -c Release -f net10.0 }
 Invoke-Gate 'verify-tlsname'      { & dotnet run --project (Join-Path $repo 'bench\verify-tlsname')  -c Release -f net10.0 }
 Invoke-Gate 'verify-timeouts'     { & dotnet run --project (Join-Path $repo 'bench\verify-timeouts') -c Release -f net10.0 }
+# Added 2026-08-04 with receive parking (TODO item 1). Slower than the others (~40s: it deliberately waits
+# out two stall samples per backend) but still far cheaper than the smoke matrix, so it stays in this tier.
+Invoke-Gate 'verify-parking'      { & dotnet run --project (Join-Path $repo 'bench\verify-parking')  -c Release -f net10.0 }
 
 # 3. The pre-existing narrow gates, which the same commits could have broken.
 Invoke-Gate 'Verify-TlsFloor'     { & (Join-Path $PSScriptRoot 'Verify-TlsFloor.ps1') }

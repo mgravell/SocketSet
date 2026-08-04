@@ -171,6 +171,36 @@ public class SocketSetOptions
     /// </summary>
     public int MaxInboundBufferBytes { get; set; } = 4 * 1024 * 1024;
 
+    /// <summary>
+    /// Turn OFF the defensive tail wipe on the recycled receive/send buffers (REVIEW.md D4). Default
+    /// false, i.e. the wipe is ON — that is the right posture and is meant to stay the default.
+    ///
+    /// WHAT IT BUYS YOU, said plainly, because the name is deliberately unpleasant: with this set, bytes
+    /// past the payload in <c>ReceiveContext.RawBuffer</c> / the three <c>SendBuffer</c>s are the PREVIOUS
+    /// TENANT'S, and on a TLS connection that is another client's decrypted plaintext. A handler that then
+    /// sets <c>ResponseBytes</c> above <c>PayloadBytes</c> — a miscomputed frame length is the realistic
+    /// accident — puts those bytes on the wire. That is the disclosure the wipe exists to stop.
+    ///
+    /// SO WHY OFFER IT. A closed deployment where every handler is known to write exactly what it reports,
+    /// and where the buffers are never shared with anything the operator does not own, is paying for a
+    /// guarantee it does not need. This is that operator's switch, and it is scoped PER SET because the
+    /// claim is about the whole deployment, not one hot handler — for the narrower "this one callback has
+    /// measured it and knows what it is doing" case, the per-call <c>RawBufferUnwiped</c> /
+    /// <c>SendBufferUnwiped</c> accessors already exist and are a much smaller thing to assert.
+    ///
+    /// Before reaching for it, note the wipe is already free or proportional on the paths that matter:
+    /// <c>GetWriteSpan(sizeHint)</c> clears only the delta over what it has already granted, and a reply
+    /// no larger than the request (the instant-response idiom) clears nothing at all. The cost is real
+    /// only for a handler that takes the WHOLE buffer via <c>RawBuffer</c>/<c>SendBuffer</c>.
+    ///
+    /// IT IS REPORTED. <see cref="SocketSet.ToString"/> prints <c>wipe=on</c> or <c>wipe=off</c>
+    /// unconditionally, so a rig can gate on it and a silent "wipes off" cannot be mistaken for the
+    /// pre-2026-08-04 behaviour the audit found. Gated by <c>bench/verify-tailwipe</c>, whose off-cells
+    /// assert the wipe does NOT happen here — an untested flag in that direction is the direction that
+    /// matters.
+    /// </summary>
+    public bool DangerousDisableBufferWipe { get; set; }
+
     /// <summary>Backlog passed to <c>listen()</c> on every backend — the kernel's queue of
     /// completed-handshake connections awaiting accept. Cheap; size it to absorb connection bursts.</summary>
     public int ListenBacklog { get; set; } = 512;

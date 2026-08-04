@@ -3,6 +3,15 @@
 // This asserts BOTH that those bytes cannot reach the wire, and that avoiding them is charged at cost.
 // Exit 0 = all PASS.
 //
+// SINCE 2026-08-04 EVERY CELL RUNS TWICE: once with the wipe on (the default) and once with
+// SocketSetOptions.DangerousDisableBufferWipe set. The OFF half is not a formality -- it is the only
+// direction in which the new option can be tested at all. A flag that silently did nothing would leave
+// the ON half green and the deployment that asked for the saving still paying for it; a flag that
+// accidentally applied everywhere would leave the OFF half green and the guarantee quietly gone. So the
+// off-cells assert the INVERSE of the on-cells: the marker bytes MUST be visible, and the delta cell must
+// clear exactly ZERO. Plus a banner cell, because a wipes-off set that does not SAY so is precisely the
+// silent degradation the audit exists to prevent (see SocketSet.ToString).
+//
 // FOUR CELLS. The first three are the disclosure vectors; the fourth is the cost property.
 //   A  RawBuffer, then over-report            -> caught by wipe-on-access
 //   B  ResponseBytes above PayloadBytes, and  -> NOT caught by wipe-on-access. This is the realistic
@@ -36,16 +45,28 @@ const int Port = 19801, Reply = 900, Rounds = 64, Grow = 5;
 int failures = 0;
 
 foreach (var (backend, name) in GateBackends.All)
+foreach (bool wipe in new[] { true, false })
 {
     foreach (var mode in new[] { Mode.RawBuffer, Mode.ResponseBytesOnly, Mode.GetWriteSpanBigger, Mode.ExactDelta })
     {
         var opts = new SocketSetOptions
         {
             Shards = 1, Factory = backend, ReceiveBufferSize = 4096, BufferPagesPerShard = 16,
+            DangerousDisableBufferWipe = !wipe,
         };
         using var srv = new Srv(opts, mode, Reply, Grow);
         srv.Listen(new IPEndPoint(IPAddress.Loopback, Port));
         Thread.Sleep(250);
+
+        // The banner, asserted once per posture. A rig can only gate on the posture if the process states
+        // it, and stating it only when it is unusual would make "off" and "an older build" print the same.
+        if (mode == Mode.RawBuffer)
+        {
+            string banner = srv.ToString(), want = wipe ? "wipe=on" : "wipe=off";
+            bool said = banner.Contains(want);
+            if (!said) failures++;
+            Console.WriteLine($"  {(said ? "PASS" : "FAIL")}  {name,-14} {$"banner says {want}",-34} {banner}");
+        }
 
         int leaked = 0, replies = 0, worstCleared = -1, measured = 0;
         using (var c = new TcpClient())
@@ -88,17 +109,24 @@ foreach (var (backend, name) in GateBackends.All)
         bool ok; string detail;
         if (mode == Mode.ExactDelta)
         {
-            ok = measured > 0 && worstCleared == Grow;
+            // ON: exactly the delta. OFF: exactly nothing -- and "nothing" has to be asserted, because a
+            // wipe that quietly survived the opt-out would otherwise show up as a green run.
+            int wantCleared = wipe ? Grow : 0;
+            ok = measured > 0 && worstCleared == wantCleared;
             detail = $"replies={replies} measurable={measured} cleared={worstCleared} "
-                   + $"(must be exactly {Grow}: 0 would leak, ~4000 would be the over-charge)";
+                   + (wipe ? $"(must be exactly {Grow}: 0 would leak, ~4000 would be the over-charge)"
+                           : "(must be exactly 0: anything cleared means the opt-out did not take)");
         }
         else
         {
-            ok = leaked == 0;
-            detail = $"replies={replies} leaking={leaked}";
+            // ON: nothing may leak. OFF: the previous tenant's marker MUST come back, or the option is
+            // inert and the on-cells above are testing a wipe nobody can turn off.
+            ok = wipe ? leaked == 0 : leaked > 0;
+            detail = $"replies={replies} leaking={leaked}"
+                   + (wipe ? "" : " (must be non-zero: that IS what the opt-out gives up)");
         }
         if (!ok) failures++;
-        Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {name,-14} {Label(mode),-34} {detail}");
+        Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {name,-14} {Label(mode),-34} {(wipe ? "wipe=on " : "wipe=off")} {detail}");
         Thread.Sleep(150);
     }
 }

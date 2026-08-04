@@ -39,4 +39,14 @@ public sealed class SocketSetTransportMetrics
 
     internal void OnInboundOverflow() => Interlocked.Increment(ref _inboundOverflow);
 
+    private long _receiveParks;
+
+    /// <summary>Times the transport stopped reading a connection because Kestrel had not drained the
+    /// inbound pipe (REVIEW.md D3 / TODO item 1). This is the HEALTHY form of the same pressure
+    /// <see cref="InboundOverflow"/> counts: parking slows the peer through the TCP window, overflow drops
+    /// it. A deployment seeing parks and no overflows is working as intended; one seeing overflows on a
+    /// backend that can park is either overshooting badly or running on io_uring, which cannot.</summary>
+    public long ReceiveParks => Interlocked.Read(ref _receiveParks);
+
+    internal void OnReceivePark() => Interlocked.Increment(ref _receiveParks);
 }

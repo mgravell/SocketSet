@@ -91,10 +91,121 @@ public abstract class Connection : IBufferWriter<byte>
     /// engine options. Seeded by the owning set.</summary>
     internal int MaxInboundBufferBytes;
 
+    /// <summary>
+    /// Copy of <see cref="SocketSetOptions.DangerousDisableBufferWipe"/>, here for the same reason as
+    /// <see cref="MaxInboundBufferBytes"/>: the four context ref structs get a raw pointer and a length
+    /// from the backend and can reach the Connection, but not the engine options.
+    ///
+    /// Consumed by seeding each context's <c>_wipedTo</c> high-water mark to the END of the buffer, which
+    /// is the whole implementation: every wipe trigger is already monotone through that mark, so one
+    /// changed initializer turns all of them off with no branch anywhere on the hot path and no extra
+    /// field per context.
+    /// </summary>
+    internal bool SkipBufferWipe;
+
     /// <summary>True once the app has seen this connection open (OnAccept/OnConnect fired); gates
     /// <see cref="SocketSet.OnClosed"/> so it pairs with an open and never fires for a connection the
     /// app never saw (e.g. a failed connect). Backend-managed on the owning IO thread.</summary>
     internal bool Opened;
+
+    // =====================================================================
+    // RECEIVE PARKING (REVIEW.md D3; TODO item 1)
+    // ---------------------------------------------------------------------
+    // Backpressure on the INBOUND half was advisory: the receive callback runs on the loop thread and
+    // cannot wait for the consumer's flush, so bytes that arrived during one were staged in memory and a
+    // peer uploading faster than the application drained grew that staging without limit. 2026-08-04
+    // BOUNDED it (SocketSetOptions.MaxInboundBufferBytes) by dropping the connection at the cap, which is
+    // the right answer for abuse and a blunt one for a merely slow consumer. Parking is the actual fix:
+    // stop re-arming the receive, let the socket's receive buffer fill, and let the TCP window slow the
+    // PEER instead of killing it.
+    //
+    // THE STATE MACHINE, and why it is a CAS rather than a bool. Park is requested on the receive thread
+    // (from inside the receive callback, where the consumer discovers it is behind); resume comes from an
+    // arbitrary thread-pool continuation when the flush completes. Those two race, and both orders are
+    // reachable:
+    //   - resume lands FIRST (the flush completed before the loop got back to its re-arm point): the state
+    //     returns to Running, the loop's park attempt fails, and it simply re-arms as usual. Nothing is
+    //     marshaled, because nothing is parked.
+    //   - resume lands SECOND: the loop has already published Parked, so the resume marshals a re-arm onto
+    //     the loop thread through the backend's existing cross-thread queue.
+    // Exactly one re-arm happens either way. A plain "paused" bool cannot express the first case, and
+    // getting it wrong does not leak or corrupt — it HANGS, silently, with the connection alive and never
+    // reading again. That is the failure mode worth designing against and the one bench/verify-parking
+    // exists to catch.
+    // =====================================================================
+
+    private const int RecvRunning = 0, RecvParkRequested = 1, RecvParked = 2;
+    private int _recvState;
+
+    /// <summary>
+    /// Can this backend actually stop reading? FALSE on io_uring, whose receive is MULTISHOT: parking
+    /// there means cancelling an armed operation and re-arming later, sharing the cancel path with
+    /// teardown, where a race produces a hang rather than a leak. Deliberately deferred (TODO item 1)
+    /// rather than attempted.
+    ///
+    /// It is a capability rather than a silent no-op because a consumer that believes it parked and then
+    /// waits for backpressure to do its work would simply never be told otherwise. Callers must honour a
+    /// false: keep their own bound and drop at it, exactly as before.
+    /// </summary>
+    public virtual bool SupportsReceiveParking => false;
+
+    /// <summary>
+    /// Ask the transport to stop reading from this connection until <see cref="ResumeReceive"/>. Returns
+    /// FALSE, having done nothing, when <see cref="SupportsReceiveParking"/> is false — the caller must
+    /// then fall back to bounding its own buffering.
+    ///
+    /// Intended to be called from a receive callback, on the transport's own thread, which is where a
+    /// consumer discovers it is falling behind; calling it from elsewhere is legal and means "park at the
+    /// next opportunity" (the request is honoured when the in-flight receive completes).
+    ///
+    /// PAIR IT WITH A RESUME ON EVERY PATH. A park with no matching resume is a connection that stays
+    /// open and never reads again.
+    /// </summary>
+    public bool TryPauseReceive()
+    {
+        if (!SupportsReceiveParking) return false;
+        // Only from Running. An unconditional store would clobber an established Parked back to
+        // ParkRequested, after which the matching resume would take the "the loop will re-arm itself"
+        // branch — but the loop is not going to run again, because nothing is armed. That is the hang.
+        Interlocked.CompareExchange(ref _recvState, RecvParkRequested, RecvRunning);
+        return true;
+    }
+
+    /// <summary>Resume a parked (or about-to-park) receive. Callable from any thread, idempotent, and
+    /// safe to call when nothing is parked.</summary>
+    public void ResumeReceive()
+    {
+        // Parked == the loop really did stop, so it needs kicking; ParkRequested == it has not reached its
+        // re-arm point yet and will now find Running there and carry on by itself.
+        if (Interlocked.Exchange(ref _recvState, RecvRunning) == RecvParked) SubmitResumeReceive();
+    }
+
+    /// <summary>
+    /// Receive thread, at the re-arm decision: TRUE means a park was requested and has now taken effect,
+    /// so do NOT re-arm. False means carry on (including when a resume raced in first).
+    ///
+    /// THIS IS ON THE HOT PATH — once per receive completion on every backend — so the interlocked
+    /// compare-exchange is guarded by a plain read that is false in the overwhelmingly common case. The
+    /// guard cannot lose a park: a request that lands between the read and the return is simply honoured
+    /// at the NEXT receive completion, and "stop reading soon" is what the caller asked for. What it
+    /// must not do is skip the CAS when the state IS non-Running, which is why the read is Volatile.
+    /// </summary>
+    internal bool TryParkReceive()
+        => Volatile.Read(ref _recvState) != RecvRunning
+           && Interlocked.CompareExchange(ref _recvState, RecvParked, RecvParkRequested) == RecvParkRequested;
+
+    /// <summary>A park is pending or taken. Read by the backends whose receive path loops (epoll's read
+    /// burst) so they stop pulling more bytes in the same pass.</summary>
+    internal bool ReceiveParkPending => Volatile.Read(ref _recvState) != RecvRunning;
+
+    /// <summary>Clear parking state when a pooled Connection is re-tenanted, so a new connection cannot
+    /// inherit the last one's park. Called from every backend's slot-init.</summary>
+    internal void ResetReceiveParking() => Volatile.Write(ref _recvState, RecvRunning);
+
+    /// <summary>Marshal a re-arm onto the owning loop thread. Backends that report
+    /// <see cref="SupportsReceiveParking"/> MUST override this; the default exists for the backends that
+    /// cannot park, where it is unreachable.</summary>
+    private protected virtual void SubmitResumeReceive() { }
 
     /// <summary>
     /// Request that this connection be closed, callable from any thread — the teardown is marshaled

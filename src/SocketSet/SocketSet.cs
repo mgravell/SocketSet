@@ -139,7 +139,12 @@ public abstract partial class SocketSet : IDisposable
     /// <summary>One diagnostic line: derived type, backend, shard count, live connections (when the
     /// backend tracks them), and the TLS posture. TLS is per-SET (options-level): one provider and one
     /// <see cref="TlsMode"/> for every connection this set makes or accepts.
-    /// e.g. <c>EchoServer [io_uring] shards=6 connections=42 tls=openssl (Both, ktls-capable)</c>.</summary>
+    /// e.g. <c>EchoServer [io_uring] shards=6 connections=42 tls=openssl (Both, ktls-capable) wipe=on</c>.
+    ///
+    /// <c>wipe=</c> is printed UNCONDITIONALLY, including when it says the boring thing. An option that
+    /// only announced itself when set would make "wipes off" and "an old build with no such option" print
+    /// identically, and a silent degradation is precisely what
+    /// <see cref="SocketSetOptions.DangerousDisableBufferWipe"/> must not be able to become.</summary>
     public override string ToString()
     {
         var shards = _shards; // snapshot: growth publishes a longer array atomically
@@ -166,6 +171,8 @@ public abstract partial class SocketSet : IDisposable
         {
             sb.Append(" tls=off");
         }
+
+        sb.Append(" wipe=").Append(Options.DangerousDisableBufferWipe ? "off" : "on");
         return sb.ToString();
     }
 
@@ -808,6 +815,13 @@ public abstract partial class SocketSet : IDisposable
     // is already inside every boundary the library has, so there is nothing here to defend against
     // it and pretending otherwise would only buy false confidence. The thing worth stopping is an
     // ordinary length bug quietly putting another connection's data on the wire.
+    //
+    // TURNING IT OFF (2026-08-04). It is a DEFAULT, not a law: SocketSetOptions.DangerousDisableBufferWipe
+    // disables it for a whole set, for a closed deployment that controls every handler and is paying for a
+    // guarantee it does not need. Per-SET is the deliberate granularity — the claim being made is about
+    // the deployment, not about one callback; the per-call *Unwiped accessors already cover the narrower
+    // "this handler has measured it" case, and keeping the two distinct keeps the broad claim broad and
+    // loud. SocketSet.ToString reports wipe=on/off unconditionally so the difference cannot be silent.
     // =====================================================================================
 
     protected internal unsafe ref struct AcceptContext(Connection connection, byte* buffer, int bufferLength)
@@ -893,7 +907,11 @@ public abstract partial class SocketSet : IDisposable
         // Offset up to which the buffer is known-zeroed (or explicitly disclaimed). Unlike a receive
         // there is no payload to preserve, so this starts at 0: the whole buffer is the previous
         // tenant's. Monotone, so the two triggers compose in any order and nothing is cleared twice.
-        private int _wipedTo;
+        //
+        // ...unless the set opted out (SocketSetOptions.DangerousDisableBufferWipe), in which case it
+        // starts at the END and every trigger is a no-op. The opt-out is exactly this one initializer:
+        // because the mark is monotone, disabling it needs no branch on the hot path and no extra field.
+        private int _wipedTo = connection.SkipBufferWipe ? bufferLength : 0;
 
         private void WipeTo(int end)
         {
@@ -989,7 +1007,11 @@ public abstract partial class SocketSet : IDisposable
         // Offset up to which the buffer is known-zeroed (or explicitly disclaimed). Unlike a receive
         // there is no payload to preserve, so this starts at 0: the whole buffer is the previous
         // tenant's. Monotone, so the two triggers compose in any order and nothing is cleared twice.
-        private int _wipedTo;
+        //
+        // ...unless the set opted out (SocketSetOptions.DangerousDisableBufferWipe), in which case it
+        // starts at the END and every trigger is a no-op. The opt-out is exactly this one initializer:
+        // because the mark is monotone, disabling it needs no branch on the hot path and no extra field.
+        private int _wipedTo = connection.SkipBufferWipe ? bufferLength : 0;
 
         private void WipeTo(int end)
         {
@@ -1111,7 +1133,11 @@ public abstract partial class SocketSet : IDisposable
         // Offset up to which the tail is known-zeroed (or explicitly disclaimed). Starts at the payload
         // end: everything below it is the peer's own bytes and is never wiped. Monotone, so the two
         // triggers compose in any order and nothing is cleared twice.
-        private int _wipedTo = bytes;
+        //
+        // ...unless the set opted out (SocketSetOptions.DangerousDisableBufferWipe), in which case it
+        // starts at the END and every trigger is a no-op. The opt-out is exactly this one initializer:
+        // because the mark is monotone, disabling it needs no branch on the hot path and no extra field.
+        private int _wipedTo = connection.SkipBufferWipe ? bufferLength : bytes;
 
         private void WipeTo(int end)
         {
@@ -1218,7 +1244,11 @@ public abstract partial class SocketSet : IDisposable
         // Offset up to which the buffer is known-zeroed (or explicitly disclaimed). Unlike a receive
         // there is no payload to preserve, so this starts at 0: the whole buffer is the previous
         // tenant's. Monotone, so the two triggers compose in any order and nothing is cleared twice.
-        private int _wipedTo;
+        //
+        // ...unless the set opted out (SocketSetOptions.DangerousDisableBufferWipe), in which case it
+        // starts at the END and every trigger is a no-op. The opt-out is exactly this one initializer:
+        // because the mark is monotone, disabling it needs no branch on the hot path and no extra field.
+        private int _wipedTo = connection.SkipBufferWipe ? bufferLength : 0;
 
         private void WipeTo(int end)
         {

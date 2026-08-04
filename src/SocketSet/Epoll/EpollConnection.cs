@@ -101,6 +101,13 @@ internal sealed class EpollConnection : OutboundConnection
     /// blocked, because a level-triggered EPOLLOUT on an idle socket would wake the loop continuously.</summary>
     public bool WantWrite;
 
+    /// <summary>True while read interest (EPOLLIN|EPOLLRDHUP) has been REMOVED from this fd because the
+    /// consumer parked the receive. Loop thread only. Unlike the completion backends, parking here is not
+    /// "skip the next arm" — epoll is LEVEL-triggered, so leaving read interest registered on a socket
+    /// with unread data returns from every <c>epoll_wait</c> immediately and spins the loop at 100%. The
+    /// interest has to actually come off the fd, which is why this flag exists at all.</summary>
+    public bool RecvParked;
+
     /// <summary>The in-flight zero-copy send (BYO pipe path), or null. When set, EPOLLOUT drives its
     /// <c>writev</c> drain rather than the pooled <see cref="Pending"/> queue. Loop thread only.</summary>
     public EpollZcSend? Zc;
@@ -116,6 +123,17 @@ internal sealed class EpollConnection : OutboundConnection
         // Marshal onto the loop thread (generation-guarded there), so this is safe from any thread
         // including from inside a callback.
         if (Volatile.Read(ref Fd) >= 0) Shard.SubmitClose(Slot, Volatile.Read(ref Generation));
+    }
+
+    /// <summary>epoll can drop read interest with one <c>EPOLL_CTL_MOD</c>; see
+    /// <see cref="Connection.SupportsReceiveParking"/> for why io_uring cannot follow.</summary>
+    public override bool SupportsReceiveParking => true;
+
+    private protected override void SubmitResumeReceive()
+    {
+        // Generation-captured marshal onto the loop, exactly like Close/Flush: re-registering interest is
+        // an epoll_ctl on a specific fd, so a resume for a re-tenanted slot must be dropped, not applied.
+        if (Volatile.Read(ref Fd) >= 0) Shard.SubmitResumeReceive(Slot, Volatile.Read(ref Generation));
     }
 
     // --- out-of-band IBufferWriter path (accumulator in OutboundConnection) ---

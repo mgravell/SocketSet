@@ -96,7 +96,23 @@ both have caused hesitation:
     replying 25 must clear exactly 5, not 0 and not the whole tail. Three of its four cells are
     disclosure vectors; the discriminating one is `ResponseBytes` set above `PayloadBytes` WITHOUT ever
     touching `RawBuffer`, which a wipe-on-first-access sails straight past. Run it on any change to the
-    context types.
+    context types. **Since 2026-08-04 every cell runs TWICE**, with
+    `SocketSetOptions.DangerousDisableBufferWipe` off and on, and the off-half asserts the INVERSE — the
+    previous tenant's bytes MUST come back, and `cleared` must be exactly 0. That is the only direction
+    in which the opt-out can be tested at all: an inert flag leaves the on-half green, and a flag that
+    leaked into the default leaves the off-half green.
+  - **`bench/verify-parking`** (added 2026-08-04; cross-platform) — that a slow consumer SLOWS THE PEER
+    instead of getting the peer killed (receive parking, `REVIEW.md` D3). Parking's failure mode is a
+    HANG, not a leak: a connection that parks and never resumes stays open, healthy-looking and silent
+    forever, and nothing in the smoke matrix can see it because every cell there has a consumer that
+    keeps up and so never parks at all. Hence `resume/completes`, whose only job is to release a stalled
+    consumer and demand all 8 MiB back byte-exact. The discriminating cell is `stalled/peer-held`: the
+    sender must STOP (two samples a second apart, so "slow" cannot pass as "stopped") while the
+    connection stays ALIVE — against the pre-parking code the sender instead runs to the 4 MiB bound and
+    the connection is dropped. `drain/control` runs the same volume past a consumer that does read, so
+    the stall cannot be general slowness. On a backend that reports it cannot park (io_uring), the rig
+    asserts the DOCUMENTED degradation rather than skipping, so a backend that quietly started or
+    stopped parking fails.
   - **`bench/verify-tlsname`** (added 2026-08-04; cross-platform) — that hostname verification actually
     RUNS, and that the `"*"` opt-out actually opts out. Its meaning lives entirely in the cells that must
     be REFUSED (`wrong.example`, `127.0.0.2`, and an unset host); the accept-cells alone would pass just

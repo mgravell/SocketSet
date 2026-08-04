@@ -376,7 +376,67 @@ Cheapest credible shape: a coarse per-shard sweep over slots with `Opened == fal
 deadline on established connections. Wants a measurement of what the sweep costs per loop iteration
 before it goes in, since it touches the hottest loop in the repo.
 
-### D3. BOUNDED 2026-08-04 (not yet cured): inbound buffering now has a limit
+### D3. CURED 2026-08-04 (same day, second pass): receive PARKING on four of five backends
+
+**Marc's call: build parking, shelve io_uring.** That split is what made this tractable in one pass — the
+four backends that arm ONE receive at a time need no cancellation at all, and io_uring, the only one that
+does, is the only one left out.
+
+**The mechanism.** `Connection` grows a three-state park machine (`Running` / `ParkRequested` / `Parked`)
+plus `TryPauseReceive()` / `ResumeReceive()`. Both inbound bridges request a park at the exact moment
+their flush goes async — which IS the pipe saying the application is behind — and resume when it drains.
+Each backend honours it at its own re-arm point: IOCP and RIO simply do not post the next
+`WSARecv`/`RIOReceive`, managed does not start the next `ReceiveAsync`, and epoll takes `EPOLLIN` off the
+fd with one `EPOLL_CTL_MOD`. The socket's receive queue then fills, the advertised window closes, and the
+**peer** slows down.
+
+**Why a CAS and not a bool**, since this is the part that would rot quietly. Park is requested on the
+receive thread; resume arrives on an arbitrary thread-pool continuation. Both orders happen. If the
+resume lands first, the state is already back to `Running`, the loop's park attempt fails, and it re-arms
+normally with nothing marshaled. If it lands second, the loop has published `Parked` and the resume
+marshals a re-arm through the backend's existing generation-guarded cross-thread queue. Exactly one
+re-arm either way. Getting this wrong does not leak or corrupt — it **hangs**, with the connection alive
+and never reading again, which is why `bench/verify-parking` has a cell whose only job is to resume.
+
+**Three things came out of building it that were not the feature:**
+
+1. **The D3 bound did not do what its own writeup said.** `PipeIoBridge.OnReceived` set `overflowed = true`
+   and then `return`ed *from inside the lock* — which returns from the METHOD, so the `if (overflowed)
+   { Overflow(); return; }` below it was unreachable. The cap therefore dropped the BYTES and left the
+   connection open, un-counted, with a silent hole in the stream, where the intent was a loud close.
+   Nothing could see it: the bound has no gate of its own, and no smoke cell ever reaches the cap. Found
+   only because parking made me read the staging path line by line. Fixed in the same change.
+2. **A `ValueTask` was consumed twice** on `DrainFlushesAsync`'s synchronous path: `flush.Result` was read
+   and then the loop `continue`d back to `await flush`. Latent, order-dependent, and fixed with a flag.
+3. **The bound fires on healthy traffic**, which strengthens the case for parking rather than merely
+   illustrating it. In the falsification run below, `verify-parking`'s CONTROL cell — a consumer that
+   *does* drain — lost its connection at 7.88 of 8.00 MiB on two backends, because a fast uploader can
+   outrun an async consumer past 4 MiB without anything being wrong. With parking on, the same cell
+   passes in 0.0s. "Blunt for a merely slow consumer" was, if anything, understated.
+
+**io_uring is not done, and says so.** `IoUringConnection.SupportsReceiveParking` returns false with the
+reasoning attached, and both bridges read it: there the `MaxInboundBufferBytes` bound remains the whole
+mechanism. That is a capability, not a silent no-op, precisely so a consumer cannot sit waiting for
+backpressure that is never coming — and `verify-parking` asserts the *documented degradation* on such a
+backend rather than skipping the cell, so a backend that quietly started or stopped parking would fail.
+
+**Gate:** `bench/verify-parking` (cross-platform), four cells per backend. Shown to fail before it was
+believed: with `TryPauseReceive` stubbed to claim success and do nothing, 8 of 12 cells failed on Windows
+— the sender ran to 4.6 MiB and the connection was DROPPED, and the resume cell reported `STALLED: 0.00
+of 8.00 MiB after resume`. Windows run, 2026-08-04: **12/12 PASS** across IOCP, RIO and Managed, all three
+holding the sender at 0.25 MiB and delivering all 8 MiB byte-exact after release. The Linux half
+(io_uring, epoll) is **UNRUN** — same shape of debt as the one this session's Windows catch-up cleared,
+and worth saying plainly rather than leaving to be discovered.
+
+**What is still open:** epoll's parked state cannot mask `EPOLLERR`/`EPOLLHUP` (the kernel reports them
+whether or not they were requested, and level-triggered, so ignoring one would spin a core). A parked
+connection that takes a HUP is therefore CLOSED rather than parked-and-waited-on. That is correct for a
+fully-dead socket, which is what HUP means, but it is a behavioural difference from the other three and
+it is written down here rather than left to be re-derived. Original writeup below.
+
+---
+
+### D3 (bounded, 2026-08-04, first pass): inbound buffering gets a limit
 
 **This is the bound, not the cure, and the distinction is deliberate.** Original writeup below.
 
@@ -500,6 +560,32 @@ pointer arithmetic, or the explicitly-named `RawBufferUnwiped` / `SendBufferUnwi
 already inside every boundary the library has. Pretending otherwise would buy false confidence. The
 thing worth stopping is an ordinary length bug quietly putting another connection's data on the wire.
 Marc's call, recorded here so nobody "hardens" it later on a misunderstanding.
+
+**AND IT IS NOW OPTIONAL, PER SET (2026-08-04, second pass; Marc: "it seems a binary 'I care about this'
+decision").** `SocketSetOptions.DangerousDisableBufferWipe` turns the whole thing off for one
+`SocketSet`. Three things about the shape are worth recording, because two of them were the only real
+design questions:
+
+- **Per-SET, not per-connection or per-listener**, and that is the point rather than a simplification.
+  The claim being made — "every handler in this deployment writes exactly what it reports, and these
+  buffers are never shared with anything I do not own" — is a statement about the whole deployment. The
+  narrower "this one hot handler has measured it" case already had an answer in the per-call
+  `RawBufferUnwiped` / `SendBufferUnwiped` accessors, and collapsing the two would blur a broad claim
+  into a local one.
+- **The implementation is ONE field initializer**, which is why the granularity question was not also a
+  cost question. TODO worried about threading a bool into `ref struct` contexts that see only a pointer
+  and a length. They already carry the `Connection`, and every wipe trigger is monotone through
+  `_wipedTo` — so seeding `_wipedTo` to the buffer END disables all of them at once, with no branch
+  anywhere on the hot path and no extra field per context.
+- **It is LOUD.** `SocketSet.ToString()` prints `wipe=on` / `wipe=off` **unconditionally**, including
+  when it says the boring thing. Printing only the unusual value would make "off" and "an old build with
+  no such option" indistinguishable, which is the silent-degradation shape this audit exists to remove.
+
+**Gated in the direction that matters.** `verify-tailwipe` now runs every cell twice, and the off-half
+asserts the INVERSE: the previous tenant's marker bytes MUST come back (`leaking=64` of 64 rounds) and
+the delta cell must clear exactly ZERO. An inert flag would leave the on-half green and fail here; a flag
+that leaked into the default would do the opposite. Windows 2026-08-04: **30/30 PASS** across IOCP, RIO
+and Managed, `cleared=5` with the wipe on and `cleared=0` with it off, plus a banner cell per posture.
 
 ---
 
@@ -662,6 +748,36 @@ Every Linux gate, re-run after each of the seven commits this audit produced:
 | `bench/verify-aspnet.sh` | **18/18 PASS** |
 | `bench/verify-timeouts` | **8/8 PASS** (new; 4 cells x 2 backends) |
 | `bench/verify-tlsname` | **6/6 PASS** (new; 3 of them refusal cells) |
+
+### WINDOWS: RUN 2026-08-04 (later the same day), for receive parking + the wipe opt-out
+
+`bench/Run-SecurityGates.ps1`, whole suite, on the tree that has parking and
+`DangerousDisableBufferWipe` in it. **ALL TEN GATES PASS.**
+
+| gate | result |
+|---|---|
+| full solution build (net10.0 + net472) | 0 errors, 3 warnings, all pre-existing (orphaned doc comments under `#if NET` on the netfx target) |
+| `bench/verify-parking` | **12/12 PASS** (new; 4 cells x IOCP/RIO/Managed) |
+| `bench/verify-tailwipe` | **30/30 PASS** (was 12; every cell now runs at both wipe postures, plus a banner cell each) |
+| `bench/Verify-BindAddress.ps1` | **6/6 PASS** |
+| `bench/Verify-BindReachability.ps1` | **9/9 PASS** |
+| `bench/verify-tlsname` | **6/6 PASS** (SNI-announce assertions still declined on SChannel, as designed) |
+| `bench/verify-timeouts` | **8/8 PASS** |
+| `bench/Verify-TlsFloor.ps1` | **PASS**, both refusal cells |
+| `bench/Verify-AspNet.ps1` | **18/18 PASS** — the one that matters most here, since `SocketSetConnection.WriteInbound` now parks |
+| `bench/Run-SmokeMatrix.ps1` | **48/48 PASS** |
+
+**The smoke matrix cannot see parking, and that is the point of the new rig.** Every cell there has a
+consumer that keeps up, so no flush goes async, so nothing ever parks — 48/48 says the change did not
+break the ordinary path, and says nothing whatever about whether parking works. Read the two results as
+answering different questions.
+
+**Hot-path cost: reasoned, not measured.** `TryParkReceive` runs once per receive completion on every
+backend, so its interlocked compare-exchange is guarded by a plain `Volatile.Read` that is false unless a
+park is actually pending — the common path is a load and a not-taken branch. That was NOT separately
+measured: the smoke matrix's throughput lines are not a scored rig (`bench/README.md` rules 4-6), and no
+six-pass A/B was run. Recorded as an argument, so that a later measurement can contradict it rather than
+have to rediscover the claim.
 
 ### WINDOWS: RUN 2026-08-04, and the Windows half of all seven commits is now clean
 

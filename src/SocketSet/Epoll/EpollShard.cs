@@ -88,6 +88,8 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // --- cross-thread queues, drained on the loop thread ---
     private readonly ConcurrentQueue<(int Fd, object? Token, SocketSets.Tls.TlsProvider? Tls)> _incoming = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation)> _closes = [];
+    // Parked receives to re-arm (Connection.ResumeReceive, from the consumer's flush continuation).
+    private readonly ConcurrentQueue<(int Slot, uint Generation)> _resumes = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation, byte[] Data, int Len)> _flush = [];
     private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)> _connects = [];
     private readonly ConcurrentQueue<(int Fd, object? Token, SocketSets.Tls.TlsProvider? Tls)> _newListeners = [];
@@ -236,16 +238,55 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // than leaving us to discover it only via a zero-length recv.
     private const uint ConnEventsRead = LibC.EPOLLIN | LibC.EPOLLRDHUP;
 
+    /// <summary>The interest mask this connection should currently carry: read unless the receive is
+    /// parked, plus write when something is blocked. One place, because there are now two independent
+    /// reasons to rewrite the mask and computing it at each call site is how they would drift apart.</summary>
+    private static uint InterestFor(EpollConnection conn)
+        => (conn.RecvParked ? 0u : ConnEventsRead) | (conn.WantWrite ? LibC.EPOLLOUT : 0u);
+
     private void ArmWrite(EpollConnection conn)
     {
         if (conn.WantWrite || conn.Fd < 0) return;
-        if (Modify(conn.Fd, ConnEventsRead | LibC.EPOLLOUT, KindConn | (uint)conn.Slot)) conn.WantWrite = true;
+        if (Modify(conn.Fd, InterestFor(conn) | LibC.EPOLLOUT, KindConn | (uint)conn.Slot)) conn.WantWrite = true;
     }
 
     private void DisarmWrite(EpollConnection conn)
     {
         if (!conn.WantWrite || conn.Fd < 0) return;
-        if (Modify(conn.Fd, ConnEventsRead, KindConn | (uint)conn.Slot)) conn.WantWrite = false;
+        if (Modify(conn.Fd, InterestFor(conn) & ~LibC.EPOLLOUT, KindConn | (uint)conn.Slot)) conn.WantWrite = false;
+    }
+
+    /// <summary>
+    /// PARKING (REVIEW.md D3), the readiness-model version: take read interest OFF the fd. The consumer is
+    /// behind, so we stop reading, the socket's receive queue fills, the advertised window closes, and the
+    /// PEER slows down instead of being dropped at a buffering cap.
+    ///
+    /// Dropping EPOLLRDHUP with EPOLLIN is not incidental. Both are level-triggered, so either one left
+    /// registered over an unread condition returns from every epoll_wait immediately and spins the loop.
+    /// EPOLLERR/EPOLLHUP cannot be masked off at all, which is why <see cref="HandleConnection"/> closes a
+    /// PARKED connection on HUP rather than trying to ignore it.
+    /// </summary>
+    private void ParkReceive(EpollConnection conn)
+    {
+        if (conn.RecvParked || conn.Fd < 0) return;
+        conn.RecvParked = true;
+        // A failed epoll_ctl on a live fd leaves read interest ON while the loop believes it is off, which
+        // is a level-triggered spin at 100% of a core. Drop the connection instead: it is the only outcome
+        // here that is neither a hang nor a burnt core, and it should not be reachable.
+        if (!Modify(conn.Fd, InterestFor(conn), KindConn | (uint)conn.Slot)) CloseClient(conn.Slot);
+    }
+
+    /// <summary>A parked receive was resumed from off-loop: put read interest back, then drain
+    /// immediately rather than waiting for the next epoll_wait to re-report the level. (Level-triggering
+    /// WOULD re-report it, so the pump is a latency saving rather than a correctness one — but it also
+    /// means the resume path is exercised end-to-end even on an idle loop.)</summary>
+    private void ResumeReceive(int slot, uint generation)
+    {
+        var conn = _conns[slot];
+        if (conn.Generation != generation || conn.Fd < 0 || conn.Closing || !conn.RecvParked) return;
+        conn.RecvParked = false;
+        if (!Modify(conn.Fd, InterestFor(conn), KindConn | (uint)conn.Slot)) { CloseClient(slot); return; }
+        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) PumpReceive(conn);
     }
 
     // =====================================================================
@@ -270,6 +311,10 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
     internal void SubmitClose(int slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
 
+    /// <summary>Marshal a parked-receive resume onto the loop thread (from
+    /// <see cref="Connection.ResumeReceive"/>, which runs on the consumer's flush continuation).</summary>
+    internal void SubmitResumeReceive(int slot, uint generation) { _resumes.Enqueue((slot, generation)); Poke(); }
+
     internal void SubmitFlush(int slot, uint generation, byte[] data, int length)
     {
         _flush.Enqueue((slot, generation, data, length));
@@ -290,6 +335,8 @@ internal sealed unsafe class EpollShard : SocketSetShard
         }
         while (_zeroCopy.TryDequeue(out var z)) StartZc(z.Slot, z.Generation, z.Zc);
         while (_closes.TryDequeue(out var x)) RequestClose(x.Slot, x.Generation);
+        // After the closes, so a close and a resume landing in the same pass resolve as "closed".
+        while (_resumes.TryDequeue(out var r)) ResumeReceive(r.Slot, r.Generation);
     }
 
     // =====================================================================
@@ -308,11 +355,14 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.Closing = false;
         conn.Connecting = false;
         conn.WantWrite = false;
+        conn.RecvParked = false; // a recycled slot must not inherit the last tenant's parked interest mask
         conn.RecvBuf = -1;
         conn.SendOffset = 0;
         conn.Pending?.Clear();
         conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock starts here
+        conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
+        conn.ResetReceiveParking();
         conn.Tls = null;
         conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
         conn.Zc = null;         // ditto — any in-flight zero-copy send was finished in CloseClient
@@ -652,6 +702,13 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // to read, and discarding it on the hangup event would truncate the last response.
         if ((events & LibC.EPOLLERR) != 0) { CloseClient(slot); return; }
 
+        // PARKED: read interest is off the fd, but EPOLLERR/EPOLLHUP are reported whether requested or
+        // not — and level-triggered, so an ignored HUP would return from every epoll_wait and spin a core.
+        // A HUP is a fully-dead socket (both directions down), so there is no buffered data worth waiting
+        // to deliver and closing is both correct and the only non-spinning answer. Anything else while
+        // parked is a write event, which is handled below as usual.
+        if (conn.RecvParked && (events & LibC.EPOLLHUP) != 0) { CloseClient(slot); return; }
+
         // kTLS: a distinct data path (SSL_read for RX / plaintext write for TX, kernel does the crypto), so
         // route it before the userspace pumps. While handshaking, either readiness event just steps the
         // handshake; once ready, EPOLLOUT drains blocked plaintext sends and EPOLLIN drives SSL_read.
@@ -659,7 +716,13 @@ internal sealed unsafe class EpollShard : SocketSetShard
         {
             if (!conn.KtlsReady) { KtlsPump(conn); return; }
             if ((events & LibC.EPOLLOUT) != 0) { PumpSend(conn); if (conn.Fd < 0 || conn.Closing) return; }
-            if ((events & (LibC.EPOLLIN | LibC.EPOLLRDHUP | LibC.EPOLLHUP)) != 0) KtlsRead(conn);
+            if (!conn.RecvParked && (events & (LibC.EPOLLIN | LibC.EPOLLRDHUP | LibC.EPOLLHUP)) != 0)
+            {
+                KtlsRead(conn);
+                // Same park point as the userspace path: honour a request raised inside the callback once
+                // the read side is quiet. Guarded on liveness because KtlsRead can tear the slot down.
+                if (conn.Fd >= 0 && !conn.Closing && conn.TryParkReceive()) ParkReceive(conn);
+            }
             return;
         }
 
@@ -670,6 +733,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
             if (conn.Fd < 0 || conn.Closing) return;
         }
 
+        if (conn.RecvParked) return; // read interest is off; only the write half above still applies
         if ((events & (LibC.EPOLLIN | LibC.EPOLLRDHUP | LibC.EPOLLHUP)) != 0) PumpReceive(conn);
     }
 
@@ -695,7 +759,8 @@ internal sealed unsafe class EpollShard : SocketSetShard
                     bridge.CommitReceive((int)n);           // advance + flush; no transport-side copy
                     if (conn.Fd < 0 || conn.Closing) return;
                     if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
-                    if (n < mem.Length) return;             // socket drained (short read)
+                    if (conn.ReceiveParkPending) break;      // consumer fell behind mid-burst
+                    if (n < mem.Length) break;              // socket drained (short read)
                     continue;
                 }
                 // n <= 0: fall through to the shared error/EOF handling below. GetMemory without Advance is
@@ -709,9 +774,10 @@ internal sealed unsafe class EpollShard : SocketSetShard
                     if (!Deliver(conn, buf, (int)n)) return;
                     if (conn.Fd < 0 || conn.Closing) return;
                     if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+                    if (conn.ReceiveParkPending) break;      // consumer fell behind mid-burst
                     // A short read means the socket buffer is drained; skip the extra syscall that would
                     // only return EAGAIN. Safe under level-triggering: if more arrives we get another wake.
-                    if (n < _recvBufSize) return;
+                    if (n < _recvBufSize) break;
                     continue;
                 }
             }
@@ -719,10 +785,17 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
             int err = Marshal.GetLastPInvokeError();
             if (err == LibC.EINTR) continue;
-            if (err == LibC.EAGAIN) return; // spurious/already-drained wake - normal, not an error
+            if (err == LibC.EAGAIN) break; // spurious/already-drained wake - normal, not an error
             CloseClient(conn.Slot);
             return;
         }
+
+        // Every exit that leaves the connection LIVE lands here (the burst ran out, the socket drained, or
+        // the consumer asked us to stop mid-burst). A park request is honoured at exactly this point: the
+        // socket is quiet right now, so taking read interest off it costs one epoll_ctl and nothing else.
+        // Draining first and parking afterwards is deliberate — parking with data already sitting in the
+        // socket buffer would be correct but pointlessly delays bytes the consumer could have had.
+        if (conn.TryParkReceive()) ParkReceive(conn);
     }
 
     /// <summary>Hand received bytes to the app and send any inline response. False if the connection died.</summary>

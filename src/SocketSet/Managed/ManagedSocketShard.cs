@@ -223,10 +223,22 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Receive
     // =====================================================================
 
+    /// <summary>A parked receive was resumed (see <c>ManagedConnection.SubmitResumeReceive</c>). Nothing
+    /// to marshal on this backend — start reading again on the caller's thread.</summary>
+    private void ResumeReceive(ManagedConnection conn) => PumpReceive(conn);
+
     private void PumpReceive(ManagedConnection conn)
     {
         while (true)
         {
+            // PARKING (REVIEW.md D3), and this ONE site covers every path that would start a receive:
+            // the accept/connect open, a synchronous completion going round again, and the async
+            // completion re-entering. The consumer asked us to stop, so do not start the next receive --
+            // the socket buffer fills, the window closes, and the peer slows down instead of being
+            // dropped at a cap. Nothing follows the CAS but this return, which is what makes it safe for
+            // the resuming thread to take over the SAEA.
+            if (conn.TryParkReceive()) return;
+
             bool pending;
             try
             {
@@ -610,6 +622,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         var conn = new ManagedConnection(this, socket, _bufferSize, _recvBufSize) { UserToken = token };
         conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;   // deadline clock
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes;
+        conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
+        // Managed never recycles a Connection (a fresh object per socket), so parking state starts clean
+        // anyway; called for uniformity, so the five backends have one visible seeding site each.
+        conn.ResetReceiveParking();
         _connections[conn] = 0;
         return conn;
     }
@@ -813,6 +829,21 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         }
 
         public override void Close() => Shard.Close(this); // idempotent (TryRemove-gated); any thread
+
+        /// <summary>One SAEA receive is in flight at a time, so parking is "do not start the next one".
+        /// See <see cref="Connection.SupportsReceiveParking"/>.</summary>
+        public override bool SupportsReceiveParking => true;
+
+        /// <summary>Unlike the other backends there is no loop thread to marshal onto — this backend IS
+        /// callback-driven — so the resume starts the receive right here, on the resuming thread. Safe
+        /// because a parked connection has no receive outstanding and nothing else is touching
+        /// <c>RecvArgs</c>: the park CAS lives at the TOP of <c>PumpReceive</c>'s loop, with nothing after
+        /// it but the return, so a thread that can observe Parked is a thread whose predecessor has
+        /// already finished with the SAEA.</summary>
+        private protected override void SubmitResumeReceive()
+        {
+            if (!Closed) Shard.ResumeReceive(this);
+        }
 
         // --- IBufferWriter<byte> (out-of-band writes; Send(span/seq) is the base sugar over these) ---
 

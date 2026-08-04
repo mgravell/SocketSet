@@ -213,6 +213,8 @@ internal sealed class IoUringShard : SocketSetShard
         conn.Pending?.Clear();
         conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock starts here
+        conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
+        conn.ResetReceiveParking();
         // Bump the generation before publishing Fd: any out-of-band send/close captured against the
         // previous tenant now mismatches and is dropped rather than misdelivered.
         Volatile.Write(ref conn.Generation, conn.Generation + 1);

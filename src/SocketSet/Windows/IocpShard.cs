@@ -120,6 +120,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // Out-of-band flushed writes (Connection.Flush from any thread): a private byte[] + length + the
     // capturing generation, sent on the loop through the normal Pending path. Generation-guarded.
     private readonly ConcurrentQueue<(uint Slot, uint Generation, byte[] Data, int Len)> _flush = [];
+    // Parked receives to re-arm (Connection.ResumeReceive, from the consumer's flush continuation).
+    // Generation-guarded for the same reason as the two above: the slot may have been re-tenanted.
+    private readonly ConcurrentQueue<(uint Slot, uint Generation)> _resumes = [];
 
     // Synchronous (FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) recv/send completions that posted no port
     // packet. Loop-thread-only. Deferred here and drained ITERATIVELY (not by calling the handler
@@ -277,6 +280,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             var conn = _conns[c.Slot - 1];
             if (conn.Generation == c.Generation && conn.Socket != 0) CloseClient(c.Slot);
         }
+
+        // After the closes, so a close and a resume landing in the same pass resolve as "closed".
+        while (_resumes.TryDequeue(out var r)) ResumeRecv(r.Slot, r.Generation);
 
         // f.Data is rented (see OutboundConnection.Flush) and owned by this loop now: return it however
         // PumpFlush exits, including the drop paths where the slot was re-tenanted.
@@ -620,6 +626,14 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         Poke();
     }
 
+    /// <summary>Marshal a parked-receive resume onto the loop thread (from <see cref="Connection.ResumeReceive"/>,
+    /// which runs on whichever thread completed the consumer's flush).</summary>
+    public override void SubmitResumeReceive(uint slot, uint generation)
+    {
+        _resumes.Enqueue((slot, generation));
+        Poke();
+    }
+
     // =====================================================================
     // Slot table
     // =====================================================================
@@ -649,6 +663,8 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         conn.IsClient = false;
         conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock
+        conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
+        conn.ResetReceiveParking();
 
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
@@ -1047,7 +1063,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         conn.Opened = true;
         Parent.DispatchAccept(ref ctx);
 
-        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmRecv(conn);
+        ArmRecvIfWanted(conn);
 
         int sb = ctx.SendBytes;
         if (leased && sb > 0 && conn.Socket != 0 && !conn.Closing) SubmitSendBuffer(conn, slot, wi, sb);
@@ -1079,7 +1095,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         conn.Opened = true;
         Parent.DispatchConnect(ref ctx);
 
-        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmRecv(conn);
+        ArmRecvIfWanted(conn);
 
         int sb = ctx.SendBytes;
         if (leased && sb > 0 && conn.Socket != 0 && !conn.Closing) SubmitSendBuffer(conn, slot, wi, sb);
@@ -1106,6 +1122,15 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
         if (keep && conn.Socket != 0 && !conn.Closing && (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
         {
+            // PARKING (REVIEW.md D3): the consumer called TryPauseReceive from inside the callback because
+            // it is behind. Simply do not post the next WSARecv — the socket's receive buffer fills, the
+            // advertised window closes, and the PEER slows down instead of being dropped at a cap.
+            //
+            // RecvArmed MUST clear here even though nothing failed. It means "an operation is outstanding"
+            // and it is what defer-recycle waits on; leaving it set would hang a subsequent close forever
+            // on a completion that is never coming. Nothing else needs guarding, because a parked slot has
+            // no in-flight receive to land on it.
+            if (conn.TryParkReceive()) { conn.RecvArmed = false; return; }
             ArmRecv(conn); // re-arm (RecvArmed remains true)
         }
         else
@@ -1431,13 +1456,35 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         // A client speaks first (ClientHello); a server emits nothing until it has seen one. Either way the
         // receive must be armed so the handshake can advance as bytes arrive.
         if (!DriveTlsHandshake(conn, slot, default)) return;
-        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmRecv(conn);
+        ArmRecvIfWanted(conn);
     }
 
 
 
 
 
+
+    /// <summary>Arm the receive unless the input half is shut, or the consumer has asked us to park
+    /// (REVIEW.md D3). The three open-a-connection paths and the handshake path all go through here so
+    /// that a <c>TryPauseReceive</c> issued from OnAccept/OnConnect is honoured rather than overrun.</summary>
+    private void ArmRecvIfWanted(IocpConnection conn)
+    {
+        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+        if (conn.TryParkReceive()) { conn.RecvArmed = false; return; }
+        ArmRecv(conn);
+    }
+
+    /// <summary>A parked receive was resumed from off-loop; re-arm it here, on the loop thread.
+    /// Generation-guarded like every other marshaled request, and gated on <c>RecvArmed</c> rather than on
+    /// the park state: that flag is the loop's own record of whether an operation is outstanding, so it is
+    /// what makes a duplicate or late resume a no-op instead of a second WSARecv on one buffer.</summary>
+    private void ResumeRecv(uint slot, uint generation)
+    {
+        var conn = _conns[slot - 1];
+        if (conn.Generation != generation || conn.Socket == 0 || conn.Closing || conn.RecvArmed) return;
+        if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+        ArmRecv(conn);
+    }
 
     private void ArmRecv(IocpConnection conn)
     {
