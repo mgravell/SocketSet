@@ -56,8 +56,25 @@ param(
     # Extra demo/responder flags applied to BOTH sides, e.g. --byo, --pipe-segment 65536. Without this a
     # change that only affects an opt-in path (zero-copy send is reached only via --byo) measures as
     # exactly nothing, and the null result looks like a property of the change rather than of the leg.
-    [string[]]$ExtraArgs = @()
+    [string[]]$ExtraArgs = @(),
+    # POST large request BODIES to /echo instead of GETting /payload, scoring goodput on the REQUEST.
+    # Implies -Bridged (/echo is a demo endpoint).
+    #
+    # ADDED 2026-08-04, and the gap it closes is the reason receive parking could not be A/B'd. Every
+    # before/after claim in this repo goes through this rig, and this rig only ever sent a SMALL request
+    # and measured a LARGE response -- so a change to the INBOUND path had no same-session A/B available
+    # at all. Run-Upload.ps1 sends bodies but measures one build, and house rule 1 forbids comparing its
+    # output across runs (two identical builds have measured 6% apart on this host, and once 58%).
+    # So the inbound half of the transport was, in the strict sense, unmeasurable: the only rig that
+    # could isolate a change could not exercise the path, and the only rig that exercised the path could
+    # not isolate a change. This switch is the intersection.
+    #
+    # Goodput is computed on the REQUEST size, so these MiB/s are NOT comparable with the response-scored
+    # tables -- same caveat as Run-Upload.ps1, for the same reason.
+    [switch]$Upload
 )
+
+if ($Upload) { $Bridged = $true }
 
 $ErrorActionPreference = "Stop"
 Add-Type -Namespace Bench -Name Power -MemberDefinition @'
@@ -85,6 +102,20 @@ $env:GOMAXPROCS = "$half"
 # a worktree behind, so New-Side clears the path before reusing it.
 $root = Join-Path ([System.IO.Path]::GetTempPath()) "ss-ab"
 $worktrees = @()
+
+# Request-body files for -Upload, one per size, generated once and reused. Zero-filled: the demo's /echo
+# does not look at the bytes, and a compressible body is not a confound here because nothing in this path
+# compresses.
+$bodyDir = Join-Path ([System.IO.Path]::GetTempPath()) "ss-ab-bodies"
+if ($Upload) {
+    New-Item -ItemType Directory -Force $bodyDir | Out-Null
+    foreach ($s in $Sizes) {
+        $f = Join-Path $bodyDir "$s.bin"
+        if (-not (Test-Path $f) -or (Get-Item $f).Length -ne $s) {
+            [System.IO.File]::WriteAllBytes($f, (New-Object byte[] $s))
+        }
+    }
+}
 
 & git -C $repo worktree prune 2>$null
 
@@ -123,7 +154,9 @@ function Measure-One([string]$exe, [int]$port, [int]$sz) {
         # the rig was talking plaintext to an https listener and reporting it as a TRANSPORT mismatch,
         # which reads as "the build is wrong" rather than "the harness cannot reach it".
         $scheme = if ($ExtraArgs -contains "--tls" -or $ExtraArgs -contains "--ktls") { "https" } else { "http" }
-        $url = if ($Bridged) { "${scheme}://127.0.0.1:$port/payload?n=$sz" } else { "${scheme}://127.0.0.1:$port/" }
+        $url = if ($Upload) { "${scheme}://127.0.0.1:$port/echo" }
+               elseif ($Bridged) { "${scheme}://127.0.0.1:$port/payload?n=$sz" }
+               else { "${scheme}://127.0.0.1:$port/" }
         if ($Bridged) {
             # Trust the banner, not the flag: refuse to measure a side whose transport is not the one asked for.
             $cfg = $null
@@ -150,7 +183,10 @@ function Measure-One([string]$exe, [int]$port, [int]$sz) {
         foreach ($phase in @($WarmupDuration, $Duration)) {
             # -k: skip certificate verification (the demo's cert is a throwaway self-signed one). Harmless
             # on the plaintext legs, and required on the TLS ones.
-            $b = Start-Process $bombardier -ArgumentList @("-k", "-c", "$Connections", "-d", $phase, "-o", "json", "-p", "r", $url) `
+            $loadArgs = @("-k", "-c", "$Connections", "-d", $phase, "-o", "json", "-p", "r")
+            if ($Upload) { $loadArgs += @("-m", "POST", "-f", (Join-Path $bodyDir "$sz.bin")) }
+            $loadArgs += $url
+            $b = Start-Process $bombardier -ArgumentList $loadArgs `
                 -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\ab.json" -RedirectStandardError "$env:TEMP\ab.jerr"
             try { $b.ProcessorAffinity = [IntPtr]$clientMask } catch { }
             $b.WaitForExit()
@@ -213,7 +249,8 @@ try {
     }
 
     Write-Host ""
-    Write-Host "=== goodput MiB/s, median of $($Repetitions - 1) scored passes ===" -ForegroundColor Cyan
+    $what = if ($Upload) { "goodput MiB/s on the REQUEST body (POST /echo)" } else { "goodput MiB/s" }
+    Write-Host "=== $what, median of $($Repetitions - 1) scored passes ===" -ForegroundColor Cyan
     Write-Host ("  {0,-9} {1,10} {2,11} {3,9}   {4}" -f "payload", "before", "after", "change", "passes (before | after)")
     foreach ($sz in $Sizes) {
         $b = Get-Median @($rb[$sz]); $a = Get-Median @($ra[$sz])

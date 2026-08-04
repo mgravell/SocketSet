@@ -161,6 +161,23 @@ app.MapGet("/stats", () => Results.Json(new
     closedEmpty = metrics?.ClosedEmpty ?? 0,
     writeFail = metrics?.WriteFail ?? 0,
     sendFalse = metrics?.SendFalse ?? 0,
+    // INBOUND BACKPRESSURE, both faces of it (REVIEW.md D3). Added 2026-08-04 because the upload A/B for
+    // receive parking could not be INTERPRETED without them: a null result means "parking is free" only
+    // if parking actually happened, and "the workload never parked" otherwise. That is house rule 2 --
+    // confirm the fast path was TAKEN, not just enabled -- and it is the same shape as the IOCP zero-copy
+    // send that looked like "no benefit at 256KB" for a week while declining every single response.
+    //
+    // receiveParks is the HEALTHY response (the peer gets slowed through the TCP window);
+    // inboundOverflow is the blunt one (the connection is dropped at MaxInboundBufferBytes). Parks with
+    // no overflows is the intended shape; overflows on a backend that can park mean the overshoot is
+    // large, or that this is io_uring, which cannot park.
+    //
+    // receiveParks COVERS --classic AND --half-pipe ONLY. In BYO mode (the default) the library's own
+    // PipeIoBridge drives the pipe and cannot reach this counter, so this reads 0 there no matter how
+    // hard it parks -- use SS_BRIDGE_STATS=1 and read PARKED= on that line instead. Do not conclude
+    // "byo never parks" from a zero here; that is the misreading this comment exists to prevent.
+    receiveParks = metrics?.ReceiveParks ?? 0,
+    inboundOverflow = metrics?.InboundOverflow ?? 0,
     // GC / memory, for the allocation-and-RSS axis (the half-pipe's "leaner machinery" claim). Read these
     // before and after a fixed load and diff: gen0 collections and allocatedBytes are the alloc signal;
     // rssBytes/gcHeapBytes are the footprint signal. GetTotalAllocatedBytes is process-wide, so drive ONE

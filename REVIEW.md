@@ -772,7 +772,22 @@ consumer that keeps up, so no flush goes async, so nothing ever parks — 48/48 
 break the ordinary path, and says nothing whatever about whether parking works. Read the two results as
 answering different questions.
 
-**Hot-path cost: reasoned, not measured.** `TryParkReceive` runs once per receive completion on every
+**Hot-path cost: MEASURED, later the same day — the "reasoned, not measured" note below is superseded.**
+Three pre-registered predictions, all confirmed; tables in `RESULTS.md`. Bare responder A/B (6 scored
+passes, interleaved worktrees): every size overlaps, and the 512 B row's 0.8% per-side spread bounds the
+cost of the unconditional additions at **under 1%**. Inbound A/B: flat at 4 KB/64 KB/1 MB. And the
+mechanism was confirmed independently of throughput — on a 1 MiB-body upload the staged second copy went
+from **3,141 to 0**, with `PARKED` equal to async flushes exactly.
+
+Two instrument gaps were found and closed in the process, and the second is the one worth remembering:
+`SocketSetTransportMetrics.ReceiveParks` is structurally blind on the BYO path (it lives in the
+AspNetCore assembly; `PipeIoBridge` cannot reach it) and read a flat **0** while that path parked ~4,300
+times in six seconds. One plausible sentence away from "BYO never parks" being written down as a finding
+— the same shape as the IOCP zero-copy send that read as "no benefit at 256KB" for a week while
+declining every response. `PARKED=` on the `SS_BRIDGE_STATS=1` line covers it now.
+
+*The original pre-measurement note follows, kept because it was an explicit claim that a measurement
+later had the chance to contradict.* `TryParkReceive` runs once per receive completion on every
 backend, so its interlocked compare-exchange is guarded by a plain `Volatile.Read` that is false unless a
 park is actually pending — the common path is a load and a not-taken branch. That was NOT separately
 measured: the smoke matrix's throughput lines are not a scored rig (`bench/README.md` rules 4-6), and no

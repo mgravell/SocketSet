@@ -122,7 +122,28 @@ equivalent.
    `REVIEW.md` D3. Gated by `bench/verify-parking` (12/12 on Windows; falsified first — a stubbed
    `TryPauseReceive` fails 8 of 12).
 
+   **MEASURED 2026-08-04 (Windows), and it cost nothing detectable.** Three pre-registered predictions,
+   all three confirmed, full tables in `RESULTS.md`. The tight bound is P1's 512 B row: under **1%**
+   (0.8% per-side spread over 6 scored passes). The inbound A/B (P3) is flat at 4 KB/64 KB/1 MB. The
+   result worth carrying, though, is the MECHANISM rather than the throughput: on a 1 MiB-body upload the
+   staged second copy went from **3,141 to 0**, with `PARKED` tracking async flushes exactly
+   (3,007 = 3,007). Categorical, so it does not depend on the noise floor.
+
+   **Two method findings came out of it, both now fixed:**
+   - **The inbound path was not A/B-able at all.** `Run-Upload.ps1` sends bodies but measures ONE build;
+     `Compare-Commits.ps1` isolates a change but only ever sent a small request and measured a large
+     response. Every prior inbound claim was therefore reasoned, not measured — not by choice, but
+     because the intersection did not exist. `Compare-Commits.ps1 -Upload` is that intersection now.
+   - **`SocketSetTransportMetrics.ReceiveParks` is blind on the BYO path** and reported a flat 0 while
+     that path was parking ~4,300 times in six seconds. "Free" and "never ran" are the same number when
+     nothing counts it. `PARKED=` on the `SS_BRIDGE_STATS=1` line covers it now, and both counters' docs
+     say what they do and do not see.
+
    **WHAT IS LEFT ON THIS ITEM:**
+   - **Nobody has measured parking while it is CONTINUOUSLY engaged.** Every rig here has a consumer that
+     keeps up, so parks sit at 0.2% of receives; the slow-consumer shape is asserted for CORRECTNESS by
+     `bench/verify-parking` and has no throughput rig at all. That is the honest gap, and it is the one
+     an adversary would sit in.
    - **io_uring parking**, deliberately shelved. `IoUringConnection.SupportsReceiveParking` returns false
      and both bridges honour it by keeping the bound, so io_uring is *bounded, not cured* — the state D3
      described for everything. The difficulty is unchanged and is the reason: its receive is MULTISHOT,

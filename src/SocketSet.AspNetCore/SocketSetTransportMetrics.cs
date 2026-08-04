@@ -45,7 +45,16 @@ public sealed class SocketSetTransportMetrics
     /// inbound pipe (REVIEW.md D3 / TODO item 1). This is the HEALTHY form of the same pressure
     /// <see cref="InboundOverflow"/> counts: parking slows the peer through the TCP window, overflow drops
     /// it. A deployment seeing parks and no overflows is working as intended; one seeing overflows on a
-    /// backend that can park is either overshooting badly or running on io_uring, which cannot.</summary>
+    /// backend that can park is either overshooting badly or running on io_uring, which cannot.
+    ///
+    /// SCOPE, AND IT IS NOT THE WHOLE PICTURE: this counts the CLASSIC and HALF-PIPE paths only, because
+    /// only those run through <c>SocketSetConnection.WriteInbound</c>. In BYO mode the transport drives
+    /// the pipe itself through the library's own <c>PipeIoBridge</c>, which cannot reach this type, so
+    /// this reads ZERO there however hard that connection is parking. Measured 2026-08-04, a 1 MiB-body
+    /// upload parked ~4,300 times in six seconds on BYO while this counter sat at 0 -- and a zero that
+    /// means "not counted" is indistinguishable from one that means "never happened", which is exactly
+    /// the trap house rule 2 exists for. BYO parks are counted inside the library and reported on the
+    /// <c>SS_BRIDGE_STATS=1</c> line as <c>PARKED=</c>.</summary>
     public long ReceiveParks => Interlocked.Read(ref _receiveParks);
 
     internal void OnReceivePark() => Interlocked.Increment(ref _receiveParks);

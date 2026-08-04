@@ -53,6 +53,188 @@ the scanner is NOT a lever). `verify-proxy.cs` (13 cells, RESP3-literate) gates 
 and Garnet; rigs quantisation-audit themselves; `TlsMode` has a refusal cell. What this box still
 cannot see: kTLS NIC offload, real-network behaviour, handshake/churn costs — the lab questions.
 
+## RECEIVE PARKING + THE WIPE OPT-OUT: what they cost (2026-08-04, Windows)
+
+**PRE-REGISTERED BEFORE THE FIRST RUN** (house rule 3), verbatim, so the outcome can falsify it rather
+than be reconciled with it. The change under test is `e5d0298` against `b8acf38`: receive parking on
+IOCP/RIO/managed/epoll, plus `SocketSetOptions.DangerousDisableBufferWipe`.
+
+**What was added to the hot path, exactly.** One `Volatile.Read` and a not-taken branch per receive
+completion (`Connection.TryParkReceive`, which guards its interlocked CAS behind that read); one extra
+field store per slot init; and, for the wipe flag, a changed field initializer in four `ref struct`
+contexts with identical default semantics. Nothing else.
+
+**P1 — the outbound sweep (`Compare-Commits.ps1`, bare responder, 512 B / 4 KB / 16 KB / 256 KB):** NO
+detectable difference at any size. The bare responder's consumer is the receive CALLBACK, which never
+calls `TryPauseReceive`, so parking is not merely idle here — it is unreachable. **Falsified if** any size
+shows disjoint ranges, which would mean the guarded CAS is not free or something unintended changed.
+
+**P2 — the bridged sweep (`-Bridged`):** same answer, and this leg matters more than P1 because parking
+lives in the BRIDGES (`PipeIoBridge`, `SocketSetConnection`), so it is reachable here. `SS_BRIDGE_STATS`
+previously put async flushes at ~0.1% of receives on a response-shaped workload, so parks should be rare
+enough to be invisible. **Falsified if** the bridged sweep separates where the bare one does not — that
+would locate the cost in the bridge rather than in `TryParkReceive`.
+
+**P3 — the INBOUND path (`Run-Upload.ps1`, 4 KB / 64 KB / 1 MB POST bodies), and this is the one with
+real risk.** This rig exists precisely because "the receive-side work (item 7: zero-copy receive +
+receive parking) would have been done blind". Parking triggers on ANY async inbound flush, so a healthy
+fast uploader could park/resume repeatedly and pay a round trip through the loop's cross-thread queue for
+it. My prediction is unchanged-or-slightly-better (the park replaces a staged second copy), but I am
+least confident here. **Falsified if** upload goodput drops materially at any size — that would say the
+trigger is too eager and wants a threshold (park only above N outstanding bytes) rather than firing on
+the first async flush.
+
+### P1 — CONFIRMED. The outbound sweep cannot tell the two commits apart
+
+`Compare-Commits.ps1 -Before b8acf38 -After e5d0298 -Repetitions 7`, bare responder, IOCP, 16 shards,
+`-c 64`, 6 scored passes, interleaved with the leading side swapped per pass. Goodput MiB/s.
+
+| payload | before (min-max of 6) | after (min-max of 6) | median change | verdict |
+|---|---|---|---|---|
+| 512 B | 153.7-154.9 | 154.2-155.1 | +0.2% | **overlapping — no delta claimed** |
+| 4 KB | 1179.0-1185.5 | 1175.4-1187.6 | −0.1% | **overlapping** |
+| 16 KB | 4454.2-4483.8 | 4462.1-4489.4 | 0.0% | **overlapping** |
+| 256 KB | 7753.6-8502.1 | 7981.8-8570.7 | −1.2% | **overlapping** (per-side spread ~9%, so −1.2% is unmeasurable here) |
+
+Every pair of ranges overlaps, so per house rule 5 no delta is quoted for any size. The 256 KB row is a
+textbook instance of the warning in `bench/README.md`: the per-side spread there is ~9%, and a −1.2%
+median difference sitting inside it is not evidence of anything. Reading it as a small regression would
+be exactly the mistake six passes exist to prevent.
+
+**This confirms the cheap half of the claim and nothing more.** The bare responder's consumer is the
+receive CALLBACK, which never calls `TryPauseReceive`, so parking here is not idle — it is unreachable.
+What P1 actually establishes is that the *unconditional* part of the change (the guarded
+`TryParkReceive` on every receive completion, the extra slot-init store, the reworked `_wipedTo`
+initializers) is free. P2 and P3 are the legs that can reach parking itself.
+
+**The strongest single statement P1 supports** is the 512 B row, where the per-side spread is **0.8%**:
+whatever the change costs on a receive-completion-dominated workload, it is under 1%.
+
+### P2 — nothing separates, but say what the instrument could actually have SEEN
+
+Same invocation with `-Bridged` (AspNetDemo through Kestrel, `/payload` GET). This leg matters more than
+P1 because parking lives in the BRIDGES, so it is reachable here.
+
+| payload | before (min-max of 6) | after (min-max of 6) | median change | per-side spread |
+|---|---|---|---|---|
+| 512 B | 121.1-128.4 | 123.2-137.6 | +4.5% | 6.0% / 11.7% |
+| 4 KB | 884.2-978.8 | 885.0-950.8 | +0.3% | 10.7% / 7.4% |
+| 16 KB | 3208.1-3372.1 | 3069.2-3482.8 | −3.0% | 5.1% / 13.5% |
+| 256 KB | 8126.5-10446.4 | 8793.4-10112.8 | −6.2% | **28.5%** / 15.0% |
+
+Every pair overlaps, so again no delta is claimed — including the eye-catching +4.5% at 512 B and −6.2%
+at 256 KB, both of which sit well inside their own spreads.
+
+**But a null result is only as strong as the resolution behind it, and this one is weak.** The bridged
+rig's per-side spread runs 5-28% against the bare rig's 0.8-9% on the same host in the same hour. At 256
+KB it spans 28.5% on the `before` side alone — a build compared against ITSELF would produce ranges that
+wide. So P2 excludes a regression larger than roughly a quarter at 256 KB and roughly a tenth at 4-16 KB,
+and it excludes nothing finer. Quoting it as "no cost on the bridged path" would be over-reading it; the
+honest form is **"this instrument could not have seen a cost smaller than its own noise, and it saw
+nothing."** The tight bound comes from P1's 512 B row, not from here.
+
+That spread is a property of the bridged leg rather than of this change (it was 6-10% when the
+per-measurement warm-up was added in 2026-07-29 and is worse at 256 KB), and it is recorded here because
+the next person tempted to run a bridged A/B for a single-digit effect should know it cannot resolve one.
+
+### THE INBOUND PATH WAS NOT A/B-ABLE AT ALL, and that had to be fixed before P3 could be asked
+
+Worth recording as a method finding in its own right, because it is a gap that had gone unnoticed through
+several sessions of inbound work. `Run-Upload.ps1` sends request BODIES but measures ONE build.
+`Compare-Commits.ps1` is the only rig that isolates a change (worktrees, same session, interleaved,
+order-swapped) but it only ever sent a SMALL request and measured a LARGE response. And house rule 1
+forbids stitching the two together across runs — two identical builds have measured 6% apart on this
+host, and once 58%.
+
+So the inbound half of the transport was, strictly, unmeasurable for a before/after: **the only rig that
+could isolate a change could not exercise the path, and the only rig that exercised the path could not
+isolate a change.** Every previous inbound claim (the D3 bound, the staged second copy, now parking) was
+therefore reasoned rather than measured — not because anyone chose to, but because the intersection did
+not exist. `Compare-Commits.ps1 -Upload` (2026-08-04) is that intersection: POST a body file to `/echo`,
+score goodput on the REQUEST, everything else about the harness unchanged.
+
+### Absolute inbound numbers on this host, post-parking (`Run-Upload.ps1`, IOCP, 12 shards, `-c 64`)
+
+Goodput MiB/s on the REQUEST body, median of 6 scored passes [min-max]; **not comparable with the
+response-scored tables above.** `kestrel` is a same-session control and the verdicts are the rig's own
+disjointness test, not eyeballed.
+
+| body | classic | byo | byo-pin | kestrel (control) | verdict vs control |
+|---|---|---|---|---|---|
+| 4 KB | 729.8 [703.2-741.8] | 726.1 [712.4-736.7] | 736.9 [728.6-747.9] | 779.4 [770.1-781.6] | **Kestrel +5.5-6.8%, all three disjoint** |
+| 64 KB | 2107.3 [2086.1-2123.0] | 2086.1 [2047.3-2142.0] | 2140.9 [2127.4-2196.0] | 2044.4 [1975.9-2080.1] | **classic +3.1%, byo-pin +4.7% (disjoint); byo overlapping** |
+| 1 MB | 1390.4 [1365.4-1412.8] | 1393.6 [1365.0-1404.4] | 1515.4 [1406.7-1562.0] | 1535.8 [1484.1-1566.2] | **Kestrel +9.3-9.5% over classic/byo; byo-pin overlapping** |
+
+The rig's original pre-registration was "Kestrel should lead, because it is the only one of the three not
+copying inbound." That holds at 4 KB and 1 MB and is **FALSIFIED at 64 KB**, where two of our three legs
+are disjointly ahead of it. Not attributed here — this is a single sweep of the current build, and
+nothing in it isolates *why*; it is recorded so the next inbound session starts from a measurement rather
+than from the old assumption. p99 at 4 KB reads exactly `1,503us` on all four legs, which is the
+documented Windows client-timer quantum (`bench/README.md` rule 8) and is not quoted as a latency result.
+
+### P3 — CONFIRMED, and the mechanism is confirmed separately from the throughput
+
+`Compare-Commits.ps1 -Upload -Sizes 4096,65536,1048576 -Repetitions 7`, POST `/echo`, goodput on the
+REQUEST body, 6 scored passes, interleaved.
+
+| body | before (min-max of 6) | after (min-max of 6) | median change | verdict |
+|---|---|---|---|---|
+| 4 KB | 699.6-735.5 | 686.8-739.2 | +0.1% | **overlapping** |
+| 64 KB | 2074.8-2214.8 | 2114.0-2224.0 | −0.0% | **overlapping** |
+| 1 MB | 1415.8-1485.5 | 1425.6-1500.4 | +0.6% | **overlapping** |
+
+Per-side spreads are 5-7%, so this excludes an inbound regression larger than about that and nothing
+finer. The pre-registered worry — that parking on the FIRST async flush would make a healthy fast
+uploader ping-pong park/resume through the loop's cross-thread queue — is not visible at any size.
+
+**A NULL RESULT HERE WAS NOT INTERPRETABLE UNTIL THE FAST PATH WAS CONFIRMED TAKEN**, and it very nearly
+was not. House rule 2 exists because "it is free" and "it never ran" produce the same number. The first
+attempt to check used `SocketSetTransportMetrics.ReceiveParks`, which reported:
+
+```
+byo      accepts=65 receiveParks=0     inboundOverflow=0
+classic  accepts=65 receiveParks=3,865 inboundOverflow=0
+```
+
+The obvious reading — "BYO never parks" — is WRONG. That counter lives in the `SocketSet.AspNetCore`
+assembly and only `SocketSetConnection.WriteInbound` (classic/half-pipe) can reach it; in BYO mode the
+library's own `PipeIoBridge` drives the pipe and cannot. The zero meant *not counted*. This is the same
+shape as the IOCP zero-copy send that read as "no benefit at 256KB" for a week while declining every
+response, and it was one plausible sentence away from being written down as a finding.
+
+**`SS_BRIDGE_STATS=1` settles it, on the same 6-second 1 MiB-body upload, and settles the mechanism too:**
+
+| build | receives | async flushes | **staged (2nd copy)** | parked |
+|---|---:|---:|---:|---:|
+| `b8acf38` (before) | 1,914,650 | 4,832 (0.3%) | **3,141 (0.4 MiB)** | n/a |
+| `e5d0298` (after) | 1,800,799 | 3,007 (0.2%) | **0** | **3,007** |
+
+Two things, and the second is the better result:
+
+1. **Parking engages heavily** — ~3,000-4,300 parks in six seconds — so the null above is a measurement
+   of parking, not of parking's absence.
+2. **The staged second copy is GONE, categorically.** Every async flush used to admit further receives
+   that were copied a second time into the staging queue; now the reads stop instead, and `PARKED` tracks
+   `async` exactly (3,007 = 3,007) while `STAGED` is zero. That is the designed behaviour observed
+   directly rather than inferred, and being categorical (0 vs 3,141) it does not depend on the
+   throughput noise floor at all.
+
+`PARKED=` was added to the bridge-stats line in this session precisely so the next person does not have
+to rediscover that the AspNetCore counter is blind on the BYO path; the counter's own doc now says so.
+
+### What these three legs do and do not license
+
+**Do:** the change is under 1% on a receive-completion-dominated workload (P1, 512 B, 0.8% spread); it is
+not visible on the inbound path at 4 KB-1 MB with parking demonstrably active (P3); and it removes the
+staged second copy outright (categorical).
+
+**Do not:** none of this measures parking under the condition it exists FOR — a consumer that is
+genuinely, persistently behind. Every leg here has a consumer that keeps up, which is why parks sit at
+0.2% of receives. The behaviour that matters under a slow consumer is asserted by `bench/verify-parking`
+(the peer is held rather than dropped, and resumes byte-exact) and is a correctness claim, not a
+throughput one. Nothing here says what parking costs when it is engaged continuously, and no rig in this
+repo currently creates that shape under load.
+
 ## WHERE THINGS STAND (2026-07-30, extended through 2026-07-31) — the consolidated view of the HTTP/Kestrel era
 
 Everything below this section is a dated investigation; this is the summary they add up to. Cells are

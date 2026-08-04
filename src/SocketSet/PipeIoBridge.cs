@@ -122,7 +122,12 @@ internal sealed class PipeIoBridge
             $"zero-copy-recv={zc:n0} ({(recv > 0 ? 100.0 * zc / recv : 0):n1}% of receives) | " +
             $"flush: sync={Interlocked.Read(ref s_flushSync):n0} async={async_:n0} ({(recv > 0 ? 100.0 * async_ / recv : 0):n1}% of receives) | " +
             $"STAGED (second copy)={staged:n0} ({(recv > 0 ? 100.0 * staged / recv : 0):n1}% of receives, " +
-            $"{Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB)");
+            $"{Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB) | " +
+            // PARKED is the number that makes STAGED interpretable: with parking working, an async flush
+            // stops the reads, so staged should fall to ZERO and parks should track asyncs. Measured
+            // 2026-08-04 on a 1 MiB-body upload: before parking, 4,832 async -> 3,141 staged; after,
+            // 4,298 async -> 0 staged. Same instrument, same workload, opposite ends of one change.
+            $"PARKED={Interlocked.Read(ref s_parks):n0}");
     }
 
     private static readonly Timer? StatsTimer = ReportStats
@@ -198,7 +203,23 @@ internal sealed class PipeIoBridge
     // callback inside the bridge's own lock.
     private bool _parked;   // guarded by _inGate; false also when the backend cannot park at all
 
-    private void ParkIfPossible() => _parked = _conn.TryPauseReceive();
+    private void ParkIfPossible()
+    {
+        _parked = _conn.TryPauseReceive();
+        if (_parked && ReportStats) Interlocked.Increment(ref s_parks);
+    }
+
+    private static long s_parks;
+
+    /// <summary>Receives parked because the consumer was behind, process-wide. Counted only under
+    /// SS_BRIDGE_STATS, like everything else on this line.
+    ///
+    /// IT EXISTS BECAUSE ITS ABSENCE ALMOST CAUSED A MISREADING (2026-08-04). The upload A/B for parking
+    /// came back as a clean null on both bridges -- but `SocketSetTransportMetrics.ReceiveParks` reads
+    /// ZERO on the BYO path, because that counter lives in the AspNetCore assembly and this bridge cannot
+    /// reach it. "Parking is free" and "parking never happened" are the same number when nothing counts
+    /// it, and telling them apart is house rule 2.</summary>
+    internal static long ParkCount => Interlocked.Read(ref s_parks);
 
     /// <summary>Whether the flush that just drained had parked the receive; clears the flag under the
     /// lock so the resume happens exactly once, then the caller raises it outside the lock.</summary>
