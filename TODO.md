@@ -47,7 +47,16 @@ equivalent.
      callbacks subsume them and nothing outside the library passes one; leaving both means two
      mechanisms with precedence rules between them. Kept for now only so the callback change could land
      without touching every signature at once.
-   - **SNI-based server certificate selection** is still open, and is NOT solved by the callback: SNI
+   - **SNI-based server certificate selection — DEFERRED 2026-08-04 (Marc: "a future idea, not currently
+     scheduled").** Not a rejection and not a blocked item: nobody is waiting on it, so it does not belong
+     in a priority list. The analysis below is kept intact because it is the expensive part and re-deriving
+     it would cost more than reading it. **What the deferral leaves live** is the containment, already
+     landed: the doc says null is ambiguous under SChannel, and `verify-tlsname` prints the announce
+     assertions as SKIPPED there. Anyone picking this up should treat "the `"*"`/IP-literal suppression
+     cells prove nothing on Windows" as the thing being bought, alongside the selection feature itself.
+     The original writeup follows.
+
+     **SNI-based server certificate selection** is still open, and is NOT solved by the callback: SNI
      and ALPN both ride in the ClientHello, and `OnServerAuthenticate` fires before the receive is even
      armed. What DID land is the read-only half: `Connection.RequestedServerName` surfaces the name the
      client asked for, from OnAccept onwards (OpenSSL only; SChannel returns null, see below).

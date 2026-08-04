@@ -706,6 +706,14 @@ Fixed with a `GateBackends.ServerSniObservable` capability flag: the announce as
 the same treatment — it said null means "the client sent none", which on Windows means "we cannot tell",
 and code routing or admitting on that difference would see every Windows client as having sent no SNI.
 
+**DECIDED: the fix is DEFERRED** (Marc, 2026-08-04: "a future idea, not currently scheduled"). Recorded
+here so the next audit does not re-raise it as an oversight. What that leaves standing is containment
+rather than a cure, and the residual is worth stating plainly: under SChannel the `"*"` and IP-literal
+cells of `verify-tlsname` assert nothing, so **SNI suppression is verified on Linux only**. The client
+side is unaffected on both providers — it is the server's ability to *observe* what it was told that is
+missing, not the client's suppression of it. Routes (b) and (c) in TODO's D1 follow-up remain the way in,
+and either would restore the discrimination as well as enabling certificate selection.
+
 ### The check that "is not automated" now is, and it has been shown to fail
 
 `bench/Verify-BindReachability.ps1` (new, 2026-08-04) closes the gap the handover called the one that
