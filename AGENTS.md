@@ -3,6 +3,8 @@
 `README.md` is the user-facing doc. This file is for whoever picks the work up — human or agent — and
 exists because the important context is *not* in the code.
 
+This library makes extensive and unapologetic use of agent assistance under human guidance and oversight.
+
 ## Read these before doing anything
 
 | file | why |
