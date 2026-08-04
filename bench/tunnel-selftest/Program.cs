@@ -30,6 +30,11 @@ if (surface is "mux" or "mux-tls")
         // TLS lives in the TRANSPORT (SocketSet's OpenSSL, pinned trust, verification on); config.Ssl
         // stays false by contract -- the connect path throws if both are set.
         options.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
+        // TargetHost is mandatory since 2026-08-04 (it used to default to null, which silently disabled
+        // the hostname check). We dial an IP literal, which the provider verifies against the
+        // certificate's iPAddress SAN rather than its DNS names -- the demo cert carries the loopback
+        // address for exactly this.
+        options.TlsClient.TargetHost = target;
     }
     // The END-TO-END cell: a real ConnectionMultiplexer whose IO core is SocketSet, via
     // Tunnel.ConnectTransportAsync -> SocketSetTunnel -> PhysicalConnection transport mode (push-feed).
@@ -67,6 +72,7 @@ switch (surface)
         // The SE.Redis-to-managed-Redis shape: TLS client dial, trust pinned to the server's cert,
         // verification ON. ConnectAsync completes only after the handshake (the OnConnect contract).
         options.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
+        options.TlsClient.TargetHost = target; // mandatory; an IP literal verifies against iPAddress SANs
         endpoint = new IPEndPoint(IPAddress.Parse(target), port);
         break;
     case "uds":

@@ -94,7 +94,24 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
     public override TlsFilter CreateClientFilter(TlsClientOptions options)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        return new SChannelTlsFilter(this, client: true, options.TargetHost, BuildAlpnBuffer(options.AlpnProtocols));
+        // SNI name and VERIFY name are no longer the same string, so they are computed once here and the
+        // filter is handed both. See OpenSslTlsProvider.ApplyPeerName for the three cases; the split
+        // matters most for an IP literal, which must not be sent as SNI (RFC 6066) but must still be
+        // verified — against iPAddress SANs, which is what X509Certificate2.MatchesHostname does when the
+        // string parses as an address.
+        string? host = options.TargetHost;
+        if (string.IsNullOrWhiteSpace(host))
+            throw new ArgumentException(
+                "TargetHost is required. Pass the name being dialled so the certificate can be verified "
+                + $"against it, or \"{TlsClientAuthenticateContext.AnyHost}\" to state explicitly that no "
+                + "name check is wanted.", nameof(options));
+
+        bool anyHost = host == TlsClientAuthenticateContext.AnyHost;
+        bool isIp = !anyHost && IPAddress.TryParse(host, out _);
+        string? sniName = anyHost || isIp ? null : host;   // no SNI for "*" or for an address literal
+        string? verifyName = anyHost ? null : host;        // null == do not check the name
+
+        return new SChannelTlsFilter(this, client: true, sniName, verifyName, BuildAlpnBuffer(options.AlpnProtocols));
     }
 
     public override TlsFilter CreateServerFilter(TlsServerOptions options)
@@ -102,7 +119,7 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_serverCred == null)
             throw new InvalidOperationException("This provider has no server certificate; it is client-only.");
-        return new SChannelTlsFilter(this, client: false, targetHost: null, BuildAlpnBuffer(options.AlpnProtocols));
+        return new SChannelTlsFilter(this, client: false, sniName: null, verifyName: null, BuildAlpnBuffer(options.AlpnProtocols));
     }
 
     /// <summary>
@@ -160,7 +177,10 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
             return false;
         }
 
-        if (host is { Length: > 0 } && !remote.MatchesHostname(host))
+        // A null host here is the "*" opt-out, resolved in CreateClientFilter, NOT an unset field: an
+        // unset TargetHost is refused before a filter is ever built. MatchesHostname handles an IP
+        // literal by matching iPAddress SANs, which is why the IP case needs no separate branch.
+        if (host is not null && !remote.MatchesHostname(host))
         {
             reason = $"certificate is not valid for host '{host}'";
             return false;

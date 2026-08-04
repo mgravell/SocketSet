@@ -184,6 +184,115 @@ public abstract partial class SocketSet : IDisposable
         Debug.WriteLine(exception.Message);
     }
 
+    // =====================================================================
+    // TLS negotiation: whether, and how (2026-08-04; see REVIEW.md D1)
+    // =====================================================================
+
+    /// <summary>
+    /// Should this OUTBOUND connection use TLS, and with what? Runs on the owning loop thread once per
+    /// connection, immediately before the handshake would begin, with the connection (and therefore its
+    /// <see cref="Connection.UserToken"/>) already live.
+    ///
+    /// The default reproduces the engine-level configuration exactly: it returns whether
+    /// <see cref="SocketSetOptions.TlsMode"/> enables the client direction, with the context pre-seeded
+    /// from <see cref="SocketSetOptions.Tls"/> and <see cref="SocketSetOptions.TlsClient"/>. So an
+    /// application that never overrides this behaves as it always did.
+    ///
+    /// Override it when one engine serves more than one TLS posture — which is the normal case for a
+    /// client, since a single engine dials many endpoints and each needs its own
+    /// <see cref="Tls.TlsClientAuthenticateContext.TargetHost"/>. Key off
+    /// <c>ctx.Connection.UserToken</c>.
+    /// </summary>
+    protected internal virtual bool OnClientAuthenticate(ref Tls.TlsClientAuthenticateContext ctx)
+        => Options.TlsEnabled(isClient: true);
+
+    /// <summary>Inbound twin of <see cref="OnClientAuthenticate"/>. Default: the engine-level
+    /// configuration, exactly as before.</summary>
+    protected internal virtual bool OnServerAuthenticate(ref Tls.TlsServerAuthenticateContext ctx)
+        => Options.TlsEnabled(isClient: false);
+
+    /// <summary>
+    /// Run <see cref="OnClientAuthenticate"/> and validate what it asked for. THE SINGLE ENFORCEMENT
+    /// POINT for the client-side TLS posture: every backend routes through here, so the rules below hold
+    /// on all five without any of them having to remember them.
+    ///
+    /// FAILS CLOSED, in all three ways it can fail. A callback that throws, one that returns true
+    /// without a provider, and one that returns true without naming a host all yield
+    /// <see cref="Tls.TlsResolution.Deny"/>, and the caller drops the connection. None of them fall back
+    /// to plaintext: a silent downgrade is precisely the failure this whole item exists to remove.
+    /// </summary>
+    internal Tls.TlsResolution ResolveClientTls(Connection conn)
+    {
+        var ctx = new Tls.TlsClientAuthenticateContext(conn, conn.TlsOverride ?? Options.Tls, Options.TlsClient);
+        bool wanted;
+        try { wanted = OnClientAuthenticate(ref ctx); }
+        catch (Exception ex) { return DenyTls(conn, nameof(OnClientAuthenticate), ex); }
+
+        if (!wanted) return Tls.TlsResolution.None;
+        if (ctx.Provider is not { } provider)
+            return DenyTls(conn, nameof(OnClientAuthenticate), new InvalidOperationException(
+                "returned true but left Provider null, so there is no engine to hand the connection to."));
+
+        // THE HOST IS MANDATORY. Until 2026-08-04 a null host silently disabled hostname verification on
+        // both providers while chain verification carried on, so the connection accepted any certificate
+        // a trusted CA had ever issued, for any name. Refusing is the only safe reading of "unset".
+        if (string.IsNullOrWhiteSpace(ctx.TargetHost))
+            return DenyTls(conn, nameof(OnClientAuthenticate), new InvalidOperationException(
+                "returned true without a TargetHost. Set the name being dialled so the certificate can be "
+                + $"verified against it, or \"{Tls.TlsClientAuthenticateContext.AnyHost}\" to state "
+                + "explicitly that no name check is wanted."));
+
+        // Reuse the engine's options object unless the callback actually varied something, so the
+        // common single-posture engine allocates nothing per connection.
+        var opts = Options.TlsClient;
+        if (!string.Equals(ctx.TargetHost, opts.TargetHost, StringComparison.Ordinal)
+            || !ReferenceEquals(ctx.AlpnProtocols, opts.AlpnProtocols)
+            || ctx.AllowKernelOffload != opts.AllowKernelOffload)
+        {
+            opts = new Tls.TlsClientOptions
+            {
+                TargetHost = ctx.TargetHost,
+                AlpnProtocols = ctx.AlpnProtocols,
+                AllowKernelOffload = ctx.AllowKernelOffload,
+            };
+        }
+        return Tls.TlsResolution.ForClient(provider, opts, ctx.AllowKernelOffload);
+    }
+
+    /// <summary>Server-side twin of <see cref="ResolveClientTls"/>. No host requirement here: a server is
+    /// told a name by SNI rather than choosing one.</summary>
+    internal Tls.TlsResolution ResolveServerTls(Connection conn)
+    {
+        var ctx = new Tls.TlsServerAuthenticateContext(conn, conn.TlsOverride ?? Options.Tls, Options.TlsServer);
+        bool wanted;
+        try { wanted = OnServerAuthenticate(ref ctx); }
+        catch (Exception ex) { return DenyTls(conn, nameof(OnServerAuthenticate), ex); }
+
+        if (!wanted) return Tls.TlsResolution.None;
+        if (ctx.Provider is not { } provider)
+            return DenyTls(conn, nameof(OnServerAuthenticate), new InvalidOperationException(
+                "returned true but left Provider null, so there is no engine to hand the connection to."));
+
+        var opts = Options.TlsServer;
+        if (!ReferenceEquals(ctx.AlpnProtocols, opts.AlpnProtocols)
+            || ctx.AllowKernelOffload != opts.AllowKernelOffload)
+        {
+            opts = new Tls.TlsServerOptions
+            {
+                AlpnProtocols = ctx.AlpnProtocols,
+                AllowKernelOffload = ctx.AllowKernelOffload,
+            };
+        }
+        return Tls.TlsResolution.ForServer(provider, opts, ctx.AllowKernelOffload);
+    }
+
+    private Tls.TlsResolution DenyTls(Connection conn, string callback, Exception ex)
+    {
+        try { OnWorkerFaulted(new InvalidOperationException($"{callback}: connection refused.", ex)); }
+        catch (Exception inner) { Debug.WriteLine(inner.Message); }
+        return Tls.TlsResolution.Deny;
+    }
+
     internal SocketSetShard RoundRobin()
     {
         var arr = _shards;

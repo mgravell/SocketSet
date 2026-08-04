@@ -40,7 +40,8 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
 
     private readonly SChannelTlsProvider _owner;
     private readonly bool _client;
-    private readonly string? _targetHost; // SNI + the name we validate the certificate against
+    private readonly string? _sniName;    // sent as SNI; null for "*" and for an IP literal (RFC 6066)
+    private readonly string? _verifyName; // validated against the certificate; null == "*", check skipped
 
     // A ready-made SECBUFFER_APPLICATION_PROTOCOLS payload (header + RFC 7301 list), or null for no ALPN.
     // Built by the provider so it is shaped once per configuration rather than once per handshake step.
@@ -60,11 +61,12 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
 
     private SecPkgContextStreamSizes _sizes;
 
-    internal SChannelTlsFilter(SChannelTlsProvider owner, bool client, string? targetHost, byte[]? alpn)
+    internal SChannelTlsFilter(SChannelTlsProvider owner, bool client, string? sniName, string? verifyName, byte[]? alpn)
     {
         _owner = owner;
         _client = client;
-        _targetHost = targetHost;
+        _sniName = sniName;
+        _verifyName = verifyName;
         _alpn = alpn;
         _carry = ArrayPool<byte>.Shared.Rent(InitialCarry);
     }
@@ -140,7 +142,7 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
         fixed (byte* carry = _carry)
         fixed (byte* alpn = _alpn) // null array fixes to a null pointer; only read when sendAlpn
         fixed (SecHandle* ctx = &_ctx)
-        fixed (char* host = _targetHost) // a null string fixes to a null pointer: no SNI, no target name
+        fixed (char* host = _sniName) // a null string fixes to a null pointer: no SNI, no target name
         {
             int inCount = 0;
             if (hadCarry)
@@ -213,7 +215,7 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
         {
             using var remote = GetRemoteCertificate();
             // No alert to send: the handshake itself succeeded — we are rejecting the peer.
-            if (!_owner.ValidateRemote(remote, _targetHost, out string reason)) return Reject(reason);
+            if (!_owner.ValidateRemote(remote, _verifyName, out string reason)) return Reject(reason);
         }
 
         HandshakeComplete = true;

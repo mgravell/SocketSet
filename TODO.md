@@ -30,7 +30,29 @@ equivalent.
 
 ### The open items, in priority order (full reasoning in `REVIEW.md` D1-D6)
 
-1. **`TlsClientOptions.TargetHost` is per-ENGINE but hostname verification needs it per-CONNECTION.**
+1. ~~**`TlsClientOptions.TargetHost` is per-ENGINE but hostname verification needs it per-CONNECTION.**~~
+   **RESOLVED 2026-08-04** via Marc's `OnClientAuthenticate`/`OnServerAuthenticate` callbacks: the engine
+   is ASKED per connection rather than carrying config through `Connect`, which is the only shape that
+   works for a tunnel funnelling many endpoints through one engine. Host is now mandatory, `"*"` is the
+   explicit opt-out (and, like the BCL, sends no SNI). Gated by `bench/verify-tlsname`. Full writeup,
+   including a confident claim of mine that measurement falsified, in `REVIEW.md` D1.
+
+   **Follow-ups it leaves:**
+   - **Split announce from verify** (Marc): `"*"` currently means both "no SNI" and "no name check",
+     so "do not tell the server who I expect, but DO check what comes back" is inexpressible. The
+     machinery exists (SChannel already carries `sniName`/`verifyName` separately; the IP path already
+     announces nothing while verifying) — it is a second field, not new plumbing.
+   - **Remove the now-redundant per-connect/per-listen `TlsProvider?` parameters** on
+     `Listen`/`Connect`/`ConnectShard`/`ListenHandle` and the `Connection.TlsOverride` they feed. The
+     callbacks subsume them and nothing outside the library passes one; leaving both means two
+     mechanisms with precedence rules between them. Kept for now only so the callback change could land
+     without touching every signature at once.
+   - **SNI-based server certificate selection** is still open and is NOT solved by this: the callback
+     necessarily fires before the handshake, and SNI arrives during it. Needs a real
+     `SSL_CTX_set_tlsext_servername_callback` / SChannel equivalent inside the provider.
+
+   ORIGINAL NOTE (kept for context):
+   **`TlsClientOptions.TargetHost` is per-ENGINE but hostname verification needs it per-CONNECTION.**
    Null host means NO name check on either provider, and it defaults to null, so the posture is "any
    certificate from a trusted CA, for any name". The tunnel funnels many endpoints through one engine
    by design (2026-08-03's anchor shape), so it structurally cannot set this today, and both TLS client

@@ -52,6 +52,10 @@ if (tunnel)
     if (tls)
     {
         ss.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
+        // Mandatory since 2026-08-04. Note this ALSO closes a fairness gap in this very A/B: the
+        // SslStream control leg below sets config.SslHost and pins by thumbprint, so until now the two
+        // legs were not running the same verification posture and ours was doing strictly less work.
+        ss.TlsClient.TargetHost = host;
     }
     config.Tunnel = counting = new CountingTunnel(new SocketSetTunnel(ss));
 }

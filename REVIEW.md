@@ -203,7 +203,67 @@ not" is not a reason to leave a use-after-recycle reachable.
 These are not left out because they are small. They are left out because each one has a decision in it
 that is Marc's to make, and guessing would bake the wrong answer into the API or into a gate.
 
-### D1. `TlsClientOptions.TargetHost` is per-ENGINE, but hostname verification needs it per-CONNECTION
+### D1. RESOLVED 2026-08-04: authenticate callbacks, and the host is now mandatory
+
+**Superseded by the implementation below.** The original writeup follows, because the diagnosis stands
+even though the fix I proposed was the wrong shape.
+
+**What I proposed was to move `TlsClientOptions` onto `Connect`. Marc's answer was better:** ask the
+engine instead. `bool OnClientAuthenticate(ref TlsClientAuthenticateContext)` / `OnServerAuthenticate`
+fire once per connection on the loop thread, immediately before the handshake, and answer *whether* TLS
+and *how* in one place. That works where a `Connect` overload could not: the tunnel deliberately funnels
+many endpoints through one engine, so no caller-supplied parameter can name the host at dial time, but a
+callback CAN key off `Connection.UserToken` (which, for the tunnel, IS the transport that knows its own
+endpoint). It is also lazy, and it collapses a decision previously spread across a constructor, an
+options object and a call parameter.
+
+Git history confirms this was a miss rather than an old design: `f55d6f8` (connect granularity) landed
+2026-08-03 and `51a767f` (listen) 2026-08-04. The **provider** moved to per-connection; the options
+object holding `TargetHost` did not.
+
+Also relevant, and a genuine disjoint that justifies two context types rather than one: there is no
+`TargetHost` on the server side at all. A server is TOLD a name by SNI rather than choosing one.
+
+**The host is now mandatory, and `"*"` is the explicit opt-out.** Null, empty or whitespace is REFUSED;
+`"*"` means no SNI and no name check. `"*"` cannot collide with a real target (not a legal DNS label,
+not an IP literal, not legal as an SNI `server_name`), so it reads as a decision where null read as an
+oversight. On the wire this MIRRORS the BCL: `SslClientAuthenticationOptions.TargetHost` unset sends no
+SNI, and neither does `"*"`. It improves on the BCL only in that the *validation* opt-out is a named
+value rather than something you express by writing a `return true` callback.
+
+**Fails closed in all three directions.** A callback that throws, one that returns true without a
+provider, and one that returns true without a host all yield `TlsResolution.Deny`, and the backend drops
+the connection. None fall back to plaintext: a silent downgrade is the exact failure being removed.
+`ResolveClientTls` on `SocketSet` is the single enforcement point, so all five backends inherit it.
+
+**A CLAIM I MADE AND THEN FALSIFIED, recorded because it drove a design decision.** I stated confidently,
+twice, that `SSL_set1_host("127.0.0.1")` matches dNSName only and would therefore FAIL against our demo
+certificate's iPAddress SAN, and that this was "on the critical path" for the mandatory-host change.
+Measured 2026-08-04 with a purpose-built pair of certificates: **false.** On OpenSSL 3.x,
+`SSL_set1_host` accepts a certificate whose ONLY SAN is `IP:127.0.0.1` when dialling `127.0.0.1`, and
+refuses it when dialling `127.0.0.2`. It is genuinely matching the address, not skipping the check. The
+`X509_VERIFY_PARAM_set1_ip_asc` branch therefore fixes no observed break.
+
+It is kept, on the narrower ground that it is the DOCUMENTED API (`X509_check_host` is specified over
+dNSName; `X509_check_ip` is the address one), so the observed behaviour is undocumented and need not
+hold on another build. That is a weaker justification than a measurement and is labelled as such in the
+code — the evidence needed to delete it is already written down. The SNI half of the IP branch stands
+independently: RFC 6066 §3 forbids an address literal in `server_name`.
+
+**Gated** by `bench/verify-tlsname`, whose discriminating cells are the ones that must be REFUSED:
+`wrong.example` (name check runs), `127.0.0.2` (it runs for addresses too, rather than being skipped for
+anything IP-shaped), and `""` (fails closed at configuration time). The accept-cells alone would pass
+just as happily against the pre-fix code.
+
+**Known gap, raised by Marc:** "*" conflates two axes — announce (SNI) and verify. There is no way to say
+"do not tell the server who I expect, but do check what comes back against name X". The machinery
+already exists internally (SChannel carries `sniName`/`verifyName` separately, and the IP path already
+announces nothing while still verifying); exposing it is a second field, not new plumbing. Recorded in
+TODO rather than built, since the case is real but niche.
+
+---
+
+### D1 (original). `TlsClientOptions.TargetHost` is per-ENGINE, but hostname verification needs it per-CONNECTION
 
 **This is the one to look at first.**
 

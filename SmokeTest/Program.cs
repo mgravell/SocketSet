@@ -103,6 +103,10 @@ for (int i = 0; i < args.Length; i++)
             // Wrap connections in the no-crypto identity TLS filter — a wiring/plumbing test (a real
             // 1-RTT handshake gate + decrypt-in/encrypt-out, but the "crypto" is a passthrough copy).
             options.Tls = new IdentityTlsProvider();
+            // The identity provider is a pass-through test double with no certificates, so there is no
+            // name to check: say that explicitly rather than leaving TargetHost unset (which is now
+            // refused). Also gives the smoke matrix free coverage of the AnyHost path.
+            options.TlsClient.TargetHost = SocketSets.Tls.TlsClientAuthenticateContext.AnyHost;
             break;
 
 #if NET

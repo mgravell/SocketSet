@@ -571,19 +571,17 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // kTLS (kernel offload) and userspace TLS are the two shapes; pick per provider capability + option.
         // A kTLS connection's open is deferred to KtlsComplete, a userspace one to DriveTlsHandshake's
         // FireOpen re-entry — so both branches return here without firing OnAccept/OnConnect.
-        var engagedTls = isClient
-            ? Parent.Options.ResolveClientTls(conn.TlsOverride)
-            : Parent.Options.ResolveServerTls(conn.TlsOverride);
-        if (engagedTls is not null && conn.Tls is null && conn.KtlsSsl == 0)
+        var engagedTls = isClient ? Parent.ResolveClientTls(conn) : Parent.ResolveServerTls(conn);
+        // Refused (callback threw, or asked for TLS it could not describe) drops the connection rather
+        // than falling back to plaintext: a silent downgrade is the failure this whole path removes.
+        if (engagedTls.Refused) { CloseClient(conn.Slot); return; }
+        if (engagedTls.Enabled && conn.Tls is null && conn.KtlsSsl == 0)
         {
-            // TlsClient/TlsServer are distinct types (no common base), so read the flag per side.
-            bool allowKernel = isClient
-                ? Parent.Options.TlsClient.AllowKernelOffload
-                : Parent.Options.TlsServer.AllowKernelOffload;
-            if (allowKernel && engagedTls is OpenSslTlsProvider { SupportsKernelOffload: true } kop)
-                StartKtls(conn, isClient, kop);   // OpenSSL owns the fd; readiness-driven; kernel does crypto
+            if (engagedTls.AllowKernelOffload
+                && engagedTls.Provider is OpenSslTlsProvider { SupportsKernelOffload: true } kop)
+                StartKtls(conn, isClient, kop, engagedTls); // OpenSSL owns the fd; kernel does the crypto
             else
-                BeginTls(conn, isClient, engagedTls); // userspace TLS via memory BIOs
+                BeginTls(conn, isClient, engagedTls);       // userspace TLS via memory BIOs
             return;
         }
 
@@ -882,10 +880,9 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // that ordering for every caller: it appends to Pending whenever anything is queued ahead of it.
     // =====================================================================
 
-    private void BeginTls(EpollConnection conn, bool isClient, SocketSets.Tls.TlsProvider? provider = null)
+    private void BeginTls(EpollConnection conn, bool isClient, in SocketSets.Tls.TlsResolution tls)
     {
-        var opts = Parent.Options;
-        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : (provider ?? opts.Tls!).CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? tls.Provider!.CreateClientFilter(tls.Client!) : tls.Provider!.CreateServerFilter(tls.Server!);
         // A client speaks first (ClientHello); a server emits nothing until it has seen one. The receive
         // is already armed by the caller, so the handshake advances as bytes arrive.
         DriveTlsHandshake(conn, default);
@@ -1087,14 +1084,15 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
     // Stand up the kTLS engine at open. The fd is already non-blocking and already registered for EPOLLIN
     // (ConnEventsRead), so the handshake is driven purely by readiness — no extra arming for WANT_READ.
-    private void StartKtls(EpollConnection conn, bool client, OpenSslTlsProvider prov)
+    private void StartKtls(EpollConnection conn, bool client, OpenSslTlsProvider prov,
+                           in SocketSets.Tls.TlsResolution tls)
     {
         conn.IsClient = client;
         conn.KtlsRecv ??= new byte[_recvBufSize];
         // Client supplies TargetHost (SNI/verify); ALPN comes from whichever side's options apply.
         conn.KtlsSsl = prov.CreateKernelSsl(conn.Fd, client,
-            client ? Parent.Options.TlsClient.TargetHost : null,
-            client ? Parent.Options.TlsClient.AlpnProtocols : Parent.Options.TlsServer.AlpnProtocols);
+            client ? tls.Client!.TargetHost : null,
+            client ? tls.Client!.AlpnProtocols : tls.Server!.AlpnProtocols);
         KtlsPump(conn);
     }
 

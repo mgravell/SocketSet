@@ -114,7 +114,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             var conn = Register(sock, args.DefaultToken);
             conn.TlsOverride = args.Tls; // fresh connection object; seed the LISTENER's provider
 
-            if (Parent.Options.ResolveServerTls(conn.TlsOverride) is { } serverTls)
+            var serverTls = Parent.ResolveServerTls(conn);
+            if (serverTls.Refused) { Close(conn); return true; }   // never downgrade to plaintext
+            if (serverTls.Enabled)
             {
                 // TLS: defer OnAccept until the handshake completes (see BeginTls / FireTlsOpen).
                 BeginTls(conn, isClient: false, serverTls);
@@ -173,7 +175,9 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         conn.TlsOverride = args.Tls; // fresh connection object (managed never recycles); seed the per-connect provider
         args.Dispose(); // connect SAEA no longer needed
 
-        if (Parent.Options.ResolveClientTls(conn.TlsOverride) is { } clientTls)
+        var clientTls = Parent.ResolveClientTls(conn);
+        if (clientTls.Refused) { Close(conn); return; }         // never downgrade to plaintext
+        if (clientTls.Enabled)
         {
             // TLS: defer OnConnect until the handshake completes; the client speaks first (ClientHello).
             BeginTls(conn, isClient: true, clientTls);
@@ -438,11 +442,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
 
     // Attach a fresh TLS engine to a just-registered connection and kick the handshake. OnConnect/OnAccept
     // are NOT fired here — they fire from FireTlsOpen once the handshake completes.
-    private void BeginTls(ManagedConnection conn, bool isClient, SocketSets.Tls.TlsProvider? provider = null)
+    private void BeginTls(ManagedConnection conn, bool isClient, in SocketSets.Tls.TlsResolution tls)
     {
-        var opts = Parent.Options;
         conn.IsClient = isClient;
-        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : (provider ?? opts.Tls!).CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? tls.Provider!.CreateClientFilter(tls.Client!) : tls.Provider!.CreateServerFilter(tls.Server!);
         conn.Plain = new PooledBufferWriter(_bufferSize);  // decrypt target (data phase)
         conn.Cipher = new PooledBufferWriter(_bufferSize); // encrypt scratch
         conn.Ctrl = new PooledBufferWriter(64);            // handshake / control-record output

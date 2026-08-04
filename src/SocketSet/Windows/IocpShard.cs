@@ -1023,7 +1023,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
         // TLS: the app must not see this connection until the handshake completes, so OnAccept is deferred
         // to FireTlsOpen and everything below is skipped.
-        if (Parent.Options.ResolveServerTls(conn.TlsOverride) is { } serverTls) { BeginTls(conn, slot, isClient: false, serverTls); return; }
+        var serverTls = Parent.ResolveServerTls(conn);
+        if (serverTls.Refused) { CloseClient(slot); return; }   // never downgrade to plaintext
+        if (serverTls.Enabled) { BeginTls(conn, slot, isClient: false, serverTls); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
@@ -1053,7 +1055,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         conn.RecvBuf = ri;
 
         // TLS: OnConnect is deferred to FireTlsOpen (the client speaks first — see BeginTls).
-        if (Parent.Options.ResolveClientTls(conn.TlsOverride) is { } clientTls) { BeginTls(conn, slot, isClient: true, clientTls); return; }
+        var clientTls = Parent.ResolveClientTls(conn);
+        if (clientTls.Refused) { CloseClient(slot); return; }   // never downgrade to plaintext
+        if (clientTls.Enabled) { BeginTls(conn, slot, isClient: true, clientTls); return; }
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
@@ -1404,11 +1408,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
     // Attach a fresh engine to a just-adopted connection and start the handshake. OnAccept/OnConnect are
     // NOT fired here — they fire from FireTlsOpen once the handshake completes.
-    private void BeginTls(IocpConnection conn, uint slot, bool isClient, SocketSets.Tls.TlsProvider? provider = null)
+    private void BeginTls(IocpConnection conn, uint slot, bool isClient, in SocketSets.Tls.TlsResolution tls)
     {
-        var opts = Parent.Options;
         conn.IsClient = isClient;
-        conn.Tls = isClient ? (provider ?? opts.Tls!).CreateClientFilter(opts.TlsClient) : (provider ?? opts.Tls!).CreateServerFilter(opts.TlsServer);
+        conn.Tls = isClient ? tls.Provider!.CreateClientFilter(tls.Client!) : tls.Provider!.CreateServerFilter(tls.Server!);
 
         // A client speaks first (ClientHello); a server emits nothing until it has seen one. Either way the
         // receive must be armed so the handshake can advance as bytes arrive.

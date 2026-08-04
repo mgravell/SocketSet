@@ -12,19 +12,13 @@ public class SocketSetOptions
     /// Ignored when <see cref="Tls"/> is null.</summary>
     public TlsMode TlsMode { get; set; } = TlsMode.Both;
 
-    /// <summary>The per-direction TLS gate every backend consults at its accept/connect engage site.
-    /// One helper rather than nine hand-written conditions, so a backend cannot drift.</summary>
-    /// <summary>Resolve the CLIENT-side provider for one outbound connection: an explicit per-connect
-    /// provider wins outright (it IS the direction signal — TlsMode does not gate it); otherwise the
-    /// engine-level provider under the usual TlsMode rules.</summary>
-    internal SocketSets.Tls.TlsProvider? ResolveClientTls(SocketSets.Tls.TlsProvider? perConnect)
-        => perConnect ?? (TlsEnabled(isClient: true) ? Tls : null);
+    // ResolveClientTls / ResolveServerTls used to live here, returning a bare provider. They moved to
+    // SocketSet (2026-08-04) and grew into the OnClientAuthenticate / OnServerAuthenticate callbacks,
+    // because "which provider" turned out to be only half the decision: TargetHost has to be resolved at
+    // the same moment and per connection, and an options object on the ENGINE structurally cannot do
+    // that for an engine that dials many endpoints. See REVIEW.md D1.
 
-    /// <summary>Server-side twin of <see cref="ResolveClientTls"/>: an explicit per-LISTEN provider
-    /// wins outright; otherwise the engine-level provider under TlsMode rules.</summary>
-    internal SocketSets.Tls.TlsProvider? ResolveServerTls(SocketSets.Tls.TlsProvider? perListen)
-        => perListen ?? (TlsEnabled(isClient: false) ? Tls : null);
-
+    /// <summary>The per-direction TLS gate, still the DEFAULT answer the authenticate callbacks give.</summary>
     internal bool TlsEnabled(bool isClient)
         => Tls is not null && (TlsMode & (isClient ? TlsMode.Connect : TlsMode.Accept)) != 0;
 

@@ -107,6 +107,14 @@ internal static unsafe partial class NativeOpenSsl
     [LibraryImport(Ssl)] public static partial long SSL_get_verify_result(IntPtr ssl);
     [LibraryImport(Ssl, StringMarshalling = StringMarshalling.Utf8)] public static partial int SSL_set1_host(IntPtr ssl, string hostname);
 
+    // IP-literal verification. SSL_set1_host matches DNS-ID (and, legacy, CN) only, so verifying
+    // "127.0.0.1" through it FAILS against a certificate that carries the address in an iPAddress SAN —
+    // which is exactly what our own demo certificate does, and what every rig here dials. The IP branch
+    // needs the verify param directly: SSL_get0_param, then X509_VERIFY_PARAM_set1_ip_asc.
+    [LibraryImport(Ssl)] public static partial IntPtr SSL_get0_param(IntPtr ssl);
+    [LibraryImport(Crypto, StringMarshalling = StringMarshalling.Utf8)]
+    public static partial int X509_VERIFY_PARAM_set1_ip_asc(IntPtr param, string ipasc);
+
     // ALPN. Note the asymmetry: a CLIENT just hands over its preference list, but a SERVER has to supply a
     // selection CALLBACK — and that callback is per-SSL_CTX, with no per-SSL equivalent, which is why one
     // OpenSslTlsProvider can serve exactly one server-side protocol list.

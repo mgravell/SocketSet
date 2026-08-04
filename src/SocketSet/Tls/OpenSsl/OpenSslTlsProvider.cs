@@ -107,19 +107,74 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
     public override TlsFilter CreateClientFilter(TlsClientOptions options)
     {
         var (ssl, rbio, wbio) = NewSsl(_clientCtx);
-        SSL_set_connect_state(ssl);
-        if (options.TargetHost is { Length: > 0 } host)
+        try
         {
-            // SNI: tell the server which name we're asking for.
-            nint hp = Marshal.StringToCoTaskMemUTF8(host);
+            SSL_set_connect_state(ssl);
+            ApplyPeerName(ssl, options.TargetHost);
+            ApplyClientAlpn(ssl, options.AlpnProtocols);
+        }
+        catch { SSL_free(ssl); throw; }
+        return new OpenSslTlsFilter(ssl, rbio, wbio);
+    }
+
+    /// <summary>
+    /// Set SNI and the name to verify the peer certificate against. Shared by the memory-BIO and kTLS
+    /// paths, because having them drift is how one of them ended up verifying less than the other.
+    ///
+    /// THREE CASES, and the middle one is the one that bites:
+    ///  - <c>"*"</c> (<see cref="TlsClientAuthenticateContext.AnyHost"/>): no SNI, no name check. The
+    ///    explicit opt-out, so that "no check" is something written down rather than something that
+    ///    happens when a field was left unset.
+    ///  - AN IP LITERAL: NOT sent as SNI, and verified via X509_VERIFY_PARAM_set1_ip_asc.
+    ///
+    ///    The SNI half is unambiguous: RFC 6066 §3 forbids a literal address in server_name and some
+    ///    servers reject one.
+    ///
+    ///    The VERIFY half is belt-and-braces, and the honest history is worth keeping because I got it
+    ///    wrong. I claimed SSL_set1_host matches dNSName only, so an address would fail against a
+    ///    certificate that names it in an iPAddress SAN. MEASURED 2026-08-04 and FALSIFIED: on OpenSSL
+    ///    3.x, SSL_set1_host("127.0.0.1") both ACCEPTS a certificate whose only SAN is IP:127.0.0.1 and
+    ///    REFUSES it when dialling 127.0.0.2 — so it really is matching the address, not skipping the
+    ///    check. The set1_ip_asc branch fixes no observed break here.
+    ///
+    ///    It is kept anyway, on the narrow ground that it is the DOCUMENTED API for the job
+    ///    (X509_check_host is specified over dNSName; X509_check_ip is the address one), so the
+    ///    behaviour above is undocumented and need not hold on another build or an older 1.1.1. That is
+    ///    a weaker justification than a measurement, and it is recorded as such: if someone wants to
+    ///    delete this branch, the evidence for doing so is already here.
+    ///  - A DNS NAME: SNI plus SSL_set1_host, the classic path.
+    /// </summary>
+    private void ApplyPeerName(nint ssl, string? targetHost)
+    {
+        // No silent "unset means don't check" any more; the engine enforces this too, but a provider
+        // used directly must not be the soft spot.
+        if (string.IsNullOrWhiteSpace(targetHost))
+            throw new ArgumentException(
+                "TargetHost is required. Pass the name being dialled so the certificate can be verified "
+                + $"against it, or \"{TlsClientAuthenticateContext.AnyHost}\" to state explicitly that no "
+                + "name check is wanted.", nameof(targetHost));
+
+        if (targetHost == TlsClientAuthenticateContext.AnyHost) return; // explicit: no SNI, no name check
+
+        bool isIp = IPAddress.TryParse(targetHost, out _);
+        if (!isIp)
+        {
+            nint hp = Marshal.StringToCoTaskMemUTF8(targetHost);
             try { SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, hp); }
             finally { Marshal.FreeCoTaskMem(hp); } // OpenSSL dups the name
-            // Hostname verification: the cert must actually be valid for this name (the classic check).
-            if (_verifyServer && SSL_set1_host(ssl, host) != 1)
-                throw Err("SSL_set1_host");
         }
-        ApplyClientAlpn(ssl, options.AlpnProtocols);
-        return new OpenSslTlsFilter(ssl, rbio, wbio);
+
+        if (!_verifyServer) return;
+        if (isIp)
+        {
+            nint param = SSL_get0_param(ssl);
+            if (param == 0 || X509_VERIFY_PARAM_set1_ip_asc(param, targetHost) != 1)
+                throw Err("X509_VERIFY_PARAM_set1_ip_asc");
+        }
+        else if (SSL_set1_host(ssl, targetHost) != 1)
+        {
+            throw Err("SSL_set1_host");
+        }
     }
 
     public override TlsFilter CreateServerFilter(TlsServerOptions options)
@@ -228,27 +283,24 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
         nint ssl = SSL_new(ctx);
         if (ssl == 0) throw Err("SSL_new(ktls)");
         SSL_set_fd(ssl, fd); // socket BIO, BIO_NOCLOSE — the shard still owns/closes the fd
-        if (client)
+        try
         {
-            SSL_set_connect_state(ssl);
-            if (targetHost is { Length: > 0 } host)
+            if (client)
             {
-                nint hp = Marshal.StringToCoTaskMemUTF8(host);
-                try { SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, hp); }
-                finally { Marshal.FreeCoTaskMem(hp); }
-                // THROW on failure, exactly as CreateClientFilter does. This dropped the return value until
-                // the 2026-08-04 audit, so a failed SSL_set1_host on the kTLS path silently degraded that
-                // connection to chain-only verification (any certificate from a trusted CA, for any name)
-                // while the memory-BIO path with the same configuration refused to connect. Two paths, one
-                // provider, one security posture.
-                if (_verifyServer && SSL_set1_host(ssl, host) != 1) { SSL_free(ssl); throw Err("SSL_set1_host(ktls)"); }
+                SSL_set_connect_state(ssl);
+                // The SAME ApplyPeerName as the memory-BIO path, deliberately. Until the 2026-08-04 audit
+                // this arm had its own copy which dropped the SSL_set1_host return value, so a failure
+                // here degraded the connection to chain-only verification while the other path with
+                // identical configuration refused to connect. One provider, one posture, one code path.
+                ApplyPeerName(ssl, targetHost);
+                ApplyClientAlpn(ssl, alpn);
             }
-            ApplyClientAlpn(ssl, alpn);
+            else
+            {
+                SSL_set_accept_state(ssl);
+            }
         }
-        else
-        {
-            SSL_set_accept_state(ssl);
-        }
+        catch { SSL_free(ssl); throw; }
         return ssl;
     }
 
