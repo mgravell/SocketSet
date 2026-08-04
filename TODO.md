@@ -4,6 +4,54 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## SECURITY AUDIT 2026-08-04 (READ FIRST NEXT SESSION — full findings in `REVIEW.md`)
+
+Marc asked for a full security audit of the codebase. **The findings, the reasoning and the gate status
+all live in [`REVIEW.md`](REVIEW.md)**, which is new and is to security/correctness reviews what
+`RESULTS.md` is to measurements. Do not re-derive any of it here; this section is only the backlog that
+came out of it.
+
+One-paragraph summary so you know whether to go read it: the unsafe code and the slot-lifetime
+discipline came through clean (no wire-reachable memory-corruption bug found). The exposure was in
+**defaults that fail open**, **absent liveness limits**, and **buffer reuse surfaced through the public
+API**. Eight items were fixed this session; five are design calls left open, below.
+
+**Fixed and gated (details in `REVIEW.md` F1-F8):** `Listen(IPEndPoint)` ignoring its address and
+binding INADDR_ANY on all four native backends; IPv6 endpoints silently connecting to a truncated IPv4
+address; an application-callback exception killing an entire shard (4096 connections plus 1/N of
+capacity, permanently); `SSL_set1_host` unchecked on the kTLS path; `sockaddr_un` built per-UTF-16-char
+and unbounded; unchecked `Advance` reading past a pool page onto the wire; unguarded free-list returns;
+`HalfPipeWriter` draining a released `CycleBuffer`.
+
+**New gate:** `bench/verify-bind-address.sh` (+ SmokeTest `--bind-probe`). Nothing could previously
+distinguish a listener that honoured its bind address from one that ignored it, which is why that bug
+survived; the smoke matrix binds `IPAddress.Any` and so is blind to it by construction. Wants a Windows
+equivalent.
+
+### The open items, in priority order (full reasoning in `REVIEW.md` D1-D6)
+
+1. **`TlsClientOptions.TargetHost` is per-ENGINE but hostname verification needs it per-CONNECTION.**
+   Null host means NO name check on either provider, and it defaults to null, so the posture is "any
+   certificate from a trusted CA, for any name". The tunnel funnels many endpoints through one engine
+   by design (2026-08-03's anchor shape), so it structurally cannot set this today, and both TLS client
+   rigs currently depend on the fail-open behaviour. There is an IP-literal trap in the obvious fix:
+   `SSL_set1_host("127.0.0.1")` does not match `iPAddress` SANs, so a naive change fails against our own
+   demo certificate. Proposed shape is in `REVIEW.md`; it is public API surface, so it wants deciding
+   alongside the freeze proposal further down.
+2. **No handshake or idle timeout anywhere.** A peer that connects and sends nothing holds its slot
+   forever. This is a regression against what we replace on the ASP.NET bridge specifically, because TLS
+   terminates below Kestrel and its `HandshakeTimeout`/`MaxConcurrentConnections` never see the
+   connection. Wants a cost measurement on the sweep before it goes in the hot loop.
+3. **Backpressure is advisory in both bridges, so inbound is unbounded.** Same fix as the recorded
+   receive-PARKING item (7) — worth re-tagging that item as a robustness fix, not only an architecture
+   one, because right now it is the DoS. Note `SocketSet.AspNetCore` is a published package.
+4. **`ReceiveContext.RawBuffer` past `PayloadBytes` is another connection's data** (decrypted plaintext
+   in the TLS path), and `ResponseBytes` may be set to the full buffer length. Unstated contract rather
+   than a bug; needs a decision between documenting it, validating `ResponseBytes` against a
+   written-high-water mark, or clearing on release.
+5. **`SocketSet.snk` is a full RSA private key, committed** (verified: PRIVATEKEYBLOB/`RSA2`), with
+   `PublicSign=false`. Not an auth bypass on .NET Core, but it is our published packages' identity.
+
 ## SESSION CLOSE 2026-08-03 (READ FIRST NEXT SESSION — the day SE.Redis ran on SocketSet)
 
 One very long day. The short version: **the multiplexer now runs on SocketSet end-to-end** (Tunnel →

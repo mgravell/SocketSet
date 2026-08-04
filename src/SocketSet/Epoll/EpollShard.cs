@@ -454,13 +454,25 @@ internal sealed unsafe class EpollShard : SocketSetShard
     public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         // This shard already holds a reservation (TryPlace took it). Create the socket synchronously so
-        // its failures stay on the caller's thread, then hand the claim + connect to the loop.
-        (int domain, int proto) = endpoint switch
+        // its failures stay on the caller's thread, then hand the claim + connect to the loop. Every
+        // rejection below must release the reservation first or a refused dial leaks capacity.
+        int domain, proto;
+        try
         {
-            IPEndPoint => (LibC.AF_INET, LibC.IPPROTO_TCP),
-            UnixDomainSocketEndPoint => (LibC.AF_UNIX, 0),
-            _ => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported."),
-        };
+            switch (endpoint)
+            {
+                case IPEndPoint ip:
+                    LibC.RequireIPv4(ip, nameof(Connect)); // IPv4-only sockaddr; never truncate an IPv6 address
+                    (domain, proto) = (LibC.AF_INET, LibC.IPPROTO_TCP);
+                    break;
+                case UnixDomainSocketEndPoint:
+                    (domain, proto) = (LibC.AF_UNIX, 0);
+                    break;
+                default:
+                    throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported.");
+            }
+        }
+        catch { ReleaseReservation(); throw; }
 
         int fd = LibC.socket(domain, LibC.SOCK_STREAM, proto);
         if (fd < 0) { ReleaseReservation(); throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed"); }
@@ -490,9 +502,12 @@ internal sealed unsafe class EpollShard : SocketSetShard
         {
             var addr = new LibC.SockAddrIn
             {
-                sin_family = checked((ushort)ip.AddressFamily),
+                sin_family = LibC.AF_INET,
                 sin_port = LibC.Htons(checked((ushort)ip.Port)),
-                sin_addr = BitConverter.ToUInt32(ip.Address.GetAddressBytes(), 0),
+                // ToSinAddr asserts four bytes; the old ToUInt32(GetAddressBytes(), 0) took the first four
+                // of however many there were, which for IPv6 is a different host entirely (see RequireIPv4,
+                // called on the caller's thread in Connect so the throw is synchronous).
+                sin_addr = LibC.ToSinAddr(ip.Address),
             };
             rc = LibC.connect(fd, &addr, 16);
         }
@@ -578,13 +593,13 @@ internal sealed unsafe class EpollShard : SocketSetShard
         if (isClient)
         {
             var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _bufSize : 0);
-            Parent.OnConnect(ref ctx);
+            Parent.DispatchConnect(ref ctx);
             sb = ctx.SendBytes;
         }
         else
         {
             var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _bufSize : 0);
-            Parent.OnAccept(ref ctx);
+            Parent.DispatchAccept(ref ctx);
             sb = ctx.SendBytes;
         }
 
@@ -816,7 +831,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
                 if (conn.Pending is { Count: > 0 }) return; // blocked again; EPOLLOUT will resume us
 
                 var ctx = new SocketSet.WriteContext(conn, wp, _bufSize);
-                Parent.OnWrite(ref ctx);
+                Parent.DispatchWrite(ref ctx);
                 int n = ctx.SendBytes;
                 if (n <= 0) return;
                 if (conn.Tls is { } tls) SendEncrypted(conn, tls, wp, n); else SendBytes(conn, wp, n);
@@ -1112,13 +1127,13 @@ internal sealed unsafe class EpollShard : SocketSetShard
         if (conn.IsClient)
         {
             var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _bufSize : 0);
-            Parent.OnConnect(ref ctx);
+            Parent.DispatchConnect(ref ctx);
             sb = ctx.SendBytes;
         }
         else
         {
             var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _bufSize : 0);
-            Parent.OnAccept(ref ctx);
+            Parent.DispatchAccept(ref ctx);
             sb = ctx.SendBytes;
         }
         if (leased)

@@ -32,6 +32,21 @@ internal struct SlotAllocator(int capacity)
         return -1;
     }
 
-    /// <summary>Return a slot index for reuse (loop thread only, at teardown).</summary>
-    public void Free(int slot) => _holes[_top++] = slot;
+    /// <summary>
+    /// Return a slot index for reuse (loop thread only, at teardown).
+    ///
+    /// The guard is not defensive noise. A DOUBLE free does not merely overflow the stack — it puts the
+    /// same index in the hole list twice, so two later <see cref="Claim"/>s hand out the SAME slot and two
+    /// live connections alias one <c>Connection</c> object: shared UserToken, shared TLS filter, shared
+    /// write state. That is a silent cross-connection corruption, and with ~six teardown exit paths per
+    /// backend calling Free it is exactly the bug worth failing loudly on. Added 2026-08-04.
+    /// </summary>
+    public void Free(int slot)
+    {
+        if ((uint)slot >= (uint)capacity || _top >= capacity)
+            throw new InvalidOperationException(
+                $"SlotAllocator.Free({slot}) is out of range or would overflow the hole stack " +
+                $"(capacity {capacity}, depth {_top}) — almost certainly a double free.");
+        _holes[_top++] = slot;
+    }
 }

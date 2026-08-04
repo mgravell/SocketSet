@@ -104,6 +104,41 @@ internal static unsafe partial class LibC
         => BitConverter.IsLittleEndian ? BinaryPrimitives.ReverseEndianness(value) : value;
 
     /// <summary>
+    /// An IPv4 address as the network-order <c>sin_addr</c> word. <see cref="System.Net.IPAddress.GetAddressBytes"/>
+    /// already returns network order, so this is a straight 4-byte read — the point is that it is a read of
+    /// FOUR bytes from an address asserted to HAVE four (see <see cref="RequireIPv4"/>), rather than the
+    /// first four bytes of whatever was passed.
+    /// </summary>
+    internal static uint ToSinAddr(System.Net.IPAddress address)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        if (!address.TryWriteBytes(bytes, out int written) || written != 4)
+            throw new NotSupportedException($"'{address}' is not an IPv4 address.");
+        // MemoryMarshal.Read, not a Read{Little,Big}Endian: we want the uint whose IN-MEMORY bytes are
+        // these four unchanged, on either endianness, since sin_addr is a raw network-order word.
+        return MemoryMarshal.Read<uint>(bytes);
+    }
+
+    /// <summary>
+    /// Reject a non-IPv4 endpoint at the door, LOUDLY.
+    ///
+    /// The native backends speak <c>sockaddr_in</c> only. Before the 2026-08-04 audit an IPv6 endpoint was
+    /// not rejected: the connect paths hard-coded <c>AF_INET</c> and copied the FIRST FOUR bytes of a
+    /// sixteen-byte address, so dialling <c>2001:db8::1</c> quietly connected to <c>32.1.13.184</c> — a
+    /// successful connection to an entirely different host, which for a TLS client is the worst possible
+    /// shape of "it worked". IPv6 support is real work (a <c>sockaddr_in6</c> path on every backend, see
+    /// TODO); until then this fails instead of guessing.
+    /// </summary>
+    internal static void RequireIPv4(System.Net.IPEndPoint ip, string operation)
+    {
+        if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            throw new NotSupportedException(
+                $"{operation}: the native backends are IPv4-only today, but '{ip}' is " +
+                $"{ip.AddressFamily}. Use an IPv4 endpoint, or the managed backend " +
+                $"(SocketSetFactory.Managed), which goes through System.Net.Sockets and supports IPv6.");
+    }
+
+    /// <summary>
     /// Pin the calling thread to a single CPU (best-effort; false on failure).
     /// pid 0 targets the current thread. The mask is a kernel cpu_set_t bitmap;
     /// 128 bytes matches glibc's cpu_set_t and covers up to 1024 CPUs.
@@ -265,19 +300,39 @@ internal static unsafe partial class LibC
         public ushort sun_family;
         public fixed byte sun_path[108];
 
+        /// <summary>
+        /// Fill a sockaddr_un for <paramref name="name"/>, mapping a leading '@' to the abstract
+        /// namespace's leading NUL. Returns the address length to pass to bind()/connect().
+        ///
+        /// UTF-8 ENCODED, AND LENGTH-CHECKED — both fixed 2026-08-04. It previously wrote one byte per
+        /// UTF-16 char (<c>(byte)name[i]</c>), which for a non-ASCII path is a DIFFERENT address than the
+        /// one requested: U+0141 truncates to 'A', and anything ending in 00 truncates to NUL, which
+        /// silently shortens the path (or, at index 0, flips a filesystem socket into the abstract
+        /// namespace). And nothing bounded the write against the 108-byte sun_path — safe only because
+        /// UnixDomainSocketEndPoint happens to validate its own path length, which is an invariant
+        /// borrowed from another type rather than one enforced here. Two of the three call sites write
+        /// into a STACK sockaddr_un, so the borrowed invariant was the only thing between this and a
+        /// stack smash.
+        /// </summary>
         public static uint Init(SockAddrUn* addr, string name)
         {
             *addr = default;
             addr->sun_family = AF_UNIX;
 
-            for (int i = 0; i < name.Length; i++)
-            {
-                // interpret @abc as abstract
-                addr->sun_path[i] = (byte)(i is 0 & name[i] is '@' ? '\0' : name[i]);
-            }
+            bool abstractNs = name.Length > 0 && name[0] == '@';
+            var span = new Span<byte>(addr->sun_path, PathCapacity);
+            int written = System.Text.Encoding.UTF8.GetByteCount(name) is var need && need <= PathCapacity
+                ? System.Text.Encoding.UTF8.GetBytes(name, span)
+                : throw new ArgumentException(
+                    $"AF_UNIX path '{name}' encodes to {need} UTF-8 bytes; sun_path holds {PathCapacity}.",
+                    nameof(name));
 
-            return (uint)(sizeof(ushort) + name.Length);
+            if (abstractNs) span[0] = 0; // '@name' -> '\0name': the Linux abstract namespace
+            return (uint)(sizeof(ushort) + written);
         }
+
+        /// <summary>Bytes of <c>sun_path</c>. The kernel's own limit, not ours.</summary>
+        internal const int PathCapacity = 108;
     }
     
         // =========================================================================

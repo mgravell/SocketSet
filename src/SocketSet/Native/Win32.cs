@@ -117,19 +117,51 @@ internal static unsafe partial class Win32
         public ushort sun_family;
         public fixed byte sun_path[108];
 
+        /// <summary>UTF-8 encoded and length-checked; see the twin in <c>LibC.SockAddrUn.Init</c> for what
+        /// the per-char cast got wrong. Windows AF_UNIX is filesystem-path only, so there is no abstract
+        /// mapping here — the length includes the NUL terminator.</summary>
         public static uint Init(SockAddrUn* addr, string path)
         {
             *addr = default;
             addr->sun_family = AF_UNIX;
-            int n = path.Length;
-            for (int i = 0; i < n; i++) addr->sun_path[i] = (byte)path[i]; // filesystem path; NUL-terminated below
+            int need = System.Text.Encoding.UTF8.GetByteCount(path);
+            if (need + 1 > PathCapacity) // +1: the terminator has to fit too
+                throw new ArgumentException(
+                    $"AF_UNIX path '{path}' encodes to {need} UTF-8 bytes; sun_path holds {PathCapacity} including the NUL.",
+                    nameof(path));
+            int n = System.Text.Encoding.UTF8.GetBytes(path, new Span<byte>(addr->sun_path, PathCapacity));
             return (uint)(sizeof(ushort) + n + 1); // include the NUL terminator in the length
         }
+
+        /// <summary>Bytes of <c>sun_path</c>.</summary>
+        internal const int PathCapacity = 108;
     }
 
     /// <summary>Host-to-network byte order for a 16-bit port.</summary>
     internal static ushort Htons(ushort value)
         => System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(value); // Windows is always little-endian
+
+    /// <summary>IPv4 address as the network-order <c>sin_addr</c> word. See <see cref="RequireIPv4"/> for
+    /// why the four-byte assertion matters. Twin of <c>LibC.ToSinAddr</c>; kept here so the Windows
+    /// interop surface stays self-contained (the two files never reference each other).</summary>
+    internal static uint ToSinAddr(System.Net.IPAddress address)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        if (!address.TryWriteBytes(bytes, out int written) || written != 4)
+            throw new NotSupportedException($"'{address}' is not an IPv4 address.");
+        return System.Runtime.InteropServices.MemoryMarshal.Read<uint>(bytes);
+    }
+
+    /// <summary>Reject a non-IPv4 endpoint LOUDLY rather than truncating it. Twin of
+    /// <c>LibC.RequireIPv4</c> — see there for the failure this prevents.</summary>
+    internal static void RequireIPv4(System.Net.IPEndPoint ip, string operation)
+    {
+        if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            throw new NotSupportedException(
+                $"{operation}: the native backends are IPv4-only today, but '{ip}' is " +
+                $"{ip.AddressFamily}. Use an IPv4 endpoint, or the managed backend " +
+                $"(SocketSetFactory.Managed), which goes through System.Net.Sockets and supports IPv6.");
+    }
 
     // =====================================================================
     // AcceptEx / ConnectEx — loaded at runtime via WSAIoctl (they aren't plain exports).

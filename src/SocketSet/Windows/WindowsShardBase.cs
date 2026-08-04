@@ -298,13 +298,13 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
         if (conn.IsClient)
         {
             var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
-            Parent.OnConnect(ref ctx);
+            Parent.DispatchConnect(ref ctx);
             sb = ctx.SendBytes;
         }
         else
         {
             var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
-            Parent.OnAccept(ref ctx);
+            Parent.DispatchAccept(ref ctx);
             sb = ctx.SendBytes;
         }
 

@@ -748,12 +748,24 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         EnsureWinsock();
-        (int af, int proto) = endpoint switch
+        int af, proto;
+        // Every rejection here must release the reservation first, or a refused dial leaks capacity.
+        try
         {
-            IPEndPoint => (Win32.AF_INET, Win32.IPPROTO_TCP),
-            UnixDomainSocketEndPoint => (Win32.AF_UNIX, 0),
-            _ => throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported."),
-        };
+            switch (endpoint)
+            {
+                case IPEndPoint ip:
+                    Win32.RequireIPv4(ip, nameof(Connect)); // IPv4-only sockaddr; never truncate an IPv6 address
+                    (af, proto) = (Win32.AF_INET, Win32.IPPROTO_TCP);
+                    break;
+                case UnixDomainSocketEndPoint:
+                    (af, proto) = (Win32.AF_UNIX, 0);
+                    break;
+                default:
+                    throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported.");
+            }
+        }
+        catch { ReleaseReservation(); throw; }
 
         // This shard holds a reservation (TryPlace took it). Create + bind the socket HERE (thread-agnostic
         // syscalls, so their failures stay synchronous to the caller), then hand the claim + port-assoc +
@@ -863,10 +875,14 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
                 int one = 1;
                 Win32.setsockopt(s, Win32.SOL_SOCKET, Win32.SO_REUSEADDR, &one, sizeof(int));
                 Win32.setsockopt(s, Win32.IPPROTO_TCP, Win32.TCP_NODELAY, &one, sizeof(int));
+                Win32.RequireIPv4(ip, nameof(SocketSet.Listen));
                 Win32.SockAddrIn addr = default;
                 addr.sin_family = (ushort)Win32.AF_INET;
                 addr.sin_port = Win32.Htons((ushort)ip.Port);
-                addr.sin_addr = 0; // INADDR_ANY  TODO: honour the actual IP
+                // Honour the requested address. Was hard-coded to INADDR_ANY (the "TODO: honour the actual
+                // IP" the 2026-08-04 audit cashed in): Listen(IPEndPoint(IPAddress.Loopback, p)) listened on
+                // every interface, on every backend except managed. See IoUringFactory.Bind for the writeup.
+                addr.sin_addr = Win32.ToSinAddr(ip.Address);
                 if (Win32.bind(s, &addr, 16) == Win32.SOCKET_ERROR)
                     throw new Win32Exception(Marshal.GetLastPInvokeError(), "IP bind() failed");
                 if (Win32.listen(s, _listenBacklog) == Win32.SOCKET_ERROR)
@@ -1012,7 +1028,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
         conn.Opened = true;
-        Parent.OnAccept(ref ctx);
+        Parent.DispatchAccept(ref ctx);
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmRecv(conn);
 
@@ -1042,7 +1058,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
         conn.Opened = true;
-        Parent.OnConnect(ref ctx);
+        Parent.DispatchConnect(ref ctx);
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmRecv(conn);
 
@@ -1299,7 +1315,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         if (tls is null || conn.Opened)
         {
             var ctx = new SocketSet.WriteContext(conn, wp, _writeBufSize);
-            Parent.OnWrite(ref ctx);
+            Parent.DispatchWrite(ref ctx);
             next = ctx.SendBytes;
         }
 

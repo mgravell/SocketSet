@@ -48,7 +48,17 @@ internal unsafe struct PinnedWriteBufferPool : IDisposable
         return true;
     }
 
-    public void Release(int index) => _free[_freeTop++] = index;
+    /// <summary>Return a leased page. Guarded for the same reason as <c>SlotAllocator.Free</c>: a double
+    /// release duplicates the index in the free list, so two in-flight sends end up writing the same
+    /// pinned page and each transmits a slice of the other's payload. Added 2026-08-04.</summary>
+    public void Release(int index)
+    {
+        if ((uint)index >= (uint)_count || _freeTop >= _count)
+            throw new InvalidOperationException(
+                $"PinnedWriteBufferPool.Release({index}) is out of range or would overflow the free list " +
+                $"(count {_count}, free {_freeTop}) — almost certainly a double release.");
+        _free[_freeTop++] = index;
+    }
 
     public byte* Address(int index) => _slab + ((long)index * _bufSize);
 

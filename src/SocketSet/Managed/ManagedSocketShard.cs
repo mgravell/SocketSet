@@ -126,7 +126,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             {
                 var ctx = new SocketSet.AcceptContext(conn, buf, _bufferSize);
                 conn.Opened = true; // app now sees it open → pairs with OnClosed
-                Parent.OnAccept(ref ctx);
+                Parent.DispatchAccept(ref ctx);
                 sendBytes = ctx.SendBytes;
             }
 
@@ -185,7 +185,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         {
             var ctx = new SocketSet.ConnectContext(conn, buf, _bufferSize);
             conn.Opened = true; // app now sees it open → pairs with OnClosed
-            Parent.OnConnect(ref ctx);
+            Parent.DispatchConnect(ref ctx);
             sendBytes = ctx.SendBytes;
         }
 
@@ -352,7 +352,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             fixed (byte* buf = conn.SendBuffer)
             {
                 var ctx = new SocketSet.WriteContext(conn, buf, conn.SendBuffer.Length);
-                Parent.OnWrite(ref ctx);
+                Parent.DispatchWrite(ref ctx);
                 next = ctx.SendBytes;
             }
         }
@@ -478,13 +478,13 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             if (conn.IsClient)
             {
                 var ctx = new SocketSet.ConnectContext(conn, buf, _bufferSize);
-                Parent.OnConnect(ref ctx);
+                Parent.DispatchConnect(ref ctx);
                 sendBytes = ctx.SendBytes;
             }
             else
             {
                 var ctx = new SocketSet.AcceptContext(conn, buf, _bufferSize);
-                Parent.OnAccept(ref ctx);
+                Parent.DispatchAccept(ref ctx);
                 sendBytes = ctx.SendBytes;
             }
         }

@@ -236,7 +236,12 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
                 nint hp = Marshal.StringToCoTaskMemUTF8(host);
                 try { SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, hp); }
                 finally { Marshal.FreeCoTaskMem(hp); }
-                if (_verifyServer) SSL_set1_host(ssl, host);
+                // THROW on failure, exactly as CreateClientFilter does. This dropped the return value until
+                // the 2026-08-04 audit, so a failed SSL_set1_host on the kTLS path silently degraded that
+                // connection to chain-only verification (any certificate from a trusted CA, for any name)
+                // while the memory-BIO path with the same configuration refused to connect. Two paths, one
+                // provider, one security posture.
+                if (_verifyServer && SSL_set1_host(ssl, host) != 1) { SSL_free(ssl); throw Err("SSL_set1_host(ktls)"); }
             }
             ApplyClientAlpn(ssl, alpn);
         }

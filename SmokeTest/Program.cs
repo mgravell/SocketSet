@@ -36,6 +36,7 @@ int? writeBuffersOverride = null; // --write-buffers: pool depth, decoupled from
 int? bufferPagesOverride = null;  // --buffer-pages:  ditto
 int? oobWriteBuffersOverride = null; // --oob-write-buffers: the third pool --page rescales
 int? recvBufferOverride = null;   // --recv-buffer: per-socket receive buffer size, decoupled from --page
+string? bindProbe = null;   // --bind-probe <addr>: bind a listener there and idle (bench/verify-bind-address.sh)
 var options = new SocketSetOptions();
 for (int i = 0; i < args.Length; i++)
 {
@@ -210,6 +211,11 @@ for (int i = 0; i < args.Length; i++)
         case "--host" when i + 1 < args.Length:
             host = args[i + 1];
             break;
+        case "--bind-probe" when i + 1 < args.Length:
+            // Bind a listener to THIS address on the selected backend and idle, so an external check can
+            // ask the KERNEL what actually got bound. See bench/verify-bind-address.sh.
+            bindProbe = args[i + 1];
+            break;
         case "--port" when i + 1 < args.Length && int.TryParse(args[i + 1], out var pt):
             port = pt;
             break;
@@ -275,6 +281,25 @@ if (writeBuffersOverride is int wbv) options.WriteBuffersPerShard = wbv;
 if (bufferPagesOverride is int bpv) options.BufferPagesPerShard = bpv;
 if (oobWriteBuffersOverride is int obv) options.OutOfBandWriteBuffersPerShard = obv;
 if (recvBufferOverride is int rbv) options.ReceiveBufferSize = rbv;
+
+if (bindProbe is not null)
+{
+    // BIND-ADDRESS PROBE. Listen on exactly the address asked for, print it, and idle until killed.
+    // This mode exists because nothing in the repo could tell a listener that HONOURED its address from
+    // one that quietly bound INADDR_ANY — which is what all four native backends did until 2026-08-04
+    // (a hard-coded `sin_addr = 0` behind a TODO). It prints only what it was ASKED for; the assertion
+    // is made by bench/verify-bind-address.sh reading `ss`, i.e. asking the kernel rather than us. That
+    // split is the point: a probe that reported its own opinion of the bind address would have passed
+    // just as happily before the fix.
+    var probeEp = new IPEndPoint(IPAddress.Parse(bindProbe), port);
+    using var probe = new EchoServer(options);
+    probe.Listen(probeEp);
+    Console.WriteLine($"bind-probe: requested={probeEp} pid={Environment.ProcessId} backend={probe}");
+    Console.Out.Flush();
+    using var probeStop = new ManualResetEventSlim(false);
+    using (StopSignals.Install(probeStop)) probeStop.Wait();
+    return;
+}
 
 if (resp)
 {

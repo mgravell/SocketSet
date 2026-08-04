@@ -42,7 +42,19 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
     /// The written data is <c>[0, <see cref="WrittenCount"/>)</c>; the rest is spare capacity.</summary>
     public byte[] Array => _buf!;
 
-    public void Advance(int count) => _pos += count;
+    /// <summary>Commit <paramref name="count"/> bytes. Validated for the same reason as
+    /// <c>IoUringConnection.Advance</c>: this writer's array is handed out whole (see <see cref="Array"/>)
+    /// and its written length is what gets encrypted or sent, so an over-advance publishes uninitialised
+    /// pool memory rather than throwing.</summary>
+    public void Advance(int count)
+    {
+        int available = (_buf?.Length ?? 0) - _pos;
+        if ((uint)count > (uint)available) ThrowAdvance(count, available);
+        _pos += count;
+
+        static void ThrowAdvance(int count, int available) => throw new ArgumentOutOfRangeException(
+            nameof(count), $"Cannot advance {count} bytes; the current buffer has {available} available.");
+    }
 
     public Memory<byte> GetMemory(int sizeHint = 0)
     {

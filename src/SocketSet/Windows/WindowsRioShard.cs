@@ -575,8 +575,11 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
     {
         Win32.EnsureWinsock();
-        if (endpoint is not IPEndPoint)
+        if (endpoint is not IPEndPoint rioTarget)
             throw new NotSupportedException("The RIO backend is TCP-only; use the IOCP backend for AF_UNIX.");
+        // IPv4-only sockaddr below; reject rather than truncate (see Win32.RequireIPv4).
+        try { Win32.RequireIPv4(rioTarget, nameof(Connect)); }
+        catch { ReleaseReservation(); throw; }
 
         // This shard holds a reservation (TryPlace took it). Create + bind the socket HERE (thread-agnostic
         // syscalls, so their failures stay synchronous to the caller), then hand the claim + port-assoc +
@@ -640,6 +643,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     private (nint socket, int af, int proto) CreateListener(IPEndPoint ip)
     {
+        Win32.RequireIPv4(ip, nameof(SocketSet.Listen));
         // The listener must be REGISTERED_IO-capable too: accepted sockets inherit the listener's
         // provider characteristics via SO_UPDATE_ACCEPT_CONTEXT, and without it their RIO receives are
         // accepted at submission but silently never complete.
@@ -652,7 +656,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         Win32.SockAddrIn addr = default;
         addr.sin_family = (ushort)Win32.AF_INET;
         addr.sin_port = Win32.Htons((ushort)ip.Port);
-        addr.sin_addr = 0;
+        addr.sin_addr = Win32.ToSinAddr(ip.Address); // was 0/INADDR_ANY — see IoUringFactory.Bind
         if (Win32.bind(s, &addr, 16) == Win32.SOCKET_ERROR)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "bind() failed");
         if (Win32.listen(s, _listenBacklog) == Win32.SOCKET_ERROR)
@@ -754,7 +758,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBufSize : 0);
         conn.Opened = true;
-        Parent.OnAccept(ref ctx);
+        Parent.DispatchAccept(ref ctx);
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmReceive(conn);
 
@@ -777,7 +781,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBufSize : 0);
         conn.Opened = true;
-        Parent.OnConnect(ref ctx);
+        Parent.DispatchConnect(ref ctx);
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0) ArmReceive(conn);
 
@@ -946,7 +950,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         if (tls is null || conn.Opened)
         {
             var ctx = new SocketSet.WriteContext(conn, wp, _writeBufSize);
-            Parent.OnWrite(ref ctx);
+            Parent.DispatchWrite(ref ctx);
             next = ctx.SendBytes;
         }
 

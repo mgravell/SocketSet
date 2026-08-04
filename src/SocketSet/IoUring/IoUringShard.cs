@@ -333,6 +333,13 @@ internal sealed class IoUringShard : SocketSetShard
             ReleaseReservation();
             throw new NotSupportedException($"{nameof(Connect)} on {endpoint.GetType().Name} is not supported.");
         }
+        // IPv4-only sockaddr below. Checked HERE, on the caller's thread, so the throw is synchronous
+        // rather than a silent connect to the first four bytes of an IPv6 address (see RequireIPv4).
+        if (endpoint is IPEndPoint ipCheck)
+        {
+            try { LibC.RequireIPv4(ipCheck, nameof(Connect)); }
+            catch { ReleaseReservation(); throw; }
+        }
 
         // Create the fd here (thread-agnostic syscall, so failures stay synchronous to the caller) but
         // hand the claim + sockaddr-build + CONNECT SQE to the loop, keeping the slot table single-writer.
@@ -997,13 +1004,13 @@ internal sealed class IoUringShard : SocketSetShard
             if (conn.TlsClient)
             {
                 var ctx = new SocketSet.ConnectContext(conn, gp, gbuf.Length);
-                Parent.OnConnect(ref ctx);
+                Parent.DispatchConnect(ref ctx);
                 sb = ctx.SendBytes;
             }
             else
             {
                 var ctx = new SocketSet.AcceptContext(conn, gp, gbuf.Length);
-                Parent.OnAccept(ref ctx);
+                Parent.DispatchAccept(ref ctx);
                 sb = ctx.SendBytes;
             }
         }
@@ -1062,7 +1069,7 @@ internal sealed class IoUringShard : SocketSetShard
         fixed (byte* wp = wbuf)
         {
             var ctx = new SocketSet.WriteContext(conn, wp, wbuf.Length);
-            Parent.OnWrite(ref ctx);
+            Parent.DispatchWrite(ref ctx);
             sb = ctx.SendBytes;
         }
         if (sb > 0 && (conn.Flags & SocketSet.SocketFlags.SendClosed) == 0)
@@ -1208,13 +1215,13 @@ internal sealed class IoUringShard : SocketSetShard
         if (conn.TlsClient)
         {
             var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
-            Parent.OnConnect(ref ctx);
+            Parent.DispatchConnect(ref ctx);
             sb = ctx.SendBytes;
         }
         else
         {
             var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
-            Parent.OnAccept(ref ctx);
+            Parent.DispatchAccept(ref ctx);
             sb = ctx.SendBytes;
         }
         if (leased && sb > 0) { conn.SendBusy = true; SubmitSend(slot, fd, wi, wp, sb); }
@@ -1566,7 +1573,7 @@ internal sealed class IoUringShard : SocketSetShard
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         var ctx = new SocketSet.AcceptContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
         conn.Opened = true; // app now sees it open → pairs with OnClosed
-        Parent.OnAccept(ref ctx);
+        Parent.DispatchAccept(ref ctx);
 
         if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
             ArmRecv(slot, newFd);
@@ -1605,7 +1612,7 @@ internal sealed class IoUringShard : SocketSetShard
             bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
             var ctx = new SocketSet.ConnectContext(conn, wp, leased ? _writeBuffer.BufferSize : 0);
             conn.Opened = true; // app now sees it open → pairs with OnClosed
-            Parent.OnConnect(ref ctx);
+            Parent.DispatchConnect(ref ctx);
 
             if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
                 ArmRecv(slot, fd);
@@ -1779,7 +1786,7 @@ internal sealed class IoUringShard : SocketSetShard
     {
         byte* wp = _writeBuffer.Address(writeIndex);
         var ctx = new SocketSet.WriteContext(conn, wp, _writeBuffer.BufferSize);
-        Parent.OnWrite(ref ctx);
+        Parent.DispatchWrite(ref ctx);
 
         int next = ctx.SendBytes;
         if (next == 0 && conn.Pending is { Count: > 0 } pending)
@@ -1880,7 +1887,7 @@ internal sealed class IoUringShard : SocketSetShard
         // the window state machine); if the handler declines, return the buffer to the ring.
         byte* rp = _readBuffer.GetBufferAddress(bid);
         var ctx = new SocketSet.WriteContext(conn, rp, _readBuffer.BufferSize);
-        Parent.OnWrite(ref ctx);
+        Parent.DispatchWrite(ref ctx);
 
         int next = ctx.SendBytes;
         if (next > 0)

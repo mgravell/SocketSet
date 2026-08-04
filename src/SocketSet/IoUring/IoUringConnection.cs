@@ -217,7 +217,21 @@ internal sealed unsafe class IoUringConnection : Connection
         return _curMemMgr.Memory.Slice(_curPos, _curCap - _curPos);
     }
 
-    public override void Advance(int count) => _curPos += count;
+    /// <summary>
+    /// Commit <paramref name="count"/> bytes of the last GetSpan/GetMemory. VALIDATED, because the
+    /// consequence of an over-advance here is not a managed exception: _curPos becomes the committed
+    /// Length of an OutSeg, which becomes an iovec's iov_len, and the kernel then reads PAST the pool
+    /// page — sending whatever sits next in the shared pinned slab (another connection's buffered bytes)
+    /// to this peer. Cheap check against a silent cross-connection disclosure; caught 2026-08-04.
+    /// </summary>
+    public override void Advance(int count)
+    {
+        if ((uint)count > (uint)(_curCap - _curPos)) ThrowAdvance(count, _curCap - _curPos);
+        _curPos += count;
+
+        static void ThrowAdvance(int count, int available) => throw new ArgumentOutOfRangeException(
+            nameof(count), $"Cannot advance {count} bytes; the current buffer has {available} available.");
+    }
 
     // io_uring sends a chain of up to IovMax (1024) segments as ONE writev, so an oversized write should
     // span pooled pages rather than force a contiguous buffer. Ignoring the hint here is what stops

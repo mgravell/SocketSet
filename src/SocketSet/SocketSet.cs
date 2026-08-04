@@ -438,25 +438,92 @@ public abstract partial class SocketSet : IDisposable
     }
 
     /// <summary>
-    /// A connection has been torn down — peer close (EOF), a transport error, or a local
-    /// <see cref="Connection.Close"/>. Fires exactly once, on the owning IO thread, and only for a
-    /// connection the application actually saw open (i.e. paired with an <see cref="OnAccept"/> or
-    /// <see cref="OnConnect"/>). The fd is already closed by the time this runs; it is a notification
-    /// for bookkeeping (the <paramref name="connection"/>'s <see cref="Connection.UserToken"/> is
-    /// still readable). After it returns the connection is recycled — do not retain it.
-    /// </summary>
-    /// <summary>
     /// Receive dispatch. A connection in pipe mode (<c>ctx.UsePipe(...)</c>) has its bytes written to the
     /// pipe; everything else goes to <see cref="OnReceive"/> exactly as before. Backends call this rather
-    /// than OnReceive directly so the choice is made in one place instead of at every call site.
+    /// than OnReceive directly so the choice is made in one place instead of at every call site — and,
+    /// since 2026-08-04, so an exception out of the handler cannot unwind into the shard loop (see the
+    /// containment note below).
     /// </summary>
     internal void DispatchReceive(ref ReceiveContext ctx)
     {
+        try
+        {
 #if NET
-        var pipe = ctx.Connection.PipeIo;
-        if (pipe is not null) { pipe.OnReceived(ctx.Payload); return; }
+            var pipe = ctx.Connection.PipeIo;
+            if (pipe is not null) { pipe.OnReceived(ctx.Payload); return; }
 #endif
-        OnReceive(ref ctx);
+            OnReceive(ref ctx);
+        }
+        catch (Exception ex)
+        {
+            // Do not send whatever a half-completed handler left in the buffer.
+            ctx.ResponseBytes = 0;
+            OnCallbackFaulted(ctx.Connection, nameof(OnReceive), ex);
+        }
+    }
+
+    // =====================================================================
+    // Callback fault containment
+    // ---------------------------------------------------------------------
+    // WHY THESE WRAPPERS EXIST (2026-08-04 audit). Every loop-driven backend dispatched OnReceive/
+    // OnAccept/OnConnect/OnWrite bare, so an exception out of APPLICATION code unwound the completion
+    // loop, through OnRun, into SocketSetShard.Run's catch — which logs and falls into `finally
+    // { OnShutdown(); }`. That runs Cleanup(): every fd on the shard closed, the loop never restarted.
+    // One unhandled exception therefore killed up to SocketsPerShard (4096) live connections AND removed
+    // 1/N of the set's capacity permanently, which for a server is a remote DoS with a one-request cost.
+    //
+    // DispatchClosed was already guarded, so the shape was established; it simply had not been applied to
+    // the hot four. Containment is per-CONNECTION: the faulting connection is closed (its state is
+    // unknowable after a partial handler) and every sibling on the shard is untouched.
+    //
+    // These deliberately return void and close via Connection.Close() rather than returning a
+    // keep/drop bool. Close() is already the thread-safe, generation-guarded, marshal-onto-the-loop path
+    // every backend implements and every application uses, so there is no new teardown route to get
+    // wrong — and no call site has to change shape.
+    // =====================================================================
+
+    internal void DispatchAccept(ref AcceptContext ctx)
+    {
+        try { OnAccept(ref ctx); }
+        catch (Exception ex)
+        {
+            ctx.SendBytes = 0;
+            OnCallbackFaulted(ctx.Connection, nameof(OnAccept), ex);
+        }
+    }
+
+    internal void DispatchConnect(ref ConnectContext ctx)
+    {
+        try { OnConnect(ref ctx); }
+        catch (Exception ex)
+        {
+            ctx.SendBytes = 0;
+            OnCallbackFaulted(ctx.Connection, nameof(OnConnect), ex);
+        }
+    }
+
+    internal void DispatchWrite(ref WriteContext ctx)
+    {
+        try { OnWrite(ref ctx); }
+        catch (Exception ex)
+        {
+            ctx.SendBytes = 0;
+            OnCallbackFaulted(ctx.Connection, nameof(OnWrite), ex);
+        }
+    }
+
+    /// <summary>
+    /// An application callback threw. The default drops THAT connection (its protocol state is unknowable
+    /// after a partially-run handler) and reports through <see cref="OnWorkerFaulted"/>; the shard and
+    /// every other connection on it carry on. Override to add logging or metrics — but note that this
+    /// runs ON the loop thread, so it must not block, and an exception thrown from an override is
+    /// swallowed rather than allowed to defeat the containment it exists to provide.
+    /// </summary>
+    protected virtual void OnCallbackFaulted(Connection connection, string callback, Exception exception)
+    {
+        try { connection.Close(); } catch { /* teardown is best-effort; never re-throw into the loop */ }
+        try { OnWorkerFaulted(new InvalidOperationException($"{callback} threw; connection closed.", exception)); }
+        catch (Exception ex) { Debug.WriteLine(ex.Message); }
     }
 
     /// <summary>Close dispatch: completes a pipe-mode connection's halves so whoever is awaiting either
@@ -483,6 +550,14 @@ public abstract partial class SocketSet : IDisposable
     /// </summary>
     protected internal virtual void OnLoopDrain() { }
 
+    /// <summary>
+    /// A connection has been torn down — peer close (EOF), a transport error, or a local
+    /// <see cref="Connection.Close"/>. Fires exactly once, on the owning IO thread, and only for a
+    /// connection the application actually saw open (i.e. paired with an <see cref="OnAccept"/> or
+    /// <see cref="OnConnect"/>). The fd is already closed by the time this runs; it is a notification
+    /// for bookkeeping (the <paramref name="connection"/>'s <see cref="Connection.UserToken"/> is
+    /// still readable). After it returns the connection is recycled — do not retain it.
+    /// </summary>
     protected internal virtual void OnClosed(Connection connection)
     {
     }

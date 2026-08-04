@@ -74,7 +74,12 @@ internal sealed class HalfPipeWriter : PipeWriter
 
     public override ValueTask<FlushResult> FlushAsync(CancellationToken cancellationToken = default)
     {
-        if (!_peerGone)
+        // _completed as well as _peerGone: Complete() calls _cb.Release(), handing the CycleBuffer's
+        // segments back to the MemoryPool, so draining after it would read RECYCLED pool memory straight
+        // into Connection.Send. The FlushResult below already reported _completed; the drain did not check
+        // it (2026-08-04 audit). Kestrel should not flush after completing, but "should not" is not a
+        // reason to leave a use-after-recycle reachable.
+        if (!_peerGone && !_completed)
         {
             ReadOnlySequence<byte> seq = _cb.GetAllCommitted();
             if (!seq.IsEmpty)

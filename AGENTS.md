@@ -9,6 +9,7 @@ exists because the important context is *not* in the code.
 |---|---|
 | **`TODO.md`** | The backlog, the design calls, and **why** each was made. Starts with a "READ FIRST IF YOU ARE ON WINDOWS" section — read it if that is you, because shared code changed under Windows while it was not running. |
 | **`RESULTS.md`** | Every measurement of record, with its method and its caveats. Opens with "WHERE THINGS STAND" — the consolidated feature matrix and headline numbers. |
+| **`REVIEW.md`** | Security/correctness audits of record: what was found, how it was established, what was decided, and what was deliberately left open. What `RESULTS.md` is to measurements, this is to reviews — including the things checked that turned out to be nothing, so nobody re-derives them. |
 | **`bench/README.md`** | How to get a number you can trust on this kind of machine. Written from a session where **eight** separate confounders each produced clean-looking wrong numbers. |
 
 `TODO.md` and `RESULTS.md` are long on purpose: they record retractions and falsified predictions as
@@ -80,3 +81,9 @@ both have caused hesitation:
     2026-08-03) — that the TLS min-version floor is APPLIED, not merely configured. The discriminating
     cell is one that must be REFUSED; "TLS still works" cannot distinguish a floor that took from one
     that did nothing. Both narrow gates now exist on both OSes.
+  - **`bench/verify-bind-address.sh`** (Linux, added 2026-08-04; **no Windows equivalent yet**) — that
+    `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code
+    INADDR_ANY, and nothing could see it: the smoke matrix binds `IPAddress.Any` and connects over
+    loopback, which an Any-bound listener answers either way. The assertion is read out of `ss` by pid,
+    not printed by the process, and the discriminating cell is the CONTROL (asking for 0.0.0.0 must
+    still give 0.0.0.0) — without it, the opposite hard-coding would read as correct.

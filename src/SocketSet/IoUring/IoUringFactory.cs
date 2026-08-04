@@ -83,7 +83,8 @@ internal sealed class IoUringFactory : SocketSetFactory
     /// </summary>
     private static unsafe int Bind(IPEndPoint ip, int backlog)
     {
-        int fd = LibC.socket((ushort)ip.AddressFamily, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
+        LibC.RequireIPv4(ip, nameof(SocketSet.Listen));
+        int fd = LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
 
         int one = 1;
@@ -96,9 +97,14 @@ internal sealed class IoUringFactory : SocketSetFactory
 
         var addr = new LibC.SockAddrIn
         {
-            sin_family = checked((ushort)ip.AddressFamily),
+            sin_family = LibC.AF_INET,
             sin_port = LibC.Htons(checked((ushort)ip.Port)),
-            sin_addr = 0, // INADDR_ANY TODO: use the actual IP
+            // BIND THE ADDRESS WE WERE GIVEN. This was hard-coded to 0 (INADDR_ANY) with a "TODO: use the
+            // actual IP" until the 2026-08-04 audit: Listen(IPEndPoint(IPAddress.Loopback, p)) silently
+            // listened on EVERY interface, and only the managed backend honoured the address — so the same
+            // call was loopback-only in a managed-backend test and world-reachable in production. That is
+            // the wrong direction for a default to fail in, so it is now honoured on every backend.
+            sin_addr = LibC.ToSinAddr(ip.Address),
         };
         if (LibC.bind(fd, &addr, 16) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "IP bind() failed");
