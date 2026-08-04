@@ -107,10 +107,10 @@ internal static unsafe partial class NativeOpenSsl
     [LibraryImport(Ssl)] public static partial long SSL_get_verify_result(IntPtr ssl);
     [LibraryImport(Ssl, StringMarshalling = StringMarshalling.Utf8)] public static partial int SSL_set1_host(IntPtr ssl, string hostname);
 
-    // IP-literal verification. SSL_set1_host matches DNS-ID (and, legacy, CN) only, so verifying
-    // "127.0.0.1" through it FAILS against a certificate that carries the address in an iPAddress SAN —
-    // which is exactly what our own demo certificate does, and what every rig here dials. The IP branch
-    // needs the verify param directly: SSL_get0_param, then X509_VERIFY_PARAM_set1_ip_asc.
+    // IP-literal verification: SSL_get0_param, then X509_VERIFY_PARAM_set1_ip_asc. This is the
+    // DOCUMENTED api for matching an address (X509_check_host is specified over dNSName; X509_check_ip is
+    // the address one). It is NOT here because SSL_set1_host was observed to fail on addresses — I
+    // claimed that and measurement falsified it; see OpenSslTlsProvider.ApplyPeerName for the numbers.
     [LibraryImport(Ssl)] public static partial IntPtr SSL_get0_param(IntPtr ssl);
     [LibraryImport(Crypto, StringMarshalling = StringMarshalling.Utf8)]
     public static partial int X509_VERIFY_PARAM_set1_ip_asc(IntPtr param, string ipasc);
@@ -118,6 +118,11 @@ internal static unsafe partial class NativeOpenSsl
     // ALPN. Note the asymmetry: a CLIENT just hands over its preference list, but a SERVER has to supply a
     // selection CALLBACK — and that callback is per-SSL_CTX, with no per-SSL equivalent, which is why one
     // OpenSslTlsProvider can serve exactly one server-side protocol list.
+    /// <summary>Server-side: the name the CLIENT asked for in its SNI extension, or null if it sent
+    /// none. (On a client this echoes back the name we set, which is why only server filters expose it.)
+    /// Valid only once the ClientHello has been parsed, i.e. from handshake completion onwards.</summary>
+    [LibraryImport(Ssl)] public static partial IntPtr SSL_get_servername(IntPtr ssl, int type);
+
     [LibraryImport(Ssl)] public static partial int SSL_set_alpn_protos(IntPtr ssl, byte* protos, uint protosLen);
     [LibraryImport(Ssl)] public static partial void SSL_CTX_set_alpn_select_cb(IntPtr ctx, IntPtr cb, IntPtr arg);
     [LibraryImport(Ssl)] public static partial void SSL_get0_alpn_selected(IntPtr ssl, byte** data, uint* len);

@@ -34,22 +34,28 @@ int failures = 0;
 // comparable: the certificate is the constant, the name being demanded is the variable.
 using var provider = OpenSslTlsProvider.CreateSelfSignedLoopback("localhost");
 
-foreach (var (host, mustConnect, label) in new[]
+// expectSni: what the SERVER should report as the name it was told, for the cells that connect.
+// "<null>" means the client correctly sent NO SNI -- which is the whole point for "*" and for an IP
+// literal (RFC 6066 forbids an address there), and is the only way to tell "we suppressed it" from
+// "we sent it anyway and nobody noticed".
+foreach (var (host, mustConnect, expectSni, label) in new[]
 {
-    ("localhost",     true,  "DNS name matches SAN"),
-    ("127.0.0.1",     true,  "IP literal matches iPAddress SAN"),
-    ("127.0.0.2",     false, "WRONG IP (must be refused)"),
-    ("*",             true,  "AnyHost: explicit opt-out"),
-    ("wrong.example", false, "WRONG NAME (must be refused)"),
-    ("",              false, "unset (must be refused)"),
+    ("localhost",     true,  "localhost", "DNS name matches SAN"),
+    ("127.0.0.1",     true,  "<null>",    "IP literal matches iPAddress SAN"),
+    ("127.0.0.2",     false, null,        "WRONG IP (must be refused)"),
+    ("*",             true,  "<null>",    "AnyHost: explicit opt-out"),
+    ("wrong.example", false, null,        "WRONG NAME (must be refused)"),
+    ("",              false, null,        "unset (must be refused)"),
 })
 {
     bool connected = false;
     string detail = "";
+    Echo echo = null;
     try
     {
         var serverOpts = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring, Tls = provider };
         using var server = new Echo(serverOpts);
+        echo = server;
         server.Listen(new IPEndPoint(IPAddress.Loopback, Port));
 
         var clientOpts = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring, Tls = provider };
@@ -57,6 +63,10 @@ foreach (var (host, mustConnect, label) in new[]
         using var client = new Dialer(clientOpts);
         client.Connect(new IPEndPoint(IPAddress.Loopback, Port));
         connected = client.Opened.Wait(TimeSpan.FromSeconds(5));
+        // WAIT FOR THE SERVER TOO. Under TLS 1.3 the CLIENT considers the handshake done when it sends
+        // its Finished, and the server only when it RECEIVES it -- so the client's signal fires first and
+        // reading the server's view straight after it is a race. It duly failed that way on the first run.
+        if (connected) server.Accepted.Wait(TimeSpan.FromSeconds(5));
     }
     catch (Exception ex)
     {
@@ -65,9 +75,16 @@ foreach (var (host, mustConnect, label) in new[]
     }
 
     bool ok = connected == mustConnect;
+    string sniSeen = echo?.Sni ?? "<no server>";
+    if (ok && mustConnect && expectSni is not null && sniSeen != expectSni)
+    {
+        ok = false;
+        detail = $"server was told SNI {sniSeen}, expected {expectSni}";
+    }
     if (!ok) failures++;
     string verdict = connected ? "CONNECTED" : "REFUSED";
-    Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {("\"" + host + "\""),-16} {label,-34} {verdict} {detail}");
+    string sniNote = mustConnect ? $" sni={sniSeen}" : "";
+    Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {("\"" + host + "\""),-16} {label,-34} {verdict}{sniNote} {detail}");
     Thread.Sleep(200);
 }
 
@@ -78,6 +95,17 @@ return failures == 0 ? 0 : 1;
 
 sealed class Echo(SocketSetOptions o) : SocketSet(o)
 {
+    // What the CLIENT asked for via SNI, as seen from the server, once the handshake is done. Null is a
+    // real answer (no SNI sent), so it is distinguished from "no connection happened" by Saw.
+    public volatile string Sni = "<none seen>";
+    public readonly ManualResetEventSlim Accepted = new(false);
+
+    protected override void OnAccept(ref AcceptContext ctx)
+    {
+        Sni = ctx.Connection.RequestedServerName ?? "<null>";
+        Accepted.Set();
+    }
+
     protected override void OnReceive(ref ReceiveContext ctx)
     {
         if (!ctx.IsEof) ctx.ResponseBytes = ctx.PayloadBytes;

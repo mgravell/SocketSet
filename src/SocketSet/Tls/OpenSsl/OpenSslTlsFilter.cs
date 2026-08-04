@@ -15,7 +15,7 @@ namespace SocketSets.Tls.OpenSsl;
 /// per-direction modes. All calls run on the owning loop thread (or, on the managed backend, under its
 /// per-connection gate), matching the "not thread-safe" contract — an <c>SSL*</c> is not thread-safe.
 /// </summary>
-internal sealed unsafe class OpenSslTlsFilter(nint ssl, nint rbio, nint wbio) : TlsFilter
+internal sealed unsafe class OpenSslTlsFilter(nint ssl, nint rbio, nint wbio, bool server = false) : TlsFilter
 {
     // rbio/wbio are owned by the SSL after SSL_set_bio, so SSL_free frees them too — we keep the handles
     // only to write received ciphertext in (rbio) and read ciphertext-to-send out (wbio).
@@ -33,6 +33,7 @@ internal sealed unsafe class OpenSslTlsFilter(nint ssl, nint rbio, nint wbio) : 
         {
             HandshakeComplete = true;
             NegotiatedProtocol = GetAlpnSelected(ssl);
+            if (server) RequestedServerName = GetRequestedServerName(ssl);
             return TlsHandshakeStatus.Completed;
         }
 
@@ -110,6 +111,14 @@ internal sealed unsafe class OpenSslTlsFilter(nint ssl, nint rbio, nint wbio) : 
         uint len = 0;
         SSL_get0_alpn_selected(ssl, &data, &len);
         return data == null || len == 0 ? null : AlpnProtocolList.DecodeId(new ReadOnlySpan<byte>(data, (int)len));
+    }
+
+    /// <summary>The SNI name the client asked for, or null if it offered none. Shared with the kTLS
+    /// path, which drives its own <c>SSL*</c> and so has no filter to ask.</summary>
+    internal static string? GetRequestedServerName(nint ssl)
+    {
+        IntPtr p = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+        return p == IntPtr.Zero ? null : System.Runtime.InteropServices.Marshal.PtrToStringUTF8(p);
     }
 
     // Feed received ciphertext into the SSL's read side. A memory BIO grows to accept it, but loop to be safe.

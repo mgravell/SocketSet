@@ -47,9 +47,30 @@ equivalent.
      callbacks subsume them and nothing outside the library passes one; leaving both means two
      mechanisms with precedence rules between them. Kept for now only so the callback change could land
      without touching every signature at once.
-   - **SNI-based server certificate selection** is still open and is NOT solved by this: the callback
-     necessarily fires before the handshake, and SNI arrives during it. Needs a real
-     `SSL_CTX_set_tlsext_servername_callback` / SChannel equivalent inside the provider.
+   - **SNI-based server certificate selection** is still open, and is NOT solved by the callback: SNI
+     and ALPN both ride in the ClientHello, and `OnServerAuthenticate` fires before the receive is even
+     armed. What DID land is the read-only half: `Connection.RequestedServerName` surfaces the name the
+     client asked for, from OnAccept onwards (OpenSSL only; SChannel returns null, see below).
+     Three routes to the selection half, in increasing order of ambition:
+     - **(a) OpenSSL native hook.** `SSL_CTX_set_client_hello_cb` (3.x; sees the raw ClientHello, can
+       read any extension, and can swap the whole context with `SSL_set_SSL_CTX`), or the older
+       `SSL_CTX_set_tlsext_servername_callback`. Precedent exists and is proven: `SelectAlpn` is already
+       an `UnmanagedCallersOnly` cdecl callback invoked from inside `SSL_do_handshake`, so the shape and
+       its risks are known. OpenSSL-only, which breaks the provider parity deliberately established in
+       bd3c31b.
+     - **(b) SChannel.** No server-side SNI hook exists. .NET's own `SslStream` solves this by PARSING
+       the ClientHello in managed code before handing bytes to SChannel. We are well placed to copy that:
+       `SChannelTlsFilter` already buffers the first flight in `_carry` before the first
+       `AcceptSecurityContext`.
+     - **(c) Peek in the shard, uniform across providers.** Parse SNI out of the first ClientHello
+       ourselves, THEN call `OnServerAuthenticate` with it populated. This is the shape that makes
+       Marc's original question ("can the server context surface the instructed SNI?") answer YES, and
+       it gives one answer on both providers and all five backends. Costs: the callback's timing
+       contract changes from "at accept" to "on first bytes"; the first flight must be buffered before a
+       provider is chosen; and it needs our own ClientHello parser, which is ATTACKER-FACING input from
+       an unauthenticated peer and therefore wants fuzzing, not just care.
+     Recommendation if this is wanted: (c), with (a) as the fallback if uniformity turns out not to
+     matter. (b) is really a component of (c) rather than an alternative to it.
 
    ORIGINAL NOTE (kept for context):
    **`TlsClientOptions.TargetHost` is per-ENGINE but hostname verification needs it per-CONNECTION.**

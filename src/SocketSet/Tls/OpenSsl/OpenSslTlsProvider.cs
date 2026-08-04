@@ -183,7 +183,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
         ConfigureServerAlpn(options.AlpnProtocols);
         var (ssl, rbio, wbio) = NewSsl(_serverCtx);
         SSL_set_accept_state(ssl);
-        return new OpenSslTlsFilter(ssl, rbio, wbio);
+        return new OpenSslTlsFilter(ssl, rbio, wbio, server: true);
     }
 
     /// <summary>Offer an ALPN list on a client SSL. OpenSSL copies the bytes, so nothing needs to outlive

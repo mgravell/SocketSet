@@ -1208,6 +1208,7 @@ internal sealed class IoUringShard : SocketSetShard
         // No TlsFilter on this path, so publish the ALPN result straight from the SSL before the app sees
         // the connection open — Connection.NegotiatedProtocol falls back to this.
         conn.KernelAlpn = OpenSslTlsFilter.GetAlpnSelected(conn.KtlsSsl);
+        if (!conn.TlsClient) conn.KernelServerName = OpenSslTlsFilter.GetRequestedServerName(conn.KtlsSsl);
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         conn.Opened = true; // app now sees it open → pairs with OnClosed

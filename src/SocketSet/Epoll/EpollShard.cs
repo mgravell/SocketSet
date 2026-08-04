@@ -1118,6 +1118,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.KtlsReady = true;
         // No TlsFilter here, so publish the ALPN result straight off the SSL — NegotiatedProtocol reads it.
         conn.KernelAlpn = OpenSslTlsFilter.GetAlpnSelected(conn.KtlsSsl);
+        if (!conn.IsClient) conn.KernelServerName = OpenSslTlsFilter.GetRequestedServerName(conn.KtlsSsl);
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         conn.Opened = true; // app now sees it open → pairs with OnClosed

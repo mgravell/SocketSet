@@ -108,6 +108,20 @@ public abstract class TlsFilter : IDisposable
     /// the app's OnAccept/OnConnect fires, so a dispatcher can branch on it immediately.</summary>
     public string? NegotiatedProtocol { get; protected set; }
 
+    /// <summary>
+    /// SERVER SIDE ONLY: the name the client asked for in its SNI extension, or null if it sent none
+    /// (or this is a client filter). Set by the time <see cref="DriveHandshake"/> reports
+    /// <see cref="TlsHandshakeStatus.Completed"/>, so it is readable from OnAccept onwards.
+    ///
+    /// NOTE WHAT THIS IS NOT. It is not available on <see cref="TlsServerAuthenticateContext"/>, and
+    /// cannot be: that callback runs BEFORE the receive is even armed, so no ClientHello has arrived and
+    /// the value would be unconditionally null. Choosing a CERTIFICATE by SNI therefore cannot use this
+    /// either -- that needs a callback inside the handshake
+    /// (<c>SSL_CTX_set_tlsext_servername_callback</c>), which is still open. This is for the cases that
+    /// only need to KNOW afterwards: logging, routing, per-vhost metrics.
+    /// </summary>
+    public string? RequestedServerName { get; protected set; }
+
     /// <summary>Who decrypts inbound records. <see cref="TlsCryptoMode.Transform"/> until (and unless) the
     /// filter enables kTLS RX during the handshake transition. Baseline + Windows: always Transform.</summary>
     public TlsCryptoMode InboundCrypto { get; protected set; } = TlsCryptoMode.Transform;

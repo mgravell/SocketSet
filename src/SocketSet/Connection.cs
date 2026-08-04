@@ -60,6 +60,19 @@ public abstract class Connection : IBufferWriter<byte>
     /// </summary>
     public string? NegotiatedProtocol => Tls?.NegotiatedProtocol ?? KernelAlpn;
 
+    /// <summary>The kTLS-path twin of <see cref="TlsFilter.RequestedServerName"/>.</summary>
+    internal string? KernelServerName { get; set; }
+
+    /// <summary>
+    /// SERVER SIDE: the name this client asked for via SNI, or null if it sent none (and always null on
+    /// an outbound connection, and on plaintext). Valid from OnAccept onwards.
+    ///
+    /// Deliberately NOT on <c>TlsServerAuthenticateContext</c>: that callback runs before the receive is
+    /// armed, so no ClientHello exists yet and the value there would always be null. See
+    /// <see cref="TlsFilter.RequestedServerName"/>.
+    /// </summary>
+    public string? RequestedServerName => Tls?.RequestedServerName ?? KernelServerName;
+
     /// <summary>True once the app has seen this connection open (OnAccept/OnConnect fired); gates
     /// <see cref="SocketSet.OnClosed"/> so it pairs with an open and never fires for a connection the
     /// app never saw (e.g. a failed connect). Backend-managed on the owning IO thread.</summary>

@@ -93,7 +93,9 @@ both have caused hesitation:
   - **`bench/verify-tlsname`** (added 2026-08-04; cross-platform) — that hostname verification actually
     RUNS, and that the `"*"` opt-out actually opts out. Its meaning lives entirely in the cells that must
     be REFUSED (`wrong.example`, `127.0.0.2`, and an unset host); the accept-cells alone would pass just
-    as happily against the pre-fix code, where a null `TargetHost` silently skipped the name check.
+    as happily against the pre-fix code, where a null `TargetHost` silently skipped the name check. It
+    also asserts what the SERVER was told via SNI, which is what proves `"*"` and IP literals really do
+    suppress the extension on the wire rather than merely being documented to.
   - **`bench/verify-bind-address.sh`** (Linux, added 2026-08-04; **no Windows equivalent yet**) — that
     `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code
     INADDR_ANY, and nothing could see it: the smoke matrix binds `IPAddress.Any` and connects over
