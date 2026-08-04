@@ -311,7 +311,7 @@ internal sealed class IoUringShard : SocketSetShard
 
     public override void Listen(EndPoint endpoint, object? userToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
     {
-        int fd = IoUringFactory.Bind(endpoint, Parent.Options.ListenBacklog);
+        int fd = IoUringFactory.Bind(endpoint, Parent.Options.ListenBacklog, Parent.Options);
         _listeners[fd] = (userToken, tls); // defaults for connections accepted here
         EnqueueAccept(fd, local);
     }
@@ -1659,6 +1659,14 @@ internal sealed class IoUringShard : SocketSetShard
         }
 
         int fd = conn.Fd; // live (not closing) → valid; defer-recycle means no stale completions
+        if (res > 0 && !hasBuf)
+        {
+            // A buffer-select recv reporting bytes without IORING_CQE_F_BUFFER should be impossible. If it
+            // ever happened we would read buffer id 0 -- i.e. deliver ANOTHER connection's data. Drop the
+            // connection instead of trusting it. REVIEW.md D6.
+            CloseClient(slot);
+            return;
+        }
         if (res > 0)
         {
             // DeliverReceive may borrow the buffer for a no-copy echo; if so it owns releasing it.

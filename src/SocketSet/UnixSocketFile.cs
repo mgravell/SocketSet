@@ -43,6 +43,32 @@ internal static class UnixSocketFile
     /// path, not something you care about. (We deliberately don't stat for S_ISSOCK — that's more
     /// cross-platform P/Invoke than it's worth here.)
     /// </summary>
+    /// <summary>
+    /// Restrict a just-bound FILESYSTEM socket to <paramref name="mode"/> (0 = leave the umask's choice).
+    /// No-op for the abstract namespace, which has no inode, and on non-Linux, where AF_UNIX permissions
+    /// are governed by directory ACLs rather than the socket file's mode.
+    ///
+    /// Called BETWEEN bind() and listen() so there is no window where the socket exists, accepts, and is
+    /// still world-connectable.
+    /// </summary>
+    public static void Restrict(string? path, int mode)
+    {
+        if (mode <= 0 || path is not { Length: > 0 }) return;
+        if (path[0] is '@' or '\0') return; // abstract namespace: no file to chmod
+#if NET
+        if (!OperatingSystem.IsLinux()) return;
+        // Best-effort, deliberately: a bind that succeeded should not be undone because the filesystem
+        // declined a chmod (an exotic mount, a container overlay). But it must be VISIBLE, because
+        // "permissions silently not applied" is the same class of failure as the audit's other findings.
+        if (Native.LibC.chmod(path, (uint)mode) != 0)
+        {
+            Console.Error.WriteLine($"[socketset] WARNING: could not chmod '{path}' to {Convert.ToString(mode, 8)}: " +
+                $"errno {System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}. The socket may be " +
+                "connectable by other local users.");
+        }
+#endif
+    }
+
     public static void PrepareForBind(string? path)
     {
         if (path is not { Length: > 0 }) return;

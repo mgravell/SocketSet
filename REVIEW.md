@@ -459,7 +459,13 @@ public contract, so it wants a decision rather than a guess.
 > is strictly better than what I proposed here, and is what shipped. Left in place because being wrong
 > about an option is worth recording alongside the option that worked.
 
-### D5. `SocketSet.snk` is a full RSA private key, committed
+### D5. ACCEPTED RISK 2026-08-04 (Marc: "we're OK with this")
+
+Marc's explicit call: the committed strong-name key is accepted. Recorded as a decision rather than an
+oversight so it is not re-raised as a finding by the next audit. The reasoning below still describes what
+is being accepted.
+
+### D5 (original). `SocketSet.snk` is a full RSA private key, committed
 
 Verified rather than assumed: the file begins `0x07` (PRIVATEKEYBLOB) with `RSA2` magic, ie. a full key
 pair, not a public key. `Directory.Build.props:47-50` has `SignAssembly=true` with `PublicSign=false`.
@@ -471,7 +477,47 @@ unrecoverable without rolling the key, which changes assembly identity for every
 answer is `PublicSign` with only the public key checked in. Marc's call because it touches published
 packages.
 
-### D6. Smaller items, recorded rather than fixed
+### D6. RESOLVED 2026-08-04 (Marc: "fine to pick up and fix, adding options as necessary")
+
+All but one are now fixed. Where the behaviour was a POLICY choice rather than a bug, it became an
+option with a secure default, per Marc's steer.
+
+- **`SO_REUSEPORT` is now `SocketSetOptions.ReusePort`** (default true). It has to stay on by default:
+  reuse-port multi-bind is how io_uring and epoll get one listener per shard. `CanMultiBind` now follows
+  the option rather than asserting the capability independently, because with it off the second shard's
+  bind would simply fail EADDRINUSE.
+- **Unix-domain socket files are now chmod'd**, `SocketSetOptions.UnixSocketMode`, default **0600**, and
+  applied BETWEEN bind and listen so there is no window where the socket both exists and is
+  world-connectable. MEASURED, with a control in the same session: a UDS bound with no chmod on this box
+  gets **0775** (group- and world-connectable, with no authentication anywhere in the stack behind it);
+  with the change it is **0600**. No-op for the abstract namespace (no inode) and on Windows (directory
+  ACLs). The chmod failing is a loud warning rather than a failed bind, because a bind that worked should
+  not be undone by an exotic mount, but it must not be silent either.
+- **Kernel-supplied buffer ids are masked**, and `HandleRecv` now DROPS a connection whose recv reports
+  bytes without `IORING_CQE_F_BUFFER` rather than falling through to buffer id 0 — which would have
+  delivered another connection's data. The kernel invariant holds; the mask is free and the cost of being
+  wrong was an out-of-slab read.
+- **TLS failures are visible in Release** — see the separate commit; `Debug.WriteLine` meant they did not
+  exist at all outside a debug build.
+- **Revocation is settable**: `SChannelTlsProvider(..., X509RevocationMode)`. Default stays `NoCheck`
+  (matching `SslStream`) because changing it silently adds a network dependency to every handshake, but
+  it is no longer hard-coded, and the docs say plainly that `Online` is the right answer for a client
+  dialling a real off-box service.
+- **Pooled buffers holding plaintext are cleared on return**, via `PooledBuffers.ReturnCleared(array,
+  used)`. Deliberately NOT `Return(clearArray: true)`, per Marc: that clears the whole array, and these
+  are routinely far larger than the part used (`ArrayPool` rounds to a power of two, and the TLS writers
+  grow to a connection's high-water and stay). Clearing 64KB to retire 40 bytes of RESP is the wrong
+  trade on a per-message path. Applied to the three that actually carry plaintext — SChannel's `_carry`
+  (decryption is in place), `PooledBufferWriter` (the decrypt target), and `PipeIoBridge._staged` — each
+  tracking a high-water mark so the clear costs the bytes actually touched. The other ~25 pool returns in
+  the backends carry ciphertext or outbound copies and were left alone.
+
+**Still open from D6:** `UnixSocketFile.PrepareForBind` still deletes whatever file is at the path,
+unconditionally, with a `File.Exists`/`File.Delete` TOCTOU. The chmod above reduces the consequence but
+not the primitive. Nothing reads `SO_PEERCRED` either, so a UDS peer is still unauthenticated beyond
+filesystem permissions — which is now a real boundary rather than a nominal one.
+
+### D6 (original). Smaller items, recorded rather than fixed
 
 - **`SO_REUSEPORT` is set unconditionally** on every IP listener (`IoUringFactory.cs:91`). It is
   structural to multi-bind so it cannot simply come off, but it does mean any process running as the

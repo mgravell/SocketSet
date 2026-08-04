@@ -58,6 +58,9 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
     // take (SECBUFFER_EXTRA) rather than buffering it, so this is ours to keep.
     private byte[] _carry;
     private int _carryLen;
+    // Furthest byte ever written in _carry. Tracked so the clear-on-return costs the bytes actually
+    // touched rather than the whole (power-of-two rounded, possibly much larger) rented array.
+    private int _highWater;
 
     private SecPkgContextStreamSizes _sizes;
 
@@ -477,9 +480,10 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
         }
         if (_carry.Length != 0)
         {
-            ArrayPool<byte>.Shared.Return(_carry);
+            PooledBuffers.ReturnCleared(_carry, _highWater);
             _carry = [];
             _carryLen = 0;
+            _highWater = 0;
         }
     }
 
@@ -495,11 +499,15 @@ internal sealed unsafe class SChannelTlsFilter : TlsFilter
         {
             byte[] bigger = ArrayPool<byte>.Shared.Rent(Math.Max(need, _carry.Length * 2));
             _carry.AsSpan(0, _carryLen).CopyTo(bigger);
-            ArrayPool<byte>.Shared.Return(_carry);
+            // DecryptMessage works in place, so _carry holds decrypted PLAINTEXT, and this pool is
+            // process-wide. Clear what was used (not the whole array) before letting it go.
+            PooledBuffers.ReturnCleared(_carry, _highWater);
             _carry = bigger;
+            _highWater = _carryLen;
         }
         data.CopyTo(_carry.AsSpan(_carryLen));
         _carryLen = need;
+        if (need > _highWater) _highWater = need;
     }
 
     /// <summary>Retain only the trailing <paramref name="tail"/> bytes — what SSPI reported as unconsumed.

@@ -100,6 +100,30 @@ public class SocketSetOptions
     /// </summary>
     public int ReceiveBufferSize { get; set; }
 
+    /// <summary>
+    /// Set <c>SO_REUSEPORT</c> on IP listeners (Linux). Default true, because reuse-port multi-bind is
+    /// how io_uring and epoll get one listener PER SHARD with the kernel balancing accepts across them --
+    /// turning it off collapses those backends onto a single-listener path.
+    ///
+    /// It is an option because it is also a (small) exposure, flagged by the 2026-08-04 audit: any
+    /// process running as the SAME UID can join the group and take a share of inbound connections. On a
+    /// single-tenant box that is nothing; on a shared one it is worth being able to say no.
+    /// </summary>
+    public bool ReusePort { get; set; } = true;
+
+    /// <summary>
+    /// Permission bits applied to a FILESYSTEM Unix-domain socket after bind (Linux/macOS; ignored for
+    /// abstract-namespace sockets, which have no inode, and on Windows, where AF_UNIX access is governed
+    /// by directory ACLs instead).
+    ///
+    /// DEFAULT 0600: owner only. Before 2026-08-04 nothing chmod'd the socket at all, so the mode came
+    /// from the process umask and was typically 0755 -- i.e. connectable by any local user, with no
+    /// authentication anywhere in the stack to make up for it. For the sidecar shape this library is
+    /// aimed at (proxy and app as the same user) 0600 is exactly right; widen it deliberately if a
+    /// different user genuinely needs to connect.
+    /// </summary>
+    public int UnixSocketMode { get; set; } = 0b110_000_000; // 0600
+
     /// <summary>Backlog passed to <c>listen()</c> on every backend — the kernel's queue of
     /// completed-handshake connections awaiting accept. Cheap; size it to absorb connection bursts.</summary>
     public int ListenBacklog { get; set; } = 512;

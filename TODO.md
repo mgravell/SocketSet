@@ -95,8 +95,15 @@ equivalent.
    my first cut: `ResponseBytes` above `PayloadBytes` without ever touching `RawBuffer` bypasses a
    wipe-on-first-access entirely, and is the more likely accident. Gated by `bench/verify-tailwipe`.
    Full writeup and the measurement in `REVIEW.md` D4.
-5. **`SocketSet.snk` is a full RSA private key, committed** (verified: PRIVATEKEYBLOB/`RSA2`), with
-   `PublicSign=false`. Not an auth bypass on .NET Core, but it is our published packages' identity.
+5. ~~**`SocketSet.snk` is a full RSA private key, committed**~~ **ACCEPTED RISK** (Marc, 2026-08-04:
+   "we're OK with this"). Recorded as a decision so the next audit does not re-raise it.
+
+5b. ~~**D6 smaller items**~~ **DONE 2026-08-04**, with options where the behaviour was policy:
+   `SocketSetOptions.ReusePort`, `SocketSetOptions.UnixSocketMode` (default 0600 -- measured: a UDS with
+   no chmod gets 0775 on this box), buffer-id masking + an `IORING_CQE_F_BUFFER` guard, TLS faults
+   visible in Release, settable revocation mode, and used-portion clears on the pooled buffers that
+   carry plaintext. Details in `REVIEW.md` D6. STILL OPEN from it: `PrepareForBind`'s unconditional
+   delete + TOCTOU, and no `SO_PEERCRED` peer check on UDS.
 
 6. **MAKE THE DEFENSIVE WIPES OPT-OUT** (Marc, 2026-08-04). What shipped is fair as a DEFAULT — on by
    default is the right posture, and `GetWriteSpan` already makes the common cases free or

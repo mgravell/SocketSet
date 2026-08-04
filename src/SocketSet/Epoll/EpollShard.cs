@@ -382,7 +382,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
     public override void Listen(EndPoint endpoint, object? userToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
     {
-        int fd = IoUringFactory.Bind(endpoint, _listenBacklog);
+        int fd = IoUringFactory.Bind(endpoint, _listenBacklog, Parent.Options);
         LibC.SetNonBlocking(fd);
         _newListeners.Enqueue((fd, userToken, tls));
         Poke();

@@ -72,6 +72,12 @@ internal static unsafe partial class LibC
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int fcntl(int fd, int cmd, int arg);
 
+    /// <summary>Set the permission bits of a filesystem path. Used to restrict a Unix-domain socket file
+    /// to its owner (see <see cref="SocketSetOptions.UnixSocketMode"/>), which nothing did before
+    /// 2026-08-04 -- the mode came from the umask and was typically world-connectable.</summary>
+    [LibraryImport(Lib, EntryPoint = "chmod", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int chmod(string path, uint mode);
+
     /// <summary>Set a socket non-blocking (best-effort; kTLS handshake needs it).</summary>
     internal static void SetNonBlocking(int fd)
     {

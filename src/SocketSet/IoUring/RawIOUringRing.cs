@@ -211,7 +211,11 @@ internal unsafe struct ManagedBufferPool : IDisposable
         if (res < 0) throw new InvalidOperationException($"PBUF registration failed: {res} (errno {Marshal.GetLastPInvokeError()})");
     }
 
-    public byte* GetBufferAddress(ushort bid) => _dataSlab + (bid * _bufSize);
+    /// <summary>Address of provided buffer <paramref name="bid"/>. MASKED against the ring size: the id
+    /// comes from the kernel and the invariant holds, but this is raw pointer arithmetic into a slab, so
+    /// the cost of being wrong is an out-of-slab read rather than an exception. The mask is free (entries
+    /// is a power of two, enforced in the constructor). REVIEW.md D6.</summary>
+    public byte* GetBufferAddress(ushort bid) => _dataSlab + ((bid & (_entries - 1)) * _bufSize);
 
     /// <summary>Return a consumed buffer to the kernel. Loop-thread only (single consumer).</summary>
     public void ReleaseBuffer(ushort bid)
@@ -219,6 +223,7 @@ internal unsafe struct ManagedBufferPool : IDisposable
         uint mask = _entries - 1;
         ushort tail = _bufRing->tail; // we are the only writer, plain read is fine
         LibC.io_uring_buf* slot = &_bufs[tail & mask];
+        bid = (ushort)(bid & mask); // same masking as GetBufferAddress; never republish an out-of-range id
         slot->addr = (ulong)(_dataSlab + (bid * _bufSize));
         slot->len = _bufSize;
         slot->bid = bid;

@@ -232,7 +232,7 @@ internal sealed class PipeIoBridge
                 {
                     var seg = _staged.Dequeue();
                     _pipe.Output.Write(seg.AsSpan());
-                    ArrayPool<byte>.Shared.Return(seg.Array!);
+                    PooledBuffers.ReturnCleared(in seg); // staged bytes are received plaintext
                 }
                 flush = _pipe.Output.FlushAsync();
                 if (flush.IsCompletedSuccessfully)
@@ -250,7 +250,7 @@ internal sealed class PipeIoBridge
             lock (_inGate)
             {
                 _flushPending = false;
-                while (_staged.Count > 0) ArrayPool<byte>.Shared.Return(_staged.Dequeue().Array!);
+                while (_staged.Count > 0) PooledBuffers.ReturnCleared(_staged.Dequeue());
             }
             _conn.Close();
         }
@@ -328,7 +328,7 @@ internal sealed class PipeIoBridge
         if (Interlocked.Exchange(ref _completed, 1) != 0) return;
         lock (_inGate)
         {
-            while (_staged.Count > 0) ArrayPool<byte>.Shared.Return(_staged.Dequeue().Array!);
+            while (_staged.Count > 0) PooledBuffers.ReturnCleared(_staged.Dequeue());
         }
         try { _pipe.Output.Complete(fault); } catch { }
         try { _pipe.Input.Complete(fault); } catch { }

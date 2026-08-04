@@ -85,7 +85,7 @@ public abstract class SocketSetFactory
     /// also naturally spreads multiple <em>distinct</em> listen endpoints across shards instead of
     /// piling them all on one.
     /// </summary>
-    public virtual bool CanMultiBind(EndPoint endpoint) => false;
+    public virtual bool CanMultiBind(EndPoint endpoint, SocketSetOptions options) => false;
 
     /// <summary>
     /// Upper bound on the number of shards this backend wants, regardless of

@@ -32,7 +32,11 @@ internal sealed class IoUringFactory : SocketSetFactory
 
     // Reuse-port multi-bind is IP-only: every shard binds the same TCP port and the kernel balances
     // accepts. AF_UNIX can't multi-bind (a second bind to the path fails), so it stays single-listener.
-    public override bool CanMultiBind(EndPoint endpoint) => endpoint is IPEndPoint;
+    // Multi-bind IS reuse-port: every shard binds the same port and the kernel balances accepts. With
+    // SocketSetOptions.ReusePort off, the second shard's bind would simply fail (EADDRINUSE), so the
+    // capability has to follow the option rather than be asserted independently.
+    public override bool CanMultiBind(EndPoint endpoint, SocketSetOptions options)
+        => endpoint is IPEndPoint && options.ReusePort;
 
     /// <summary>
     /// True only if this host can actually run the io_uring backend with the features we
@@ -68,10 +72,10 @@ internal sealed class IoUringFactory : SocketSetFactory
         catch (EntryPointNotFoundException) { return false; }
     }
 
-    public static int Bind(EndPoint endpoint, int backlog) => endpoint switch
+    public static int Bind(EndPoint endpoint, int backlog, SocketSetOptions? options = null) => endpoint switch
         {
-            IPEndPoint ip => Bind(ip, backlog),
-            UnixDomainSocketEndPoint uds => Bind(uds, backlog),
+            IPEndPoint ip => Bind(ip, backlog, options?.ReusePort ?? true),
+            UnixDomainSocketEndPoint uds => Bind(uds, backlog, options?.UnixSocketMode ?? 0),
             _ => throw new NotSupportedException(endpoint.GetType().Name)
         };
 
@@ -81,7 +85,7 @@ internal sealed class IoUringFactory : SocketSetFactory
     /// accepted sockets, which keeps it off the accept hot path. (The AF_UNIX
     /// overload has no Nagle, so the option is N/A there.)
     /// </summary>
-    private static unsafe int Bind(IPEndPoint ip, int backlog)
+    private static unsafe int Bind(IPEndPoint ip, int backlog, bool reusePort = true)
     {
         LibC.RequireIPv4(ip, nameof(SocketSet.Listen));
         int fd = LibC.socket(LibC.AF_INET, LibC.SOCK_STREAM, LibC.IPPROTO_TCP);
@@ -89,7 +93,8 @@ internal sealed class IoUringFactory : SocketSetFactory
 
         int one = 1;
         LibC.setsockopt(fd, LibC.SOL_SOCKET, LibC.SO_REUSEADDR, &one, sizeof(int));
-        LibC.setsockopt(fd, LibC.SOL_SOCKET, LibC.SO_REUSEPORT, &one, sizeof(int));
+        // Opt-out: see SocketSetOptions.ReusePort. Off means a single listener on one shard.
+        if (reusePort) LibC.setsockopt(fd, LibC.SOL_SOCKET, LibC.SO_REUSEPORT, &one, sizeof(int));
         // Disable Nagle so request/response echoes are not held for coalescing
         // (Nagle + delayed-ACK is the classic ~40ms ping-pong stall). Inherited
         // by every socket accept() returns from this listener.
@@ -114,7 +119,7 @@ internal sealed class IoUringFactory : SocketSetFactory
         return fd;
     }
 
-    private static unsafe int Bind(UnixDomainSocketEndPoint uds, int backlog)
+    private static unsafe int Bind(UnixDomainSocketEndPoint uds, int backlog, int mode = 0)
     {
         int fd = LibC.socket(LibC.AF_UNIX, LibC.SOCK_STREAM, 0);
         if (fd < 0) throw new Win32Exception(Marshal.GetLastPInvokeError(), $"socket(AF_UNIX) failed");
@@ -127,6 +132,10 @@ internal sealed class IoUringFactory : SocketSetFactory
         uint len = LibC.SockAddrUn.Init(&addr, uds.ToString());
         if (LibC.bind(fd, &addr, len) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), $"UDS bind(AF_UNIX) failed");
+        // Restrict the socket FILE before anyone can connect -- between bind() and listen(), so there is
+        // no window in which it is both present and world-connectable. No-op for the abstract namespace,
+        // which has no inode. See SocketSetOptions.UnixSocketMode.
+        UnixSocketFile.Restrict(uds.ToString(), mode);
         if (LibC.listen(fd, backlog) < 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), $"UDS listen() failed");
 

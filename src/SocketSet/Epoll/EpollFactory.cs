@@ -35,7 +35,11 @@ internal sealed class EpollFactory : SocketSetFactory
 
     // Reuse-port multi-bind is IP-only: every shard binds the same TCP port and the kernel balances
     // accepts across them. AF_UNIX cannot multi-bind, so it stays single-listener.
-    public override bool CanMultiBind(EndPoint endpoint) => endpoint is IPEndPoint;
+    // Multi-bind IS reuse-port: every shard binds the same port and the kernel balances accepts. With
+    // SocketSetOptions.ReusePort off, the second shard's bind would simply fail (EADDRINUSE), so the
+    // capability has to follow the option rather than be asserted independently.
+    public override bool CanMultiBind(EndPoint endpoint, SocketSetOptions options)
+        => endpoint is IPEndPoint && options.ReusePort;
 
     /// <summary>Definitively probe rather than infer from a version string: create a throwaway epoll fd.
     /// epoll has been in Linux since 2.6 and is not gated by a sysctl, so this only really distinguishes

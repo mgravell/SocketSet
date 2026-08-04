@@ -457,7 +457,7 @@ public abstract partial class SocketSet : IDisposable
     public void Listen(EndPoint endpoint, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
     {
         ValidateEndpoint(endpoint);
-        if (Options.Factory.CanMultiBind(endpoint))
+        if (Options.Factory.CanMultiBind(endpoint, Options))
         {
             // Reuse-port: every shard binds its own listener and the kernel balances accepts (io_uring/IP).
             // Record it and bind the current shards under the growth lock so the two are atomic against a

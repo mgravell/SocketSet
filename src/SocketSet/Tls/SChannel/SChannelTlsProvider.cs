@@ -36,6 +36,11 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
     private readonly X509Certificate2? _trust;
     private readonly bool _verifyServer;
     private readonly bool _ownsCerts; // set by CreateSelfSignedLoopback: dispose + delete the key on exit
+    /// <summary>Revocation policy for the chain build. Defaults to NoCheck, matching SslStream, but is now
+    /// SETTABLE (REVIEW.md D6): NoCheck means a revoked certificate is still accepted, which for a client
+    /// dialling a real off-box service is the wrong answer -- Online is. Left as the default only because
+    /// changing it silently adds a network dependency to every handshake.</summary>
+    private readonly X509RevocationMode _revocationMode;
     private bool _disposed;
 
     // NOTE: the floor is deliberately NOT retained as a field. The renegotiation refusal in
@@ -58,15 +63,17 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
         X509Certificate2? serverCertificate = null,
         X509Certificate2? trustCertificate = null,
         bool verifyServer = true,
-        TlsProtocol minProtocol = TlsProtocol.Tls13)
-        : this(serverCertificate, trustCertificate, verifyServer, minProtocol, ownsCerts: false)
+        TlsProtocol minProtocol = TlsProtocol.Tls13,
+        X509RevocationMode revocationMode = X509RevocationMode.NoCheck)
+        : this(serverCertificate, trustCertificate, verifyServer, minProtocol, ownsCerts: false, revocationMode)
     {
     }
 
     private SChannelTlsProvider(
         X509Certificate2? serverCertificate, X509Certificate2? trustCertificate, bool verifyServer,
-        TlsProtocol minProtocol, bool ownsCerts)
+        TlsProtocol minProtocol, bool ownsCerts, X509RevocationMode revocationMode = X509RevocationMode.NoCheck)
     {
+        _revocationMode = revocationMode;
         _serverCert = serverCertificate;
         _trust = trustCertificate;
         _verifyServer = verifyServer;
@@ -160,9 +167,7 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
         if (remote is null) { reason = "server presented no certificate"; return false; }
 
         using var chain = new X509Chain();
-        // Matches SslStream's default (CheckCertificateRevocation: false).
-        // TODO: expose revocation policy; Online is the right answer for a real off-box client.
-        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        chain.ChainPolicy.RevocationMode = _revocationMode;
         if (_trust is not null)
         {
             // Trust exactly this certificate and nothing else — not "this, plus every public CA".

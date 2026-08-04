@@ -15,6 +15,9 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
 {
     private byte[]? _buf;
     private int _pos;
+    // Furthest byte ever written, across Resets, so the clear-on-return covers everything that was ever
+    // plaintext in this array without clearing the whole rented (rounded-up) length.
+    private int _highWater;
 
     /// <summary>Largest capacity this writer has ever held, so a re-rent after <see cref="TakeArray"/>
     /// starts there instead of at the size hint.
@@ -51,6 +54,7 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
         int available = (_buf?.Length ?? 0) - _pos;
         if ((uint)count > (uint)available) ThrowAdvance(count, available);
         _pos += count;
+        if (_pos > _highWater) _highWater = _pos;
 
         static void ThrowAdvance(int count, int available) => throw new ArgumentOutOfRangeException(
             nameof(count), $"Cannot advance {count} bytes; the current buffer has {available} available.");
@@ -101,13 +105,15 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
         int size = Math.Max(_buf.Length * 2, _pos + sizeHint);
         var bigger = ArrayPool<byte>.Shared.Rent(size);
         Buffer.BlockCopy(_buf, 0, bigger, 0, _pos);
-        ArrayPool<byte>.Shared.Return(_buf);
+        // This writer is the TLS decrypt target, so what is being handed back to a process-wide pool is
+        // plaintext. Clear the used prefix only (see PooledBuffers).
+        PooledBuffers.ReturnCleared(_buf, _highWater);
         _buf = bigger;
         _capacity = bigger.Length;
     }
 
     public void Dispose()
     {
-        if (_buf is not null) { ArrayPool<byte>.Shared.Return(_buf); _buf = null; }
+        if (_buf is not null) { PooledBuffers.ReturnCleared(_buf, _highWater); _buf = null; }
     }
 }
