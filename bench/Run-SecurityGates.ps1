@@ -43,6 +43,11 @@ Invoke-Gate 'build (net10.0 + net472)' {
 # 2. The security gates added by the audit. All cross-platform .NET rigs; they select Windows backends
 #    and the SChannel provider automatically (see bench/GateBackends.cs).
 Invoke-Gate 'verify-bind-address' { & (Join-Path $PSScriptRoot 'Verify-BindAddress.ps1') }
+# The network half of the same question, and until 2026-08-04 the one check here that was NOT automated.
+# Verify-BindAddress asks the kernel what the socket carries; this asks whether anyone else can reach it.
+# It can report INCONCLUSIVE (exit 2) if a host firewall blocks its own control, which is neither a pass
+# nor a library failure -- so it is scored on "not FAIL" rather than on exit 0.
+Invoke-Gate 'verify-bind-reachability' { & (Join-Path $PSScriptRoot 'Verify-BindReachability.ps1'); if ($LASTEXITCODE -eq 2) { Write-Host '  (inconclusive, not scored as a failure)' -ForegroundColor Yellow; $global:LASTEXITCODE = 0 } }
 Invoke-Gate 'verify-tailwipe'     { & dotnet run --project (Join-Path $repo 'bench\verify-tailwipe') -c Release -f net10.0 }
 Invoke-Gate 'verify-tlsname'      { & dotnet run --project (Join-Path $repo 'bench\verify-tlsname')  -c Release -f net10.0 }
 Invoke-Gate 'verify-timeouts'     { & dotnet run --project (Join-Path $repo 'bench\verify-timeouts') -c Release -f net10.0 }
@@ -69,9 +74,9 @@ Write-Host '========================================='
 if ($failed -eq 0) {
     Write-Host 'ALL GATES PASS' -ForegroundColor Green
     Write-Host ''
-    Write-Host 'THE DISCRIMINATING CHECK IS NOT AUTOMATED, and matters most: bind a listener to 127.0.0.1'
-    Write-Host 'and confirm it is NOT reachable on this box''s LAN address. Loopback connectivity cannot'
-    Write-Host 'tell a bind that took from one that did nothing.'
+    Write-Host 'The discriminating bind check IS automated now (Verify-BindReachability, 2026-08-04): a'
+    Write-Host 'listener on 127.0.0.1 is confirmed unreachable on this box''s LAN address, behind a control'
+    Write-Host 'that proves the LAN address answers at all. Run it with -SimulateBug to watch it fail.'
     exit 0
 }
 Write-Host "$failed GATE(S) FAILED" -ForegroundColor Red

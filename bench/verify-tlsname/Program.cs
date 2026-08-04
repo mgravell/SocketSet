@@ -40,6 +40,21 @@ using var provider = (IDisposable)GateBackends.SelfSigned();   // SChannel on Wi
 var (tlsBackend, backendName) = GateBackends.Tls[0];
 Console.WriteLine($"=== verify-tlsname: backend={backendName} ===");
 
+// THE SNI HALF OF THIS RIG DOES NOT EXIST ON EVERY PROVIDER, and it has to say so. SChannel offers no
+// server-side way to read the name a client asked for, so Connection.RequestedServerName is always null on
+// Windows. Left unsaid, the "127.0.0.1" and "*" cells -- whose whole content is "the client sent NO SNI" --
+// would report sni=<null> and PASS there without observing anything at all: a provider that can never
+// report SNI is indistinguishable from a client that correctly suppressed it. The accept/refuse cells are
+// unaffected and remain fully discriminating on both providers; it is only the announce half that goes
+// unmade, and an unmade assertion must be printed as unmade rather than as a pass.
+bool sniObservable = GateBackends.ServerSniObservable;
+if (!sniObservable)
+{
+    Console.WriteLine("  NOTE  server-side SNI is NOT OBSERVABLE on this provider (SChannel has no");
+    Console.WriteLine("        SSL_get_servername equivalent), so the announce assertions below are");
+    Console.WriteLine("        SKIPPED, not passed. The name-verification cells are unaffected.");
+}
+
 foreach (var (host, mustConnect, expectSni, label) in new[]
 {
     ("localhost",     true,  "localhost", "DNS name matches SAN"),
@@ -80,7 +95,8 @@ foreach (var (host, mustConnect, expectSni, label) in new[]
 
     bool ok = connected == mustConnect;
     string sniSeen = echo?.Sni ?? "<no server>";
-    if (ok && mustConnect && expectSni is not null && sniSeen != expectSni)
+    bool sniChecked = sniObservable && mustConnect && expectSni is not null;
+    if (ok && sniChecked && sniSeen != expectSni)
     {
         ok = false;
         detail = $"server was told SNI {sniSeen}, expected {expectSni}";
@@ -94,13 +110,19 @@ foreach (var (host, mustConnect, expectSni, label) in new[]
         ok = false; failures++;
         detail = "refused with NO reason reported (OnTlsFault never fired)";
     }
-    string sniNote = mustConnect ? $" sni={sniSeen}" : $" reason=\"{Trunc(fault)}\"";
+    // Print what was ASSERTED, not merely what was seen: "sni=<null>" and "sni=(not observable)" are very
+    // different claims and must not render alike.
+    string sniNote = mustConnect
+        ? (sniChecked ? $" sni={sniSeen}" : (mustConnect && expectSni is not null ? " sni=(not observable)" : ""))
+        : $" reason=\"{Trunc(fault)}\"";
     Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {("\"" + host + "\""),-16} {label,-34} {verdict}{sniNote} {detail}");
     Thread.Sleep(200);
 }
 
 Console.WriteLine(failures == 0
-    ? "\n=== verify-tlsname: ALL PASS (including the refusal cells) ==="
+    ? (sniObservable
+        ? "\n=== verify-tlsname: ALL PASS (including the refusal cells) ==="
+        : "\n=== verify-tlsname: ALL PASS (refusal cells included; SNI-announce assertions NOT MADE on this provider) ===")
     : $"\n=== verify-tlsname: {failures} FAILURE(S) ===");
 return failures == 0 ? 0 : 1;
 

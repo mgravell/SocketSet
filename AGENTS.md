@@ -107,9 +107,19 @@ both have caused hesitation:
     quiet is actually reaped. Self-controlling rather than merely positive: a COMPLETED handshake must
     survive the same budget (so "reaped" cannot mean "we drop everything"), and the idle-off/idle-on pair
     is a controlled A/B proving both that the default is off and that the option is not inert.
-  - **`bench/verify-bind-address.sh`** (Linux, added 2026-08-04; **no Windows equivalent yet**) — that
+  - **`bench/verify-bind-address.sh`** (Linux) / **`bench/Verify-BindAddress.ps1`** (Windows), added
+    2026-08-04 — that
     `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code
     INADDR_ANY, and nothing could see it: the smoke matrix binds `IPAddress.Any` and connects over
-    loopback, which an Any-bound listener answers either way. The assertion is read out of `ss` by pid,
-    not printed by the process, and the discriminating cell is the CONTROL (asking for 0.0.0.0 must
-    still give 0.0.0.0) — without it, the opposite hard-coding would read as correct.
+    loopback, which an Any-bound listener answers either way. The assertion is read out of `ss` /
+    `Get-NetTCPConnection` by pid, not printed by the process, and the discriminating cell is the CONTROL
+    (asking for 0.0.0.0 must still give 0.0.0.0) — without it, the opposite hard-coding would read as
+    correct.
+  - **`bench/Verify-BindReachability.ps1`** (Windows, added 2026-08-04; **no Linux equivalent yet**) —
+    the NETWORK half of that same question, and until now the one check nothing automated. The rig above
+    asks the kernel what address the socket carries; this asks whether anyone else can reach it. No second
+    machine: connecting to this box's own LAN address still carries that address as the destination, so a
+    127.0.0.1-bound socket does not match it. Its control is load-bearing — bound to `0.0.0.0` the LAN
+    address MUST answer, or a host firewall would make every backend "pass" while proving nothing, so that
+    case reports INCONCLUSIVE rather than green. `-SimulateBug` reproduces the INADDR_ANY bug at the same
+    observation point with no library edit, and is how the gate was shown to fail before it was believed.

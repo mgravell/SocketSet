@@ -51,6 +51,16 @@ equivalent.
      and ALPN both ride in the ClientHello, and `OnServerAuthenticate` fires before the receive is even
      armed. What DID land is the read-only half: `Connection.RequestedServerName` surfaces the name the
      client asked for, from OnAccept onwards (OpenSSL only; SChannel returns null, see below).
+     **WINDOWS RAISED THE PRICE OF LEAVING THIS OPEN (2026-08-04).** `verify-tlsname`'s first Windows run
+     failed the `"localhost"` cell, and chasing it found the reporting half is not merely absent on
+     SChannel but *misreported*: `Connection.RequestedServerName` returns null unconditionally there, and
+     the public doc said null means "the client sent none". Anyone routing or admitting on SNI would see
+     every Windows client as having sent none. The doc now says so, and the rig now declines to assert the
+     announce half rather than passing it vacuously (`GateBackends.ServerSniObservable`) — but that is
+     containment, not a fix, and it means the `"*"`/IP-literal suppression cells prove nothing on Windows.
+     **Route (b) or (c) below would restore that discrimination**, which is a second reason to want them
+     beyond server certificate selection.
+
      Three routes to the selection half, in increasing order of ambition:
      - **(a) OpenSSL native hook.** `SSL_CTX_set_client_hello_cb` (3.x; sees the raw ClientHello, can
        read any extension, and can swap the whole context with `SSL_set_SSL_CTX`), or the older
@@ -185,10 +195,28 @@ fixed, then won where it matters), and everything is pushed. The long version, i
 6. **Marc-only pending**: nuget push; PR/merge calls on marc/transport-push-feed + marc/uds-abstract-
    config; redis PRs #15572/#15575 shepherding (8.12 bucket, quiet); #2012 watch.
 
-## READ FIRST IF YOU ARE ON WINDOWS (2026-08-04: SEVEN COMMITS OF UNRUN WINDOWS CHANGES)
+## WINDOWS CATCH-UP 2026-08-04: **DONE, ALL GATES GREEN** (was: seven commits of unrun Windows changes)
 
-> **RUN `bench/Run-SecurityGates.ps1` FIRST. That is the whole ask.** One command: full multi-target
-> build, then every security gate, cheapest first.
+> **The ask was `bench/Run-SecurityGates.ps1`, and it is done.** The Windows half of all seven audit
+> commits is now exercised and clean: **48/48** smoke, **18/18** AspNet, **6/6** bind-address, **9/9**
+> bind-reachability, TLS floor, tailwipe (`cleared=5` exactly), timeouts 8/8. The full table, and the
+> reasoning, are in **`REVIEW.md` -> "WINDOWS: RUN 2026-08-04"**. Do not re-derive it here.
+>
+> Four things came out of it that are worth carrying forward:
+>
+> 1. **Both pre-registered fragile spots held.** The deadline sweep at the top of the IOCP/RIO loops is
+>    not reaping live connections, and `WindowsShardBase.SweepTimeouts`' `i + 1` slot indexing does match
+>    `CloseClient` on both backends. Predicted as the likely breaks; neither fired.
+> 2. **The `.ps1` caveat did not materialise** — both scripts written blind on Linux parsed and ran
+>    first time. The prediction was wrong and writing it down was still right.
+> 3. **`verify-tlsname` failed, and it was the RIG, not the library** — but the cells that PASSED were
+>    the worse problem, and the fix is recorded in the D1 follow-up above.
+> 4. **The "one check that is not automated" is now automated** and has been shown to fail:
+>    `bench/Verify-BindReachability.ps1`, wired into `Run-SecurityGates.ps1`, with a `-SimulateBug`
+>    switch that reproduces the INADDR_ANY bug without touching library code.
+>
+> *The original pre-run briefing follows, kept because its two predictions were pre-registered and both
+> turned out to be wrong — which is the part worth remembering.*
 >
 > **WHY.** A 2026-08-04 security audit produced seven commits, and every one of them changed shared or
 > Windows code that has NEVER EXECUTED on Windows: `IocpShard`, `WindowsRioShard`, `WindowsShardBase`,
@@ -198,9 +226,11 @@ fixed, then won where it matters), and everything is pushed. The long version, i
 > resolution moved to `OnClientAuthenticate`/`OnServerAuthenticate` with a MANDATORY `TargetHost`,
 > handshake/idle deadlines with a per-shard sweep, and bounded inbound buffering.
 >
-> **THE ONE CHECK THAT IS NOT AUTOMATED**, and it is the one that matters most: bind a listener to
+> ~~**THE ONE CHECK THAT IS NOT AUTOMATED**, and it is the one that matters most: bind a listener to
 > `127.0.0.1` and confirm it is NOT reachable on this box's LAN address. Loopback connectivity cannot
-> distinguish a bind that took from one that did nothing — that is exactly how the bug survived.
+> distinguish a bind that took from one that did nothing — that is exactly how the bug survived.~~
+> **AUTOMATED 2026-08-04** as `bench/Verify-BindReachability.ps1`: 9/9 PASS, controls confirmed answering
+> (so not a firewall artefact), and shown to FAIL via `-SimulateBug`.
 >
 > **Expect these to be the fragile ones.** The Windows deadline sweep sits at the TOP of both loops
 > (IOCP and RIO have early `continue`s on WAIT_TIMEOUT / port-closed that would skip a sweep placed after

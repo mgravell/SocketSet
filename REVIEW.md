@@ -663,16 +663,67 @@ Every Linux gate, re-run after each of the seven commits this audit produced:
 | `bench/verify-timeouts` | **8/8 PASS** (new; 4 cells x 2 backends) |
 | `bench/verify-tlsname` | **6/6 PASS** (new; 3 of them refusal cells) |
 
-**Windows: ALL OF IT UNRUN**, across all seven commits. `bench/Run-SecurityGates.ps1` (new) runs the lot
-in one command, starting with a FULL multi-target build — the single-target habit shipped a net472 break
-during this very session. `bench/Verify-BindAddress.ps1` is the Windows twin of the Linux bind gate; the
-three `verify-*` .NET rigs are cross-platform and pick this OS's backends and TLS provider via
-`bench/GateBackends.cs`. The discriminating check for the bind fix is deliberately NOT automated and is
-called out at the end of the run: a listener on `127.0.0.1` must not be reachable on the LAN address.
+### WINDOWS: RUN 2026-08-04, and the Windows half of all seven commits is now clean
 
-Caveat, stated so it is not discovered as a surprise: the two new `.ps1` files were authored on Linux,
-which has no PowerShell, so they have never been parsed. The .NET rigs they drive do build and pass
-here. Treat a first-run failure in the scripts as a harness bug before suspecting the library.
+Run on the Windows box the same day, via `bench/Run-SecurityGates.ps1`. Every one of the six files the
+audit touched that had never executed on Windows — `IocpShard`, `WindowsRioShard`, `WindowsShardBase`,
+`Win32.cs`, `SocketSetShard`, `SocketSet.cs` — is now exercised.
+
+| gate | result |
+|---|---|
+| full solution build (net10.0 + net472) | 0 errors, 11 warnings, all pre-existing |
+| `bench/Verify-BindAddress.ps1` | **6/6 PASS** (iocp/rio/managed x loopback + the `0.0.0.0` control) |
+| `bench/Verify-BindReachability.ps1` | **9/9 PASS** (new — see below) |
+| `bench/verify-tailwipe` | **ALL PASS**, `cleared=5` exactly (0 would leak, ~4000 would over-charge) |
+| `bench/verify-tlsname` | **1 FAIL**, then ALL PASS — the failure was the RIG. See below |
+| `bench/verify-timeouts` | **8/8 PASS** (IOCP + Managed) |
+| `bench/Verify-TlsFloor.ps1` | **12/12 PASS**, both refusal cells included |
+| `bench/Verify-AspNet.ps1` | **18/18 PASS** |
+| `bench/Run-SmokeMatrix.ps1` | **48/48 PASS**, first run |
+
+**Both pre-registered fragile spots held.** The handover predicted two: that the Windows deadline sweep,
+placed at the TOP of the IOCP and RIO loops to dodge their early `continue`s, might reap live connections
+at ~10s; and that `WindowsShardBase.SweepTimeouts` closing by slot index `i + 1` might not match
+`CloseClient`'s convention on those backends. Neither fired — `handshake/spared` survives its budget on
+both, and `idle/off-by-default` survives, so the sweep is neither over- nor under-firing.
+
+**The `.ps1` caveat did not materialise.** Both scripts authored blind on Linux parsed and ran correctly
+on the first attempt. Recorded because the prediction was explicit and wrong; the caveat was still the
+right thing to have written down.
+
+**The one failure was in the gate, and the passing cells were the worse problem.** `verify-tlsname`'s
+`"localhost"` cell failed asserting the server saw `SNI=localhost`. That is not a library defect:
+`SChannelTlsFilter` never sets `RequestedServerName` (only `OpenSslTlsFilter` does), so
+`Connection.RequestedServerName` is ALWAYS null under SChannel — already known, recorded in D1's
+follow-ups. The client side is fine; `_sniName` reaches `InitializeSecurityContext` as `pszTargetName`,
+and all three refusal cells refuse correctly, so name verification genuinely runs on Windows.
+
+The real finding is the two cells that PASSED. `"127.0.0.1"` and `"*"` exist to assert *the client sent no
+SNI*, and they read `sni=<null>` from a provider that reports null unconditionally. They observed nothing
+and printed as passes — the exact silent degradation these gates exist to catch, sitting inside a gate.
+Fixed with a `GateBackends.ServerSniObservable` capability flag: the announce assertions now print as
+**SKIPPED, not passed**, and the summary line says so. `Connection.RequestedServerName`'s public doc got
+the same treatment — it said null means "the client sent none", which on Windows means "we cannot tell",
+and code routing or admitting on that difference would see every Windows client as having sent no SNI.
+
+### The check that "is not automated" now is, and it has been shown to fail
+
+`bench/Verify-BindReachability.ps1` (new, 2026-08-04) closes the gap the handover called the one that
+matters most. `Verify-BindAddress` asks the KERNEL what address the socket carries; this asks the NETWORK
+whether anyone else can reach it. They fail differently, and no second machine is needed: connecting to
+this box's own LAN address still carries that address as the destination, so a socket bound to 127.0.0.1
+does not match it.
+
+Three cells per backend, and the FIRST is what makes the other two mean anything — bound to `0.0.0.0` the
+LAN address MUST answer. Without it, a host firewall blocking inbound would make every backend "pass" the
+cell that matters while proving nothing, which is the same shape as the bug. That case reports
+INCONCLUSIVE and exits 2 rather than green. On this box the controls did answer, so the 9/9 is real.
+
+**And it was shown to fail**, per the rule that earned its keep on the Linux bind gate. The bug was
+"bind INADDR_ANY whatever you were asked for", so `-SimulateBug` reproduces it exactly at the same
+observation point — the assertion cells bind `0.0.0.0` — with no library edit to remember to revert.
+The result was the pre-registered pattern rather than merely "some failure": all three
+`loopback-only (lan)` cells FAIL, all three controls and all three liveness cells unaffected.
 
 One real break was caught here and is worth recording: `--bind-probe` used `Environment.ProcessId`,
 which is net5+, and this repo multi-targets net472. A `-f net10.0` build passes happily; the FULL

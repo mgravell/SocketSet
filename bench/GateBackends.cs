@@ -27,6 +27,14 @@ internal static class GateBackends
         ? [(SocketSetFactory.WindowsIocp, "IOCP"), (SocketSetFactory.Managed, "Managed")]
         : [(SocketSetFactory.IoUring, "IoUring"), (SocketSetFactory.Epoll, "Epoll")];
 
+    /// <summary>Can the SERVER report the SNI the client asked for? OpenSSL can (SSL_get_servername);
+    /// SChannel has no equivalent, so <c>Connection.RequestedServerName</c> is ALWAYS null on Windows --
+    /// see TODO's D1 follow-up, which lists the three routes to fixing that. This is a capability flag and
+    /// not a quiet <c>if (IsWindows)</c> in the rig because the point is that the rig must SAY the
+    /// assertion was not made: a cell expecting "no SNI" passes vacuously against a provider that reports
+    /// no SNI ever, which is a silent degradation of exactly the kind these gates exist to catch.</summary>
+    public static bool ServerSniObservable => !IsWindows;
+
     /// <summary>A throwaway self-signed provider for "localhost" (+ the loopback IP in its SAN), from
     /// whichever engine this OS actually has: SChannel on Windows, OpenSSL elsewhere. Both factories
     /// produce the same SAN shape, which is what lets the name cells be written once.</summary>

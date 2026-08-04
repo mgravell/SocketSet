@@ -67,6 +67,13 @@ public abstract class Connection : IBufferWriter<byte>
     /// SERVER SIDE: the name this client asked for via SNI, or null if it sent none (and always null on
     /// an outbound connection, and on plaintext). Valid from OnAccept onwards.
     ///
+    /// PROVIDER SUPPORT IS NOT UNIFORM, and null is therefore ambiguous on one of them. OpenSSL reports
+    /// the name (SSL_get_servername); SChannel offers no server-side equivalent, so this is ALWAYS null
+    /// under the SChannel provider — "we cannot tell", not "the client sent none". Do not make a security
+    /// decision on the difference: code that routes or admits on this value will see every Windows client
+    /// as having sent no SNI. Verified 2026-08-04 on Windows by bench/verify-tlsname, which now declines
+    /// to assert the announce half rather than passing it vacuously.
+    ///
     /// Deliberately NOT on <c>TlsServerAuthenticateContext</c>: that callback runs before the receive is
     /// armed, so no ClientHello exists yet and the value there would always be null. See
     /// <see cref="TlsFilter.RequestedServerName"/>.
