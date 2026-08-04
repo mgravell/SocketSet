@@ -21,14 +21,13 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using SocketSets;
-using SocketSets.Tls.OpenSsl;
 
 int failures = 0;
-using var provider = OpenSslTlsProvider.CreateSelfSignedLoopback("localhost");
+using var providerDisposable = (IDisposable)GateBackends.SelfSigned();  // SChannel on Windows
+var provider = (SocketSets.Tls.TlsProvider)providerDisposable;
 
-foreach (var factory in new[] { SocketSetFactory.IoUring, SocketSetFactory.Epoll })
+foreach (var (factory, be) in GateBackends.Tls)
 {
-    string be = factory.GetType().Name.Replace("Factory", "");
 
     // --- 1/2: a silent TCP peer against a TLS listener, vs one that handshakes properly -------------
     {

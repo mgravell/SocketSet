@@ -71,8 +71,11 @@ both have caused hesitation:
   and **`bench/run-smoke-matrix.sh`** on Linux (60 cells: io_uring/epoll/managed x plaintext/OpenSSL-TLS,
   plus `@abstract`-UDS and `+ktls` cells). Each reduces to one PASS/FAIL line per cell in ~3-6 minutes.
   Both exist because the gate was previously run by hand and so was skipped between OSes.
-- **Those gate the TRANSPORT. Two narrower gates cover things they cannot see** (Windows only so far; both
-  want a Linux equivalent):
+- **ONE COMMAND runs every security gate on Windows: `bench/Run-SecurityGates.ps1`.** Full multi-target
+  build first (a `-f net10.0` build is blind to net472 breaks, which has bitten), then the gates cheapest
+  first so a broken build does not cost you the smoke matrix before you find out. The Linux equivalent is
+  still the individual rigs.
+- **Those gate the TRANSPORT. The narrower gates cover things they cannot see:**
   - **`bench/Verify-AspNet.ps1`** (Windows) / **`bench/verify-aspnet.sh`** (Linux, added 2026-08-03) —
     the ASP.NET BRIDGE, which nothing gated until 2026-08-01 (and nothing gated on Linux until
     2026-08-03). 18 cells each (backend x `byo`/`classic`/`half-pipe` x plaintext/TLS), ~15s-2min:
@@ -83,6 +86,10 @@ both have caused hesitation:
     2026-08-03) — that the TLS min-version floor is APPLIED, not merely configured. The discriminating
     cell is one that must be REFUSED; "TLS still works" cannot distinguish a floor that took from one
     that did nothing. Both narrow gates now exist on both OSes.
+  - The three `bench/verify-*` .NET rigs below are CROSS-PLATFORM: they pick this OS's backends and TLS
+    provider automatically (`bench/GateBackends.cs` — IOCP/RIO/Managed + SChannel on Windows,
+    io_uring/epoll/Managed + OpenSSL on Linux), so `dotnet run --project bench/<rig>` is the whole
+    invocation on either.
   - **`bench/verify-tailwipe`** (added 2026-08-04; cross-platform, `dotnet run --project`) — that the
     recycled receive/send buffers cannot put a previous tenant's bytes (another client's decrypted
     plaintext, under TLS) on the wire, AND that avoiding them is charged at cost: a 20-byte request

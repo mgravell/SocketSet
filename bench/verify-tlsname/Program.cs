@@ -24,7 +24,6 @@
 // Exit 0 = all PASS.
 using System.Net;
 using SocketSets;
-using SocketSets.Tls.OpenSsl;
 
 const int Port = 19871;
 int failures = 0;
@@ -32,12 +31,15 @@ int failures = 0;
 // One self-signed cert for "localhost", carrying DNS:localhost AND IP:127.0.0.1 as SANs, presented by
 // the server on every cell. Only the CLIENT's expectation varies, which is what keeps the cells
 // comparable: the certificate is the constant, the name being demanded is the variable.
-using var provider = OpenSslTlsProvider.CreateSelfSignedLoopback("localhost");
+using var provider = (IDisposable)GateBackends.SelfSigned();   // SChannel on Windows, OpenSSL elsewhere
 
 // expectSni: what the SERVER should report as the name it was told, for the cells that connect.
 // "<null>" means the client correctly sent NO SNI -- which is the whole point for "*" and for an IP
 // literal (RFC 6066 forbids an address there), and is the only way to tell "we suppressed it" from
 // "we sent it anyway and nobody noticed".
+var (tlsBackend, backendName) = GateBackends.Tls[0];
+Console.WriteLine($"=== verify-tlsname: backend={backendName} ===");
+
 foreach (var (host, mustConnect, expectSni, label) in new[]
 {
     ("localhost",     true,  "localhost", "DNS name matches SAN"),
@@ -54,12 +56,12 @@ foreach (var (host, mustConnect, expectSni, label) in new[]
     Dialer dialer = null;
     try
     {
-        var serverOpts = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring, Tls = provider };
+        var serverOpts = new SocketSetOptions { Shards = 1, Factory = tlsBackend, Tls = (SocketSets.Tls.TlsProvider)provider };
         using var server = new Echo(serverOpts);
         echo = server;
         server.Listen(new IPEndPoint(IPAddress.Loopback, Port));
 
-        var clientOpts = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring, Tls = provider };
+        var clientOpts = new SocketSetOptions { Shards = 1, Factory = tlsBackend, Tls = (SocketSets.Tls.TlsProvider)provider };
         clientOpts.TlsClient.TargetHost = host;
         using var client = new Dialer(clientOpts);
         dialer = client;

@@ -185,6 +185,39 @@ fixed, then won where it matters), and everything is pushed. The long version, i
 6. **Marc-only pending**: nuget push; PR/merge calls on marc/transport-push-feed + marc/uds-abstract-
    config; redis PRs #15572/#15575 shepherding (8.12 bucket, quiet); #2012 watch.
 
+## READ FIRST IF YOU ARE ON WINDOWS (2026-08-04: SEVEN COMMITS OF UNRUN WINDOWS CHANGES)
+
+> **RUN `bench/Run-SecurityGates.ps1` FIRST. That is the whole ask.** One command: full multi-target
+> build, then every security gate, cheapest first.
+>
+> **WHY.** A 2026-08-04 security audit produced seven commits, and every one of them changed shared or
+> Windows code that has NEVER EXECUTED on Windows: `IocpShard`, `WindowsRioShard`, `WindowsShardBase`,
+> `Win32.cs`, `SocketSetShard`, `SocketSet.cs`. Specifically —
+> bind addresses now honoured (was hard-coded INADDR_ANY), IPv4-only guards on connect, application
+> callbacks contained so an exception cannot kill a shard, the receive/send buffer tail wipe, TLS
+> resolution moved to `OnClientAuthenticate`/`OnServerAuthenticate` with a MANDATORY `TargetHost`,
+> handshake/idle deadlines with a per-shard sweep, and bounded inbound buffering.
+>
+> **THE ONE CHECK THAT IS NOT AUTOMATED**, and it is the one that matters most: bind a listener to
+> `127.0.0.1` and confirm it is NOT reachable on this box's LAN address. Loopback connectivity cannot
+> distinguish a bind that took from one that did nothing — that is exactly how the bug survived.
+>
+> **Expect these to be the fragile ones.** The Windows deadline sweep sits at the TOP of both loops
+> (IOCP and RIO have early `continue`s on WAIT_TIMEOUT / port-closed that would skip a sweep placed after
+> the completion batch) — if connections are being dropped at ~10s, that is `HandshakeTimeout` and the
+> sweep firing when it should not. And `WindowsShardBase.SweepTimeouts` closes by slot index `i + 1`,
+> which assumes the slot table is 1-based exactly as the io_uring one is; verify that against
+> `CloseClient` on both backends.
+>
+> **CAVEAT ON THE TWO NEW SCRIPTS.** `bench/Verify-BindAddress.ps1` and `bench/Run-SecurityGates.ps1`
+> were written on Linux and there is no PowerShell on that box, so they have never been PARSED, let alone
+> run. Expect a syntax slip and treat the first run as debugging the harness, not the library. The .NET
+> rigs they invoke (`verify-tailwipe`, `verify-tlsname`, `verify-timeouts`) DO build and pass here, and
+> are cross-platform by construction (`bench/GateBackends.cs`), so those are the trustworthy part.
+>
+> Everything below this line is the PREVIOUS Windows catch-up (2026-08-01), which was completed. It is
+> kept for the history, not as a task list.
+
 ## READ FIRST IF YOU ARE ON WINDOWS (written 2026-08-01, switching back from Linux)
 
 > **THIS CATCH-UP IS DONE (2026-08-01 Windows session). Items 1-4 of the priority list below are all

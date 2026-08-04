@@ -25,8 +25,9 @@
 // green run that proves nothing. A first version connected fresh clients per probe and passed even
 // against the broken build: io_uring hands out provided buffers by bid from a per-shard ring, so a new
 // connection rarely lands on the buffer a previous tenant dirtied. Hence ONE connection, a small
-// (16-entry) pool, and repeated rounds — epoll and managed reuse one per-connection buffer every time,
-// and io_uring collides within 64 rounds with certainty.
+// (16-entry) pool, and repeated rounds — the per-connection-buffer backends (epoll, managed, IOCP, RIO)
+// reuse one buffer every time, and io_uring, whose provided-buffer ring cycles by bid, collides within
+// 64 rounds with certainty. Backend selection is per-OS: see bench/GateBackends.cs.
 using System.Net;
 using System.Net.Sockets;
 using SocketSets;
@@ -34,9 +35,8 @@ using SocketSets;
 const int Port = 19801, Reply = 900, Rounds = 64, Grow = 5;
 int failures = 0;
 
-foreach (var backend in new[] { SocketSetFactory.IoUring, SocketSetFactory.Epoll, SocketSetFactory.Managed })
+foreach (var (backend, name) in GateBackends.All)
 {
-    string name = backend.GetType().Name.Replace("SocketFactory", "").Replace("Factory", "");
     foreach (var mode in new[] { Mode.RawBuffer, Mode.ResponseBytesOnly, Mode.GetWriteSpanBigger, Mode.ExactDelta })
     {
         var opts = new SocketSetOptions

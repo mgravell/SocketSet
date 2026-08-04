@@ -650,7 +650,7 @@ Recorded so the next audit does not re-derive them.
 
 ## GATE STATUS FOR THIS AUDIT
 
-Every Linux gate, run after all the fixes above were in:
+Every Linux gate, re-run after each of the seven commits this audit produced:
 
 | gate | result |
 |---|---|
@@ -660,6 +660,19 @@ Every Linux gate, run after all the fixes above were in:
 | `bench/verify-bind-address.sh` | **6/6 PASS** (new; see below) |
 | `bench/verify-tls-floor.sh` | **8/8 PASS**, including both refusal cells |
 | `bench/verify-aspnet.sh` | **18/18 PASS** |
+| `bench/verify-timeouts` | **8/8 PASS** (new; 4 cells x 2 backends) |
+| `bench/verify-tlsname` | **6/6 PASS** (new; 3 of them refusal cells) |
+
+**Windows: ALL OF IT UNRUN**, across all seven commits. `bench/Run-SecurityGates.ps1` (new) runs the lot
+in one command, starting with a FULL multi-target build — the single-target habit shipped a net472 break
+during this very session. `bench/Verify-BindAddress.ps1` is the Windows twin of the Linux bind gate; the
+three `verify-*` .NET rigs are cross-platform and pick this OS's backends and TLS provider via
+`bench/GateBackends.cs`. The discriminating check for the bind fix is deliberately NOT automated and is
+called out at the end of the run: a listener on `127.0.0.1` must not be reachable on the LAN address.
+
+Caveat, stated so it is not discovered as a surprise: the two new `.ps1` files were authored on Linux,
+which has no PowerShell, so they have never been parsed. The .NET rigs they drive do build and pass
+here. Treat a first-run failure in the scripts as a harness bug before suspecting the library.
 
 One real break was caught here and is worth recording: `--bind-probe` used `Environment.ProcessId`,
 which is net5+, and this repo multi-targets net472. A `-f net10.0` build passes happily; the FULL
