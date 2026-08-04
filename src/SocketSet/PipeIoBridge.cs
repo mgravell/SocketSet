@@ -52,18 +52,19 @@ internal sealed class PipeIoBridge
 
     private int _completed; // 0 = live, 1 = teardown already run (Interlocked; both threads can reach it)
 
-    private PipeIoBridge(Connection conn, IDuplexPipe pipe, bool pinned)
+    private PipeIoBridge(Connection conn, IDuplexPipe pipe, bool pinned, int maxStaged)
     {
         _conn = conn;
         _pipe = pipe;
         Pinned = pinned;
+        _maxStaged = maxStaged;
     }
 
     /// <summary>Attach a pipe to a connection and start pumping its outbound half. Called from
     /// OnAccept/OnConnect, i.e. on the owning loop thread.</summary>
-    internal static PipeIoBridge Attach(Connection conn, IDuplexPipe pipe, bool pinned)
+    internal static PipeIoBridge Attach(Connection conn, IDuplexPipe pipe, bool pinned, int maxStaged)
     {
-        var bridge = new PipeIoBridge(conn, pipe, pinned);
+        var bridge = new PipeIoBridge(conn, pipe, pinned, maxStaged);
         conn.PipeIo = bridge;
         // The outbound half is a straightforward async loop, so it runs off the loop thread: awaiting
         // ReadAsync is what applies backpressure to the application, and the loop thread must never wait.
@@ -82,6 +83,8 @@ internal sealed class PipeIoBridge
     private readonly object _inGate = new();
     private bool _flushPending;
     private readonly Queue<ArraySegment<byte>> _staged = new();
+    private int _stagedBytes;          // guarded by _inGate
+    private readonly int _maxStaged;   // 0 == unbounded (opt-out)
 
     // ---- SS_BRIDGE_STATS=1: how expensive IS the inbound path, really? --------------------------------
     //
@@ -184,14 +187,23 @@ internal sealed class PipeIoBridge
 
         if (ReportStats) { Interlocked.Increment(ref s_recv); Interlocked.Add(ref s_recvBytes, data.Length); }
 
+        bool overflowed = false;
         ValueTask<FlushResult> flush;
         lock (_inGate)
         {
             if (_flushPending)
             {
-                // A flush is outstanding: touching the writer now would throw. Stage instead.
+                // A flush is outstanding: touching the writer now would throw. Stage instead -- but
+                // BOUNDED. This queue had no limit until 2026-08-04, so a peer uploading faster than the
+                // application drained grew it without end (REVIEW.md D3).
+                if (_maxStaged > 0 && _stagedBytes + data.Length > _maxStaged)
+                {
+                    overflowed = true;
+                    return;
+                }
                 var buf = ArrayPool<byte>.Shared.Rent(data.Length);
                 data.CopyTo(buf);
+                _stagedBytes += data.Length;
                 _staged.Enqueue(new ArraySegment<byte>(buf, 0, data.Length));
                 if (ReportStats) { Interlocked.Increment(ref s_staged); Interlocked.Add(ref s_stagedBytes, data.Length); }
                 return;
@@ -209,8 +221,23 @@ internal sealed class PipeIoBridge
             if (ReportStats) Interlocked.Increment(ref s_flushAsync);
             _flushPending = true;
         }
+        if (overflowed) { Overflow(); return; }
         _ = DrainFlushesAsync(flush);
     }
+
+    /// <summary>The staging bound was hit: the application is not draining and we will not grow without
+    /// limit on its behalf. Drop the connection, loudly enough to be diagnosable.</summary>
+    private void Overflow()
+    {
+        Interlocked.Increment(ref s_overflow);
+        _conn.Close();
+    }
+
+    private static long s_overflow;
+
+    /// <summary>Inbound bytes dropped-for-overflow, process-wide. Non-zero means either an abusive peer or
+    /// a cap set too low, and those want telling apart.</summary>
+    internal static long OverflowCount => Interlocked.Read(ref s_overflow);
 
     /// <summary>Await an outstanding flush, then write anything staged behind it and flush again, until
     /// nothing is left. Runs off the loop thread; the lock only ever guards short bookkeeping.</summary>
@@ -231,6 +258,7 @@ internal sealed class PipeIoBridge
                 while (_staged.Count > 0)
                 {
                     var seg = _staged.Dequeue();
+                    _stagedBytes -= seg.Count;
                     _pipe.Output.Write(seg.AsSpan());
                     PooledBuffers.ReturnCleared(in seg); // staged bytes are received plaintext
                 }
@@ -251,6 +279,7 @@ internal sealed class PipeIoBridge
             {
                 _flushPending = false;
                 while (_staged.Count > 0) PooledBuffers.ReturnCleared(_staged.Dequeue());
+                _stagedBytes = 0;
             }
             _conn.Close();
         }
@@ -329,6 +358,7 @@ internal sealed class PipeIoBridge
         lock (_inGate)
         {
             while (_staged.Count > 0) PooledBuffers.ReturnCleared(_staged.Dequeue());
+            _stagedBytes = 0;
         }
         try { _pipe.Output.Complete(fault); } catch { }
         try { _pipe.Input.Complete(fault); } catch { }

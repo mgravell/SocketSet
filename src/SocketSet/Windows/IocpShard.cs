@@ -647,7 +647,8 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         DiscardPending(conn); // returns the buffers AND clears PendingHeadOffset (a stale one corrupts)
         conn.Tls = null;      // disposed by TryFinalize; cleared here so a rolled-back claim starts clean
         conn.IsClient = false;
-        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis; // deadline clock
+        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;
+        conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock
 
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.

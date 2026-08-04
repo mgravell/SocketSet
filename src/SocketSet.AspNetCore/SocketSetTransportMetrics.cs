@@ -30,4 +30,13 @@ public sealed class SocketSetTransportMetrics
     internal void OnClosedEmpty() => Interlocked.Increment(ref _closedEmpty);
     internal void OnWriteFail() => Interlocked.Increment(ref _writeFail);
     internal void OnSendFalse() => Interlocked.Increment(ref _sendFalse);
+    private long _inboundOverflow;
+
+    /// <summary>Connections aborted for running too far ahead of Kestrel on the inbound half
+    /// (REVIEW.md D3). Non-zero means either an abusive peer or a cap set too low, and those want
+    /// telling apart -- which is why it is a counter and not only a log line.</summary>
+    public long InboundOverflow => Interlocked.Read(ref _inboundOverflow);
+
+    internal void OnInboundOverflow() => Interlocked.Increment(ref _inboundOverflow);
+
 }

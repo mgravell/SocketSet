@@ -847,7 +847,7 @@ public abstract partial class SocketSet : IDisposable
         public readonly void UsePipe(IDuplexPipe pipe, bool pinned = false)
         {
             ArgumentNullException.ThrowIfNull(pipe);
-            PipeIoBridge.Attach(connection, pipe, pinned);
+            PipeIoBridge.Attach(connection, pipe, pinned, connection.MaxInboundBufferBytes);
         }
 #endif
 
@@ -943,7 +943,7 @@ public abstract partial class SocketSet : IDisposable
         public readonly void UsePipe(IDuplexPipe pipe, bool pinned = false)
         {
             ArgumentNullException.ThrowIfNull(pipe);
-            PipeIoBridge.Attach(connection, pipe, pinned);
+            PipeIoBridge.Attach(connection, pipe, pinned, connection.MaxInboundBufferBytes);
         }
 #endif
 

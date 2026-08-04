@@ -79,6 +79,11 @@ public abstract class Connection : IBufferWriter<byte>
     internal long StartedTicks;
     internal long LastActivityTicks;
 
+    /// <summary>Copy of <see cref="SocketSetOptions.MaxInboundBufferBytes"/>, carried here because
+    /// <c>ctx.UsePipe</c> runs from a ref-struct context that can reach the Connection but not the
+    /// engine options. Seeded by the owning set.</summary>
+    internal int MaxInboundBufferBytes;
+
     /// <summary>True once the app has seen this connection open (OnAccept/OnConnect fired); gates
     /// <see cref="SocketSet.OnClosed"/> so it pairs with an open and never fires for a connection the
     /// app never saw (e.g. a failed connect). Backend-managed on the owning IO thread.</summary>

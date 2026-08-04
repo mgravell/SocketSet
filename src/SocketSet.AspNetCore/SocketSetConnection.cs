@@ -56,11 +56,12 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
 
     public SocketSetConnection(Connection conn, bool tls, bool byo = false,
                               int pipeSegment = 0, MemoryPool<byte>? pipePool = null, bool halfPipe = false,
-                              SocketSetTransportMetrics? metrics = null)
+                              SocketSetTransportMetrics? metrics = null, long maxInboundBuffer = 4 * 1024 * 1024)
     {
         _conn = conn;
         _byo = byo;
         _metrics = metrics ?? new SocketSetTransportMetrics();
+        _maxUnflushed = maxInboundBuffer;
         var sched = PipeScheduler.ThreadPool;
         // EXPERIMENT (SS_PIPE_SCHED): which pipe reader resumes INLINE instead of hopping to the ThreadPool.
         //
@@ -163,11 +164,28 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
     public override IDictionary<object, object?> Items { get; set; }
     public override CancellationToken ConnectionClosed { get => _closedCts.Token; set { } }
 
-    /// <summary>Loop thread: copy freshly-received bytes into the inbound pipe and signal Kestrel. The copy
-    /// releases SocketSet's library-owned recv buffer immediately. FlushAsync completes synchronously under
-    /// the pause threshold, so this never blocks the loop (fire-and-forget beyond that — demo backpressure).</summary>
     public bool GotData;
 
+    // Bytes written to the inbound pipe whose flush has not completed. The loop thread cannot WAIT for a
+    // flush, so this is the only measure of how far ahead of Kestrel we are running.
+    private long _unflushed;
+    private readonly long _maxUnflushed;
+
+    /// <summary>
+    /// Loop thread: copy freshly-received bytes into the inbound pipe and signal Kestrel. The copy
+    /// releases SocketSet's library-owned recv buffer immediately.
+    ///
+    /// THE FLUSH RESULT USED TO BE DISCARDED (<c>_ = w.FlushAsync()</c>), which meant the
+    /// <c>pauseWriterThreshold</c> configured two lines away in the constructor did NOTHING: a client
+    /// uploading faster than the handler drained grew the pipe without bound, which is memory exhaustion
+    /// needing no protocol trickery (REVIEW.md D3). It is now tracked, and a connection that runs more
+    /// than <c>MaxInboundBufferBytes</c> ahead of Kestrel is ABORTED.
+    ///
+    /// Aborting is the blunt half of the fix and is labelled as such: the right answer is receive PARKING
+    /// (stop reading until the flush completes, so the TCP window slows the peer instead of the peer
+    /// being dropped), which needs per-backend cooperation and is recorded in TODO. This bounds the
+    /// damage in the meantime, with a cap generous enough that only a real mismatch reaches it.
+    /// </summary>
     public void WriteInbound(ReadOnlySpan<byte> data)
     {
         if (data.IsEmpty) return;
@@ -175,7 +193,31 @@ internal sealed class SocketSetConnection : ConnectionContext, IDuplexPipe
         PipeWriter w = _inbound.Writer;
         data.CopyTo(w.GetSpan(data.Length));
         w.Advance(data.Length);
-        _ = w.FlushAsync();
+
+        int n = data.Length;
+        var flush = w.FlushAsync();
+        if (flush.IsCompletedSuccessfully)
+        {
+            _ = flush.Result; // consume; nothing outstanding
+            return;
+        }
+
+        long pending = Interlocked.Add(ref _unflushed, n);
+        if (_maxUnflushed > 0 && pending > _maxUnflushed)
+        {
+            _metrics.OnInboundOverflow();
+            Abort(new ConnectionAbortedException(
+                $"inbound buffer exceeded {_maxUnflushed} bytes with the application not draining"));
+            return;
+        }
+        TrackFlush(flush, n);
+    }
+
+    private async void TrackFlush(ValueTask<FlushResult> flush, int bytes)
+    {
+        try { await flush; }
+        catch { /* the pipe is done; teardown runs elsewhere */ }
+        finally { Interlocked.Add(ref _unflushed, -bytes); }
     }
 
     /// <summary>Loop thread: the peer closed / the socket errored. EOF the inbound pipe so Kestrel finishes

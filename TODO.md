@@ -91,7 +91,19 @@ equivalent.
    forever. This is a regression against what we replace on the ASP.NET bridge specifically, because TLS
    terminates below Kestrel and its `HandshakeTimeout`/`MaxConcurrentConnections` never see the
    connection. Wants a cost measurement on the sweep before it goes in the hot loop.
-3. **Backpressure is advisory in both bridges, so inbound is unbounded.** Same fix as the recorded
+3. ~~**Backpressure is advisory in both bridges, so inbound is unbounded.**~~ **BOUNDED 2026-08-04, NOT
+   CURED.** Both inbound paths now track how far ahead of the application they run and drop a connection
+   past `MaxInboundBufferBytes` (4 MiB default), with counters. That removes the unbounded case.
+
+   **STILL WANTED: receive PARKING**, which is the actual fix — stop re-arming the receive until the
+   flush completes, so the TCP window slows the peer instead of the peer being killed. Deferred, with the
+   difficulty stated: it needs per-backend pause/resume, with resume marshalled from a thread-pool
+   continuation back onto the loop thread, and io_uring is the awkward one because its receive is
+   MULTISHOT — pausing means cancelling an armed op and re-arming later, sharing the cancel path with
+   teardown, where a race produces a HANG rather than a leak. epoll (drop EPOLLIN via EPOLL_CTL_MOD),
+   managed, IOCP and RIO are all easy by comparison, since their receives are one-shot: parking there is
+   simply "do not post the next one". This supersedes the old receive-parking item (7). ORIGINAL NOTE:
+   **Backpressure is advisory in both bridges, so inbound is unbounded.** Same fix as the recorded
    receive-PARKING item (7) — worth re-tagging that item as a robustness fix, not only an architecture
    one, because right now it is the DoS. Note `SocketSet.AspNetCore` is a published package.
 4. ~~**`ReceiveContext.RawBuffer` past `PayloadBytes` is another connection's data**~~ **RESOLVED

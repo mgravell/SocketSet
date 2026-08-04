@@ -100,7 +100,8 @@ internal sealed class SocketSetConnectionListener : IConnectionListener
         // With TLS this fires only after the handshake has completed, so conn.NegotiatedProtocol is
         // already settled by the time the features are built.
         _metrics.OnAccept();
-        var c = new SocketSetConnection(conn, _tls is not null, ByoPipe, _options.PipeSegment, _pipePool, HalfPipe, _metrics);
+        var c = new SocketSetConnection(conn, _tls is not null, ByoPipe, _options.PipeSegment, _pipePool, HalfPipe,
+            _metrics, _options.MaxInboundBufferBytes);
         conn.UserToken = c;
         return c;
     }

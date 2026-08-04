@@ -153,6 +153,24 @@ public class SocketSetOptions
     /// </summary>
     public TimeSpan IdleTimeout { get; set; }
 
+    /// <summary>
+    /// Cap on inbound bytes buffered for ONE connection in pipe mode while the application is not
+    /// keeping up. Default 4 MiB; <c>0</c> disables the cap (the pre-2026-08-04 behaviour).
+    ///
+    /// It exists because backpressure on the inbound half is ADVISORY (REVIEW.md D3): the receive
+    /// callback runs on the loop thread and cannot wait for a flush, so a flush that goes async is
+    /// observed later and bytes that arrive meanwhile are staged. Nothing bounded that staging, so a peer
+    /// uploading faster than the handler drains grew the buffer without limit -- a plain memory-exhaustion
+    /// DoS, needing no protocol trickery at all.
+    ///
+    /// THIS IS THE BOUND, NOT THE CURE. The proper fix is receive PARKING (do not re-arm the receive until
+    /// the flush completes), which pushes back through the TCP window and slows the peer instead of
+    /// dropping it; it needs per-backend cooperation and is recorded in TODO. Until then a connection that
+    /// exceeds this is CLOSED, which is the right answer for abuse and a blunt one for a merely slow
+    /// consumer -- hence a cap generous enough that only a real mismatch reaches it.
+    /// </summary>
+    public int MaxInboundBufferBytes { get; set; } = 4 * 1024 * 1024;
+
     /// <summary>Backlog passed to <c>listen()</c> on every backend — the kernel's queue of
     /// completed-handshake connections awaiting accept. Cheap; size it to absorb connection bursts.</summary>
     public int ListenBacklog { get; set; } = 512;

@@ -311,7 +311,8 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.RecvBuf = -1;
         conn.SendOffset = 0;
         conn.Pending?.Clear();
-        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis; // deadline clock starts here
+        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;
+        conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock starts here
         conn.Tls = null;
         conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
         conn.Zc = null;         // ditto — any in-flight zero-copy send was finished in CloseClient

@@ -376,7 +376,38 @@ Cheapest credible shape: a coarse per-shard sweep over slots with `Opened == fal
 deadline on established connections. Wants a measurement of what the sweep costs per loop iteration
 before it goes in, since it touches the hottest loop in the repo.
 
-### D3. Backpressure is advisory in both bridges, so inbound is unbounded
+### D3. BOUNDED 2026-08-04 (not yet cured): inbound buffering now has a limit
+
+**This is the bound, not the cure, and the distinction is deliberate.** Original writeup below.
+
+`SocketSetConnection.WriteInbound` did `_ = w.FlushAsync()` and threw the task away, which made the
+`pauseWriterThreshold: 1 << 20` configured two lines earlier completely inert: a client uploading faster
+than the handler drained grew the pipe without bound. `PipeIoBridge` had the same shape plus an
+unbounded `_staged` queue of pooled rentals. Memory exhaustion needing no protocol trickery at all.
+
+**What landed:** both paths now TRACK how far ahead of the application they are running, and a connection
+that exceeds `MaxInboundBufferBytes` (default 4 MiB, 0 disables) is dropped —
+`SocketSetTransportMetrics.InboundOverflow` and `PipeIoBridge.OverflowCount` count it, because a cap set
+too low and an abusive peer look identical in a log and different in a counter.
+
+**Why that is only half the answer.** Dropping is right for abuse and blunt for a merely slow consumer.
+The correct fix is receive PARKING — stop re-arming the receive until the flush completes, so the TCP
+window slows the peer instead of the peer being killed — which is what Kestrel's own transport does and
+what `pauseWriterThreshold` is supposed to mean.
+
+I did not build parking here, and the reason is worth recording rather than hiding: it needs per-backend
+pause/resume with the resume marshalled from a thread-pool continuation back onto the loop, and io_uring
+is genuinely awkward because its receive is MULTISHOT — pausing means cancelling an armed op and
+re-arming later, sharing the cancel path with teardown. A racy implementation there produces HANGS,
+which is a worse failure than the bounded-growth it would replace. Bounding first is the low-risk step
+that removes the unbounded case; parking is recorded in TODO with that difficulty spelled out.
+
+The cap is deliberately generous (4 MiB) so that only a real mismatch reaches it, precisely because the
+consequence is currently a drop rather than a slowdown.
+
+---
+
+### D3 (original). Backpressure is advisory in both bridges, so inbound is unbounded
 
 `SocketSetConnection.WriteInbound` (`SocketSet.AspNetCore`) does `_ = w.FlushAsync()` and discards the
 task, which means the `pauseWriterThreshold: 1 << 20` set two lines earlier does nothing: a client

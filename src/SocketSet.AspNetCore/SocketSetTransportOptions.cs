@@ -60,4 +60,13 @@ public sealed class SocketSetTransportOptions
 
     /// <summary>Write buffers per shard; 0 leaves the backend default.</summary>
     public int WriteBuffers { get; set; }
+
+    /// <summary>
+    /// Cap on inbound bytes buffered for one connection while Kestrel is not draining. Default 4 MiB;
+    /// 0 disables. See <c>SocketSetConnection.WriteInbound</c>: the flush result used to be discarded,
+    /// which made the pipe's own pauseWriterThreshold inert and let a fast uploader grow it without
+    /// bound (REVIEW.md D3). Exceeding this ABORTS the connection, which is the bound rather than the
+    /// cure -- receive parking is the real fix and is recorded in TODO.
+    /// </summary>
+    public long MaxInboundBufferBytes { get; set; } = 4 * 1024 * 1024;
 }

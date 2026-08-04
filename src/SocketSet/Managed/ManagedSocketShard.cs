@@ -51,6 +51,28 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     {
     }
 
+    /// <summary>
+    /// This backend has NO LOOP THREAD (SAEA completions dispatch on the thread pool), so there is no
+    /// pass on which to notice a sweep request. Wake IS the sweep here: it runs on the set's timer
+    /// thread, which is safe because Close is idempotent and TryRemove-gated, unlike the slot-table
+    /// backends where teardown is single-writer and must stay on the loop.
+    /// </summary>
+    protected override void Wake() => MaybeSweep();
+
+    /// <summary>Drop connections past their deadline. No slot table here -- connections live in a
+    /// ConcurrentDictionary. This is also the one backend with NO capacity cap (TryReserve always
+    /// succeeds), so a deadline is the only bound it has at all.</summary>
+    protected override void SweepTimeouts(long nowTicks)
+    {
+        foreach (var conn in _connections.Keys)
+        {
+            if (conn.Closed) continue;
+            if (Parent.ExpiryReason(conn, nowTicks) is not { } reason) continue;
+            Parent.DispatchTimeout(conn, reason);
+            Close(conn);
+        }
+    }
+
     protected override void OnShutdown()
     {
         lock (_listeners)
@@ -239,6 +261,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             // Capacity is the RECEIVE buffer's: an in-place response is written back into the buffer the
             // bytes arrived in, so it is bounded by that, not by the send scratch.
             var ctx = new SocketSet.ReceiveContext(conn, buf, _recvBufSize, n);
+            conn.LastActivityTicks = Clock.Millis;
             Parent.DispatchReceive(ref ctx);
             response = ctx.ResponseBytes;
         }
@@ -538,7 +561,8 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
             fixed (byte* pp = plainBuf)
             {
                 var ctx = new SocketSet.ReceiveContext(conn, pp, plainBuf.Length, plainLen);
-                Parent.DispatchReceive(ref ctx);
+                conn.LastActivityTicks = Clock.Millis;
+            Parent.DispatchReceive(ref ctx);
                 response = ctx.ResponseBytes;
             }
             if (response > 0) SendEncrypted(conn, new ReadOnlySpan<byte>(plainBuf, 0, response));
@@ -584,6 +608,8 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     private ManagedConnection Register(Socket socket, object? token)
     {
         var conn = new ManagedConnection(this, socket, _bufferSize, _recvBufSize) { UserToken = token };
+        conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;   // deadline clock
+        conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes;
         _connections[conn] = 0;
         return conn;
     }
