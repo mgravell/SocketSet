@@ -16,6 +16,14 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 
 ## WHERE THINGS STAND (2026-08-03) — the consolidated view, RESP era
 
+> **EVERY NUMBER IN THIS SECTION IS LINUX** (7900X bare metal, io_uring/epoll, OpenSSL), and that
+> qualifier became load-bearing on 2026-08-05. The TLS advantage recorded below is an
+> OpenSSL-vs-`SslStream` result: it is an ENGINE swap as well as an I/O-model swap. On WINDOWS both
+> sides are SChannel, only the I/O model differs, and the advantage **does not appear** — `kestrel+tls`
+> beats `iocp+tls` disjointly at 512 B, with a three-way TLS tie inside 0.8% on the fixed-size matrix.
+> See "WINDOWS BASELINE REFRESH (2026-08-05)" below. Do not quote a TLS headline from this file without
+> the OS attached.
+
 Everything below this block is a dated investigation; this is the summary they add up to. The 2026-07-30
 consolidated view (next section) is kept as the record of the HTTP/Kestrel era; on 2026-08-02 the
 project's guidepost changed from "beat Kestrel" to the RESP ecosystem (see TODO's direction-change

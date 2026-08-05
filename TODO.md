@@ -4,7 +4,64 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## SECURITY AUDIT 2026-08-04 (READ FIRST NEXT SESSION — full findings in `REVIEW.md`)
+## SESSION CLOSE 2026-08-05 — READ THIS FIRST; the 2026-08-04 audit section below is now HISTORY
+
+Ten commits, all pushed. The audit section that follows is still the right reference for *why* things
+are the way they are, but it is no longer the current state: several of its open items are closed and
+two of its recorded numbers have been superseded.
+
+**What landed** (each has its own commit message carrying the reasoning):
+
+1. **Receive parking** on IOCP/RIO/managed/epoll — the cure for D3, which had only been *bounded*.
+   io_uring deliberately declines (multishot receive) and SAYS so via `SupportsReceiveParking`.
+2. **The tail wipe became opt-out per set** (`DangerousDisableBufferWipe`), reported unconditionally in
+   the banner.
+3. **Announce split from verify** (`TlsClientOptions.ServerNameIndication`) — the D1 follow-up.
+4. **The per-call `TlsProvider?` parameter and `Connection.TlsOverride` are deleted** — the other D1
+   follow-up. Two mechanisms for one decision are gone.
+5. **Measured**: parking costs **under 1%** (bare A/B, 512 B, 0.8% spread) and removes the staged second
+   copy outright (**3,141 → 0**, categorical). Full tables in `RESULTS.md`.
+6. **New rigs**: `bench/verify-parking` (5 cells), `bench/measure-parking` (built, correctness-verified,
+   **NOT scored**), `Compare-Commits.ps1 -Upload`, and `verify-tlsname` now reads the ClientHello off
+   the wire so the announce half is finally assertable on Windows.
+
+**Three things in the older sections are now WRONG or WEAKER than they read, and this is the part worth
+carrying:**
+
+- **"TLS is the real strength" is a LINUX result and does not transfer to Windows.** Measured
+  2026-08-05: `kestrel+tls` beats `iocp+tls` disjointly at 512 B, and `Run-Matrix` shows a three-way TLS
+  tie inside 0.8%. On Linux we swap the whole engine (OpenSSL vs `SslStream`); on Windows both sides are
+  SChannel and only the I/O model differs. Read every TLS headline with its OS attached.
+- **`Run-TlsSizes.ps1`'s `-Shards 16` default was a hard-coded value from a 16-core machine**, and cost
+  ~15% at 256 KB plaintext on this 12-core half. Now derived. **Every 256 KB plaintext figure taken
+  before 2026-08-05 inherits that default**, so re-measure before quoting one.
+- **A claim of mine was retracted the same day it was made.** "s8 beats s16 disjointly" held at 6 scored
+  passes and does NOT at 10 — one outlier is the entire overlap, though 10 of 11 passes still separate.
+  Which exposed a real method problem, now in `bench/README.md`: **rules 4 and 5 pull against each
+  other**, because min-max can only widen with more samples, so adding passes makes disjointness
+  strictly *harder*. A lucky 3-pass run reads as more conclusive than an honest 11-pass one.
+
+**START HERE NEXT SESSION**, in order:
+
+- **If you are on LINUX: the entire Linux half of this session is UNRUN.** epoll's parking, io_uring's
+  declining to park, and the announce/verify split all exist only as code written on Windows — the same
+  debt the Windows catch-up cleared on 2026-08-04, pointing the other way. `bench/verify-parking`,
+  `bench/verify-tlsname` and `bench/run-smoke-matrix.sh` are the three to run. Pre-registered fragile
+  spots for epoll are in item 1 below (the `EPOLL_CTL_MOD` mask arithmetic, and the HUP-while-parked
+  close, which exists because `EPOLLERR`/`EPOLLHUP` cannot be masked off and a level-triggered one would
+  spin a core).
+- **If the box is QUIET and you want numbers:** (a) `bench/measure-parking` scored, with a large
+  `--mib` and six passes — the outstanding question the rig was built for; (b) the 64 KB pipe-block
+  default decision, which needs a same-session A/B carrying BOTH throughput and memory (the memory side
+  already measured at 1.17x on Windows, against the 2.7x that made it a flag on Linux); (c) a Windows
+  baseline re-run at the corrected shard default.
+- **Still open from the audit:** io_uring parking; `PrepareForBind`'s unconditional delete + TOCTOU; no
+  `SO_PEERCRED` on UDS; `Verify-BindReachability` has no Linux twin; SNI-based server certificate
+  selection remains deferred by decision, not oversight.
+
+---
+
+## SECURITY AUDIT 2026-08-04 (full findings in `REVIEW.md`) — superseded as "read first" by the section above
 
 Marc asked for a full security audit of the codebase. **The findings, the reasoning and the gate status
 all live in [`REVIEW.md`](REVIEW.md)**, which is new and is to security/correctness reviews what
