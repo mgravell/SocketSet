@@ -235,6 +235,179 @@ genuinely, persistently behind. Every leg here has a consumer that keeps up, whi
 throughput one. Nothing here says what parking costs when it is engaged continuously, and no rig in this
 repo currently creates that shape under load.
 
+## WINDOWS BASELINE REFRESH (2026-08-05) — `Run-TlsSizes.ps1` + `Run-Matrix.ps1`
+
+**PRE-REGISTERED BEFORE THE RUN.** The Windows tables further down date from 2026-07-27/30. Since then
+the transport gained drain coalescing (`5ec2b65`), the TLS authenticate callbacks, the deadline sweep
+(ON by default, so a timer per set and a `MaybeSweep()` per loop pass), the D3 inbound bound, receive
+parking and the wipe opt-out. So a refresh is overdue.
+
+**THE FIRST THING TO SAY IS WHAT THIS CANNOT DO.** These numbers must NOT be differenced against the
+2026-07-27/30 Windows tables. Same host, but a different session and months of intervening change — house
+rule 1 exists because two IDENTICAL builds measured 6% apart here, and once 58%. Any apparent movement
+against those tables is uninterpretable: it cannot be separated into "the code changed", "the session
+differed", and "the host drifted". **This is a fresh baseline of record, not a before/after.** The only
+claims it licenses are leg-vs-leg WITHIN this run, where every leg is same-session, interleaved and
+reshuffled. The before/after question was answered separately, and properly, by the three A/B legs above.
+
+Predictions, so the table can falsify something rather than merely be read:
+
+- **P4 — `iocp+tls` beats `kestrel+tls` at 512 B and 16 KB.** The Linux equivalent (OpenSSL vs
+  `SslStream`) wins +13-26% across that range. Windows pairs SChannel-via-raw-SSPI against
+  `SslStream`-over-SChannel, i.e. the same crypto with a different I/O model, so the mechanism is the
+  I/O model alone and the margin should be SMALLER than Linux's. **Falsified if** Kestrel leads at either
+  size.
+- **P5 — `rio` trails `iocp` at 256 KB plaintext.** `WindowsRioShard.IssueSend` posts one write page per
+  send (Windows caps `maxSendDataBuffers` at 1) where `IocpShard.IssueSendPages` issues one `WSASend`
+  over up to 64 `WSABUF`s. The plaintext RIO control exists precisely to make that attributable to the
+  send path rather than the cipher. **Falsified if** RIO matches or beats IOCP there.
+- **P6 — `httpsys` leads plaintext at 512 B.** It is the kernel-mode HTTP stack; request parsing and
+  response framing never reach user mode. **Falsified if** a user-mode leg beats it at the small end.
+
+### The table (`Run-TlsSizes.ps1 -Repetitions 7`, 6 scored passes, `-c 64`, shards=16, GET `/payload`)
+
+Goodput MiB/s, median of 6; the spread column is the honesty check and it is doing real work here.
+
+| size | kestrel | kestrel+tls | iocp/s16 | iocp+tls/s16 | rio/s16 | rio+tls/s16 | httpsys | httpsys+tls |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 B | **149.4** | 137.9 | 130.4 | 129.1 | 130.6 | 126.6 | 120.0 | 102.6 |
+| 16 KB | **4040.7** | 3164.9 | 3344.3 | 3220.0 | 3579.4 | 3243.4 | 2776.1 | 2234.8 |
+| 256 KB | 11214.9 | 6959.8 | 8926.4 | 5542.6 | 7931.2 | 5676.6 | **11927.4** | 10066.9 |
+
+Per-leg spread (max-min as % of median), same run:
+
+| size | kestrel | kestrel+tls | iocp | iocp+tls | rio | rio+tls | httpsys | httpsys+tls |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 B | 1.0% | 2.2% | 5.8% | 6.3% | 13.4% | 13.9% | 2.4% | 2.1% |
+| 16 KB | 1.0% | 1.5% | 11.2% | 8.1% | 13.7% | 9.3% | 4.6% | 3.7% |
+| 256 KB | 3.5% | 3.8% | **16.3%** | 12.9% | 9.8% | 10.7% | 2.9% | 4.4% |
+
+### TWO OF THE THREE PREDICTIONS ARE FALSIFIED, and the falsifications are the finding
+
+**P4 FALSIFIED. In-transport SChannel does NOT beat `SslStream` on Windows.** At 512 B `kestrel+tls`
+(137.9, spread 2.2%) is disjointly AHEAD of `iocp+tls` (129.1, spread 6.3%); at 16 KB the medians favour
+us by 1.7% but the ranges overlap, so nothing is claimed. I predicted a win, smaller than Linux's — the
+direction itself was wrong.
+
+The mechanism is worth stating, because it explains why this is not a contradiction of the Linux result
+and must not be read as one. On **Linux** the TLS comparison swaps the whole ENGINE: our OpenSSL against
+`SslStream`, which is a different implementation as well as a different I/O model, and that wins +13-26%.
+On **Windows both sides are SChannel** — we drive it through raw SSPI, Kestrel drives it through
+`SslStream` — so the only variable is the I/O model, and on this evidence Kestrel's is not the thing
+holding it back. **The recorded "TLS is the real strength" headline is a LINUX result and does not
+transfer to Windows.** It is stated per-OS everywhere it appears; this is the measurement behind that.
+
+**P6 FALSIFIED, and interestingly so.** `httpsys` is LAST of the four plaintext legs at 512 B (120.0
+against Kestrel's 149.4, disjoint) — the kernel stack loses at the small end. It only takes the lead at
+**256 KB**, where it is 11927.4 against Kestrel's 11214.9, disjoint. So the kernel-mode advantage here is
+a bulk-transfer property, not a per-request one; at 512 B whatever it saves in parsing it gives back
+elsewhere. Recorded rather than explained — nothing in this sweep isolates why.
+
+**P5 NOT PROVEN, in either direction.** `iocp` (8926.4) does sit above `rio` (7931.2) at 256 KB
+plaintext, matching the prediction's direction and the one-page-per-`RIOSend` argument — but IOCP's own
+spread there is **16.3%** and RIO's 9.8%, and the ranges overlap. Per house rule 5, no delta. The
+prediction is neither confirmed nor falsified; the instrument could not answer it.
+
+### A CONFOUND THIS RUN CANNOT RULE OUT, and it is ours, not the rig's
+
+**Our legs are 3-6x noisier than every leg we are being compared against**: 5.8-16.3% spread against
+Kestrel's 1.0-3.8% and http.sys's 2.1-4.6%, on the same host in the same passes. That asymmetry is not a
+detail — it is why P5 could not be answered, and it should be explained before any of the plaintext
+orderings above are treated as settled.
+
+The obvious candidate is the rig's DEFAULT: **`shards=16` against a server half of 12 logical CPUs**
+(`server=0xfff`). Each shard is a dedicated loop thread, so 16 threads are competing for 12 cores while
+Kestrel and http.sys size themselves to the true count. The Linux headline table that produced the
+favourable numbers ran **12 shards on 12 cores**. If that is the mechanism, this table understates our
+legs by construction and the per-leg noise is the oversubscription showing.
+
+This is exactly "a rig is not neutral about what it can see". Tested immediately below — **and the
+hypothesis is WRONG.**
+
+### `Run-Matrix.ps1` — the shard sweep, which kills the oversubscription theory
+
+16 legs, 2-byte `/plaintext`, `-c 128`, 15s, median of 3 scored passes. Requests/second.
+
+| leg | s4 | s8 | s16 |
+|---|---:|---:|---:|
+| iocp | 173,091 | 272,368 | **293,023** |
+| iocp+tls | 164,746 | 263,435 | **289,177** |
+| rio | 183,243 | 279,472 | **290,498** |
+| rio+tls | 176,568 | 266,451 | **284,286** |
+
+| no-shard leg | rps |
+|---|---:|
+| kestrel | **304,806** |
+| managed | 304,575 |
+| managed+tls | 291,444 |
+| kestrel+tls | 291,220 |
+
+**More shards is monotonically BETTER through 16, on a 12-core server half.** If 16 loop threads on 12
+cores were the handicap, s8 should have beaten s16; instead s16 leads s8 on every one of the four legs
+(+7.6% iocp, +9.8% iocp+tls, +3.9% rio, +6.7% rio+tls), and s16 leads s4 by up to 69%. My confound theory
+predicted the opposite and is falsified. (Caveat on the falsification's reach:
+this tests 2-byte payloads at `-c 128`. It does not test shard count at 256 KB, which is where the
+`Run-TlsSizes` spreads were worst — see the follow-up run below.)
+
+**The noise theory dies here too, and more decisively.** Within-leg spreads in THIS run are 0.1-4.1% —
+`iocp-s16` at **0.5%**, `managed` at 0.4%, i.e. as tight as Kestrel's 0.3%. Same host, same day, same
+pinning. So "our legs are inherently noisy on Windows" is not the explanation for the 5.8-16.3% spreads
+in the payload sweep; the difference has to be in the measurement shape (8s vs 15s scored, `-c 64` vs
+`-c 128`, sized payloads vs 2 bytes), not in the transport.
+
+**What this table does say, and it is consistent with P4.** At 2 bytes Kestrel (304,806) and managed
+(304,575) lead, with `iocp-s16` 3.9% behind — and the three TLS legs are within **0.8% of each other**
+(`managed+tls` 291,444, `kestrel+tls` 291,220, `iocp-s16+tls` 289,177), i.e. a three-way tie. In-transport
+SChannel shows no advantage over `SslStream` here either, independently of the payload sweep.
+
+**Read the small-payload ties with care**, per `bench/README.md` rule 7: `-c 128` is past the knee for
+small messages on this host, so legs converging is partly the operating point. The `s4 → s8 → s16`
+ordering is far too large (69%) to be that, but the 0.8% TLS three-way tie is exactly the kind of gap the
+rule warns about. p99 is at the 1,503µs quantum throughout and is not quoted (rule 8).
+
+### …AND THE CAVEAT ON THAT FALSIFICATION WAS THE WHOLE STORY: at 256 KB the shard theory is RIGHT
+
+`Run-TlsSizes.ps1 -Shards 8,12,16 -Sizes 262144 -Repetitions 7`, iocp/rio legs plus a Kestrel control,
+same session. Goodput MiB/s, median of 6 [spread].
+
+| leg | s8 | s12 | s16 |
+|---|---:|---:|---:|
+| iocp | **10943.3** [2.6%] | 10817.5 [4.5%] | 9283.4 [16.5%] |
+| rio | **8169.9** [17.2%] | 7814.8 [9.4%] | 7645.8 [13.5%] |
+| iocp+tls | 4349.0 [2.4%] | 4504.2 [5.0%] | **5519.3** [5.0%] |
+| rio+tls | 4922.2 [5.9%] | 5491.4 [5.2%] | **5290.5** [9.9%] |
+| kestrel (control, no shards) | 10661.7 [12.7%] | — | — |
+
+**Three findings, and the first one retracts a number in the baseline table above.**
+
+**1. The plaintext 256 KB row was measured at a bad shard count and understates us by ~15%.** `iocp/s8`
+(10943.3) beats `iocp/s16` (9283.4) DISJOINTLY, and the spread collapses from 16.5% to 2.6% with it. So
+the oversubscription theory I raised, and that `Run-Matrix` appeared to falsify, is **correct at 256 KB
+and wrong at 2 bytes** — the falsification was payload-specific, which is exactly the caveat attached to
+it, and it turned out to be load-bearing rather than pedantic.
+
+**Corrected reading of the headline plaintext cell:** at a sane shard count `iocp` is 10943.3 [2.6%]
+against Kestrel's 10661.7 [12.7%] — **overlapping, i.e. PARITY**, not the 20% deficit the shards=16 table
+shows. The `Run-TlsSizes` default of `-Shards 16` is a poor default for this host and payload, and every
+256 KB plaintext figure in the sweep above inherits it.
+
+**2. P5 is now CONFIRMED, at the shard count where the instrument can actually see.** `iocp/s8`
+(10943.3, ±1.3%) against `rio/s8` (8169.9, ±8.6%) is disjoint — RIO trails IOCP by ~34% at 256 KB
+plaintext, which is the one-page-per-`RIOSend` cost the plaintext RIO control exists to attribute. At
+s16 the same comparison was unanswerable because IOCP's own spread was 16.5%. The prediction was right;
+only the operating point was hiding it.
+
+**3. NEW, and not predicted by anyone: the best shard count is PATH-DEPENDENT, and inverts.** Plaintext
+256 KB wants FEWER shards (s8 > s12 > s16 for both transports); TLS 256 KB wants MORE (s16 > s12 > s8 for
+iocp+tls, +26.9% s8→s16, disjoint). A plausible story is that the plaintext path at this size is
+copy/bandwidth-bound, where 16 threads on 12 cores is contention, while the TLS path is CPU-bound in the
+record layer, where extra runnable threads still find work — but nothing here isolates that, and it is
+recorded as an observation, not a mechanism.
+
+**Consequence for the rigs, worth acting on:** a single default shard count cannot serve both halves of
+this table, so any future Windows headline sweep should either sweep shards or state the one it used
+next to every number. The tables above now do.
+
 ## WHERE THINGS STAND (2026-07-30, extended through 2026-07-31) — the consolidated view of the HTTP/Kestrel era
 
 Everything below this section is a dated investigation; this is the summary they add up to. Cells are

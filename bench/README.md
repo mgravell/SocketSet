@@ -18,7 +18,7 @@ itself as an error.
 | **`Soak-Churn.ps1`** | Long connection-churn soak across backends. Exists because **no benchmark here churns connections** — every one holds keep-alive and measures steady state, which is why item 0e hid for months. Watches for all three faces of a lifetime bug: crash, wedge, and a quiet accounting imbalance. |
 | **`Repro-RioChurnCrash.ps1`** | Reproduces **TODO item 0e** — an intermittent access violation in RIO+TLS under churn, present on the default configuration. Judge a fix over 20+ reps across all its configs: pool depth moves the *rate* without removing the fault, so a lower rate looks exactly like a fix. |
 | `Measure-PipeMemory.ps1` | *"What does the pipe block size COST?"* Windows: peak working set vs connection count for the bridge's pipe pool. Run it at **2048** connections — the effect is connections × block, so 64 measures nothing and reads as free. |
-| `Run-TlsSizes.ps1` | Windows: how transports/TLS scale with payload size (and shard count). |
+| `Run-TlsSizes.ps1` | Windows: how transports/TLS scale with payload size (and shard count). **Its `-Shards 16` DEFAULT is wrong for 256 KB plaintext on this host** — measured 2026-08-05, `iocp/s8` beats `iocp/s16` disjointly (10,943 vs 9,283 MiB/s) and the per-leg spread collapses 16.5% → 2.6%. Sweep shards, or state the one you used beside every number. |
 | `Run-Matrix.ps1` | Windows: fixed-size transport × TLS matrix. |
 | `run-matrix.sh`, `run-tls-sizes.sh` | Linux equivalents of the two above. Both take `SHARDS="4 8 12"`. |
 | `run-bare-vs-bridged.sh` | *"Is this cost the transport or the Kestrel bridge?"* Bare responder at a MATCHED shard count, same session. |
@@ -102,6 +102,15 @@ the io_uring note below.
 in the background; an unrelated `git add <one-file>; git commit` in the same checkout then committed the
 staged reverts, because `git commit` writes the whole index. It reverted the change under test, and the
 A/B measured the old code as its own "after". Use worktrees.
+
+**6b. Sweep SHARD COUNT before believing a transport comparison, and do not assume one answer covers the
+payload range.** Measured 2026-08-05 on this host: at a 2-byte payload more shards is monotonically
+better (`s4 → s8 → s16` is +69% on IOCP), while at 256 KB plaintext it REVERSES (`s8` beats `s16`
+disjointly, +17.9%) — and at 256 KB *TLS* it reverses back (`s16` beats `s8` by +26.9%). One default
+cannot serve all three. This cost a headline number: the 256 KB plaintext row of the Windows baseline was
+first measured at the rig's default `s16` and read as a 20% deficit against Kestrel; at `s8` the same
+comparison is parity. The 2-byte sweep was run FIRST and appeared to settle the question in the opposite
+direction, which is the trap — a shard-count answer is only valid at the payload it was measured at.
 
 **7. Sweep concurrency before believing two transports are equal.**
 A saturated operating point flattens everything that can reach the ceiling. On the current host (12C/24T
