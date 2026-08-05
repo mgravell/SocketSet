@@ -173,10 +173,22 @@ equivalent.
      say what they do and do not see.
 
    **WHAT IS LEFT ON THIS ITEM:**
-   - **Nobody has measured parking while it is CONTINUOUSLY engaged.** Every rig here has a consumer that
-     keeps up, so parks sit at 0.2% of receives; the slow-consumer shape is asserted for CORRECTNESS by
-     `bench/verify-parking` and has no throughput rig at all. That is the honest gap, and it is the one
-     an adversary would sit in.
+   - **Parking under CONTINUOUS engagement: the rig now exists, the scored run does not.**
+     `bench/measure-parking` (2026-08-05, cross-platform) throttles the CONSUMER so parking fires
+     constantly, against a control that throttles the PRODUCER instead — matched bytes, rate and
+     duration, with only the presence of back-pressure differing. There is deliberately no before/after
+     leg: the pre-parking build does not survive this workload at all, which is the point.
+     Correctness-verified (assertions pass, clean 31-vs-0 park separation across IOCP/RIO/Managed) but
+     **NOT yet scored** — it was built while the box had unrelated background load, and its numbers are
+     therefore not measurements of record. Run it on a quiet box.
+
+     Two things it wants when that happens: a large `--mib` (the CPU column reads `n/a` below the
+     process-timer resolution rather than printing a misleading 0), and the usual six scored passes.
+     Two flaws in my own first cut are recorded in its header because both are the kind that produce a
+     confident wrong answer: pacing the producer to EXACTLY the consumer's rate left the "control"
+     parking 343 times against the pressured leg's 424 (a control that reproduces the condition it
+     controls for is not one), and a 64 KiB pause threshold made a merely BURSTY producer look like
+     back-pressure. Both were caught by the rig's own assertions rather than by inspection.
    - **io_uring parking**, deliberately shelved. `IoUringConnection.SupportsReceiveParking` returns false
      and both bridges honour it by keeping the bound, so io_uring is *bounded, not cured* — the state D3
      described for everything. The difficulty is unchanged and is the reason: its receive is MULTISHOT,

@@ -162,9 +162,30 @@ public abstract class Connection : IBufferWriter<byte>
         // Only from Running. An unconditional store would clobber an established Parked back to
         // ParkRequested, after which the matching resume would take the "the loop will re-arm itself"
         // branch — but the loop is not going to run again, because nothing is armed. That is the hang.
-        Interlocked.CompareExchange(ref _recvState, RecvParkRequested, RecvRunning);
+        if (Interlocked.CompareExchange(ref _recvState, RecvParkRequested, RecvRunning) == RecvRunning)
+            Interlocked.Increment(ref s_parks);
         return true;
     }
+
+    private static long s_parks;
+
+    /// <summary>
+    /// Receives parked because a consumer was behind, process-wide, since start. Counted only on the
+    /// transition into a park, so a park already in effect is not re-counted.
+    ///
+    /// PUBLIC AND UNCONDITIONAL because of house rule 2 — confirm a fast path was TAKEN, not just
+    /// enabled — and because the alternatives were both bad. `SocketSetTransportMetrics.ReceiveParks`
+    /// sees only the ASP.NET classic path; `PipeIoBridge`'s counter needs `SS_BRIDGE_STATS`; and the raw
+    /// callback/pipe path had no observable at all. A measurement of what parking COSTS is meaningless
+    /// without evidence that parking happened, and "it was free" and "it never ran" are the same number
+    /// when nothing counts it — which this codebase has already been bitten by twice (IOCP zero-copy
+    /// send, and the BYO park count reading a flat zero while parking ~4,300 times in six seconds).
+    ///
+    /// The interlocked increment is on the PARK, not on the receive, so it costs nothing in the steady
+    /// state (parks ran at 0.2% of receives on a real upload) and is negligible against a park's own
+    /// cost, which is an epoll_ctl or a cross-thread enqueue plus a wake.
+    /// </summary>
+    public static long TotalReceiveParks => Interlocked.Read(ref s_parks);
 
     /// <summary>Resume a parked (or about-to-park) receive. Callable from any thread, idempotent, and
     /// safe to call when nothing is parked.</summary>
