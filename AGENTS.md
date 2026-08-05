@@ -112,7 +112,11 @@ both have caused hesitation:
     the connection is dropped. `drain/control` runs the same volume past a consumer that does read, so
     the stall cannot be general slowness. On a backend that reports it cannot park (io_uring), the rig
     asserts the DOCUMENTED degradation rather than skipping, so a backend that quietly started or
-    stopped parking fails.
+    stopped parking fails. A fifth cell, `parked/peer-vanishes`, covers the state a CHURN SOAK cannot
+    reach: parking leaves a live connection with NO RECEIVE OUTSTANDING, which is what IOCP/RIO
+    defer-recycle reasons about, and a churn soak's echo consumer always keeps up so it never parks. Its
+    diagnostic reports `noticed while parked: False` — a completion backend cannot see the peer leave
+    while parked, because seeing it needs an armed receive.
   - **`bench/verify-tlsname`** (added 2026-08-04; cross-platform) — that hostname verification actually
     RUNS, and that the `"*"` opt-out actually opts out. Its meaning lives entirely in the cells that must
     be REFUSED (`wrong.example`, `127.0.0.2`, and an unset host); the accept-cells alone would pass just

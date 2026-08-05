@@ -432,7 +432,29 @@ and worth saying plainly rather than leaving to be discovered.
 whether or not they were requested, and level-triggered, so ignoring one would spin a core). A parked
 connection that takes a HUP is therefore CLOSED rather than parked-and-waited-on. That is correct for a
 fully-dead socket, which is what HUP means, but it is a behavioural difference from the other three and
-it is written down here rather than left to be re-derived. Original writeup below.
+it is written down here rather than left to be re-derived.
+
+**A PROPERTY OF PARKING, FOUND 2026-08-05 BY READING A GREEN RESULT PROPERLY.** The churn soak
+(`Soak-Churn.ps1`, 5 cases x 180s, 1.2M connections) came back clean — and then, on reading what it had
+actually exercised, covered none of the risk: a churn soak's consumer is an echo callback that always
+keeps up, so it never parks. 1.2M churned connections therefore said nothing about the state parking
+newly creates, which is **a live connection with no receive outstanding** — exactly the condition
+IOCP/RIO defer-recycle reasons about, since parking clears `RecvArmed` with no completion coming.
+
+A cell was added for it (`parked/peer-vanishes`), and it passes on all three Windows backends — but its
+diagnostic line records the property that matters: **`noticed while parked: False`**. A completion
+backend structurally CANNOT observe the peer going away while parked, because observing it requires an
+armed receive and there is not one. The close surfaces only when the consumer catches up and the receive
+is re-armed.
+
+That is bounded and self-healing rather than a leak, and the reasoning is worth keeping: once the peer is
+gone no more data arrives, so the consumer necessarily drains, which resumes the receive, which takes the
+EOF. The connection is held for as long as the consumer stays behind and no longer. The pathological case
+is an application wedged FOREVER — and such an application holds slots regardless of parking. Note
+though that `IdleTimeout` is the only backstop and it is OFF by default (D2), so there is no independent
+reaper for this state; if a future workload can wedge a consumer indefinitely, that is the knob.
+
+Original writeup below.
 
 ---
 

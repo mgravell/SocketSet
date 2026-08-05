@@ -120,6 +120,56 @@ foreach (var (factory, be) in GateBackends.All)
         client.Stop();
     }
     Thread.Sleep(300);
+
+    // ---- 5: PARKED, THEN THE PEER VANISHES -----------------------------------------------------------
+    //
+    // ADDED after the 2026-08-05 churn soak came back clean and I read what it had actually covered. A
+    // churn soak never parks -- its consumer is an echo callback that always keeps up -- so 1.2M churned
+    // connections said nothing about the state parking newly creates: a live connection with NO RECEIVE
+    // OUTSTANDING. On IOCP and RIO that is precisely the condition defer-recycle reasons about, because
+    // parking clears RecvArmed with no completion coming to clear it later. A slot freed while an op is
+    // still in flight, or never freed at all, is the shape of item 0e.
+    //
+    // And a completion backend structurally CANNOT notice the peer going away while parked: noticing
+    // requires an armed receive, and there is not one. So the close is discovered only when the consumer
+    // catches up and the receive is re-armed -- which is what this cell asserts actually happens, rather
+    // than the connection being stranded. That is the anti-leak assertion, and nothing else here makes it.
+    if (true)
+    {
+        var o = new SocketSetOptions { Shards = 1, Factory = factory };
+        using var srv = new Sink(o, stall: true);
+        srv.Listen(new IPEndPoint(IPAddress.Loopback, Port + 2));
+        Thread.Sleep(300);
+
+        var client = new Sender(Port + 2, Offer, Chunk);
+        client.Start();
+        Thread.Sleep(2500);                     // long enough to be parked (see cell 2's samples)
+
+        bool parkedAndAlive = srv.Parks && !srv.AnyClosed;
+        client.Stop();                          // the peer disappears WHILE PARKED
+        Thread.Sleep(1000);
+
+        // Before the consumer moves, nothing can have noticed on a completion backend. Recorded rather
+        // than asserted: epoll CAN notice (EPOLLHUP is delivered whether or not it was requested), so
+        // requiring either answer here would be asserting a backend's internals rather than the contract.
+        bool noticedWhileParked = srv.AnyClosed;
+
+        srv.Release();                          // consumer catches up -> receive re-arms -> EOF surfaces
+        bool reaped = srv.WaitClosed(TimeSpan.FromSeconds(15));
+
+        if (srv.Parks)
+        {
+            Report(ref failures, parkedAndAlive && reaped, $"{be} parked/peer-vanishes",
+                reaped ? $"torn down after resume (noticed while parked: {noticedWhileParked})"
+                       : "STRANDED: still open 15s after the peer vanished and the consumer caught up");
+        }
+        else
+        {
+            Console.WriteLine($"  SKIP  {be + " parked/peer-vanishes",-34} cannot park, so the state does not arise");
+        }
+        client.Stop();
+    }
+    Thread.Sleep(300);
 }
 
 Console.WriteLine(failures == 0 ? "\n=== verify-parking: ALL PASS ===" : $"\n=== verify-parking: {failures} FAILURE(S) ===");
@@ -156,6 +206,17 @@ sealed class Sink : SocketSet
     public int Corruptions => Volatile.Read(ref _corruptions);
 
     public void Release() => _gate.Set();
+
+    public bool WaitClosed(TimeSpan within)
+    {
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed < within)
+        {
+            if (AnyClosed) return true;
+            Thread.Sleep(25);
+        }
+        return false;
+    }
 
     public bool WaitReceived(long target, TimeSpan within)
     {
