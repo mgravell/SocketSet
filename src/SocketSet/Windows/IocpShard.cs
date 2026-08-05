@@ -79,7 +79,6 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         public nint Buf;      // (byte*) native AcceptEx output buffer (AcceptBufSize)
         public nint Op;       // (AcceptOp*) native op context
         public object? Token; // default UserToken for connections accepted here
-        public SocketSets.Tls.TlsProvider? Tls; // default per-LISTENER provider, inherited by accepts
         public int Af;        // family/proto for creating the next accept socket
         public int Proto;
         public GCHandle Gc;   // keeps this instance alive + gives a stable identity in AcceptOp.Handle
@@ -91,7 +90,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // ConnectEx — so the slot table stays single-writer. The socket is created caller-side (thread-agnostic
     // syscalls, sync failures stay synchronous); the port-assoc + ConnectEx run on the loop (their failures
     // become async, uniform with accept).
-    private readonly ConcurrentQueue<(nint Socket, EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)> _pendingConnects = [];
+    private readonly ConcurrentQueue<(nint Socket, EndPoint Endpoint, object? Token)> _pendingConnects = [];
 
     // --- options snapshot ---
     private readonly int _opCount;
@@ -113,7 +112,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // --- cross-thread queues drained on the loop thread ---
     // Accepted sockets handed to this shard by the single acceptor. The default token travels with the
     // socket since the target shard has no listener of its own to look it up on.
-    private readonly ConcurrentQueue<(nint Socket, object? Token, SocketSets.Tls.TlsProvider? Tls)> _incoming = [];
+    private readonly ConcurrentQueue<(nint Socket, object? Token)> _incoming = [];
     // Close requests marshaled from arbitrary threads. Generation-guarded so a request can't retract a
     // slot that has since been closed and re-tenanted.
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
@@ -273,7 +272,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             AdoptAccepted(inbound.Socket, inbound.Token);
 
         while (_pendingConnects.TryDequeue(out var pc))
-            StartConnect(pc.Socket, pc.Endpoint, pc.Token, pc.Tls);
+            StartConnect(pc.Socket, pc.Endpoint, pc.Token);
 
         while (_closes.TryDequeue(out var c))
         {
@@ -382,9 +381,9 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
     /// <summary>Marshal an accepted socket onto this shard's loop (called from the acceptor shard's
     /// loop). The socket is process-global so any port can adopt it.</summary>
-    internal void EnqueueInbound(nint socket, object? token, SocketSets.Tls.TlsProvider? tls = null)
+    internal void EnqueueInbound(nint socket, object? token)
     {
-        _incoming.Enqueue((socket, token, tls));
+        _incoming.Enqueue((socket, token));
         Poke();
     }
 
@@ -648,7 +647,6 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         if (idx < 0) return null;
         var conn = _conns[idx];
         conn.UserToken = userToken;
-        conn.TlsOverride = null; // recycled slot must not inherit the last tenant's provider
         conn.Flags = flags;
         conn.Opened = false;
         conn.Closing = false;
@@ -745,7 +743,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // Public entry points
     // =====================================================================
 
-    public override void Listen(EndPoint endpoint, object? userToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Listen(EndPoint endpoint, object? userToken, bool local)
     {
         EnsureWinsock();
         // IOCP has no reuse-port load balancing, so this is always a single listener (the factory reports
@@ -760,10 +758,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(listener) failed");
         }
 
-        StartAccept(listener, af, proto, userToken, tls);
+        StartAccept(listener, af, proto, userToken);
     }
 
-    public override void ListenHandle(nint handle, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void ListenHandle(nint handle, object? userToken)
     {
         EnsureWinsock();
         if (handle == 0 || handle == Win32.INVALID_SOCKET)
@@ -773,10 +771,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         Win32.LoadExtensions(handle);
         if (Win32.CreateIoCompletionPort(handle, _port, 0, 0) == 0)
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "CreateIoCompletionPort(listener) failed");
-        StartAccept(handle, Win32.AF_INET, Win32.IPPROTO_TCP, userToken, tls);
+        StartAccept(handle, Win32.AF_INET, Win32.IPPROTO_TCP, userToken);
     }
 
-    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Connect(EndPoint endpoint, object? userToken)
     {
         EnsureWinsock();
         int af, proto;
@@ -833,7 +831,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             }
         }
 
-        _pendingConnects.Enqueue((s, endpoint, userToken, tls));
+        _pendingConnects.Enqueue((s, endpoint, userToken));
         Poke();
     }
 
@@ -841,11 +839,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // build the target sockaddr into the slot's stable native storage, and post ConnectEx. The reservation
     // is consumed by the claim, or released here on any post-claim failure (which are now async, like
     // accept — the caller has already returned).
-    private void StartConnect(nint s, EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    private void StartConnect(nint s, EndPoint endpoint, object? userToken)
     {
         var conn = InitClient(s, userToken, SocketSet.SocketFlags.None);
         if (conn is null) { Win32.closesocket(s); ReleaseReservation(); return; }
-        conn.TlsOverride = tls; // InitClient nulled it (slot recycle); an explicit provider re-seeds it
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(s, _port, slot, 0) == 0)
@@ -942,14 +939,14 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
     // Arm a pool of AcceptConcurrency outstanding AcceptEx on the listener — a backlog of accept
     // consumers so connect bursts don't serialize on one accept-at-a-time, and one failed re-post
     // doesn't stall the whole listener. Each completion re-posts its own state (see HandleAccept).
-    private void StartAccept(nint listener, int af, int proto, object? token, SocketSets.Tls.TlsProvider? tls = null)
+    private void StartAccept(nint listener, int af, int proto, object? token)
     {
         for (int i = 0; i < _acceptConcurrency; i++)
         {
             var st = new AcceptState
             {
                 Listener = listener,
-                Token = token, Tls = tls,
+                Token = token,
                 Af = af,
                 Proto = proto,
                 Buf = (nint)NativeMemory.AllocZeroed(AcceptBufSize),
@@ -1014,21 +1011,20 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         // Single acceptor → place on the first shard with a free slot (capacity-aware; drops only if
         // every shard is full).
         var target = (IocpShard?)Parent.TryPlace();
-        if (target is not null) target.EnqueueInbound(acc, st.Token, st.Tls);
+        if (target is not null) target.EnqueueInbound(acc, st.Token);
         else Win32.closesocket(acc); // every shard full → drop (runtime shard growth would expand here)
 
         PostAccept(st); // keep the listener saturated
     }
 
     // Associate an accepted socket with THIS shard's port, run OnAccept, arm recv, fire any initial send.
-    private void AdoptAccepted(nint socket, object? token, SocketSets.Tls.TlsProvider? listenTls = null)
+    private void AdoptAccepted(nint socket, object? token)
     {
         int one = 1;
         Win32.setsockopt(socket, Win32.IPPROTO_TCP, Win32.TCP_NODELAY, &one, sizeof(int)); // harmless on AF_UNIX
 
         var conn = InitClient(socket, token, SocketSet.SocketFlags.None);
         if (conn is null) { Win32.closesocket(socket); ReleaseReservation(); return; }
-        conn.TlsOverride = listenTls; // InitClient nulled it; the LISTENER's provider re-seeds it
         uint slot = conn.Slot;
 
         if (Win32.CreateIoCompletionPort(socket, _port, slot, 0) == 0)

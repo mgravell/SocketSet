@@ -61,11 +61,25 @@ equivalent.
      suppression cells no longer "prove nothing on Windows" — they are now observed directly. What
      remains SChannel-specific is `Connection.RequestedServerName` (the SERVER's view), which is
      unrelated to what the client announces and is still always null there.
-   - **Remove the now-redundant per-connect/per-listen `TlsProvider?` parameters** on
-     `Listen`/`Connect`/`ConnectShard`/`ListenHandle` and the `Connection.TlsOverride` they feed. The
-     callbacks subsume them and nothing outside the library passes one; leaving both means two
-     mechanisms with precedence rules between them. Kept for now only so the callback change could land
-     without touching every signature at once.
+   - ~~**Remove the now-redundant per-connect/per-listen `TlsProvider?` parameters**~~ **DONE
+     2026-08-05.** Gone from `Listen`/`Connect`/`ConnectShard`/`ListenHandle` (public), from
+     `SocketSetShard`'s three virtuals, from all five backends and their cross-thread queues and listener
+     maps, and `Connection.TlsOverride` is deleted with them. `ResolveClientTls`/`ResolveServerTls` now
+     read `Options.Tls` directly, so the `TlsOverride ?? Options.Tls` precedence rule — which existed
+     only in one `??` and in nobody's head — is gone too.
+
+     Checked before removing rather than assumed: **nothing outside the library ever passed one**, across
+     `src`, `SmokeTest`, `bench`, `AspNetDemo`, `GarnetDemo` and `experiments`. So this deleted an unused
+     mechanism rather than migrating a used one. Migration path if it is ever wanted back: override
+     `OnServerAuthenticate`/`OnClientAuthenticate` and switch on `ctx.Connection.UserToken`, which the
+     listener seeds for accepts and the caller seeds for dials — strictly more expressive than the
+     parameter was, since it can also vary per connection rather than per listener.
+
+     Mechanical, wide (8 files) and done partly with bulk replacement, so the diff was AUDITED line by
+     line afterwards rather than trusted: that caught two collateral edits (`ProcessReceiveTls(conn, tls,
+     n)` and four `SendEncrypted(conn, tls, …)` calls losing their `tls` argument, both of which the
+     compiler caught) and two BOMs stripped by `File.WriteAllText`, which the compiler would NOT have
+     caught. Restored.
    - **SNI-based server certificate selection — DEFERRED 2026-08-04 (Marc: "a future idea, not currently
      scheduled").** Not a rejection and not a blocked item: nobody is waiting on it, so it does not belong
      in a priority list. The analysis below is kept intact because it is the expensive part and re-deriving

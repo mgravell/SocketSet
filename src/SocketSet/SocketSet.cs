@@ -36,7 +36,7 @@ public abstract partial class SocketSet : IDisposable
     // exist is atomic against a concurrent growth: a shard created in between is bound by the replay, one
     // created after sees the completed record. Stays null on the single-listener path (Windows/UDS/
     // ListenHandle), where a grown shard already receives bounced connections with no listener changes.
-    private List<(EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)>? _multiBindListens;
+    private List<(EndPoint Endpoint, object? Token)>? _multiBindListens;
 
     private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(30);
 
@@ -304,7 +304,7 @@ public abstract partial class SocketSet : IDisposable
     /// </summary>
     internal Tls.TlsResolution ResolveClientTls(Connection conn)
     {
-        var ctx = new Tls.TlsClientAuthenticateContext(conn, conn.TlsOverride ?? Options.Tls, Options.TlsClient);
+        var ctx = new Tls.TlsClientAuthenticateContext(conn, Options.Tls, Options.TlsClient);
         bool wanted;
         try { wanted = OnClientAuthenticate(ref ctx); }
         catch (Exception ex) { return DenyTls(conn, nameof(OnClientAuthenticate), ex); }
@@ -350,7 +350,7 @@ public abstract partial class SocketSet : IDisposable
     /// told a name by SNI rather than choosing one.</summary>
     internal Tls.TlsResolution ResolveServerTls(Connection conn)
     {
-        var ctx = new Tls.TlsServerAuthenticateContext(conn, conn.TlsOverride ?? Options.Tls, Options.TlsServer);
+        var ctx = new Tls.TlsServerAuthenticateContext(conn, Options.Tls, Options.TlsServer);
         bool wanted;
         try { wanted = OnServerAuthenticate(ref ctx); }
         catch (Exception ex) { return DenyTls(conn, nameof(OnServerAuthenticate), ex); }
@@ -478,9 +478,9 @@ public abstract partial class SocketSet : IDisposable
             // needs nothing here — a grown shard there already takes bounced connections.
             if (_multiBindListens is { } listens)
             {
-                foreach (var (endpoint, token, tls) in listens)
+                foreach (var (endpoint, token) in listens)
                 {
-                    shard.Listen(endpoint, token, local: true, tls);
+                    shard.Listen(endpoint, token, local: true);
                 }
             }
 
@@ -534,14 +534,27 @@ public abstract partial class SocketSet : IDisposable
 #endif
     }
 
-    /// <summary>
-    /// <paramref name="tls"/>: per-LISTENER TLS provider — connections accepted on THIS listener use it,
-    /// overriding the engine-level options outright (an explicit provider IS the direction signal;
-    /// <see cref="TlsMode"/> does not gate it). Null = engine options decide, exactly as before. With
-    /// the per-connect twin on <see cref="Connect(EndPoint, object?, SocketSets.Tls.TlsProvider?)"/>,
-    /// one engine can serve many TLS contexts in both directions.
-    /// </summary>
-    public void Listen(EndPoint endpoint, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
+    // =====================================================================
+    // The per-call TlsProvider parameter is GONE (2026-08-05).
+    // ---------------------------------------------------------------------
+    // Listen/Connect/ConnectShard/ListenHandle each used to take a TlsProvider?, which was stashed on
+    // Connection.TlsOverride and consulted by ResolveClientTls/ResolveServerTls as `TlsOverride ??
+    // Options.Tls`. Once OnClientAuthenticate/OnServerAuthenticate landed (D1) that was a SECOND
+    // mechanism for the same decision, with a precedence rule between them that existed only in one
+    // `??` and in nobody's head. Two ways to choose a provider is how they disagree.
+    //
+    // The callbacks subsume it completely, and more flexibly: they run per connection with the
+    // Connection already live, so keying off UserToken - which the LISTENER seeds for accepts, and the
+    // caller seeds for dials - expresses "this listener uses provider A, that one B" and every finer
+    // split besides. Nothing outside the library ever passed the parameter (checked across src,
+    // SmokeTest, bench, AspNetDemo, GarnetDemo and experiments before removing it), so this deletes an
+    // unused mechanism rather than migrating a used one.
+    //
+    // MIGRATION, if it ever mattered: override OnServerAuthenticate/OnClientAuthenticate and switch on
+    // ctx.Connection.UserToken, setting ctx.Provider.
+    // =====================================================================
+
+    public void Listen(EndPoint endpoint, object? userToken = null)
     {
         ValidateEndpoint(endpoint);
         if (Options.Factory.CanMultiBind(endpoint, Options))
@@ -551,10 +564,10 @@ public abstract partial class SocketSet : IDisposable
             // concurrent grow — a shard added in between is bound by TryGrow's replay, never left unbound.
             lock (_growLock)
             {
-                (_multiBindListens ??= []).Add((endpoint, userToken, tls));
+                (_multiBindListens ??= []).Add((endpoint, userToken));
                 foreach (var shard in _shards)
                 {
-                    shard.Listen(endpoint, userToken, local: true, tls);
+                    shard.Listen(endpoint, userToken, local: true);
                 }
             }
         }
@@ -563,7 +576,7 @@ public abstract partial class SocketSet : IDisposable
             // Single listener on one shard, which bounces accepted connections round-robin. Because the
             // shard is chosen round-robin, distinct listen endpoints land on different shards rather than
             // all piling their accept load onto shard 0.
-            RoundRobin().Listen(endpoint, userToken, local: false, tls);
+            RoundRobin().Listen(endpoint, userToken, local: false);
         }
     }
 
@@ -575,7 +588,7 @@ public abstract partial class SocketSet : IDisposable
     /// asked for a specific placement, so falling back to another shard would silently defeat the point;
     /// degrade explicitly at the call site instead.
     /// </summary>
-    public void ConnectShard(int shardIndex, EndPoint endpoint, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
+    public void ConnectShard(int shardIndex, EndPoint endpoint, object? userToken = null)
     {
         ValidateEndpoint(endpoint);
         var arr = _shards;
@@ -583,18 +596,10 @@ public abstract partial class SocketSet : IDisposable
         var shard = arr[shardIndex];
         if (!shard.TryReserve())
             throw new InvalidOperationException($"Shard {shardIndex} is at capacity; cannot place the connection.");
-        shard.Connect(endpoint, userToken, tls);
+        shard.Connect(endpoint, userToken);
     }
 
-    /// <summary>
-    /// <paramref name="tls"/>: per-connection TLS provider for THIS dial, overriding the engine-level
-    /// options outright (an explicit provider IS the direction signal; <see cref="TlsMode"/> does not
-    /// gate it). Null = the engine options decide, exactly as before. This is the "one engine, many TLS
-    /// contexts" granularity: e.g. a proxy terminating with cert A downstream while originating with
-    /// trust B upstream, on a single SocketSet. Client-side only today; per-Listen granularity is a
-    /// recorded follow-up.
-    /// </summary>
-    public void Connect(EndPoint endpoint, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
+    public void Connect(EndPoint endpoint, object? userToken = null)
     {
         ValidateEndpoint(endpoint);
         // Walk for a shard with a free slot rather than committing to one round-robin pick that might be
@@ -602,7 +607,7 @@ public abstract partial class SocketSet : IDisposable
         // claiming the slot, or releases it on a pre-claim failure.
         var shard = TryPlace()
             ?? throw new InvalidOperationException("All shards are at capacity; cannot place the connection.");
-        shard.Connect(endpoint, userToken, tls);
+        shard.Connect(endpoint, userToken);
     }
 
     /// <summary>
@@ -614,8 +619,8 @@ public abstract partial class SocketSet : IDisposable
     /// <paramref name="userToken"/> becomes the default <see cref="Connection.UserToken"/> for
     /// connections accepted on it. The set takes ownership of the handle and closes it on teardown.
     /// </summary>
-    public void ListenHandle(nint handle, object? userToken = null, SocketSets.Tls.TlsProvider? tls = null)
-        => RoundRobin().ListenHandle(handle, userToken, tls);
+    public void ListenHandle(nint handle, object? userToken = null)
+        => RoundRobin().ListenHandle(handle, userToken);
 
     protected internal virtual void OnAccept(ref AcceptContext ctx)
     {

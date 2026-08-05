@@ -83,16 +83,16 @@ internal sealed unsafe class EpollShard : SocketSetShard
     private PooledBufferWriter? _tlsCtrl;    // handshake / control-record output
 
     // --- listeners (loop thread) ---
-    private readonly Dictionary<int, (object? Token, SocketSets.Tls.TlsProvider? Tls)> _listeners = [];
+    private readonly Dictionary<int, object?> _listeners = [];
 
     // --- cross-thread queues, drained on the loop thread ---
-    private readonly ConcurrentQueue<(int Fd, object? Token, SocketSets.Tls.TlsProvider? Tls)> _incoming = [];
+    private readonly ConcurrentQueue<(int Fd, object? Token)> _incoming = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation)> _closes = [];
     // Parked receives to re-arm (Connection.ResumeReceive, from the consumer's flush continuation).
     private readonly ConcurrentQueue<(int Slot, uint Generation)> _resumes = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation, byte[] Data, int Len)> _flush = [];
-    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)> _connects = [];
-    private readonly ConcurrentQueue<(int Fd, object? Token, SocketSets.Tls.TlsProvider? Tls)> _newListeners = [];
+    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token)> _connects = [];
+    private readonly ConcurrentQueue<(int Fd, object? Token)> _newListeners = [];
     private readonly ConcurrentQueue<(int Slot, uint Generation, EpollZcSend Zc)> _zeroCopy = [];
 
     private const int IovMax = 1024; // UIO_MAXIOV: writev rejects iovcnt above this with -EINVAL
@@ -307,7 +307,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         while (LibC.read(_wakeFd, &sink, 8) == 8) { } // EFD_NONBLOCK: returns EAGAIN when empty
     }
 
-    internal void EnqueueInbound(int fd, object? token, SocketSets.Tls.TlsProvider? tls = null) { _incoming.Enqueue((fd, token, tls)); Poke(); }
+    internal void EnqueueInbound(int fd, object? token) { _incoming.Enqueue((fd, token)); Poke(); }
 
     internal void SubmitClose(int slot, uint generation) { _closes.Enqueue((slot, generation)); Poke(); }
 
@@ -323,9 +323,9 @@ internal sealed unsafe class EpollShard : SocketSetShard
 
     private void DrainCrossThread()
     {
-        while (_newListeners.TryDequeue(out var l)) StartListen(l.Fd, l.Token, l.Tls);
-        while (_connects.TryDequeue(out var c)) StartConnect(c.Fd, c.Endpoint, c.Token, c.Tls);
-        while (_incoming.TryDequeue(out var a)) AdoptAccepted(a.Fd, a.Token, a.Tls);
+        while (_newListeners.TryDequeue(out var l)) StartListen(l.Fd, l.Token);
+        while (_connects.TryDequeue(out var c)) StartConnect(c.Fd, c.Endpoint, c.Token);
+        while (_incoming.TryDequeue(out var a)) AdoptAccepted(a.Fd, a.Token);
         // f.Data is rented (see OutboundConnection.Flush) and owned by this loop now: return it however
         // PumpFlush exits, including the drop paths where the slot was re-tenanted.
         while (_flush.TryDequeue(out var f))
@@ -349,7 +349,6 @@ internal sealed unsafe class EpollShard : SocketSetShard
         if (idx < 0) return null;
         var conn = _conns[idx];
         conn.UserToken = userToken;
-        conn.TlsOverride = null; // recycled slot must not inherit the last tenant's provider
         conn.Flags = flags;
         conn.Opened = false;
         conn.Closing = false;
@@ -448,23 +447,23 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // Listen / accept
     // =====================================================================
 
-    public override void Listen(EndPoint endpoint, object? userToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Listen(EndPoint endpoint, object? userToken, bool local)
     {
         int fd = IoUringFactory.Bind(endpoint, _listenBacklog, Parent.Options);
         LibC.SetNonBlocking(fd);
-        _newListeners.Enqueue((fd, userToken, tls));
+        _newListeners.Enqueue((fd, userToken));
         Poke();
     }
 
-    public override void ListenHandle(nint handle, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void ListenHandle(nint handle, object? userToken)
     {
         int fd = (int)handle;
         LibC.SetNonBlocking(fd);
-        _newListeners.Enqueue((fd, userToken, tls));
+        _newListeners.Enqueue((fd, userToken));
         Poke();
     }
 
-    private void StartListen(int fd, object? token, SocketSets.Tls.TlsProvider? tls = null)
+    private void StartListen(int fd, object? token)
     {
         if (!Register(fd, LibC.EPOLLIN, KindListen | (uint)fd))
         {
@@ -472,7 +471,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
             LibC.close(fd);
             return;
         }
-        _listeners[fd] = (token, tls);
+        _listeners[fd] = token;
     }
 
     /// <summary>Drain the accept backlog. Level-triggered would re-notify, but accepting in a burst keeps
@@ -480,7 +479,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
     private void AcceptBurst(int listenFd)
     {
         if (!_listeners.TryGetValue(listenFd, out var listener)) return;
-        var (token, listenTls) = listener;
+        var token = listener;
         while (true)
         {
             int fd = LibC.accept4(listenFd, null, null, LibC.SOCK_NONBLOCK | LibC.SOCK_CLOEXEC);
@@ -494,16 +493,15 @@ internal sealed unsafe class EpollShard : SocketSetShard
             // Capacity-aware placement across shards; drops only if every shard is full.
             var target = (EpollShard?)Parent.TryPlace();
             if (target is null) { LibC.close(fd); continue; }
-            if (ReferenceEquals(target, this)) AdoptAccepted(fd, token, listenTls);
-            else target.EnqueueInbound(fd, token, listenTls);
+            if (ReferenceEquals(target, this)) AdoptAccepted(fd, token);
+            else target.EnqueueInbound(fd, token);
         }
     }
 
-    private void AdoptAccepted(int fd, object? token, SocketSets.Tls.TlsProvider? listenTls = null)
+    private void AdoptAccepted(int fd, object? token)
     {
         var conn = InitClient(fd, token, SocketSet.SocketFlags.None);
         if (conn is null) { LibC.close(fd); ReleaseReservation(); return; }
-        conn.TlsOverride = listenTls; // InitClient nulled it; the LISTENER's provider re-seeds it
 
         if (!_recvBuffer.TryLease(out int ri, out _)) { LibC.close(fd); FreeSlot(conn); return; }
         conn.RecvBuf = ri;
@@ -524,7 +522,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
     // Connect
     // =====================================================================
 
-    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Connect(EndPoint endpoint, object? userToken)
     {
         // This shard already holds a reservation (TryPlace took it). Create the socket synchronously so
         // its failures stay on the caller's thread, then hand the claim + connect to the loop. Every
@@ -556,15 +554,14 @@ internal sealed unsafe class EpollShard : SocketSetShard
             LibC.setsockopt(fd, LibC.IPPROTO_TCP, LibC.TCP_NODELAY, &one, sizeof(int));
         }
 
-        _connects.Enqueue((fd, endpoint, userToken, tls));
+        _connects.Enqueue((fd, endpoint, userToken));
         Poke();
     }
 
-    private void StartConnect(int fd, EndPoint endpoint, object? token, SocketSets.Tls.TlsProvider? tls = null)
+    private void StartConnect(int fd, EndPoint endpoint, object? token)
     {
         var conn = InitClient(fd, token, SocketSet.SocketFlags.None);
         if (conn is null) { LibC.close(fd); ReleaseReservation(); return; }
-        conn.TlsOverride = tls; // InitClient nulled it (slot recycle); an explicit provider re-seeds it
 
         if (!_recvBuffer.TryLease(out int ri, out _)) { LibC.close(fd); FreeSlot(conn); return; }
         conn.RecvBuf = ri;

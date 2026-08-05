@@ -89,7 +89,7 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Listen / accept
     // =====================================================================
 
-    public override void Listen(EndPoint endpoint, object? defaultToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Listen(EndPoint endpoint, object? defaultToken, bool local)
     {
         // MaxShards == 1, so there is only ever one shard here; a single listener binds
         // the endpoint directly — no reuse-port fan-out.
@@ -97,18 +97,18 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         listener.Listen(Parent.Options.ListenBacklog);
         lock (_listeners) _listeners.Add(listener);
 
-        StartAccept(new AcceptArgs(this, listener, defaultToken, tls));
+        StartAccept(new AcceptArgs(this, listener, defaultToken));
     }
 
 #if NET
-    public override void ListenHandle(nint handle, object? defaultToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void ListenHandle(nint handle, object? defaultToken)
     {
         // Wrap the handed-over handle (must already be bound + listening); we own it now. The raw-handle
         // Socket ctor is .NET 5+, so netfx falls through to the base NotSupported — there's no clean
         // public way to wrap a bare handle on .NET Framework.
         var listener = new Socket(new SafeSocketHandle(handle, ownsHandle: true));
         lock (_listeners) _listeners.Add(listener);
-        StartAccept(new AcceptArgs(this, listener, defaultToken, tls));
+        StartAccept(new AcceptArgs(this, listener, defaultToken));
     }
 #endif
 
@@ -134,7 +134,6 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         {
             MaybeNoDelay(sock);
             var conn = Register(sock, args.DefaultToken);
-            conn.TlsOverride = args.Tls; // fresh connection object; seed the LISTENER's provider
 
             var serverTls = Parent.ResolveServerTls(conn);
             if (serverTls.Refused) { Close(conn); return true; }   // never downgrade to plaintext
@@ -165,11 +164,11 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Connect
     // =====================================================================
 
-    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Connect(EndPoint endpoint, object? userToken)
     {
         var target = Normalize(endpoint);
         var socket = NewSocket(target);
-        var args = new ConnectArgs(this, userToken, tls) { RemoteEndPoint = target };
+        var args = new ConnectArgs(this, userToken) { RemoteEndPoint = target };
         try
         {
             if (!socket.ConnectAsync(args)) CompleteConnect(args);
@@ -194,7 +193,6 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         MaybeNoDelay(socket);
         var token = args.Token;
         var conn = Register(socket, token);
-        conn.TlsOverride = args.Tls; // fresh connection object (managed never recycles); seed the per-connect provider
         args.Dispose(); // connect SAEA no longer needed
 
         var clientTls = Parent.ResolveClientTls(conn);
@@ -723,12 +721,11 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     // Strongly-typed SocketAsyncEventArgs subclasses (state as fields; direct dispatch).
     // ---------------------------------------------------------------------
 
-    private sealed class AcceptArgs(ManagedSocketShard shard, Socket listener, object? defaultToken, SocketSets.Tls.TlsProvider? tls = null) : SocketAsyncEventArgs
+    private sealed class AcceptArgs(ManagedSocketShard shard, Socket listener, object? defaultToken) : SocketAsyncEventArgs
     {
         public readonly ManagedSocketShard Shard = shard;
         public readonly Socket Listener = listener;
         public readonly object? DefaultToken = defaultToken;
-        public readonly SocketSets.Tls.TlsProvider? Tls = tls;
 
         protected override void OnCompleted(SocketAsyncEventArgs e)
         {
@@ -736,11 +733,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         }
     }
 
-    private sealed class ConnectArgs(ManagedSocketShard shard, object? token, SocketSets.Tls.TlsProvider? tls = null) : SocketAsyncEventArgs
+    private sealed class ConnectArgs(ManagedSocketShard shard, object? token) : SocketAsyncEventArgs
     {
         public readonly ManagedSocketShard Shard = shard;
         public readonly object? Token = token;
-        public readonly SocketSets.Tls.TlsProvider? Tls = tls;
 
         protected override void OnCompleted(SocketAsyncEventArgs e) => Shard.CompleteConnect(this);
     }

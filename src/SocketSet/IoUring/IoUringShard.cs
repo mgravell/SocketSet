@@ -52,7 +52,7 @@ internal sealed class IoUringShard : SocketSetShard
                                   // it's a mutable struct, so a readonly field would mutate a throwaway copy.
     // Connect requests marshaled from the caller thread to the loop, which claims the slot + issues the
     // CONNECT SQE — so the slot table stays single-writer (only the loop claims). fd is created caller-side.
-    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token, SocketSets.Tls.TlsProvider? Tls)> _pendingConnects = [];
+    private readonly ConcurrentQueue<(int Fd, EndPoint Endpoint, object? Token)> _pendingConnects = [];
 
     // --- options snapshot ---
     private readonly int _socketsPerShard;
@@ -92,10 +92,10 @@ internal sealed class IoUringShard : SocketSetShard
     // any non-reuse-port listener). Drained on the loop thread, then adopted here.
     // The default accept token travels with the fd since the target shard has no
     // listener of its own to look it up on.
-    private readonly ConcurrentQueue<(int Fd, object? Token, SocketSets.Tls.TlsProvider? Tls)> _incoming = [];
+    private readonly ConcurrentQueue<(int Fd, object? Token)> _incoming = [];
 
     // Bound listener fd -> the default UserToken to seed into each AcceptContext.
-    private readonly ConcurrentDictionary<int, (object? Token, SocketSets.Tls.TlsProvider? Tls)> _listeners = new();
+    private readonly ConcurrentDictionary<int, object?> _listeners = new();
 
     // Flushed out-of-band writes marshaled from arbitrary threads onto the loop thread. The chain's
     // buffers were leased by the writing thread (OOB pool pages and/or ArrayPool overflow). The
@@ -205,7 +205,6 @@ internal sealed class IoUringShard : SocketSetShard
         if (idx < 0) return null;
         var conn = _conns[idx];
         conn.UserToken = userToken;
-        conn.TlsOverride = null; // recycled slot must not inherit the last tenant's provider
         conn.Flags = flags;
         conn.SendBusy = false;
         conn.TlsClient = false;  // Tls/KtlsSsl are nulled in TryFinalize; belt-and-suspenders for a fresh tenant
@@ -313,25 +312,25 @@ internal sealed class IoUringShard : SocketSetShard
     // Public entry points (called from arbitrary threads)
     // =====================================================================
 
-    public override void Listen(EndPoint endpoint, object? userToken, bool local, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Listen(EndPoint endpoint, object? userToken, bool local)
     {
         int fd = IoUringFactory.Bind(endpoint, Parent.Options.ListenBacklog, Parent.Options);
-        _listeners[fd] = (userToken, tls); // defaults for connections accepted here
+        _listeners[fd] = userToken; // defaults for connections accepted here
         EnqueueAccept(fd, local);
     }
 
-    public override void ListenHandle(nint handle, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void ListenHandle(nint handle, object? userToken)
     {
         // Inherited/handed-over listener: it's a single fd (not reuse-port multi-bound), so this one
         // shard drives the accept and bounces each connection round-robin (local: false), exactly like
         // the UDS single-listener path. Assumed already bound + listen()ed by the caller.
         int fd = checked((int)handle);
         if (fd <= 0) throw new ArgumentOutOfRangeException(nameof(handle), "Invalid socket handle.");
-        _listeners[fd] = (userToken, tls);
+        _listeners[fd] = userToken;
         EnqueueAccept(fd, local: false);
     }
 
-    public override void Connect(EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    public override void Connect(EndPoint endpoint, object? userToken)
     {
         // This shard holds a reservation (TryPlace took it before dispatching here); release it on any
         // failure before the connect is handed to the loop, so a rejected connect doesn't leak capacity.
@@ -359,18 +358,17 @@ internal sealed class IoUringShard : SocketSetShard
             throw new Win32Exception(Marshal.GetLastPInvokeError(), "socket() failed");
         }
 
-        _pendingConnects.Enqueue((fd, endpoint, userToken, tls));
+        _pendingConnects.Enqueue((fd, endpoint, userToken));
         Poke();
     }
 
     // Loop thread: claim the reserved slot for a marshaled connect, build the target sockaddr into its
     // stable native storage, and issue the CONNECT SQE. The reservation is consumed by the claim, or
     // released here on the (should-not-happen) claim-failure backstop.
-    private unsafe void StartConnect(int fd, EndPoint endpoint, object? userToken, SocketSets.Tls.TlsProvider? tls = null)
+    private unsafe void StartConnect(int fd, EndPoint endpoint, object? userToken)
     {
         var conn = InitClient(fd, userToken, SocketSet.SocketFlags.None);
         if (conn is null) { LibC.close(fd); ReleaseReservation(); return; }
-        conn.TlsOverride = tls; // InitClient nulled it (slot recycle); an explicit provider re-seeds it
         uint slot = conn.Slot;
 
         byte* addrPtr = _connectAddrs + (nint)(slot - 1) * AddrStride;
@@ -429,9 +427,9 @@ internal sealed class IoUringShard : SocketSetShard
     /// <summary>Adopt an fd accepted on another shard's single listener. Cross-thread;
     /// the fd is process-global so any shard's ring can drive it. The default accept
     /// token is carried across since the target shard has no listener to look it up.</summary>
-    internal void EnqueueInbound(int fd, object? defaultToken, SocketSets.Tls.TlsProvider? tls = null)
+    internal void EnqueueInbound(int fd, object? defaultToken)
     {
-        _incoming.Enqueue((fd, defaultToken, tls));
+        _incoming.Enqueue((fd, defaultToken));
         Poke();
     }
 
@@ -1375,11 +1373,11 @@ internal sealed class IoUringShard : SocketSetShard
         {
             // Adopt any connections handed off from another shard's listener.
             while (_incoming.TryDequeue(out var inbound))
-                AdoptAccepted(inbound.Fd, inbound.Token, inbound.Tls);
+                AdoptAccepted(inbound.Fd, inbound.Token);
 
             // Start any connects marshaled in from caller threads (claim + CONNECT SQE on the loop).
             while (_pendingConnects.TryDequeue(out var pc))
-                StartConnect(pc.Fd, pc.Endpoint, pc.Token, pc.Tls);
+                StartConnect(pc.Fd, pc.Endpoint, pc.Token);
 
             // Issue any out-of-band writes flushed in from other threads.
             while (_flush.TryDequeue(out var f))
@@ -1521,7 +1519,7 @@ internal sealed class IoUringShard : SocketSetShard
         if (res >= 0)
         {
             int newFd = res;
-            var (defaultToken, listenTls) = _listeners.TryGetValue(listenerFd, out var t) ? t : (null, null);
+            var defaultToken = _listeners.TryGetValue(listenerFd, out var t) ? t : null;
             if (local)
             {
                 // reuse-port: each shard has its own listener, so it is already balanced — adopt here.
@@ -1534,12 +1532,12 @@ internal sealed class IoUringShard : SocketSetShard
                 // AcceptBurst already routes every accept through TryPlace, so only io_uring needed this).
                 if (TryReserve())
                 {
-                    AdoptAccepted(newFd, defaultToken, listenTls);
+                    AdoptAccepted(newFd, defaultToken);
                 }
                 else
                 {
                     var target = (IoUringShard?)Parent.TryPlace();
-                    if (target is not null) target.EnqueueInbound(newFd, defaultToken, listenTls);
+                    if (target is not null) target.EnqueueInbound(newFd, defaultToken);
                     else LibC.close(newFd); // genuinely full and growth off/exhausted (TryPlace counted it)
                 }
             }
@@ -1548,7 +1546,7 @@ internal sealed class IoUringShard : SocketSetShard
                 // Single listener (e.g. UDS): all accepts land on this one shard, so place each connection
                 // on the first shard with a free slot (capacity-aware; drops only if every shard is full).
                 var target = (IoUringShard?)Parent.TryPlace();
-                if (target is not null) target.EnqueueInbound(newFd, defaultToken, listenTls);
+                if (target is not null) target.EnqueueInbound(newFd, defaultToken);
                 else LibC.close(newFd); // every shard full → drop (runtime shard growth would expand here)
             }
         }
@@ -1561,7 +1559,7 @@ internal sealed class IoUringShard : SocketSetShard
     /// <summary>Run OnAccept, allocate a slot, arm the first receive and fire any
     /// initial send — all on the loop thread that will own this connection. The
     /// handler sees <paramref name="userToken"/> pre-seeded and may replace it.</summary>
-    private unsafe void AdoptAccepted(int newFd, object? userToken, SocketSets.Tls.TlsProvider? listenTls = null)
+    private unsafe void AdoptAccepted(int newFd, object? userToken)
     {
         // Set TCP_NODELAY explicitly rather than relying on the accepted socket inheriting
         // it from the listener. Harmless on AF_UNIX (setsockopt just fails, ignored).
@@ -1579,7 +1577,6 @@ internal sealed class IoUringShard : SocketSetShard
             return;
         }
 
-        conn.TlsOverride = listenTls; // InitClient nulled it; the LISTENER's provider re-seeds it
         uint slot = conn.Slot;
 
         var serverTls = Parent.ResolveServerTls(conn);
