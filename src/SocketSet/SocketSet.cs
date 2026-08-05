@@ -325,14 +325,20 @@ public abstract partial class SocketSet : IDisposable
 
         // Reuse the engine's options object unless the callback actually varied something, so the
         // common single-posture engine allocates nothing per connection.
+        // EVERY field the callback can set must appear in this comparison. A field missing from it is not
+        // a missed optimisation, it is a SILENTLY IGNORED setting: the engine-level options object gets
+        // reused and whatever the callback asked for is dropped. ServerNameIndication was added here in
+        // the same change that introduced it, for that reason.
         var opts = Options.TlsClient;
         if (!string.Equals(ctx.TargetHost, opts.TargetHost, StringComparison.Ordinal)
+            || !string.Equals(ctx.ServerNameIndication, opts.ServerNameIndication, StringComparison.Ordinal)
             || !ReferenceEquals(ctx.AlpnProtocols, opts.AlpnProtocols)
             || ctx.AllowKernelOffload != opts.AllowKernelOffload)
         {
             opts = new Tls.TlsClientOptions
             {
                 TargetHost = ctx.TargetHost,
+                ServerNameIndication = ctx.ServerNameIndication,
                 AlpnProtocols = ctx.AlpnProtocols,
                 AllowKernelOffload = ctx.AllowKernelOffload,
             };

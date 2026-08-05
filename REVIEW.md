@@ -310,6 +310,38 @@ broken.
 This is public API surface, so it interacts with the freeze proposal in `TODO.md`. Worth deciding
 together.
 
+### D1 follow-up RESOLVED 2026-08-05: announce and verify are now separate fields
+
+`TargetHost` drove both the SNI sent and the name verified, so `"*"` meant "announce nothing" AND "check
+nothing" as one indivisible choice — and *"do not tell the server who I expect, but DO check what it
+presents"* was inexpressible. That is a reasonable posture (SNI travels in the clear in the ClientHello,
+so suppressing it withholds the destination from a passive observer, and none of that is a reason to stop
+verifying), and conflating the two meant reaching for privacy silently bought a downgrade.
+
+`TlsClientOptions.ServerNameIndication` (null = derive, i.e. unchanged; `"*"` = announce nothing, keep
+verifying; any other name = announce that, still verify `TargetHost`). An IP literal is REFUSED here
+rather than sent — deriving suppresses one silently because the caller did not ask, but asking explicitly
+is a mistake worth reporting. The announce rule lives in ONE method shared by both providers, because
+SChannel and OpenSSL implement that half separately and two copies of a security default is how they
+drift; it is threaded through the kTLS path too, whose own comment already warned about exactly that.
+
+**THE GATING PROBLEM IS THE INTERESTING PART.** `verify-tlsname` asserted the announce half by asking the
+SERVER what SNI it received — which SChannel cannot answer, so those assertions were SKIPPED on Windows
+and printed as skipped (correct, and recorded in D1 as containment). But that is *precisely* the half
+this feature changes: a suppress-the-SNI option whose only discriminating assertion is unobservable on
+the development OS is not gated at all, and would have shipped on documentation alone.
+
+The fix was to stop asking the server. The rig now opens a plain socket, reads the ClientHello and parses
+`server_name` out of it directly — provider- and OS-independent, ~60 lines, bounds-checked (they are our
+own client's bytes in a test, not attacker input, so this is not the ClientHello-parser hazard that route
+(c) of the SNI-selection work would carry). Five announce cells plus a security cell asserting that
+suppressing SNI does NOT skip the name check. **Falsified before being believed:** with the resolver
+ignoring its argument, both SPLIT cells fail and the security cell correctly stays green.
+
+Side effect worth recording: this closes, at rig level, the containment noted in D1 — the `"*"` and
+IP-literal suppression cells no longer "prove nothing on Windows". What remains SChannel-specific is
+`Connection.RequestedServerName`, the SERVER's view, which is a different question and still always null.
+
 ### D2. RESOLVED 2026-08-04: handshake deadline on by default, idle deadline opt-in
 
 The last of the three high-severity findings. Original writeup below.

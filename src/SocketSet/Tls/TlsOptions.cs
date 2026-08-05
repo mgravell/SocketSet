@@ -30,6 +30,33 @@ public sealed class TlsClientOptions
     /// </summary>
     public string? TargetHost { get; set; }
 
+    /// <summary>
+    /// What to ANNOUNCE as SNI, when that should differ from what is VERIFIED. Null (the default) means
+    /// "derive it from <see cref="TargetHost"/>", which is the behaviour that has always applied and is
+    /// what almost everyone wants.
+    ///
+    /// WHY THE TWO CAME APART (Marc, 2026-08-04). <see cref="TargetHost"/> drove both halves, so
+    /// <c>"*"</c> meant "send no SNI" AND "run no name check" as a single indivisible choice — which made
+    /// <em>"do not tell the server who I expect, but DO check what it presents"</em> inexpressible. That
+    /// is a reasonable posture: SNI travels in the clear in the ClientHello, so suppressing it withholds
+    /// the destination from a passive observer, and none of that is a reason to stop verifying the
+    /// certificate. Conflating the two meant reaching for privacy silently bought you a downgrade.
+    ///
+    /// VALUES:
+    ///  - <c>null</c> — derive from <see cref="TargetHost"/>: a DNS name is announced, an IP literal is
+    ///    not (RFC 6066 §3 forbids it), and <see cref="TlsClientAuthenticateContext.AnyHost"/> announces
+    ///    nothing. Unchanged from before this option existed.
+    ///  - <see cref="TlsClientAuthenticateContext.AnyHost"/> — announce NOTHING, while
+    ///    <see cref="TargetHost"/> continues to be verified. This is the case the split exists for.
+    ///  - any other name — announce THAT, and still verify <see cref="TargetHost"/>. For a peer reached
+    ///    through a front or a proxy, where the name that routes and the name on the certificate differ.
+    ///
+    /// An IP literal here is REFUSED rather than sent: RFC 6066 forbids an address in <c>server_name</c>,
+    /// and some servers reject the handshake outright. Deriving suppresses it silently because the caller
+    /// did not ask for it; asking for it explicitly is a mistake worth reporting.
+    /// </summary>
+    public string? ServerNameIndication { get; set; }
+
     /// <summary>Allow this connection to use kTLS if the provider supports it. Default true; set false to
     /// force the userspace transform (e.g. to A/B the paths, or work around a driver).</summary>
     public bool AllowKernelOffload { get; set; } = true;

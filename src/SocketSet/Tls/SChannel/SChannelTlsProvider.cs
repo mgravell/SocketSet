@@ -114,8 +114,10 @@ public sealed unsafe class SChannelTlsProvider : TlsProvider, IDisposable
                 + "name check is wanted.", nameof(options));
 
         bool anyHost = host == TlsClientAuthenticateContext.AnyHost;
-        bool isIp = !anyHost && IPAddress.TryParse(host, out _);
-        string? sniName = anyHost || isIp ? null : host;   // no SNI for "*" or for an address literal
+        // ANNOUNCE and VERIFY are now independent (2026-08-05). The announce half goes through the one
+        // shared rule so this provider and OpenSSL cannot drift; the verify half is unchanged and still
+        // keyed on TargetHost alone, which is what makes "suppress SNI but keep checking" work.
+        string? sniName = TlsClientAuthenticateContext.ResolveSni(host, options.ServerNameIndication);
         string? verifyName = anyHost ? null : host;        // null == do not check the name
 
         return new SChannelTlsFilter(this, client: true, sniName, verifyName, BuildAlpnBuffer(options.AlpnProtocols));

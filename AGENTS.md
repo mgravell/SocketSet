@@ -122,7 +122,12 @@ both have caused hesitation:
     be REFUSED (`wrong.example`, `127.0.0.2`, and an unset host); the accept-cells alone would pass just
     as happily against the pre-fix code, where a null `TargetHost` silently skipped the name check. It
     also asserts what the SERVER was told via SNI, which is what proves `"*"` and IP literals really do
-    suppress the extension on the wire rather than merely being documented to.
+    suppress the extension on the wire rather than merely being documented to. **Since 2026-08-05 it does
+    not have to ask the server**: it opens a plain socket, reads the ClientHello and parses `server_name`
+    out of it, so the announce half is asserted on BOTH providers — SChannel cannot report received SNI,
+    which had left every announce cell skipped on Windows, i.e. exactly the half the
+    `ServerNameIndication` split changes. When a gate's only discriminating assertion is unobservable on
+    your OS, read the wire rather than skipping the cell.
   - **`bench/verify-timeouts`** (added 2026-08-04; cross-platform) — that a peer which connects and goes
     quiet is actually reaped. Self-controlling rather than merely positive: a COMPLETED handshake must
     survive the same budget (so "reaped" cannot mean "we drop everything"), and the idle-off/idle-on pair

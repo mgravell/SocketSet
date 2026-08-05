@@ -26,6 +26,7 @@ public ref struct TlsClientAuthenticateContext
         Connection = connection;
         Provider = provider;
         TargetHost = defaults.TargetHost;
+        ServerNameIndication = defaults.ServerNameIndication;
         AlpnProtocols = defaults.AlpnProtocols;
         AllowKernelOffload = defaults.AllowKernelOffload;
     }
@@ -54,6 +55,13 @@ public ref struct TlsClientAuthenticateContext
     /// </summary>
     public string? TargetHost { get; set; }
 
+    /// <summary>What to ANNOUNCE as SNI when that must differ from what is VERIFIED; null (the default)
+    /// derives it from <see cref="TargetHost"/>, exactly as before this existed. Set it to
+    /// <see cref="AnyHost"/> to announce nothing while still verifying <see cref="TargetHost"/> — the
+    /// posture that was inexpressible while one field drove both. See
+    /// <see cref="TlsClientOptions.ServerNameIndication"/> for the full rules.</summary>
+    public string? ServerNameIndication { get; set; }
+
     /// <summary>ALPN ids to offer, in preference order; null or empty sends no ALPN extension.</summary>
     public IReadOnlyList<string>? AlpnProtocols { get; set; }
 
@@ -75,6 +83,39 @@ public ref struct TlsClientAuthenticateContext
     /// <see cref="SocketSet.ToString"/>.
     /// </summary>
     public const string AnyHost = "*";
+
+    /// <summary>
+    /// THE single rule turning (<paramref name="targetHost"/>, <paramref name="sni"/>) into the name to
+    /// actually put in the <c>server_name</c> extension, or null for "send none". Lives here rather than
+    /// in either provider because SChannel and OpenSSL each implement the announce half separately, and
+    /// two copies of a security-relevant default is how they drift — which is the whole reason the D1
+    /// follow-up existed in the first place.
+    ///
+    /// <paramref name="targetHost"/> is assumed already validated (non-blank; the engine refuses
+    /// otherwise). Returns null when nothing should be announced.
+    /// </summary>
+    internal static string? ResolveSni(string? targetHost, string? sni)
+    {
+        if (sni is null)
+        {
+            // Derive, exactly as before this option existed: no SNI for the explicit opt-out, and none
+            // for an address literal (RFC 6066 forbids one in server_name).
+            if (targetHost == AnyHost) return null;
+            return System.Net.IPAddress.TryParse(targetHost, out _) ? null : targetHost;
+        }
+
+        if (sni == AnyHost || sni.Length == 0) return null; // announce nothing, but keep verifying
+
+        // Explicitly asking to announce an address is a mistake worth reporting rather than silently
+        // dropping: deriving suppresses it because the caller did not ask, but this caller did.
+        if (System.Net.IPAddress.TryParse(sni, out _))
+            throw new ArgumentException(
+                $"ServerNameIndication '{sni}' is an IP literal. RFC 6066 forbids an address in the "
+                + $"server_name extension, and some servers reject the handshake. Use \"{AnyHost}\" to "
+                + "announce nothing.", nameof(sni));
+
+        return sni;
+    }
 }
 
 /// <summary>

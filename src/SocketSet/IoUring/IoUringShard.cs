@@ -1162,6 +1162,7 @@ internal sealed class IoUringShard : SocketSetShard
         conn.KtlsSsl = prov.CreateKernelSsl(
             fd, client,
             client ? tls.Client!.TargetHost : null,
+            client ? tls.Client!.ServerNameIndication : null,
             client ? tls.Client!.AlpnProtocols : tls.Server!.AlpnProtocols);
         KtlsPump(conn, slot, fd);
     }

@@ -119,12 +119,92 @@ foreach (var (host, mustConnect, expectSni, label) in new[]
     Thread.Sleep(200);
 }
 
+// =====================================================================================================
+// ANNOUNCE vs VERIFY (2026-08-05). TargetHost used to drive BOTH, so "*" meant no-SNI AND no-name-check
+// as one indivisible choice, and "do not tell the server who I expect, but DO check what it presents"
+// could not be said. TlsClientOptions.ServerNameIndication splits them.
+//
+// AND THE ASSERTION THAT MATTERS IS THE ONE THIS RIG COULD NOT PREVIOUSLY MAKE ON WINDOWS. The cells
+// above read the announced name from the SERVER (Connection.RequestedServerName), which SChannel cannot
+// report -- so every announce assertion was skipped here, which is exactly the half a
+// suppress-the-SNI feature changes. Skipping the only assertion that can see the new behaviour would
+// make these cells decorative.
+//
+// So this block does not ask the server. It reads the ClientHello OFF THE WIRE with a plain socket and
+// parses server_name out of it, which works identically on both providers and both OSes. Parsing
+// attacker-controlled bytes would want fuzzing; these are OUR OWN client's bytes, in a test, so the
+// parser is bounds-checked and otherwise unceremonious.
+Console.WriteLine();
+Console.WriteLine("=== announce vs verify: what actually goes on the wire (ClientHello read directly) ===");
+
+foreach (var (target, sni, expect, label) in new[]
+{
+    ("localhost",     (string)null, "localhost",     "derive: DNS name is announced"),
+    ("127.0.0.1",     (string)null, null,            "derive: IP literal is NOT announced (RFC 6066)"),
+    ("*",             (string)null, null,            "derive: AnyHost announces nothing"),
+    ("localhost",     "*",          null,            "SPLIT: suppress announce, keep verifying"),
+    ("localhost",     "front.example", "front.example", "SPLIT: announce a DIFFERENT name"),
+})
+{
+    string seen; string detail = "";
+    bool ok;
+    try
+    {
+        using var sniffer = new SniSniffer(Port + 1);
+        var clientOpts = new SocketSetOptions { Shards = 1, Factory = tlsBackend, Tls = (SocketSets.Tls.TlsProvider)provider };
+        clientOpts.TlsClient.TargetHost = target;
+        clientOpts.TlsClient.ServerNameIndication = sni;
+        using var client = new Dialer(clientOpts);
+        client.Connect(new IPEndPoint(IPAddress.Loopback, Port + 1));
+        // The sniffer never completes a handshake, so the client will fault -- irrelevant. All that is
+        // being asserted is what the client PUT IN ITS ClientHello.
+        seen = sniffer.WaitForHello(TimeSpan.FromSeconds(5));
+        ok = seen == expect;
+        if (!ok) detail = $"announced {Show(seen)}, expected {Show(expect)}";
+    }
+    catch (Exception ex) { seen = null; ok = false; detail = ex.GetType().Name + ": " + ex.Message; }
+
+    if (!ok) failures++;
+    string cfg = $"host={Show(target)} sni={(sni is null ? "(derive)" : Show(sni))}";
+    Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {cfg,-38} {label,-42} announced={Show(seen)} {detail}");
+    Thread.Sleep(150);
+}
+
+// THE SECURITY CELL FOR THE SPLIT, and the reason the feature is not merely cosmetic: suppressing the
+// announce must NOT weaken the check. Against the real server with a WRONG TargetHost and SNI off, the
+// connection must still be REFUSED -- if splitting the fields quietly disabled verification, this is
+// where it shows, and nothing above would notice.
+{
+    bool connected = false; string fault = "";
+    try
+    {
+        var serverOpts = new SocketSetOptions { Shards = 1, Factory = tlsBackend, Tls = (SocketSets.Tls.TlsProvider)provider };
+        using var server = new Echo(serverOpts);
+        server.Listen(new IPEndPoint(IPAddress.Loopback, Port + 2));
+        var clientOpts = new SocketSetOptions { Shards = 1, Factory = tlsBackend, Tls = (SocketSets.Tls.TlsProvider)provider };
+        clientOpts.TlsClient.TargetHost = "wrong.example";
+        clientOpts.TlsClient.ServerNameIndication = "*";   // announce nothing...
+        using var client = new Dialer(clientOpts);
+        client.Connect(new IPEndPoint(IPAddress.Loopback, Port + 2));
+        connected = client.Opened.Wait(TimeSpan.FromSeconds(5));
+        fault = client.Fault;
+    }
+    catch (Exception ex) { fault = ex.GetType().Name; }
+
+    bool ok = !connected && fault.Length > 0;   // ...and STILL refuse the wrong name, with a reason
+    if (!ok) failures++;
+    Console.WriteLine($"  {(ok ? "PASS" : "FAIL")}  {"host=wrong.example sni=\"*\"",-38} {"SPLIT: suppressing SNI must NOT skip the check",-42} "
+                    + (connected ? "CONNECTED -- verification was disabled by the split" : $"REFUSED reason=\"{Trunc(fault)}\""));
+}
+
 Console.WriteLine(failures == 0
     ? (sniObservable
         ? "\n=== verify-tlsname: ALL PASS (including the refusal cells) ==="
-        : "\n=== verify-tlsname: ALL PASS (refusal cells included; SNI-announce assertions NOT MADE on this provider) ===")
+        : "\n=== verify-tlsname: ALL PASS (server-side SNI unobservable here, but the ANNOUNCE cells read the wire directly) ===")
     : $"\n=== verify-tlsname: {failures} FAILURE(S) ===");
 return failures == 0 ? 0 : 1;
+
+static string Show(string s) => s is null ? "<none>" : "\"" + s + "\"";
 
 static string Trunc(string s) => s.Length <= 58 ? s : s[..55] + "...";
 
@@ -144,6 +224,100 @@ sealed class Echo(SocketSetOptions o) : SocketSet(o)
     protected override void OnReceive(ref ReceiveContext ctx)
     {
         if (!ctx.IsEof) ctx.ResponseBytes = ctx.PayloadBytes;
+    }
+}
+
+/// <summary>
+/// A plain TCP listener that accepts ONE connection, reads the first flight, and pulls the SNI out of
+/// the ClientHello. It never replies, so the client's handshake fails — which is fine and is the point:
+/// the only question is what the client ANNOUNCED, and that is fully determined by the bytes it sent
+/// first. Provider- and OS-independent, which is why it exists: it is the only way this rig can assert
+/// the announce half on SChannel, where the server side cannot report SNI at all.
+/// </summary>
+sealed class SniSniffer : IDisposable
+{
+    private readonly System.Net.Sockets.TcpListener _listener;
+    private readonly Task<string> _hello;
+    private volatile bool _sawHello;
+
+    public SniSniffer(int port)
+    {
+        _listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, port);
+        _listener.Start();
+        _hello = Task.Run(Accept);
+    }
+
+    private string Accept()
+    {
+        using var socket = _listener.AcceptSocket();
+        var buf = new byte[16 * 1024];
+        int have = 0;
+        // Read until a whole record is in hand. One ClientHello is normally one segment on loopback, but
+        // "normally" is not an invariant, so this loops on the record's own declared length.
+        while (have < 5 || have < 5 + ((buf[3] << 8) | buf[4]))
+        {
+            int n = socket.Receive(buf, have, buf.Length - have, System.Net.Sockets.SocketFlags.None);
+            if (n <= 0) break;
+            have += n;
+            if (have >= buf.Length) break;
+        }
+        _sawHello = have > 0;
+        return ParseSni(buf.AsSpan(0, have));
+    }
+
+    /// <summary>The announced name, or null for "no server_name extension". Throws if no ClientHello
+    /// arrived at all, so "nothing was announced" cannot be confused with "nothing was sent".</summary>
+    public string WaitForHello(TimeSpan within)
+    {
+        if (!_hello.Wait(within)) throw new TimeoutException("no ClientHello arrived");
+        if (!_sawHello) throw new InvalidOperationException("connection made but no bytes were sent");
+        return _hello.Result;
+    }
+
+    // Bounds-checked walk to extension 0. Every step returns null rather than throwing on a short or
+    // malformed buffer: a parse failure here must read as "could not observe", and the cell then fails
+    // on the comparison rather than blowing up with a stack trace that hides which cell it was.
+    private static string ParseSni(ReadOnlySpan<byte> b)
+    {
+        int p = 0;
+        if (b.Length < 43 || b[0] != 0x16) return null;          // TLS handshake record
+        p = 5;                                                   // skip record header
+        if (b.Length < p + 4 || b[p] != 0x01) return null;       // ClientHello
+        p += 4;                                                  // handshake type + 3-byte length
+        p += 2 + 32;                                             // client_version + random
+        if (b.Length < p + 1) return null;
+        p += 1 + b[p];                                           // session_id
+        if (b.Length < p + 2) return null;
+        p += 2 + ((b[p] << 8) | b[p + 1]);                       // cipher_suites
+        if (b.Length < p + 1) return null;
+        p += 1 + b[p];                                           // compression_methods
+        if (b.Length < p + 2) return null;
+        int extEnd = p + 2 + ((b[p] << 8) | b[p + 1]);
+        p += 2;
+        while (p + 4 <= b.Length && p + 4 <= extEnd)
+        {
+            int type = (b[p] << 8) | b[p + 1];
+            int len = (b[p + 2] << 8) | b[p + 3];
+            p += 4;
+            if (p + len > b.Length) return null;
+            if (type == 0)                                       // server_name
+            {
+                int q = p + 2;                                   // skip server_name_list length
+                if (q + 3 > b.Length) return null;
+                if (b[q] != 0) return null;                      // name_type must be host_name
+                int nameLen = (b[q + 1] << 8) | b[q + 2];
+                q += 3;
+                if (q + nameLen > b.Length) return null;
+                return System.Text.Encoding.ASCII.GetString(b.Slice(q, nameLen));
+            }
+            p += len;
+        }
+        return null;                                             // no server_name extension present
+    }
+
+    public void Dispose()
+    {
+        try { _listener.Stop(); } catch { }
     }
 }
 

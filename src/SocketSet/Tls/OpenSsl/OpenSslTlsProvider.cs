@@ -110,7 +110,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
         try
         {
             SSL_set_connect_state(ssl);
-            ApplyPeerName(ssl, options.TargetHost);
+            ApplyPeerName(ssl, options.TargetHost, options.ServerNameIndication);
             ApplyClientAlpn(ssl, options.AlpnProtocols);
         }
         catch { SSL_free(ssl); throw; }
@@ -144,7 +144,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
     ///    delete this branch, the evidence for doing so is already here.
     ///  - A DNS NAME: SNI plus SSL_set1_host, the classic path.
     /// </summary>
-    private void ApplyPeerName(nint ssl, string? targetHost)
+    private void ApplyPeerName(nint ssl, string? targetHost, string? sni)
     {
         // No silent "unset means don't check" any more; the engine enforces this too, but a provider
         // used directly must not be the soft spot.
@@ -154,15 +154,18 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
                 + $"against it, or \"{TlsClientAuthenticateContext.AnyHost}\" to state explicitly that no "
                 + "name check is wanted.", nameof(targetHost));
 
-        if (targetHost == TlsClientAuthenticateContext.AnyHost) return; // explicit: no SNI, no name check
-
-        bool isIp = IPAddress.TryParse(targetHost, out _);
-        if (!isIp)
+        // ANNOUNCE first, and independently of the verify half (2026-08-05): the announced name may be
+        // suppressed, or be a different name entirely, while TargetHost is still what gets checked. The
+        // rule is shared with SChannel so the two providers cannot disagree about it.
+        if (TlsClientAuthenticateContext.ResolveSni(targetHost, sni) is { } announce)
         {
-            nint hp = Marshal.StringToCoTaskMemUTF8(targetHost);
+            nint hp = Marshal.StringToCoTaskMemUTF8(announce);
             try { SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, hp); }
             finally { Marshal.FreeCoTaskMem(hp); } // OpenSSL dups the name
         }
+
+        if (targetHost == TlsClientAuthenticateContext.AnyHost) return; // explicit: no name check
+        bool isIp = IPAddress.TryParse(targetHost, out _);
 
         if (!_verifyServer) return;
         if (isIp)
@@ -274,7 +277,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
     /// BIO, not memory BIOs) with SSL_OP_ENABLE_KTLS active, so OpenSSL pushes the keys into the kernel at
     /// handshake completion. The caller drives SSL_do_handshake / SSL_read and frees the SSL. Returns the
     /// raw handle (this path deliberately bypasses <see cref="TlsFilter"/> — kTLS is a different I/O model).</summary>
-    internal nint CreateKernelSsl(int fd, bool client, string? targetHost, IReadOnlyList<string>? alpn)
+    internal nint CreateKernelSsl(int fd, bool client, string? targetHost, string? sni, IReadOnlyList<string>? alpn)
     {
         nint ctx = client ? _clientCtx : _serverCtx;
         if (ctx == 0) throw new InvalidOperationException("kTLS: this provider has no " + (client ? "client" : "server") + " context.");
@@ -292,7 +295,7 @@ public sealed unsafe class OpenSslTlsProvider : TlsProvider, IDisposable
                 // this arm had its own copy which dropped the SSL_set1_host return value, so a failure
                 // here degraded the connection to chain-only verification while the other path with
                 // identical configuration refused to connect. One provider, one posture, one code path.
-                ApplyPeerName(ssl, targetHost);
+                ApplyPeerName(ssl, targetHost, sni);
                 ApplyClientAlpn(ssl, alpn);
             }
             else

@@ -1189,6 +1189,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // Client supplies TargetHost (SNI/verify); ALPN comes from whichever side's options apply.
         conn.KtlsSsl = prov.CreateKernelSsl(conn.Fd, client,
             client ? tls.Client!.TargetHost : null,
+            client ? tls.Client!.ServerNameIndication : null,
             client ? tls.Client!.AlpnProtocols : tls.Server!.AlpnProtocols);
         KtlsPump(conn);
     }

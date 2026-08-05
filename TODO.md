@@ -38,10 +38,29 @@ equivalent.
    including a confident claim of mine that measurement falsified, in `REVIEW.md` D1.
 
    **Follow-ups it leaves:**
-   - **Split announce from verify** (Marc): `"*"` currently means both "no SNI" and "no name check",
-     so "do not tell the server who I expect, but DO check what comes back" is inexpressible. The
-     machinery exists (SChannel already carries `sniName`/`verifyName` separately; the IP path already
-     announces nothing while verifying) — it is a second field, not new plumbing.
+   - ~~**Split announce from verify**~~ **DONE 2026-08-05** as `TlsClientOptions.ServerNameIndication`
+     (and the matching field on `TlsClientAuthenticateContext`). Null = derive from `TargetHost`, i.e.
+     exactly the old behaviour; `"*"` = announce nothing while still verifying `TargetHost`; any other
+     name = announce that and still verify `TargetHost` (a front/proxy, where the routing name and the
+     certificate name differ). An IP literal is REFUSED here rather than sent — deriving suppresses one
+     silently because the caller did not ask for it, but asking explicitly is a mistake worth reporting.
+     The announce rule lives in ONE place (`TlsClientAuthenticateContext.ResolveSni`) because SChannel
+     and OpenSSL implement that half separately and two copies of a security default is how they drift.
+     Threaded through the kTLS path too, whose comment already warned about exactly that divergence.
+
+     **The gate is the part worth reading.** `verify-tlsname` asserted the announce half by asking the
+     SERVER, which SChannel cannot answer — so every announce assertion was SKIPPED on Windows, and that
+     is precisely the half this feature changes. A feature whose only discriminating assertion is skipped
+     on the OS you are developing on is not gated at all. So the rig now reads the **ClientHello off the
+     wire** with a plain socket and parses `server_name` itself (~60 lines, bounds-checked; they are our
+     own client's bytes, not attacker input). Five announce cells plus a security cell proving that
+     suppressing SNI does NOT skip the name check. Falsified before believing: with `ResolveSni` ignoring
+     its argument, both SPLIT cells fail and the security cell correctly stays green.
+
+     **This also closes, at rig level, the containment recorded below**: the `"*"` and IP-literal
+     suppression cells no longer "prove nothing on Windows" — they are now observed directly. What
+     remains SChannel-specific is `Connection.RequestedServerName` (the SERVER's view), which is
+     unrelated to what the client announces and is still always null there.
    - **Remove the now-redundant per-connect/per-listen `TlsProvider?` parameters** on
      `Listen`/`Connect`/`ConnectShard`/`ListenHandle` and the `Connection.TlsOverride` they feed. The
      callbacks subsume them and nothing outside the library passes one; leaving both means two
