@@ -3042,6 +3042,20 @@ much stronger than when this entry was written**, and what is left is mechanism,
 were expected. The causal story is only PARTLY consistent with the bisection — read "what does not add
 up" below before treating this as closed.**
 
+**RE-CHECKED 2026-08-05 after receive parking, and it stays fixed: `Repro-RioChurnCrash.ps1 -Reps 20`,
+80 runs across all four configs, `20 pass / 0 wedge / 0 ACCESS VIOLATION` on every one INCLUDING the
+default.** Re-run because parking edited exactly this machinery: `RecvArmed` now clears on a park with no
+completion coming (and `RecvArmed` is what defer-recycle waits on), `ArmReceive` gained a wrapper
+(`ArmReceiveIfWanted`) at all three call sites including the TLS handshake one in `BeginTls`, and
+`DrainCrossThread` gained a `_resumes` drain on every pass. This rig is RIO+TLS churn specifically, so it
+exercises the changed TLS arm site under the exact conditions the fault lived in. At the documented
+~1-in-2 rate, 20 clean runs on the default is p ≈ 1e-6.
+
+**WHAT IT DID NOT COVER, stated because the same trap was walked into an hour earlier with the churn
+soak:** SmokeTest's churn cell drives ECHO CALLBACKS, so it never parks. This is regression coverage for
+the RIO refactor, NOT evidence about parked-connection lifetimes. Those are covered by
+`bench/verify-parking`'s `parked/peer-vanishes` cell, which exists because the soak did not reach them.
+
 **The bug.** `CloseClient` calls `closesocket`, which destroys the connection's RIO request queue. But
 `conn.Rq` was only zeroed in `TryFinalize`, which **early-returns whenever an op is still in flight**
 (`RecvArmed || SendBusy`) — the normal case under churn. `FlushCommits` guards on
