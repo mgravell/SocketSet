@@ -406,7 +406,59 @@ recorded as an observation, not a mechanism.
 
 **Consequence for the rigs, worth acting on:** a single default shard count cannot serve both halves of
 this table, so any future Windows headline sweep should either sweep shards or state the one it used
-next to every number. The tables above now do.
+next to every number. The tables above now do. `Run-TlsSizes.ps1`'s `-Shards` default is now DERIVED
+from the host (`ProcessorCount / 2`, matching the pinned server half) instead of a hard-coded 16 — that
+16 was not wrong when written, it matched the 16-core machine it was written on, and it was wrong
+*elsewhere*, silently.
+
+### FOLLOW-UP (2026-08-05, later): the duration theory is FALSIFIED, and dispersion turns out to be unstable
+
+I attributed the 256 KB noise partly to `Run-TlsSizes`' 8s scored duration (against `Run-Matrix`'s 15s,
+which sees 0.3-4.1%). Held everything else fixed and varied only duration, 6 scored passes each:
+
+| duration | kestrel spread | iocp/s12 spread |
+|---|---:|---:|
+| 8s | 10.8% | 12.1% |
+| 20s | 13.8% | 14.1% |
+
+**More than twice the scored time does not reduce the spread — if anything it widens.** The theory is
+dead; duration is not the lever, and `Run-Matrix`'s tightness comes from its payload/concurrency, not
+its clock.
+
+**The more useful finding is underneath it: THE SPREAD ITSELF DOES NOT REPRODUCE.** `iocp/s12` at
+256 KB, 8s, 6 scored passes measured **4.5%** in the shard-sweep session and **12.1%** in this one —
+same configuration, same host, same day, ~3x apart. Medians reproduce (10,818 vs 10,326, within 5%);
+dispersion does not. So a tight-looking spread at 256 KB on this host is substantially LUCK, and any
+claim resting on one is weaker than it appears.
+
+**Including one of mine.** Re-ran `iocp/s8` vs `iocp/s16` at **10** scored passes rather than 6:
+
+| leg | median | spread | range |
+|---|---:|---:|---|
+| iocp/s8 | 10319.6 | 6.7% | 10056.3 - 10752.0 |
+| iocp/s16 | 9029.8 | **35.3%** | 7094.4 - 10282.3 |
+
+The ranges **OVERLAP** (10,056-10,282), so by house rule 5 **no delta may be quoted, and my earlier
+"disjoint" wording for this pair is RETRACTED.** What survives is still strong and is worth stating in
+the form the data supports: the medians differ by 14.3%, and **10 of 11 `s16` passes fall below EVERY
+`s8` pass** — a single outlier is the entire overlap.
+
+And s16's 35.3% spread is arguably the real result rather than a nuisance: **oversubscription does not
+just cost throughput at 256 KB, it makes throughput erratic.** A leg whose own range spans 45% is, in the
+rig's own words, not measured but sampled.
+
+### A METHOD PROBLEM THIS EXPOSED, worth fixing rather than working around
+
+Rule 4 says use six scored passes at 256 KB, not three. Rule 5 says quote a delta only when the per-side
+min-max ranges are disjoint. **These two pull against each other**, and this pair demonstrates it: at 6
+passes `s16` spanned 16.5% and the comparison was disjoint; at 11 passes it spans 35.3% and it is not.
+Min-max can only WIDEN with more samples, so *adding passes makes disjointness strictly harder* — a lucky
+3-pass run reads as more conclusive than an honest 11-pass one, which is exactly backwards.
+
+Min-max is the right instrument for spotting a disrupted pass (rule 2's whole point) and the wrong one
+for deciding significance at a fixed confidence. Recorded in `bench/README.md` as a caveat on rule 5,
+with the suggestion to quote **"N of M passes separate"** alongside the ranges — it is robust to a single
+outlier, it does not degrade as passes are added, and it is what actually convinced me here.
 
 ## WHERE THINGS STAND (2026-07-30, extended through 2026-07-31) — the consolidated view of the HTTP/Kestrel era
 

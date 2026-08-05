@@ -53,6 +53,11 @@ param(
     [string]$Duration = "15s",
     [string]$WarmupDuration = "4s",
     [int]$Connections = 128,
+    # A fixed LADDER, deliberately left fixed where Run-TlsSizes' single default was made host-derived
+    # (2026-08-05): a sweep cannot silently pick the wrong value, because every leg name carries its own
+    # sN and the reader sees the shape. Worth knowing that the shape is payload-dependent and inverts --
+    # at 2 bytes more shards is monotonically better (s4->s16 = +69% here), while at 256 KB plaintext s8
+    # beats s16 disjointly. Do not carry a conclusion from this table to another payload.
     [int[]]$Shards = @(4, 8, 16),
     [int]$Port = 5080,
     # Churn is bounded by REQUEST COUNT, not duration. Each request opens a fresh connection, and Windows

@@ -38,7 +38,20 @@ param(
     # leg per shard count, named e.g. "iocp+tls/s8". Worth sweeping because more shards is not obviously
     # better here: each shard is a dedicated loop thread competing with the ThreadPool that runs Kestrel
     # and the bridge pump, on the same pinned cores - whereas Kestrel's own transport adds no threads.
-    [int[]]$Shards = @(16),
+    #
+    # DERIVED FROM THE HOST as of 2026-08-05, and it used to be a hard-coded 16. That was not wrong when
+    # it was written -- it matched the machine it was written on (a 16-core GZ302) -- it was wrong
+    # ELSEWHERE, silently. The server half is pinned to ProcessorCount/2 logical CPUs, so a fixed 16 means
+    # "correct" on a 32-thread box and "33% oversubscribed" on a 24-thread one, with nothing in the output
+    # saying which you got. Measured on the 24-thread desktop: s16 against a 12-CPU half cost 15% at
+    # 256 KB plaintext (iocp 9,283 vs 10,943 at s8, disjoint) AND inflated the per-leg spread from 2.6% to
+    # 16.5%, which is what made an unrelated comparison unanswerable.
+    #
+    # Matching the pinned half is the DEFENSIBLE default rather than the optimal one: there is no optimal
+    # one. Measured the same day, the best shard count INVERTS with the path -- plaintext 256 KB wants
+    # FEWER (s8 > s12 > s16), TLS 256 KB wants MORE (s16 > s12 > s8, +26.9% disjoint). So sweep this when
+    # the answer matters, and note that the banner and the leg names carry the value either way.
+    [int[]]$Shards = @([int]([Environment]::ProcessorCount / 2)),
     # First pass is host warm-up and is discarded, so this is scored passes + 1. Do not drop below 3.
     [int]$Repetitions = 4,
     [int]$WarmupPasses = 1,

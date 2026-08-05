@@ -247,6 +247,22 @@ So: **at 256KB use six scored passes, not three**, and treat any existing low-si
 built on three passes as unproven. This bites hardest on cross-session comparisons, because a
 same-session mistake at least shares a warm-up state.
 
+**RULE 5 HAS A PERVERSE EDGE, measured 2026-08-05, and rule 4 walks straight into it.** Min-max ranges can
+only WIDEN as passes are added, so requiring disjoint min-max makes MORE passes strictly harder to
+conclude from — a lucky 3-pass run reads as more conclusive than an honest 11-pass one. Demonstrated on
+`iocp/s8` vs `iocp/s16` at 256 KB: at 6 scored passes s16 spanned 16.5% and the pair was disjoint; at 10
+it spans 35.3% and it is not, on the strength of ONE outlier while 10 of 11 s16 passes still fell below
+every s8 pass. Min-max is the right instrument for spotting a disrupted pass (rule 2) and the wrong one
+for deciding significance. **Quote "N of M passes separate" alongside the ranges** — robust to one
+outlier, and it does not decay as you add passes.
+
+**Dispersion at 256 KB does not reproduce on this host, so do not treat a tight spread as precision.**
+The same configuration (`iocp/s12`, 256 KB, 8s, 6 scored passes) measured **4.5%** in one session and
+**12.1%** in another, same host, same day. Medians reproduced to within 5%; spread was ~3x apart. And
+scored duration is NOT the lever — 8s vs 20s moved kestrel's spread 10.8% -> 13.8% and iocp's 12.1% ->
+14.1%, i.e. the wrong way. A 256 KB claim resting on one session's tight-looking spread is weaker than
+it looks; re-run it in a fresh session before believing it.
+
 **The noise floor is a property of the host, not of the project.** On the previous laptop it was ~6%, and
 once 58%. On the current desktop per-leg spreads run 0.2-2.4%, so a 2% effect is detectable here and was
 unprovable there. Re-establish it on any new machine - run the same leg several times before running
