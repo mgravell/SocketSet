@@ -460,6 +460,46 @@ for deciding significance at a fixed confidence. Recorded in `bench/README.md` a
 with the suggestion to quote **"N of M passes separate"** alongside the ranges — it is robust to a single
 outlier, it does not degrade as passes are added, and it is what actually convinced me here.
 
+## WHAT THE 64KB PIPE BLOCK COSTS ON WINDOWS (2026-08-05) — `Measure-PipeMemory.ps1`, first run ever
+
+`--pipe-segment 65536` is worth **+117.3%** on IOCP at 256 KB (it is what lets zero-copy send engage
+there at all), and the reason it is a FLAG rather than a default is its memory bill — **2.7x resident at
+2048 connections on Linux**. Nobody had ever measured that bill on Windows. Peak working set sampled
+under load, idle baseline subtracted, 4096 B payload, 12 shards, `/config`-verified geometry identical
+across legs.
+
+| connections | byo (default block) | byo-seg64k | ratio | KB/conn: byo → seg64k |
+|---|---:|---:|---:|---|
+| 64 | 230.8 MB | 212.2 MB | **0.92x** | 2015.3 → 1718.0 |
+| 512 | 228.1 MB | 270.8 MB | 1.19x | 246.5 → 331.6 |
+| 2048 | 321.0 MB | 376.3 MB | **1.17x** | 108.0 → 135.7 |
+
+**On Windows the bill is ~1.17x at 2048 connections, i.e. +25.7 KB per connection.** Idle baseline was
+104.8-105.4 MB on every leg, so the deltas are attributable to the load rather than to the runtime.
+
+**DO NOT read this as "Windows beats Linux here."** The 2.7x is another OS, another rig
+(`run-pipe-opts.sh` / `run-recv-slab.sh`) and another memory accounting (Windows working set vs Linux
+RSS), and the standing rule is never to subtract across the two. The defensible statement is narrower and
+still useful: **the specific objection that made this a flag — a 2.7x memory bill — is not what it costs
+on Windows by Windows' own measurement.**
+
+**The 64-connection row is the rig's own warning coming true, and it is worth keeping as a worked
+example.** At 64 connections the bigger block reads as **FREE, in fact better than free (0.92x)** — the
+fixed ~105 MB baseline and the shared pools swamp a per-connection effect, and the KB/conn column is
+visibly meaningless there (1,718-2,015 KB/conn cannot be a per-connection cost). `bench/README.md` says
+to run this at 2048 for exactly this reason; had it been run at 64, the honest-looking conclusion would
+have been "the 64KB block is free", which is the opposite of the truth.
+
+**Throughput did not pay for the memory** in the same run: at 2048 connections `byo-seg64k` was 217,535
+rps against `byo`'s 211,252, so the larger block is not trading speed for footprint at this payload.
+
+**What this suggests, and what is still missing before acting on it.** The cost/benefit for making 64 KB
+pipe segments the Windows default now looks strongly favourable — a large measured win on the send path
+against a ~17% working-set increase. It is NOT changed here, because the +117.3% figure comes from a
+different session and rig: a defaults change of that reach wants a same-session A/B carrying BOTH
+throughput and memory, which is a `Compare-Commits.ps1 -Bridged -ExtraArgs --pipe-segment 65536` run
+plus this rig, not one sweep. Recorded as a recommendation with its gap stated rather than as a decision.
+
 ## WHERE THINGS STAND (2026-07-30, extended through 2026-07-31) — the consolidated view of the HTTP/Kestrel era
 
 Everything below this section is a dated investigation; this is the summary they add up to. Cells are
