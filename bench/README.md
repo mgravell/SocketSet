@@ -14,7 +14,8 @@ itself as an error.
 | **`Run-SmokeMatrix.ps1`** | *"Is it still correct?"* **Windows: the correctness gate, and the first thing to run.** 48 cells (IOCP/RIO/managed × plaintext/TLS × out-of-band verify, echo callback + pipe, poke, churn), ~3 min, one PASS/FAIL line each. No `.sh` equivalent yet. |
 | `Compare-Commits.ps1` | *"Did this change help?"* Two commits, isolated worktrees, **interleaved**. **Use this for any before/after claim.** `-Bridged` measures through Kestrel rather than the bare responder; `-ExtraArgs` passes demo flags (a change on an opt-in path such as `--byo` measures as nothing without it); **`-Upload` POSTs a body to `/echo` and scores the REQUEST** — added 2026-08-04, because until then the only rig that could isolate a change could not exercise the inbound path, and the only rig that exercised it (`Run-Upload.ps1`) could not isolate a change. Note the bridged legs are BLUNT: per-side spread 5-28% against the bare rig's 0.8-9% on the same host in the same hour, so do not point `-Bridged` at a single-digit effect. |
 | `Run-Byo.ps1` | Windows counterpart of `run-byo.sh`, plus the legs that keep it honest: a `classic-seg64k` control separating pipe block size from zero-copy, and a same-session `kestrel` control. Gates every leg on the `SS_IOCP_STATS` counter, not just `/config`. |
-| **`measure-parking`** | *"What does receive PARKING cost while it is continuously engaged?"* Cross-platform (`dotnet run --project bench/measure-parking`). Every other rig here has a consumer that keeps up, so parks run at 0.2% of receives and parking measures as free because it is IDLE — this one throttles the CONSUMER so parking fires constantly. There is no before/after leg on purpose: the pre-parking build does not SURVIVE this workload (it drops the connection at `MaxInboundBufferBytes`), and that is the strongest statement of what parking bought. The control is the same build with the PRODUCER throttled instead, so bytes, rate and duration match and only the presence of back-pressure differs. Asserts the pressured leg actually parked — a zero-park run is a broken rig, not a fast transport. |
+| **`measure-parking`** | *"What does receive PARKING cost while it is continuously engaged?"* Cross-platform (`dotnet run --project bench/measure-parking`). Every other rig here has a consumer that keeps up, so parks run at 0.2% of receives and parking measures as free because it is IDLE — this one throttles the CONSUMER so parking fires constantly. There is no before/after leg on purpose: the pre-parking build does not SURVIVE this workload (it drops the connection at `MaxInboundBufferBytes`), and that is the strongest statement of what parking bought. The control is the same build with the PRODUCER throttled instead, so bytes, rate and duration match and only the presence of back-pressure differs. Asserts the pressured leg actually parked — a zero-park run is a broken rig, not a fast transport, and since 2026-08-06 also asserts the headline itself (a parked transport must still deliver at ≥98% of the consumer's drain rate). **It reports NO CPU number**, deliberately — see rule 9b. |
+| **`probe-cputime.cs`** | *"Can this OS's process-CPU counter see the work I am about to measure?"* Standalone (`dotnet run bench/probe-cputime.cs` — run it from a directory OUTSIDE the repo, or `Directory.Build.props` adds `net472` and AOT and the file-based build fails). Burns a **known, stopwatch-measured** amount of CPU continuously and again in 2 ms bursts, and prints the ratio the counter reports for each. On this host: continuous **0.90-0.98x**, bursty **1.89-3.86x**. Run it before believing any CPU column taken under a rate limit — it is the evidence behind rules 9 and 9b. |
 | **`Run-Upload.ps1`** | *"What does the INBOUND path cost?"* POSTs large request bodies to `/echo`, scoring goodput on the REQUEST. Exists because **no other rig here has ever sent a body** — every one sends a small request and measures a large response, so the receive path had no number at all until 2026-07-31. |
 | **`Soak-Churn.ps1`** | Long connection-churn soak across backends. Exists because **no benchmark here churns connections** — every one holds keep-alive and measures steady state, which is why item 0e hid for months. Watches for all three faces of a lifetime bug: crash, wedge, and a quiet accounting imbalance. |
 | **`Repro-RioChurnCrash.ps1`** | Reproduces **TODO item 0e** — an intermittent access violation in RIO+TLS under churn, present on the default configuration. Judge a fix over 20+ reps across all its configs: pool depth moves the *rate* without removing the fault, so a lower rate looks exactly like a fix. |
@@ -137,6 +138,26 @@ rate the server has idle gaps, and threads that wake, find nothing and spin befo
 time to the next request. A slower path (TLS) leaves fewer gaps to spin in and so measures *cheaper* while
 doing more work. **Measure cost per request at saturation**, where there are no idle gaps, and gate on
 "every TLS leg must cost more than its own plaintext control".
+
+**9b. Why switching instruments never fixed rule 9: on Windows the instrument CANNOT SEE bursty work.**
+Established 2026-08-06 by **`bench/probe-cputime.cs`**, which burns a *known, stopwatch-measured* amount
+of CPU in two shapes and compares what the counter says. Continuous burn is measured accurately
+(**0.90-0.98x** of true cost, on main threads and pool threads alike). The **same total work** split into
+2 ms bursts with 8 ms sleeps is charged **1.89x, 2.53x and 3.86x** across three identical repetitions.
+The mechanism is quantum-granularity accounting: Windows charges CPU in whole ~15.6 ms scheduler ticks to
+whichever thread is running when the tick fires, so a thread that wakes briefly and sleeps is *sampled*,
+not measured. Everything under a rate limit is bursty by construction, which is rule 9's whole setting.
+
+Two corollaries that cost time before they were understood:
+
+- **`Environment.CpuUsage` is not a second opinion.** It agrees with `Process.TotalProcessorTime` **to the
+  millisecond on every sample** - they are the same syscall. Swapping one for the other looks like
+  cross-validation and is not.
+- **The failure includes values that are arithmetically impossible, so it is detectable.**
+  `bench/measure-parking` reported an **exact 0 ms** for a 4-second window that moved 192 MiB through a
+  byte-by-byte verifier, interleaved with multi-second values for identical work. If a CPU column shows a
+  spread spanning an order of magnitude on repeated identical work, suspect the instrument before the
+  code. That rig now prints the spread and **refuses to print a per-MiB number at all**.
 
 ## Environment checklist — confirm before measuring
 

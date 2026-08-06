@@ -36,11 +36,28 @@
 // is the process-wide counter, read as a delta around each pass. A run where the pressured leg parks
 // zero times is a BROKEN RIG, not a fast transport, and it says so.
 //
-// CAVEAT ON THE CPU COLUMN, stated up front: both legs run under the same consumer-imposed rate limit,
-// which bench/README.md rule 9 warns is the wrong operating point for per-request CPU (idle gaps let
-// threads wake, find nothing, and charge their spin to the next unit of work). Both legs share that
-// confound identically, so the DIFFERENCE is meaningful in a way neither absolute value is. Do not
-// quote the absolute core-us/MiB anywhere.
+// THERE IS NO CPU COLUMN, AND THAT IS A RESULT (2026-08-06). It had one, with a caveat saying that both
+// legs share the rate-limit confound "identically, so the DIFFERENCE is meaningful in a way neither
+// absolute value is". THAT CLAIM WAS WRONG, and the scored run falsified it twice over:
+//
+//   1. The instrument cannot see this workload AT ALL. The column reported EXACT ZEROS for 4-second
+//      windows that moved 192 MiB through a byte-by-byte verifier -- arithmetically impossible -- mixed
+//      with multi-second values for identical work. bench/probe-cputime.cs isolates the mechanism:
+//      Windows charges CPU in whole ~15.6 ms scheduler quanta to whichever thread is running when the
+//      tick fires, so CONTINUOUS burn is measured accurately (0.90-0.98x of true cost) while BURSTY work
+//      of identical known cost is charged 1.89-3.86x, varying 2x between repetitions. Everything in a
+//      rate-limited rig is bursty by construction. Environment.CpuUsage agrees with
+//      Process.TotalProcessorTime to the millisecond -- they are the same syscall, so swapping one for
+//      the other is not a fix and is not cross-validation either.
+//   2. Even with a working instrument the two legs are NOT the same operating point for CPU. Which side
+//      is the limiter changes the I/O GRANULARITY: the pressured leg's 1 MiB pipe threshold aggregates
+//      into few large reads, while the paced leg's sleep-quantised producer drives many small ones. That
+//      difference is caused by the very thing that distinguishes the legs, so it cannot be subtracted
+//      out. A CPU A/B here would need a rig where both legs run unlimited, which is a different rig.
+//
+// So this rig answers the THROUGHPUT question (which it does cleanly, and which was the open one) and
+// declines the CPU one. The raw per-window ms spread is still printed, as the evidence for declining
+// rather than as a number to quote.
 using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
@@ -102,6 +119,16 @@ foreach (var (factory, be) in GateBackends.All)
         $"{be} the two legs are different operating points",
         $"pressured {pressuredParks:n0} vs paced {pacedParks:n0} parks -- the control must park far less, or it is not a control");
 
+    // THE HEADLINE, ASSERTED RATHER THAN EYEBALLED. With the CPU column gone this is the whole result:
+    // continuously parked, the transport still delivers at the consumer's own drain rate. Gated at 2%
+    // because a parking bug that cost real throughput would not land within 2% of the floor -- it would
+    // stall on a missed resume, which is parking's actual failure mode (REVIEW.md D3) and shows up here
+    // as goodput far BELOW the rate, not as jitter around it.
+    double pressuredRate = pressured.Select(x => x.MiBPerSec).OrderBy(x => x).ElementAt(pressured.Count / 2);
+    Check(ref failures, pressuredRate >= rateMib * 0.98,
+        $"{be} parked transport tracks the drain rate",
+        $"{pressuredRate:n1} MiB/s against a {rateMib} MiB/s consumer ({pressuredRate / rateMib:p1} of it)");
+
     Console.WriteLine();
 }
 
@@ -127,16 +154,14 @@ static void Report(string backend, string leg, List<Sample> xs)
     if (xs.Count == 0) { Console.WriteLine($"  {backend} {leg}: no samples"); return; }
     var secs = xs.Select(x => x.Seconds).OrderBy(x => x).ToArray();
     var mibs = xs.Select(x => x.MiBPerSec).OrderBy(x => x).ToArray();
-    var cpu = xs.Select(x => x.CoreUsPerMib).OrderBy(x => x).ToArray();
-    // A CPU delta below the process-time clock's resolution reads as 0.0, and a printed "0" is
-    // indistinguishable from "free". Say n/a instead and tell the reader how to make it measurable --
-    // the same rule the rest of this repo applies to counters that cannot see their own path.
-    bool cpuUsable = xs.All(x => x.CpuMs >= 50);
-    string cpuCol = cpuUsable ? $"{cpu[cpu.Length / 2],7:n0} core-us/MiB"
-                              : "    n/a (raise --mib)";
+    // The CPU spread is printed as EVIDENCE, not as a measurement -- see the header. A spread that spans
+    // an order of magnitude (routinely including an impossible 0) is the reason there is no core-us/MiB
+    // number here, and printing it is what stops the column being quietly re-added by the next reader.
+    var ms = xs.Select(x => x.CpuMs).OrderBy(x => x).ToArray();
     Console.WriteLine($"  {backend,-8} {leg,-16} {mibs[mibs.Length / 2],8:n1} MiB/s [{mibs[0]:n1}-{mibs[^1]:n1}]"
-                    + $"  {secs[secs.Length / 2],6:n2}s  cpu {cpuCol}"
-                    + $"  parks {Median(xs.Select(x => (double)x.Parks)),7:n0}");
+                    + $"  {secs[secs.Length / 2],6:n2}s"
+                    + $"  parks {Median(xs.Select(x => (double)x.Parks)),7:n0}"
+                    + $"  (cpu instrument unusable here: {ms[0]:n0}-{ms[^1]:n0} ms for identical work)");
 }
 
 static void Check(ref int failures, bool ok, string what, string detail)
@@ -159,7 +184,7 @@ static class Leg
         Thread.Sleep(250);
 
         long parks0 = Connection.TotalReceiveParks;
-        var cpu0 = Process.GetCurrentProcess().TotalProcessorTime;
+        var cpu0 = Environment.CpuUsage.TotalTime;   // retained only to print the spread; see the header
         var sw = Stopwatch.StartNew();
 
         var sender = new Producer(port, total, pace ? rateMib : 0);
@@ -167,7 +192,7 @@ static class Leg
         bool complete = srv.WaitReceived(total, TimeSpan.FromSeconds(120));
 
         sw.Stop();
-        var cpu = Process.GetCurrentProcess().TotalProcessorTime - cpu0;
+        var cpu = Environment.CpuUsage.TotalTime - cpu0;
         long parks = Connection.TotalReceiveParks - parks0;
         sender.Stop();
         Thread.Sleep(150);

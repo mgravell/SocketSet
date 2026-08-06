@@ -50,14 +50,48 @@ carrying:**
   spots for epoll are in item 1 below (the `EPOLL_CTL_MOD` mask arithmetic, and the HUP-while-parked
   close, which exists because `EPOLLERR`/`EPOLLHUP` cannot be masked off and a level-triggered one would
   spin a core).
-- **If the box is QUIET and you want numbers:** (a) `bench/measure-parking` scored, with a large
-  `--mib` and six passes — the outstanding question the rig was built for; (b) the 64 KB pipe-block
+- **If the box is QUIET and you want numbers:** ~~(a) `bench/measure-parking` scored~~ **(a) DONE
+  2026-08-06 — see below**; (b) the 64 KB pipe-block
   default decision, which needs a same-session A/B carrying BOTH throughput and memory (the memory side
   already measured at 1.17x on Windows, against the 2.7x that made it a flag on Linux); (c) a Windows
   baseline re-run at the corrected shard default.
 - **Still open from the audit:** io_uring parking; `PrepareForBind`'s unconditional delete + TOCTOU; no
   `SO_PEERCRED` on UDS; `Verify-BindReachability` has no Linux twin; SNI-based server certificate
   selection remains deferred by decision, not oversight.
+
+### 2026-08-06 (Windows, quiet box): item (a) scored, and it cost a retraction
+
+**The measurement, in one line: parking engaged costs NOTHING in throughput.** 512 MiB per leg at a
+48 MiB/s drain, 6 scored passes, IOCP/RIO/Managed — the parked transport delivers **100.0 / 100.0 / 99.9%**
+of the consumer's own rate against a 10.67s theoretical floor, byte-exact every pass, at the operating
+point where the pre-parking build DROPPED the connection. 511 parks per 512 MiB (one per MiB, matching the
+1 MiB threshold) against 0 in the control, so the path is proven taken. Full table in `RESULTS.md`.
+The rig now ASSERTS this (≥98% of drain rate) rather than leaving it to be read off a table.
+
+**The retraction, which is the part worth carrying.** `measure-parking` shipped with a CPU column whose
+header claimed both legs "share that confound identically, so the DIFFERENCE is meaningful in a way
+neither absolute value is". Wrong, twice over, and **the column is deleted**:
+
+- **The instrument cannot see this workload.** It reported an **exact 0 ms** for a 4-second window that
+  moved 192 MiB through a byte-by-byte verifier. New `bench/probe-cputime.cs` isolates why: Windows
+  charges CPU in whole ~15.6 ms scheduler quanta to whoever is running at the tick, so continuous burn
+  measures accurately (0.90-0.98x) while identical work in 2 ms bursts is charged **1.89x / 2.53x /
+  3.86x**. Everything under a rate limit is bursty by construction. On the scored run itself, RIO's
+  control charged **312-8,453 ms** and Managed's **453-10,078 ms** for identical work.
+- **Even with a good instrument the legs are not comparable for CPU**, because which side is the limiter
+  changes the I/O granularity (1 MiB aggregation vs sleep-quantised small reads) — caused by the very
+  thing that distinguishes them, so it cannot be subtracted out.
+
+**This retroactively corrects confounder #9**, whose headline asserted "the reason is not the instrument"
+— it is partly both, and nothing here separates them. Now **#16** in the ledger, with **rule 9b** in
+`bench/README.md`. Two of my own hypotheses were falsified getting there and are recorded in the probe so
+nobody repeats them: it is NOT about pool threads vs main threads, and `Environment.CpuUsage` is NOT a
+second opinion (same syscall, agrees to the millisecond).
+
+**Cost of parking in CPU remains UNMEASURED** — and is now recorded as unmeasurable-by-this-rig rather
+than as a plausible median. It needs a saturation rig with both legs unlimited, which does not exist.
+
+**No library code changed**, so no gates are implicated by this session.
 
 ---
 

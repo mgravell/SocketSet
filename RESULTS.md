@@ -55,9 +55,10 @@ refusal cell. The remaining known headrooms are small and recorded: ~8% TLS resi
 ciphertext copy, designed not built), the SMT tail trade (shards ≤ physical cores ≈ Envoy-level p99 at
 −22% throughput), and Envoy's one surviving cell (`-P 1` TLS tail).
 
-**Instruments and honesty:** the confounder ledger stands at **#15** (latest: a Debug×tier-0 scanner
-baseline that under-rated `RespReader` by ~5x — true steady state is ~9.5ns/frame, 105 Mframes/s, and
-the scanner is NOT a lever). `verify-proxy.cs` (13 cells, RESP3-literate) gates every leg incl. Envoy
+**Instruments and honesty:** the confounder ledger stands at **#16** (latest: Windows process-CPU
+accounting cannot see BURSTY work — identical known work charged 1.89-3.86x under a rate limit, and once
+an impossible exact 0 — which retroactively corrects #9's claim that its instrument was exonerated;
+`bench/probe-cputime.cs` demonstrates it). `verify-proxy.cs` (13 cells, RESP3-literate) gates every leg incl. Envoy
 and Garnet; rigs quantisation-audit themselves; `TlsMode` has a refusal cell. What this box still
 cannot see: kTLS NIC offload, real-network behaviour, handshake/churn costs — the lab questions.
 
@@ -240,8 +241,64 @@ staged second copy outright (categorical).
 genuinely, persistently behind. Every leg here has a consumer that keeps up, which is why parks sit at
 0.2% of receives. The behaviour that matters under a slow consumer is asserted by `bench/verify-parking`
 (the peer is held rather than dropped, and resumes byte-exact) and is a correctness claim, not a
-throughput one. Nothing here says what parking costs when it is engaged continuously, and no rig in this
-repo currently creates that shape under load.
+throughput one. Nothing here says what parking costs when it is engaged continuously, and ~~no rig in this
+repo currently creates that shape under load~~ — **`bench/measure-parking` now does; scored 2026-08-06 in
+the next section, which closes this gap.**
+
+## PARKING WHILE CONTINUOUSLY ENGAGED (2026-08-06, Windows) — the gap above, closed
+
+`bench/measure-parking --mib 512 --rate 48 --passes 7` (6 scored, first discarded), quiet box (idle 1-3%),
+AMD 7900X 12C/24T, one shard, loopback, plaintext. The consumer is throttled to 48 MiB/s and the producer
+runs unbounded, so parking fires continuously; the control is the SAME build with the producer throttled
+instead, so bytes, average rate and wall-clock floor match and only the presence of back-pressure differs.
+
+| backend | leg | goodput (median [min-max]) | wall | parks |
+|---|---|---|---|---|
+| IOCP | pressured | **48.0 MiB/s** [48.0-48.0] | 10.67s | **511** |
+| IOCP | paced (control) | 48.0 MiB/s [47.9-48.0] | 10.67s | 0 |
+| RIO | pressured | **48.0 MiB/s** [47.9-48.0] | 10.67s | **511** |
+| RIO | paced (control) | 48.0 MiB/s [47.9-48.0] | 10.67s | 0 |
+| Managed | pressured | **48.0 MiB/s** [47.9-48.0] | 10.67s | **511** |
+| Managed | paced (control) | 47.9 MiB/s [47.9-48.0] | 10.69s | 0 |
+
+**The result: parking engaged costs nothing in throughput.** The parked transport delivers at **100.0%,
+100.0% and 99.9%** of the consumer's own drain rate on the three backends, against a theoretical floor of
+10.67s per pass — i.e. it tracks the consumer exactly, which is the whole design intent. Every byte
+arrived byte-exact on every pass, at the operating point where the pre-parking build instead ran past
+`MaxInboundBufferBytes` and DROPPED the connection. That is asserted by the rig now, not eyeballed.
+
+**The park count is the evidence the path was taken** (house rule 2): 511 parks per 512 MiB is exactly one
+per MiB, matching the rig's 1 MiB pause threshold, against **0** in the control. A control that parked
+would not be a control.
+
+**Caveat, stated rather than buried:** both legs are limited to 48 MiB/s by construction, so this measures
+that parking does not COST throughput at a rate-limited operating point. It is not a saturation number and
+does not say what parking does to peak goodput; that would need a different rig (both legs unlimited),
+which does not exist.
+
+### THE CPU HALF OF THIS RIG WAS DELETED, AND THAT IS THE SECOND FINDING
+
+The rig shipped with a CPU column and a header claiming both legs "share that confound identically, so the
+DIFFERENCE is meaningful". **That claim is retracted.** The column reported an **exact 0 ms** for a
+4-second window that moved 192 MiB through a byte-by-byte verifier, interleaved with multi-second values
+for identical work. Chasing it produced **confounder #16** (full writeup at the bottom, mechanism isolated
+by the new `bench/probe-cputime.cs`): Windows charges CPU in whole ~15.6 ms scheduler quanta, so bursty
+work — which everything under a rate limit is — is *sampled*, not measured, and identical known work
+measures 1.89-3.86x apart. Two of my own hypotheses were falsified on the way (it is not about pool threads
+vs main threads; `Environment.CpuUsage` is not a second opinion, being the same syscall).
+
+The rig now prints the raw spread in place of a number, and the spread is the argument: on this very run,
+**RIO's control charged 312-8,453 ms and Managed's 453-10,078 ms for identical work** — a 22x range. A
+median drawn from that would have looked entirely plausible.
+
+There is a second, independent reason the column could not have worked even with a good instrument:
+**which leg is the limiter changes the I/O granularity.** The pressured leg's 1 MiB pipe threshold
+aggregates into few large reads while the paced leg's sleep-quantised producer drives many small ones — a
+difference caused by the very thing that distinguishes the legs, so it cannot be subtracted out.
+
+**What remains open:** the CPU cost of parking is UNMEASURED, and is now recorded as unmeasurable by this
+rig rather than as a number nobody should trust. It joins confounder #9's question, which is the same
+question.
 
 ## WINDOWS BASELINE REFRESH (2026-08-05) — `Run-TlsSizes.ps1` + `Run-Matrix.ps1`
 
@@ -4283,7 +4340,9 @@ Each produced *believable* numbers, which is the dangerous kind of wrong.
 8. **p99 quantised at ~500µs** by Go-client timer granularity on Windows, which made sixteen legs report
    an identical 1,503µs. A latency figure that is *identical* across unrelated legs is an instrument
    reading, not a result.
-9. **Attributing CPU cost per request - three failed attempts, and the reason is not the instrument.**
+9. **Attributing CPU cost per request - three failed attempts.** ~~and the reason is not the
+   instrument~~ **- CORRECTED 2026-08-06: the reason is PARTLY the instrument, and this entry said
+   otherwise for a week. See confounder 16, which supplies the mechanism and the demonstration.**
    Comparing CPU per request under a rate-limited load produced per-leg spreads of 38-174% and TLS legs
    *cheaper* than their own plaintext controls, every time. The first two attempts sampled
    `\Processor(N)\% Processor Time` at 1Hz, which is obviously the wrong instrument. Replacing it with
@@ -4300,6 +4359,30 @@ Each produced *believable* numbers, which is the dangerous kind of wrong.
    misattribute. All three attempts here are discarded; the question remains open. **A TLS leg beating its
    own plaintext control is a reliable "this run is noise" signal** - build that gate into anything
    comparing cost.
+
+16. **Windows process-CPU accounting cannot see BURSTY work - and this is why #9 was never fixed by
+    changing instruments.** Found 2026-08-06 while scoring `bench/measure-parking`, whose CPU column
+    reported an **exact 0 ms** for a 4-second window that moved 192 MiB through a byte-by-byte verifier -
+    arithmetically impossible - interleaved with multi-second values for identical work on the same leg.
+
+    **`bench/probe-cputime.cs` isolates it**, by burning a *known, stopwatch-measured* amount of CPU in
+    two shapes. Continuous burn is accurate: **0.90-0.98x** of true cost, on main threads and pool threads
+    alike. The **same total work** in 2 ms bursts with 8 ms sleeps is charged **1.89x, 2.53x, 3.86x** on
+    three identical repetitions. Windows charges CPU in whole ~15.6 ms scheduler quanta to whichever
+    thread is running when the tick fires, so a thread that wakes briefly and sleeps is *sampled*, not
+    measured - and every thread under a rate limit is bursty by construction.
+
+    Two things this cost, both worth carrying:
+    - **`Environment.CpuUsage` is not a second opinion.** It agrees with `Process.TotalProcessorTime`
+      **to the millisecond on every sample**; they are the same syscall. Swapping them reads like
+      cross-validation and is not. Two probe cuts were spent before that was established.
+    - **#9 blamed the server; part of the blame is the counter.** Its "threads wake, find nothing and
+      spin" mechanism is real, but it was written to explain variance the instrument was manufacturing,
+      and the entry then asserted the instrument was exonerated. Both halves are in play, and no rig here
+      can currently separate them.
+
+    `measure-parking` now **refuses to print a per-MiB CPU figure at all**, printing the raw spread in its
+    place so the next reader sees the evidence rather than a plausible median.
 
 Two further notes for anyone extending the harness: a BOM-less `.ps1` containing non-ASCII (an em-dash)
 is read as ANSI by Windows PowerShell 5.1, which turns it into a string delimiter and reports a syntax
