@@ -4,7 +4,53 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## SESSION CLOSE 2026-08-05 — READ THIS FIRST; the 2026-08-04 audit section below is now HISTORY
+## SESSION CLOSE 2026-08-07 — READ THIS FIRST; the 2026-08-05 section below is now HISTORY
+
+Four commits, **not pushed** (house rule: commit, do not push). A Windows-only measurement session on a
+quiet box: **all three of the previous handover's queued measurements (a), (b), (c) are DONE**, and each
+produced a retraction as well as a number. Their detail lives in the dated sub-sections further down —
+this is only what a fresh reader needs to know is CURRENT.
+
+**No library code changed all session**, so no gates are implicated and none were re-run.
+
+**Three things below this line are now WRONG or SUPERSEDED, and that is the load-bearing part:**
+
+1. **"In-transport SChannel shows no advantage over `SslStream` on Windows" was a SHARD-COUNT ARTEFACT.**
+   At the corrected `s12` default, `rio+tls` beats `kestrel+tls` disjointly at 512 B (+2.3%) and 16 KB
+   (+11.4%), and `iocp+tls` beats it at 16 KB (+5.8%). The margins stay small next to Linux's +13-26%,
+   which is what the shared-SChannel mechanism predicts. **Attach a shard count to every Windows TLS
+   claim.** The 2026-08-05 baseline table is superseded outright.
+2. **The 64 KB pipe block's "strongly favourable" cost/benefit is RETRACTED.** Its benefit expired when
+   `7ad9ed7` raised `MaxZeroCopySegments` 64 → 256; at 256 KB the flag now measures as nothing. It stays
+   a flag. Anything you read below recommending it as a near-default predates this.
+3. **Confounder #9 said "the reason is not the instrument". Partly wrong.** Windows process-CPU
+   accounting cannot see BURSTY work at all — identical known work charged 1.89-3.86x, and once an
+   impossible exact 0. Now #16, with rule 9b and `bench/probe-cputime.cs`. **Do not trust any CPU column
+   taken under a rate limit, on this OS, in this repo.**
+
+**START HERE NEXT SESSION**, in order:
+
+- **The LINUX half of the 2026-08-05 session is still entirely UNRUN** — unchanged from the previous
+  handover, because this session was Windows-only. `bench/verify-parking`, `bench/verify-tlsname`,
+  `bench/run-smoke-matrix.sh`. See the 2026-08-05 section below for the pre-registered fragile spots.
+- **The biggest Windows number now on the table is NOT a flag or a default:** `byo` with no flag is at
+  PARITY with vanilla Kestrel at 256 KB (same session), while `classic` — the ACTUAL default bridge path
+  — is **-51.8%** against Kestrel there. Closing `classic`-to-`byo` is worth more than anything measured
+  this session.
+- **A shard default cannot serve both paths.** Plaintext 256 KB wants FEWER shards, TLS 256 KB wants
+  MORE (+26.9% s8→s16, disjoint), and at the corrected `s12` default `iocp+tls` is LAST of eight legs at
+  256 KB. Either a per-path default or an explicit doc note. Not decided.
+- **Two unattributed observations worth a session each:** why `rio+tls` beats `iocp+tls` by 20.5% at
+  256 KB while `rio` trails `iocp` by 30.9% on plaintext at the same size; and what closed the
+  `byo`-vs-`byo-seg64k` gap since 2026-07-29 (drain coalescing `5ec2b65` is the obvious candidate and is
+  explicitly NOT claimed).
+- **Still open from the audit:** io_uring parking; `PrepareForBind`'s unconditional delete + TOCTOU; no
+  `SO_PEERCRED` on UDS; `Verify-BindReachability` has no Linux twin; SNI-based server certificate
+  selection deferred by decision.
+
+---
+
+## SESSION CLOSE 2026-08-05 — superseded as "read first" by the section above
 
 Ten commits, all pushed. The audit section that follows is still the right reference for *why* things
 are the way they are, but it is no longer the current state: several of its open items are closed and
