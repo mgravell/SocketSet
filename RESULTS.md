@@ -311,8 +311,10 @@ question.
 
 **IT IS A FRESH BASELINE, NOT A BEFORE/AFTER.** Nothing here may be differenced against the 2026-08-05
 table (house rule 1). Every claim below is leg-vs-leg WITHIN this run, and a delta is quoted only where
-the min-max ranges are DISJOINT. Predictions were written to `bench/results/prereg-baseline-2026-08-06.md`
-before launch and are scored at the bottom.
+the min-max ranges are DISJOINT. Predictions were written to
+[`bench/prereg-baseline-2026-08-06.md`](../bench/prereg-baseline-2026-08-06.md) before launch — kept as a
+committed artefact rather than in gitignored `bench/results/`, because a pre-registration nobody can read
+afterwards is not one — and are scored at the bottom.
 
 Goodput MiB/s, median of 6 [min-max]:
 
