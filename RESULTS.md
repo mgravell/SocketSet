@@ -19,10 +19,13 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > **EVERY NUMBER IN THIS SECTION IS LINUX** (7900X bare metal, io_uring/epoll, OpenSSL), and that
 > qualifier became load-bearing on 2026-08-05. The TLS advantage recorded below is an
 > OpenSSL-vs-`SslStream` result: it is an ENGINE swap as well as an I/O-model swap. On WINDOWS both
-> sides are SChannel, only the I/O model differs, and the advantage **does not appear** — `kestrel+tls`
-> beats `iocp+tls` disjointly at 512 B, with a three-way TLS tie inside 0.8% on the fixed-size matrix.
-> See "WINDOWS BASELINE REFRESH (2026-08-05)" below. Do not quote a TLS headline from this file without
-> the OS attached.
+> sides are SChannel and only the I/O model differs, so **expect a much smaller margin there — and one
+> that depends on SHARD COUNT and PAYLOAD SIZE rather than existing or not.** ~~the advantage does not
+> appear~~ (that read came from a single `s16` run; at the corrected `s12` default, measured 2026-08-06,
+> `rio+tls` beats `kestrel+tls` disjointly at 512 B **and** 16 KB, `iocp+tls` beats it at 16 KB, and both
+> lose badly at 256 KB). See "WINDOWS BASELINE OF RECORD (2026-08-06)" below, which supersedes the
+> 2026-08-05 refresh. Do not quote a TLS headline from this file without the OS **and the shard count**
+> attached.
 
 Everything below this block is a dated investigation; this is the summary they add up to. The 2026-07-30
 consolidated view (next section) is kept as the record of the HTTP/Kestrel era; on 2026-08-02 the
@@ -299,6 +302,77 @@ difference caused by the very thing that distinguishes the legs, so it cannot be
 **What remains open:** the CPU cost of parking is UNMEASURED, and is now recorded as unmeasurable by this
 rig rather than as a number nobody should trust. It joins confounder #9's question, which is the same
 question.
+
+## WINDOWS BASELINE OF RECORD (2026-08-06) — at the CORRECTED shard default, and it moves the TLS story
+
+`Run-TlsSizes.ps1 -Repetitions 7` (6 scored passes), quiet box, banner-verified
+`shards=12 / server=0xfff client=0xfff000`, `-c 64 -d 8s`, GET `/payload`. This supersedes the
+2026-08-05 table below, which inherited the hard-coded `-Shards 16`.
+
+**IT IS A FRESH BASELINE, NOT A BEFORE/AFTER.** Nothing here may be differenced against the 2026-08-05
+table (house rule 1). Every claim below is leg-vs-leg WITHIN this run, and a delta is quoted only where
+the min-max ranges are DISJOINT. Predictions were written to `bench/results/prereg-baseline-2026-08-06.md`
+before launch and are scored at the bottom.
+
+Goodput MiB/s, median of 6 [min-max]:
+
+| size | kestrel | kestrel+tls | iocp/s12 | iocp+tls/s12 | rio/s12 | rio+tls/s12 | httpsys | httpsys+tls |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 512 B | **147.7** [147.3-147.8] | 137.0 [133.7-137.2] | 143.5 [141.6-144.7] | 136.5 [134.6-138.7] | 145.5 [142.8-146.4] | 140.1 [138.9-140.5] | 119.7 [117.6-121.7] | 102.2 [100.8-103.1] |
+| 16 KB | **4006.7** [3998.1-4024.1] | 3147.3 [3117.7-3167.5] | 3899.5 [3821.9-3939.0] | 3328.8 [3192.3-3372.6] | 3902.8 [3756.6-3983.0] | 3506.5 [3469.8-3589.0] | 2766.6 [2760.2-2795.8] | 2240.2 [2227.2-2250.4] |
+| 256 KB | 10662.3 [9728.0-11321.4] | 7001.2 [6746.3-7059.0] | 10909.2 [10407.8-11348.3] | 4766.8 [4498.8-4843.7] | 8335.6 [7546.2-8733.5] | 5743.0 [5523.2-5876.9] | **11545.2** [11302.8-11683.3] | 9639.5 [9515.6-9771.4] |
+
+### THE HEADLINE: on Windows our TLS DOES lead — at 512 B and 16 KB — and collapses at 256 KB
+
+This is the finding, and it revises what the 2026-08-05 section concluded at `s16`. All disjoint:
+
+| comparison | 512 B | 16 KB | 256 KB |
+|---|---|---|---|
+| `rio+tls` vs `kestrel+tls` | **us +2.3%** | **us +11.4%** | Kestrel **+21.9%** |
+| `iocp+tls` vs `kestrel+tls` | parity (overlap) | **us +5.8%** | Kestrel **+46.9%** |
+
+So "in-transport SChannel shows no advantage over `SslStream` on Windows" — recorded on 2026-08-05 from
+an `s16` run — **is shard-count dependent and is not true at the corrected default.** At `s12`, `rio+tls`
+beats `kestrel+tls` disjointly at both 512 B and 16 KB, and `iocp+tls` beats it disjointly at 16 KB. What
+survives unchanged is that the Windows margins are SMALL (2-11%) against Linux's +13-26%, which is what
+the shared-SChannel mechanism predicts: on Windows only the I/O model differs, on Linux the engine does
+too.
+
+**And the corrected default has a real price, exactly where it was predicted to.** At 256 KB
+`iocp+tls` (4,766.8) is now **LAST of all eight legs**, beaten disjointly by `rio+tls` (+20.5%),
+`kestrel+tls` (+46.9%) and `httpsys+tls` (+102%). The TLS path wants MORE shards at large payloads
+(measured 2026-08-05: s16 > s12 > s8, +26.9% disjoint), and s12 is the wrong side of that inversion.
+**This is the cost of a defensible default over an optimal one, now quantified rather than asserted.**
+
+**An inversion nobody predicted:** `rio+tls` BEATS `iocp+tls` at 256 KB by +20.5% (disjoint) while
+`rio` TRAILS `iocp` by 30.9% (disjoint) on plaintext at the same size. RIO's one-page-per-`RIOSend`
+quantisation dominates plaintext, where the send is the whole cost; under TLS something else does.
+Recorded as an observation — nothing in this sweep isolates it.
+
+### The predictions, scored
+
+- **P7 CONFIRMED.** At 256 KB plaintext `iocp/s12` [10,407.8-11,348.3] and `kestrel` [9,728.0-11,321.4]
+  **overlap — parity**, with our median 2.3% above. The ~20% deficit in the `s16` table was the shard
+  count, not the transport.
+- **P8 CONFIRMED**, and more strongly than expected. `kestrel+tls` beats `iocp+tls` at 256 KB
+  **disjointly by +46.9%**. I predicted our own corrected default would cost this row; it costs it a lot.
+- **P9 CONFIRMED.** `iocp` [10,407.8-11,348.3] vs `rio` [7,546.2-8,733.5] at 256 KB plaintext is
+  **disjoint, +30.9%** — the `RIOSend` cost, reproduced at a second shard count (~34% at s8).
+- **P10 HALF CONFIRMED, and the half that fails is a rule-5 discipline point.** `httpsys` is LAST at
+  512 B (119.7, disjoint from all three user-mode plaintext legs) — reproduced. It leads at 256 KB on
+  the median (11,545.2 vs `iocp`'s 10,909.2) but the ranges **OVERLAP** (11,302.8 < 11,348.3), so **no
+  delta is claimed** there. 2026-08-05 called that cell disjoint; at s12 it is not.
+- **P11 WAS A BADLY FORMED PREDICTION AND IS WITHDRAWN.** It asked whether spreads came in tighter than
+  the `s16` run's — which is a CROSS-RUN comparison, i.e. the thing house rule 1 exists to forbid. I
+  wrote it anyway. The within-run statement it should have been: **our legs are not the noisy ones
+  here.** Spreads at 256 KB are `httpsys` 3.3%, `iocp` 8.6%, `rio` 14.2% and **`kestrel` 14.9% — the
+  worst plaintext leg in the run.** So 2026-08-05's worry that "our legs are 3-6x noisier than
+  everything we are compared against" does **not** reproduce at this shard count. At 512 B and 16 KB
+  Kestrel is much tighter than us (0.3-0.6% vs our 2.2-5.8%); the asymmetry is size-dependent, not
+  general.
+
+p99 at 512 B and 16 KB sits on the 1,503µs Windows client-timer quantum throughout and is **not quoted**
+(rule 8). The 256 KB p99 values are above the quantum and are in the CSV.
 
 ## WINDOWS BASELINE REFRESH (2026-08-05) — `Run-TlsSizes.ps1` + `Run-Matrix.ps1`
 

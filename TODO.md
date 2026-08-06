@@ -28,10 +28,13 @@ two of its recorded numbers have been superseded.
 **Three things in the older sections are now WRONG or WEAKER than they read, and this is the part worth
 carrying:**
 
-- **"TLS is the real strength" is a LINUX result and does not transfer to Windows.** Measured
-  2026-08-05: `kestrel+tls` beats `iocp+tls` disjointly at 512 B, and `Run-Matrix` shows a three-way TLS
-  tie inside 0.8%. On Linux we swap the whole engine (OpenSSL vs `SslStream`); on Windows both sides are
-  SChannel and only the I/O model differs. Read every TLS headline with its OS attached.
+- **"TLS is the real strength" is a LINUX result and transfers to Windows only PARTLY — and the 2026-08-05
+  reading of "not at all" was itself an artefact of a bad shard count.** On Linux we swap the whole engine
+  (OpenSSL vs `SslStream`); on Windows both sides are SChannel and only the I/O model differs, so the
+  margin is small either way. Re-measured 2026-08-06 at the corrected `s12` default: `rio+tls` beats
+  `kestrel+tls` **disjointly** at 512 B (+2.3%) and 16 KB (+11.4%), `iocp+tls` beats it at 16 KB (+5.8%)
+  — but at 256 KB `iocp+tls` is LAST of eight legs and Kestrel leads it by 46.9%. Read every TLS headline
+  with its OS **and its shard count** attached.
 - **`Run-TlsSizes.ps1`'s `-Shards 16` default was a hard-coded value from a 16-core machine**, and cost
   ~15% at 256 KB plaintext on this 12-core half. Now derived. **Every 256 KB plaintext figure taken
   before 2026-08-05 inherits that default**, so re-measure before quoting one.
@@ -53,8 +56,8 @@ carrying:**
 - **If the box is QUIET and you want numbers:** ~~(a) `bench/measure-parking` scored~~ **(a) DONE
   2026-08-06 — see below**; (b) the 64 KB pipe-block
   default decision, which needs a same-session A/B carrying BOTH throughput and memory (the memory side
-  already measured at 1.17x on Windows, against the 2.7x that made it a flag on Linux); (c) a Windows
-  baseline re-run at the corrected shard default.
+  already measured at 1.17x on Windows, against the 2.7x that made it a flag on Linux); ~~(c) a Windows
+  baseline re-run at the corrected shard default~~ **(c) DONE 2026-08-06 — see below.**
 - **Still open from the audit:** io_uring parking; `PrepareForBind`'s unconditional delete + TOCTOU; no
   `SO_PEERCRED` on UDS; `Verify-BindReachability` has no Linux twin; SNI-based server certificate
   selection remains deferred by decision, not oversight.
@@ -92,6 +95,35 @@ second opinion (same syscall, agrees to the millisecond).
 than as a plausible median. It needs a saturation rig with both legs unlimited, which does not exist.
 
 **No library code changed**, so no gates are implicated by this session.
+
+### 2026-08-06: item (c) scored, and it moved the Windows TLS story
+
+`Run-TlsSizes.ps1 -Repetitions 7` at the derived `s12` default (banner-verified). **This is the Windows
+baseline of record; the 2026-08-05 table is superseded** because it inherited the hard-coded `s16`. Full
+table and scored predictions in `RESULTS.md`.
+
+**The headline is that our TLS DOES lead on Windows at small and mid payloads**, which the `s16` run had
+concluded it did not. All disjoint: `rio+tls` beats `kestrel+tls` at 512 B (+2.3%) and 16 KB (+11.4%);
+`iocp+tls` beats it at 16 KB (+5.8%). The margins are small next to Linux's +13-26%, which is exactly what
+the shared-SChannel mechanism predicts — but "no advantage on Windows" was a shard-count artefact, not a
+property of the platform. **Attach a shard count to every Windows TLS claim from now on.**
+
+**The corrected default has a measured price, and it is large.** At 256 KB `iocp+tls` is now **LAST of
+all eight legs**, beaten disjointly by `rio+tls` (+20.5%), `kestrel+tls` (+46.9%) and `httpsys+tls`
+(+102%). The TLS path wants MORE shards at big payloads (s16 > s12 > s8, +26.9% disjoint, measured
+2026-08-05) and s12 is the wrong side of that inversion. **This is the open item the run creates:** the
+one-shard-count-per-process default cannot serve both paths, and the fix is either a per-path default or
+documenting that TLS at large payloads wants an explicit `Shards`. Not decided here.
+
+**Unpredicted inversion worth chasing:** `rio+tls` beats `iocp+tls` by 20.5% at 256 KB while `rio` trails
+`iocp` by 30.9% on plaintext at the same size. RIO's one-page-per-`RIOSend` quantisation dominates
+plaintext; under TLS something else does. Nothing in the sweep isolates it.
+
+**One of my own predictions was WITHDRAWN as badly formed**, not falsified: P11 asked whether spreads came
+in tighter than the s16 run's, which is a cross-run comparison — the exact thing house rule 1 forbids, and
+I wrote it into a pre-registration anyway. The within-run version: at 256 KB **Kestrel is the noisiest
+plaintext leg in the run (14.9%)**, against `iocp` 8.6% and `httpsys` 3.3%, so 2026-08-05's "our legs are
+3-6x noisier than everything we are compared against" does not reproduce at this shard count.
 
 ---
 
