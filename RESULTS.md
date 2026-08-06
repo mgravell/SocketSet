@@ -248,6 +248,98 @@ throughput one. Nothing here says what parking costs when it is engaged continuo
 repo currently creates that shape under load~~ — **`bench/measure-parking` now does; scored 2026-08-06 in
 the next section, which closes this gap.**
 
+## THE 64 KB PIPE BLOCK STAYS A FLAG (2026-08-07, Windows) — its justification EXPIRED
+
+The decision item: should `--pipe-segment 65536` become the Windows default? The 2026-08-05 section below
+called the cost/benefit "strongly favourable" and declined to act because the +117.3% benefit and the
+1.17x memory bill came from different sessions. This is the same-session pairing it asked for —
+`Run-Byo.ps1 -Repetitions 7` (6 scored passes) then `Measure-PipeMemory.ps1`, both at `Shards 12`, one
+quiet box, one hour. Predictions in [`bench/prereg-pipeseg-2026-08-07.md`](../bench/prereg-pipeseg-2026-08-07.md),
+written before launch.
+
+**THE ANSWER IS NO, AND FOR A REASON NONE OF MY PRE-REGISTERED "DO NOT CHANGE IT" CRITERIA ANTICIPATED:
+the benefit has evaporated.** It is not that the cost got worse; it is that the thing the flag bought was
+fixed in the transport a week earlier and nobody re-derived the recommendation.
+
+### Throughput — goodput MiB/s, median of 6 [min-max]
+
+| leg | 64 KB | 256 KB |
+|---|---|---|
+| `classic` (the default bridge) | 7637.6 [7449.8-7820.6] | 5142.0 [4964.9-5441.0] |
+| `classic-seg64k` | 7719.6 [7557.2-7980.0] | 5019.0 [4478.3-5268.1] |
+| `byo` (no flag) | 8542.2 [8490.0-8558.0] | **10675.6** [10342.1-11019.8] |
+| `byo-seg64k` | **8707.2** [8581.7-8813.4] | 10710.4 [10340.3-11046.8] |
+| `byo-seg64k-pin` | 8633.9 [8553.2-8800.1] | 10698.8 [10168.8-11003.7] |
+| `kestrel` (same-session control) | 8846.4 [8651.9-8896.3] | 10669.9 [10253.1-11064.2] |
+
+**At 256 KB the flag buys NOTHING: `byo` vs `byo-seg64k` OVERLAP** — and so do their p99s
+([5,743-7,701] vs [4,704-6,000] µs). At 64 KB it buys **+1.9%, disjoint but small**; the 64 KB p99
+difference sits on the 1,503µs Windows client-timer quantum and is **not quoted** (rule 8).
+
+### WHY, established from the counters rather than inferred
+
+`SS_IOCP_STATS` segments-per-zero-copy-send, and the numbers are exact with zero variance across passes:
+
+| leg | 64 KB | 256 KB |
+|---|---:|---:|
+| `byo` (default ~4 KB blocks) | 17.00 | **65.00** |
+| `byo-seg64k` | 2.00 | 5.00 |
+
+**That 65.00 is the famous number** — the one that made this a flag, measured a third time here. The
+cliff it fell off was `MaxZeroCopySegments`, and commit `7ad9ed7` (2026-07-29) **raised that cap from 64
+to 256** for exactly this reason. So at 256 KB zero-copy is now **TAKEN 397,048 times with 0 declines at
+the default block size**. The flag still cuts fragmentation 13x (65 → 5 segments per send) and that is now
+worth nothing measurable.
+
+**`7ad9ed7` predicted the opposite and its prediction did not survive.** It measured `byo` 8,447.9 against
+`byo-seg64k` 11,136.2 (disjoint), attributed the gap to head-of-line blocking from "65 pins and one much
+longer send occupancy per response", and concluded large blocks "remain the configuration worth
+recommending" and "are also the best p99". Today those two legs are at parity on both throughput and p99.
+**Comparing verdicts, not values** (house rule 1 forbids differencing the numbers): a comparison that was
+disjoint in that session is overlapping in this one. What closed it is NOT isolated here — drain
+coalescing (`5ec2b65`) is the obvious candidate since it changes how sends are batched, but nothing in
+this run attributes it, and it is recorded as open rather than guessed.
+
+**The unpredicted headline: `byo` with NO FLAG is now at parity with vanilla Kestrel at 256 KB**
+(10,675.6 vs 10,669.9, overlapping, same session). Reaching parity there previously required the flag.
+
+### Memory — peak working set, 4096 B payload, idle baseline ~104.8 MB subtracted
+
+| connections | `byo` | `byo-seg64k` | ratio |
+|---|---:|---:|---:|
+| 64 | 232.0 MB | 214.3 MB | **0.92x** |
+| 512 | 229.5 MB | 257.5 MB | 1.12x |
+| 2048 | 322.5 MB | 382.9 MB | **1.19x** |
+
+**1.19x at 2048 connections, i.e. +30.5 KB per connection.** The 64-connection row reads 0.92x — better
+than free — which is the rig's own documented trap reproducing exactly: a fixed ~105 MB baseline swamps a
+per-connection effect. Run this at 2048 or do not run it.
+
+(The rps column in that rig is a single 15s sample per cell, not scored passes. It is not a throughput
+result and is not quoted.)
+
+### The decision, and the predictions scored
+
+**`--pipe-segment 65536` stays a FLAG and does not become the Windows default.** At 256 KB it buys
+nothing; at 64 KB it buys +1.9%; on the `classic` path — which is what a default change would most
+affect — it buys nothing at either size; and it costs 1.19x peak working set at 2048 connections. A
+default that costs 19% of memory for a 1.9% gain at one payload size is not a good trade.
+
+- **P12 FALSIFIED.** `byo-seg64k` does not beat `byo` at 256 KB; the ranges overlap.
+- **P13 CONFIRMED.** `classic-seg64k` vs `classic` overlaps at BOTH sizes — pipe block size alone moves
+  nothing on Windows. This control is what keeps the whole result attributable.
+- **P14's PREMISE COLLAPSED, and the observed pattern is the REVERSE of the predicted one.** It asked
+  whether 64 KB would gain much less than 256 KB. The 256 KB gain is zero, so the only disjoint gain in
+  the run is at 64 KB. Scored as failed rather than quietly re-read as "confirmed", which it is only
+  vacuously.
+- **P15 CONFIRMED.** 1.19x at 2048 and an inverted 0.92x at 64.
+- **P16 CONFIRMED.** `byo-seg64k-pin` is not better than `byo-seg64k` on throughput (overlapping at both
+  sizes).
+
+**What this does NOT settle, and it is the bigger number on the page:** `classic` — the actual default
+bridge path — is **-51.8% against vanilla Kestrel at 256 KB** in this same session, where `byo` is at
+parity. The flag was never the interesting lever; the gap between `classic` and `byo` is.
+
 ## PARKING WHILE CONTINUOUSLY ENGAGED (2026-08-06, Windows) — the gap above, closed
 
 `bench/measure-parking --mib 512 --rate 48 --passes 7` (6 scored, first discarded), quiet box (idle 1-3%),
@@ -634,9 +726,16 @@ have been "the 64KB block is free", which is the opposite of the truth.
 **Throughput did not pay for the memory** in the same run: at 2048 connections `byo-seg64k` was 217,535
 rps against `byo`'s 211,252, so the larger block is not trading speed for footprint at this payload.
 
-**What this suggests, and what is still missing before acting on it.** The cost/benefit for making 64 KB
+**What this suggests, and what is still missing before acting on it.** ~~The cost/benefit for making 64 KB
 pipe segments the Windows default now looks strongly favourable — a large measured win on the send path
-against a ~17% working-set increase. It is NOT changed here, because the +117.3% figure comes from a
+against a ~17% working-set increase.~~ **SUPERSEDED 2026-08-07 — AND THIS RECOMMENDATION WAS WRONG. The
+same-session A/B demanded below was run, and the +117.3% benefit NO LONGER EXISTS: at 256 KB the flag
+measures as nothing (overlapping throughput AND p99), because `7ad9ed7` had already raised
+`MaxZeroCopySegments` 64 → 256 and zero-copy now engages at the default block size. The flag stays a
+flag. See "THE 64 KB PIPE BLOCK STAYS A FLAG (2026-08-07)" above.** This entry is kept as the worked
+example of why the demand below was the right instinct: a favourable-looking cost/benefit assembled from
+two sessions was not merely imprecise, it was pointing at a benefit that had already been engineered away.
+It is NOT changed here, because the +117.3% figure comes from a
 different session and rig: a defaults change of that reach wants a same-session A/B carrying BOTH
 throughput and memory, which is a `Compare-Commits.ps1 -Bridged -ExtraArgs --pipe-segment 65536` run
 plus this rig, not one sweep. Recorded as a recommendation with its gap stated rather than as a decision.

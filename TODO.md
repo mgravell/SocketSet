@@ -54,9 +54,8 @@ carrying:**
   close, which exists because `EPOLLERR`/`EPOLLHUP` cannot be masked off and a level-triggered one would
   spin a core).
 - **If the box is QUIET and you want numbers:** ~~(a) `bench/measure-parking` scored~~ **(a) DONE
-  2026-08-06 — see below**; (b) the 64 KB pipe-block
-  default decision, which needs a same-session A/B carrying BOTH throughput and memory (the memory side
-  already measured at 1.17x on Windows, against the 2.7x that made it a flag on Linux); ~~(c) a Windows
+  2026-08-06 — see below**; ~~(b) the 64 KB pipe-block default decision~~ **(b) DECIDED 2026-08-07: it
+  stays a flag, because its benefit expired — see below**; ~~(c) a Windows
   baseline re-run at the corrected shard default~~ **(c) DONE 2026-08-06 — see below.**
 - **Still open from the audit:** io_uring parking; `PrepareForBind`'s unconditional delete + TOCTOU; no
   `SO_PEERCRED` on UDS; `Verify-BindReachability` has no Linux twin; SNI-based server certificate
@@ -118,6 +117,38 @@ documenting that TLS at large payloads wants an explicit `Shards`. Not decided h
 **Unpredicted inversion worth chasing:** `rio+tls` beats `iocp+tls` by 20.5% at 256 KB while `rio` trails
 `iocp` by 30.9% on plaintext at the same size. RIO's one-page-per-`RIOSend` quantisation dominates
 plaintext; under TLS something else does. Nothing in the sweep isolates it.
+
+### 2026-08-07: item (b) DECIDED — the 64 KB pipe block stays a flag, because its benefit EXPIRED
+
+`Run-Byo.ps1 -Repetitions 7` then `Measure-PipeMemory.ps1`, same box, same hour, `Shards 12` — the
+same-session pairing `RESULTS.md` said the decision needed. Pre-registered in
+`bench/prereg-pipeseg-2026-08-07.md`. Full tables in `RESULTS.md`.
+
+**`--pipe-segment 65536` does NOT become the Windows default.** Not because the cost grew, but because
+**the benefit is gone**: at 256 KB `byo` and `byo-seg64k` overlap on throughput AND on p99. The +117.3%
+that made the flag look compelling was killed by `7ad9ed7` (2026-07-29), which raised
+`MaxZeroCopySegments` from 64 to 256 — and nobody re-derived the recommendation afterwards.
+
+**The counters prove it rather than suggesting it.** Segments per zero-copy send, exact and with zero
+variance: `byo` sends **65.00** segments at 256 KB (the famous number, measured a third time) against a
+cap of 256, so zero-copy is TAKEN 397,048 times with **0 declines** at the default block size. The flag
+still cuts fragmentation 13x (65 → 5) and that now buys nothing measurable.
+
+**`7ad9ed7`'s own conclusion did not survive its own follow-up.** It concluded large blocks "remain the
+configuration worth recommending" and "are also the best p99", from legs that were disjoint in that
+session. Comparing VERDICTS rather than values (house rule 1): that comparison is overlapping now. What
+closed it is not isolated — drain coalescing (`5ec2b65`) is the obvious candidate and is NOT claimed.
+
+**Scored:** P12 falsified; P13 confirmed (block size alone moves nothing — the control that keeps the
+result attributable); P14's premise collapsed and the observed pattern is the REVERSE of the predicted
+one (the only disjoint gain is at 64 KB, +1.9%, not at 256 KB); P15 confirmed (1.19x working set at 2048
+connections, and the 64-connection row reads 0.92x — the rig's documented trap reproducing exactly);
+P16 confirmed.
+
+**THE BIGGER NUMBER THIS RUN SURFACED, and it is the thing worth working on next:** `byo` with no flag is
+now at **parity with vanilla Kestrel at 256 KB** (same session, overlapping) — while `classic`, the
+ACTUAL default bridge path, is **-51.8% against Kestrel** at the same size. The flag was never the
+interesting lever. The `classic`-vs-`byo` gap is.
 
 **One of my own predictions was WITHDRAWN as badly formed**, not falsified: P11 asked whether spreads came
 in tighter than the s16 run's, which is a cross-run comparison — the exact thing house rule 1 forbids, and
