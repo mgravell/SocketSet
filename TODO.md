@@ -80,16 +80,28 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   `--batch`/`--queue`. **It is a NEW baseline and must not be differenced against the Linux tables**
   (house rule 1) — but that was true of every option, so it costs nothing.
 
-  **NO SIBLING CHECKOUT NEEDED: `dotnet tool install -g RESPite.Benchmark`.** Confirmed on NuGet
-  2026-08-07 via `dotnet tool search`: `respite.benchmark` **3.0.0**, Stack Exchange Inc. / Marc Gravell
-  / Nick Craver, verified. There is **no `StackExchange.Redis.Benchmark` tool package** — searching that
-  name returns the same single `respite.benchmark` result. (Source build also works, from
-  `StackExchange.Redis/src/RESPite.Benchmark`: `dotnet build -p:TargetVer=3 -f net10.0 -c Release`.)
+  **THE PINNED INSTRUMENT, and use this one:**
+
+  ```
+  dotnet tool install -g RESPite.Benchmark --version 3.1.13
+  ```
+
+  Marc published 3.1.13 to NuGet on 2026-08-07 specifically so this rig could pin to a public,
+  identified build. **Prefer the global tool over a source build**, and prefer a PINNED version over
+  floating: no sibling checkout, reconstructible by anyone, and the rig can gate on the version the tool
+  prints. The package id is `RESPite.Benchmark` — there is **no `StackExchange.Redis.Benchmark` tool
+  package**; searching that name on NuGet returns `respite.benchmark` and nothing else.
+
+  Source build still works as a fallback, from `StackExchange.Redis/src/RESPite.Benchmark`:
+  `dotnet build -p:TargetVer=3 -f net10.0 -c Release`.
 
   **RECORD THE GENERATOR VERSION WITH EVERY NUMBER — a different client build is a different
-  instrument.** The NuGet tool is 3.0.0; the 2026-08-07 exploratory figures below came from a LOCAL
-  SOURCE build, which announced itself as `### classic SE.Redis 3.1.15.26897 ###`. Those are not the
-  same client, and this rig's whole job is to be the constant while the server changes.
+  instrument**, and this rig's whole job is to be the constant while the server changes. Note this
+  applies RETROSPECTIVELY to the exploratory figures below: they came from a SOURCE build of a sibling
+  checkout sitting on the FEATURE BRANCH `marc/sub-command-category-fixes` (commit `69111ece`), which
+  announced itself as `### classic SE.Redis 3.1.15.26897 ###`. That is a floating instrument — a branch
+  that can move, on a checkout nobody else has. Fine for a 34x gap, where the client version cannot
+  plausibly be the cause; **not fine for anything scored**, which is exactly why the rig pins.
 
   **Two rejected alternatives, with the reasons, so they are not re-litigated:**
   - **`redis-benchmark.exe` 3.0.503** (in `StackExchange.Redis/tests/RedisConfigs/3.0.503`, the dead
