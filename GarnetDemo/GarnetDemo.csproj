@@ -10,4 +10,12 @@
     <ProjectReference Include="../src/SocketSet.Garnet/SocketSet.Garnet.csproj" />
   </ItemGroup>
 
+  <!-- Linked, not referenced: AspNetDemo is an ASP.NET host and this is a Redis server, so a
+       ProjectReference would drag the whole web stack in for one file. Sharing the SOURCE is what keeps
+       the guarantee that matters — every TLS leg in this repo presents the same key shape, so a TLS A/B
+       measures the stack and not the certificate. Same pattern as bench/GateBackends.cs. -->
+  <ItemGroup>
+    <Compile Include="../AspNetDemo/DemoCertificate.cs" Link="DemoCertificate.cs" />
+  </ItemGroup>
+
 </Project>

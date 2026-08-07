@@ -48,6 +48,47 @@ this is only what a fresh reader needs to know is CURRENT.
   `SO_PEERCRED` on UDS; `Verify-BindReachability` has no Linux twin; SNI-based server certificate
   selection deferred by decision.
 
+### GARNET ON WINDOWS: the demo now hosts there (2026-08-07); the BENCHMARK does not exist
+
+**Done, and gated:** `GarnetDemo` is hostable on Windows on **IOCP, RIO and managed**, plus stock SAEA
+and SChannel TLS, verified by **`bench/Verify-GarnetDemo.ps1`** (16 cells, real RESP round-trips).
+The LIBRARY (`SocketSet.Garnet`) never needed a change — it takes whatever `SocketSetOptions` it is
+handed and always did. Only the demo was Linux-bound: hard-coded io_uring, an OpenSSL provider and an
+absolute `/home/marc/...` path, so on Windows it BUILT and then died at construction three frames deep.
+That is worth noting as a category: **a consumer can be "cross-platform" in its library and unusable in
+its host**, and nothing in the build catches it.
+
+**NOT done, and this is the actual backlog item: there are NO Garnet numbers on Windows.** Every Garnet
+figure in `RESULTS.md` (2026-08-02/03: plaintext parity with lower p99, **TLS +9.5-24.2% all four
+disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
+
+- **A rig.** The only harnesses that drive Garnet are `run-proxy-ab.sh` / `run-mux-ab.sh` /
+  `run-client-shape.sh`, which are Linux-only as written (`taskset`, `/proc`). A `Run-GarnetAb.ps1` is
+  the deliverable, and `Verify-GarnetDemo.ps1` is its correctness gate — run that first, exactly as
+  `Run-SmokeMatrix` precedes the transport rigs.
+- **A GENERATOR, and this is the real blocker.** Every Garnet number here came from `redis-benchmark`,
+  which is not on the Windows box. Three routes, none free: a Windows `redis-benchmark` build; WSL
+  (which adds a network hop and needs its own control leg before any number is quotable); or driving it
+  from `SE.Redis`, which changes the client stack and so cannot be compared against any existing figure.
+  **Whichever is chosen, it is a NEW baseline and must not be differenced against the Linux tables**
+  (house rule 1). Note also the rigs' own caveat that `redis-benchmark` reports QUANTISED rps at short
+  durations, so it is not a tool to substitute casually.
+- **The abstract-UDS legs cannot transfer at all.** `@abstract` is a Linux namespace; Windows AF_UNIX is
+  pathname-only, and RIO cannot do AF_UNIX in any case (the library routes it to IOCP). Those cells are
+  structurally Linux-only, like kTLS NIC offload.
+
+**Why it is worth doing, sharpened by this session:** Windows matters to Garnet (a Microsoft project),
+and IOCP/RIO are load-bearing there. But the TLS claim is the interesting one and it is now
+**shard-count dependent** — at `s12` our TLS leads disjointly at 512 B and 16 KB and loses badly at
+256 KB. Garnet's TLS is stream-layer userspace, i.e. exactly the path the `+13-35% over SslStream`
+headline was meant to land on. **A Windows Garnet TLS number taken without sweeping shards would inherit
+precisely the artefact that made "no Windows TLS advantage" wrong.** Sweep shards or state the one you
+used, on every cell.
+
+One more, cheap and unpredicted: `rio` is now a hostable Garnet backend, and this session measured RIO
+BEATING IOCP under TLS at 256 KB (+20.5%) while trailing it by 30.9% on plaintext. A Garnet A/B is a
+second, differently-shaped venue for that inversion.
+
 ---
 
 ## SESSION CLOSE 2026-08-05 — superseded as "read first" by the section above
