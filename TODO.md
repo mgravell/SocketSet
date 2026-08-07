@@ -6,7 +6,7 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ## SESSION CLOSE 2026-08-07 — READ THIS FIRST; the 2026-08-05 section below is now HISTORY
 
-Four commits, **not pushed** (house rule: commit, do not push). A Windows-only measurement session on a
+Five commits (this handover is the fifth). A Windows-only measurement session on a
 quiet box: **all three of the previous handover's queued measurements (a), (b), (c) are DONE**, and each
 produced a retraction as well as a number. Their detail lives in the dated sub-sections further down —
 this is only what a fresh reader needs to know is CURRENT.
