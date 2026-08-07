@@ -179,10 +179,43 @@ shard scaling either (601,616 vs 579,969), because one shard already serves this
 A control with no headroom cannot discriminate, so it establishes nothing about shard scaling in
 general — only that RIO's problem is not distribution.
 
-**So the live question is a per-operation cost in RIO's send/receive path on this workload**, and the
-remaining candidates are `SocketSetNetworkSender`'s write pattern against RIO's `maxSendDataBuffers = 1`
-cap (Garnet replies per command, so this path is small-write-heavy in a way the HTTP demo is not), or
-something in RIO's completion-notification path. Neither has been tested.
+**THE SMALL-WRITE / `maxSendDataBuffers = 1` HYPOTHESIS IS FALSIFIED**, measured 2026-08-07 with the
+counters that already existed (`SS_RIO_STATS=1` / `SS_IOCP_STATS=1`), same workload, 120,000 GET replies:
+
+| | throughput | sends issued | per-send extras |
+|---|---|---|---|
+| `rio` | 21,695 GET/s | **22,263 RIOSends** (76 B/send) | commit **1.00**/send, notify-rearm **0.97**/send, port-wakes **1.21**/send |
+| `iocp` | 578,344 GET/s | **21,408 WSASends** (1 WSABUF each) | — |
+
+**Both backends issue essentially the SAME NUMBER OF SENDS** — ~22k for ~120k replies, i.e. both are
+already coalescing ~5 replies per send through the flush queue. So RIO is NOT fragmenting into more,
+smaller writes, and the `maxSendDataBuffers = 1` cap is not what is being paid. My hypothesis was wrong
+and the send counts are what killed it. (Also visible: IOCP's zero-copy path is completely unused here —
+`zero-copy sends=0`, everything on the copying path — so that is not the difference either.)
+
+**What RIO pays that IOCP does not is a NOTIFY ROUND TRIP PER SEND.** Every RIOSend is accompanied by
+~1 commit, ~1 `RIONotify` re-arm and ~1.2 port wakes: an arm/block/wake cycle per send batch rather than
+per drain. With ~26.7x the throughput gap and ~1.0 the send count, the cost has to be in that cycle.
+
+**This is very probably item 0d's undiagnosed root cause, now visible WITHOUT the confounds it had.**
+0d ("RIO + TLS out-of-band send is starved at the default page", 2026-07-29) is recorded as *"NOT
+diagnosed... Not fixed"*, and was worked around by giving RIO a 64 KB page default. Note what that
+workaround cannot do here: **our sends are 76 bytes, so page size is irrelevant when the cost is
+per-send.** And 0d's instrument comment asks exactly the two questions the table above answers —
+"commits-per-send (a kick per send instead of per drain?)" and "notify-rearms-per-send (a full
+arm/block/wake round trip per page?)". Both are ~1.00.
+
+**Why nothing else in the repo sees it:** the HTTP path uses pipe mode with batch-granularity flushing
+(`OnLoopDrain`), which amortises many responses per flush — hence `rio` at 512 B HTTP being fine
+(145.5 MiB/s against `iocp`'s 143.5). Garnet at `-P 1` has nothing to batch: one command in, one reply
+out. Consistent with RIO recovering to ~977k SET / ~463k GET at `-P 16`, where batching returns.
+
+**Candidate fix, untested:** `WindowsConnection.SubmitOutbound` marshals EVERY flush through the
+cross-thread queue plus a `PostQueuedCompletionStatus` wake — there is no "already on the loop thread"
+short-circuit, even though `OnReceive` runs on that thread. An on-loop fast path that issues the send
+directly would remove a wake per flush for both Windows backends, and on RIO would also remove the
+notify round trip that follows it. **Measure before believing it**: the send-count data says the loop is
+already coalescing, so the win may be smaller than the 26.7x gap suggests.
 
 **The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
 one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
