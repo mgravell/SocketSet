@@ -132,11 +132,30 @@ managed 87,489; every run after it settled to ~18-21k and stayed there. `-c 1` (
 **AND IT DOES NOT SCALE WITH CONNECTIONS AT ALL, which is the sharpest clue.** `-c 1` gives **20,138**
 and `-c 50` gives **18,373** — fifty times the concurrency buys NOTHING, and if anything costs a little.
 Note what that rules out: a per-operation latency stall would show ~20k on one connection and ~50x that
-on fifty. So the shape is not "each op is slow", it is **"the whole server is doing one op at a time"** —
-a GLOBAL serialisation. One concrete and cheaply checkable hypothesis: **RIO connection placement is
-putting every connection on one shard**, which would make `-c 50` and `-c 1` identical by construction.
-Check `ActiveConnections` per shard before looking anywhere else. (Nothing has been run against this
-hypothesis; it is a first place to look, not a diagnosis.)
+on fifty. So the shape is not "each op is slow", it is **"the whole server is doing one op at a time"**.
+
+**MY FIRST HYPOTHESIS WAS "RIO PLACEMENT PUTS EVERY CONNECTION ON ONE SHARD". IT IS RULED OUT**, within
+the hour, by a shard sweep (`-c 50 -P 1 -t GET`, first run discarded as cold):
+
+| leg | `--shards 1` | `--shards 12` |
+|---|---|---|
+| `rio` | 17,596 | 17,969 |
+| `iocp` | 601,616 | 579,969 |
+
+**At `--shards 1` there is no placement freedom at all** — every connection is on the one shard by
+construction — and RIO is still **34x** behind IOCP. So distribution cannot be the cause; the defect is
+already fully present on a single shard. What the sweep adds is that RIO gains nothing from 12 shards
+either, so whatever the bottleneck is, it does not partition per-shard.
+
+**The IOCP arm of that sweep is INCONCLUSIVE by construction, and saying so matters**: IOCP shows no
+shard scaling either (601,616 vs 579,969), because one shard already serves this workload comfortably.
+A control with no headroom cannot discriminate, so it establishes nothing about shard scaling in
+general — only that RIO's problem is not distribution.
+
+**So the live question is a per-operation cost in RIO's send/receive path on this workload**, and the
+remaining candidates are `SocketSetNetworkSender`'s write pattern against RIO's `maxSendDataBuffers = 1`
+cap (Garnet replies per command, so this path is small-write-heavy in a way the HTTP demo is not), or
+something in RIO's completion-notification path. Neither has been tested.
 
 **The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
 one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
