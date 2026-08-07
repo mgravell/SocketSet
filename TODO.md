@@ -94,6 +94,26 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   - **Check the connection count, do not infer it from a flag.** One `Get-NetTCPConnection` sample would
     have caught this at the start. Sample it DURING the run: a short run finishes before the sample
     lands and reports 0, which is how the first attempt here misread it.
+
+  **CONFIRMED FROM THE SERVER'S OWN VIEW** (Marc's suggestion, and a better check than the OS table
+  because it is the thing under test doing the reporting). With `resp-benchmark ... -c 50 -l` looping,
+  `resp-cli client list` returns **two rows, one of which is `resp-cli` itself** (`id=2 age=0 resp=2`,
+  no lib-name). The benchmark is the single `id=1 name=MGX(SE.Redis-v3.1.13.8476) age=10 resp=3`. So the
+  OS table and the server agree: one client.
+
+### GAP FOUND IN PASSING: Garnet `CLIENT LIST` shows `addr=socketset`, not an endpoint
+
+Visible in the output above: every row reads `addr=socketset laddr=socketset`. `SocketSetNetworkSender`
+defaults `RemoteEndpointName`/`LocalEndpointName` to the literal `"socketset"` because
+`SocketSetGarnetServer` never passes the real ones, and Garnet surfaces those strings directly in
+`CLIENT LIST`.
+
+**Why it is worth fixing rather than cosmetic:** `CLIENT KILL ADDR ...`, `CLIENT LIST` filtering and any
+operator or monitoring tool that identifies a client by address are all broken against a SocketSet-hosted
+Garnet — every client is indistinguishable. Stock `GarnetServerTcp` reports real `ip:port`, so this is a
+behaviour DIFFERENCE between the two legs as well as a missing feature, and an A/B that ever compares
+admin-plane behaviour would trip on it. The endpoints are available on `Connection` at accept time, so
+this is plumbing rather than design. Not fixed here; found while confirming the connection count.
 - ~~**A GENERATOR, and this is the real blocker.**~~ **SOLVED 2026-08-07: use `resp-benchmark`.**
   It takes redis-benchmark's arguments (`-h -p -c -n -d -P -t -q -l`) plus `+m` multiplexing and
   `--batch`/`--queue`. **It is a NEW baseline and must not be differenced against the Linux tables**
