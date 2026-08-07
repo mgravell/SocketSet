@@ -51,14 +51,21 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     private static long s_staleCompletions;   // MUST stay 0 - a completion from a previous tenant
     private static long s_sends, s_sendBytes, s_commitSend, s_commitRecv, s_notify, s_portWakes, s_cqDrains, s_completions, s_pumpFlush, s_stagedBytes;
+    private static long s_recvs, s_recvBytes;   // receive-side; see the dispatch site for why they exist
+    // DumpStats is static, so the per-shard receive buffer size is mirrored here purely so the B/recv
+    // figure can be read against the buffer it had to fit in. Every shard in a set uses the same value.
+    private static int _recvBufSizeForStats;
 
     private static void DumpStats(string tag)
     {
         long snd = Interlocked.Read(ref s_sends);
         if (snd == 0) return;
         double per(long x) => snd > 0 ? (double)x / snd : 0;
+        long rcv = Interlocked.Read(ref s_recvs);
         Console.Error.WriteLine($"[rio-stats:{tag}] RIOSends={snd:n0} ({Interlocked.Read(ref s_sendBytes) / (double)(1 << 20):n1} MiB, " +
             $"{Interlocked.Read(ref s_sendBytes) / (double)snd:n0} B/send) " +
+            $"RIORecvs={rcv:n0} ({Interlocked.Read(ref s_recvBytes) / (double)(1 << 20):n1} MiB, " +
+            $"{(rcv > 0 ? Interlocked.Read(ref s_recvBytes) / (double)rcv : 0):n0} B/recv of {_recvBufSizeForStats} buf) " +
             $"commits: send={Interlocked.Read(ref s_commitSend):n0} ({per(Interlocked.Read(ref s_commitSend)):n2}/send) " +
             $"recv={Interlocked.Read(ref s_commitRecv):n0} | " +
             $"notify-rearms={Interlocked.Read(ref s_notify):n0} ({per(Interlocked.Read(ref s_notify)):n2}/send) " +
@@ -197,6 +204,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
         _writeBuffer = new PinnedWriteBufferPool(_writeCount, _writeBufSize);
         _recvBuffer = new PinnedWriteBufferPool(_recvCount, _recvBufSize);
+        _recvBufSizeForStats = _recvBufSize;
         _entries = (Win32.OVERLAPPED_ENTRY*)NativeMemory.AllocZeroed(EntryBatch * (nuint)sizeof(Win32.OVERLAPPED_ENTRY));
         _ops = (CtlOp*)NativeMemory.AllocZeroed((nuint)_socketsPerShard * (nuint)sizeof(CtlOp));
         _connectAddrs = (byte*)NativeMemory.AllocZeroed((nuint)_socketsPerShard * AddrStride);
@@ -362,7 +370,17 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
                 Interlocked.Increment(ref s_staleCompletions);
                 continue;
             }
-            if (kind == ReqRecv) HandleRecv(slot, r.BytesTransferred, failed);
+            if (kind == ReqRecv)
+            {
+                // RECEIVE-SIDE accounting, added 2026-08-07 to test a specific hypothesis (Marc): that
+                // RIO is "1 packet, 1 read" -- i.e. that a completion carries one segment rather than
+                // whatever is queued. Only bytes-per-receive can tell those apart, and every counter
+                // here was send-side, so nothing in the repo could answer it. One receive is armed at a
+                // time against a _recvBufSize buffer, so B/recv near the MTU means no coalescing and
+                // B/recv near _recvBufSize means the buffer is being filled.
+                if (ReportStats) { Interlocked.Increment(ref s_recvs); Interlocked.Add(ref s_recvBytes, r.BytesTransferred); }
+                HandleRecv(slot, r.BytesTransferred, failed);
+            }
             else HandleSend(slot, r.BytesTransferred, failed);
         }
         return n;
