@@ -75,12 +75,21 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   label it as what it is: a single-shard/per-connection latency measurement, not a throughput one. The
   2026-08-07 exploratory numbers above were all taken at the default; the single `+m` cell there is a
   RIO variation, not a comparison.
-- ~~**A GENERATOR, and this is the real blocker.**~~ **SOLVED 2026-08-07: use `resp-benchmark`**
-  (`RESPite.Benchmark`, `PackAsTool` in the sibling StackExchange.Redis checkout;
-  `dotnet build -p:TargetVer=3 -f net10.0 -c Release`). It takes redis-benchmark's arguments
-  (`-h -p -c -n -d -P -t -q -l`) plus `+m` multiplexing and `--batch`/`--queue`. **It is a NEW baseline
-  and must not be differenced against the Linux tables** (house rule 1) — but that was true of every
-  option, so it costs nothing.
+- ~~**A GENERATOR, and this is the real blocker.**~~ **SOLVED 2026-08-07: use `resp-benchmark`.**
+  It takes redis-benchmark's arguments (`-h -p -c -n -d -P -t -q -l`) plus `+m` multiplexing and
+  `--batch`/`--queue`. **It is a NEW baseline and must not be differenced against the Linux tables**
+  (house rule 1) — but that was true of every option, so it costs nothing.
+
+  **NO SIBLING CHECKOUT NEEDED: `dotnet tool install -g RESPite.Benchmark`.** Confirmed on NuGet
+  2026-08-07 via `dotnet tool search`: `respite.benchmark` **3.0.0**, Stack Exchange Inc. / Marc Gravell
+  / Nick Craver, verified. There is **no `StackExchange.Redis.Benchmark` tool package** — searching that
+  name returns the same single `respite.benchmark` result. (Source build also works, from
+  `StackExchange.Redis/src/RESPite.Benchmark`: `dotnet build -p:TargetVer=3 -f net10.0 -c Release`.)
+
+  **RECORD THE GENERATOR VERSION WITH EVERY NUMBER — a different client build is a different
+  instrument.** The NuGet tool is 3.0.0; the 2026-08-07 exploratory figures below came from a LOCAL
+  SOURCE build, which announced itself as `### classic SE.Redis 3.1.15.26897 ###`. Those are not the
+  same client, and this rig's whole job is to be the constant while the server changes.
 
   **Two rejected alternatives, with the reasons, so they are not re-litigated:**
   - **`redis-benchmark.exe` 3.0.503** (in `StackExchange.Redis/tests/RedisConfigs/3.0.503`, the dead
