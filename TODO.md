@@ -96,12 +96,18 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   `dotnet build -p:TargetVer=3 -f net10.0 -c Release`.
 
   **RECORD THE GENERATOR VERSION WITH EVERY NUMBER — a different client build is a different
-  instrument**, and this rig's whole job is to be the constant while the server changes. Note this
-  applies RETROSPECTIVELY to the exploratory figures below: they came from a SOURCE build of a sibling
-  checkout sitting on the FEATURE BRANCH `marc/sub-command-category-fixes` (commit `69111ece`), which
-  announced itself as `### classic SE.Redis 3.1.15.26897 ###`. That is a floating instrument — a branch
-  that can move, on a checkout nobody else has. Fine for a 34x gap, where the client version cannot
-  plausibly be the cause; **not fine for anything scored**, which is exactly why the rig pins.
+  instrument**, and this rig's whole job is to be the constant while the server changes. The exploratory
+  figures below came from a SOURCE build of a sibling checkout on the feature branch
+  `marc/sub-command-category-fixes` (commit `69111ece`), announcing `### classic SE.Redis 3.1.15.26897
+  ###`, i.e. slightly AHEAD of the pinned 3.1.13.
+
+  **Two different worries were bundled there, and only one of them survives.** Marc (who wrote the tool)
+  states that **nothing relevant to us changes between 3.1.13 and head**, so the BEHAVIOURAL worry is
+  answered: those numbers do not need re-taking on version grounds, and 3.1.13 is the right pin. What
+  remains is RECONSTRUCTIBILITY, which is independent of whether the code differs — a feature branch can
+  move, and nobody else has that checkout, so "the generator was a local build of some branch" is not a
+  method anyone can repeat. That is the reason the rig pins to a published version, and it would be the
+  reason even if the two builds were byte-identical.
 
   **Two rejected alternatives, with the reasons, so they are not re-litigated:**
   - **`redis-benchmark.exe` 3.0.503** (in `StackExchange.Redis/tests/RedisConfigs/3.0.503`, the dead
