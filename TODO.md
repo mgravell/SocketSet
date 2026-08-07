@@ -67,14 +67,33 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   the deliverable, and `Verify-GarnetDemo.ps1` is its correctness gate — run that first, exactly as
   `Run-SmokeMatrix` precedes the transport rigs.
 
-  **DO NOT USE `+m` FOR A TRANSPORT COMPARISON** (Marc, 2026-08-07), and this is a trap the tool leads
-  you into because `+m` is often the preferred mode for client-side work. With multiplexing on, every
-  client SHARES ONE CONNECTION — which lands on exactly ONE SHARD. The rig would then measure 1/12th of
-  our transport against stock Garnet's whole thread pool, and report it as a transport result. Use the
-  DEFAULT (`-m`, a connection per client) for any leg comparing transports, and if `+m` is used at all,
-  label it as what it is: a single-shard/per-connection latency measurement, not a throughput one. The
-  2026-08-07 exploratory numbers above were all taken at the default; the single `+m` cell there is a
-  RIO variation, not a comparison.
+  **THE CLASSIC SE.REDIS LEG USES EXACTLY ONE CONNECTION, WHATEVER `-c` SAYS — AND THAT IS WORSE THAN
+  THE `+m` TRAP IT WAS ORIGINALLY WRITTEN UP AS.** Marc raised `+m` (multiplexing shares a connection,
+  so one shard). Measured 2026-08-07, the DEFAULT does it too: during a `-c 50 -P 1` run at 597,181
+  GET/s, `Get-NetTCPConnection` on the server port returned **1 established connection, on all six
+  samples over twelve seconds**. `+m` versus default made no difference (499,181 vs 509,995 GET/s, both
+  one connection), which fits — the classic leg is a `ConnectionMultiplexer`, and one multiplexer is one
+  connection per endpoint by design. The tool's readme describes `-m` as "each client has a separate
+  connection"; that is not what the classic leg does.
+
+  So on this leg **`-c` is CONCURRENCY (in-flight requests pipelined onto one connection), not
+  connection count.** Confirmed from the other end: at `-c 1 -P 1` the server counters show 80,024 sends
+  for 80,000 requests at **7 B/send** — exactly one reply per send, no batching — while at `-c 50` the
+  same counters show ~13 replies packed per send. That is one connection being pipelined harder, not
+  fifty connections.
+
+  **CONSEQUENCES, and they are large:**
+  - **Every Garnet figure in this section is a SINGLE-CONNECTION, SINGLE-SHARD result.** IOCP at ~597k
+    GET/s on one connection is a strong number; RIO at ~20k on one connection is the defect. Neither is
+    a transport-scale claim, and shard count cannot matter to any of them — which is the real reason the
+    `--shards 1` vs `--shards 12` sweep moved nothing for either backend.
+  - **`Run-GarnetAb.ps1` cannot use this leg alone for a transport A/B.** It needs genuinely many
+    connections — either a client that opens N, or N benchmark processes fanned out and summed. Until
+    then the many-connections/accept shape, which is the thing SocketSet's shard design was built for,
+    remains completely unmeasured on Windows.
+  - **Check the connection count, do not infer it from a flag.** One `Get-NetTCPConnection` sample would
+    have caught this at the start. Sample it DURING the run: a short run finishes before the sample
+    lands and reports 0, which is how the first attempt here misread it.
 - ~~**A GENERATOR, and this is the real blocker.**~~ **SOLVED 2026-08-07: use `resp-benchmark`.**
   It takes redis-benchmark's arguments (`-h -p -c -n -d -P -t -q -l`) plus `+m` multiplexing and
   `--batch`/`--queue`. **It is a NEW baseline and must not be differenced against the Linux tables**
