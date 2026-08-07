@@ -90,7 +90,8 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   - **`Run-GarnetAb.ps1` cannot use this leg alone for a transport A/B.** It needs genuinely many
     connections — either a client that opens N, or N benchmark processes fanned out and summed. Until
     then the many-connections/accept shape, which is the thing SocketSet's shard design was built for,
-    remains completely unmeasured on Windows.
+    remains completely unmeasured on Windows. **SUPERSEDED THE SAME DAY — the client was fixed rather
+    than worked around; see "THE CAUSE, LOCATED AND FIXED IN THE CLIENT" below.**
   - **Check the connection count, do not infer it from a flag.** One `Get-NetTCPConnection` sample would
     have caught this at the start. Sample it DURING the run: a short run finishes before the sample
     lands and reports 0, which is how the first attempt here misread it.
@@ -100,6 +101,39 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   `resp-cli client list` returns **two rows, one of which is `resp-cli` itself** (`id=2 age=0 resp=2`,
   no lib-name). The benchmark is the single `id=1 name=MGX(SE.Redis-v3.1.13.8476) age=10 resp=3`. So the
   OS table and the server agree: one client.
+
+#### THE CAUSE, LOCATED AND FIXED IN THE CLIENT (2026-08-07)
+
+Marc recalled the intent as one connection per client unless `+m`, and the readme agrees
+(`src/RESPite.Benchmark/readme.md`: *"when enabled clients share a connection, otherwise each client has
+a separate connection"*). The classic leg never implemented the second half. In
+`src/RESPite.Benchmark/OldCoreBenchmarkBase.cs` the constructor built ONE `ConnectionMultiplexer`, and
+`GetClient(int index)` **ignored the index**, handing that one `IDatabase` to every worker. `Multiplexed`
+was never read on that leg at all — `+m` parsed and then did nothing. The fan-out above it was always
+correct (`BenchmarkBase` allocates `ClientCount` tasks and calls `GetClient(i)` per worker); only the
+worker-to-connection mapping collapsed.
+
+**The pin had no way out, so "just use `--new`" was never available.** The shipped 3.1.13 assembly
+contains only the classic leg: the `NewCoreBenchmark`/`BridgeBenchmark` type names are absent from its
+metadata and the `--new`/`--bridge` literals from its user-string heap. Both are behind `#if NEWCORE`,
+which **nothing** in that repo defines — not a packaging choice but dormant code in every configuration.
+
+**Fixed** in `StackExchange.Redis` on `marc/benchmark-connection-per-client`: build
+`Multiplexed ? 1 : ClientCount` multiplexers and map worker `i` to `i % connectionCount`, so `+m`
+reproduces the old behaviour exactly and is now the only way to get it. Verified by sampling DURING the
+run from both vantage points — `-c 1`/`8`/`50` give 1/8/50 established connections and the same counts in
+Garnet's own `CLIENT LIST`, and `-c 50 +m` gives 1. **The `+m` cell is the discriminating one**: a fix
+that merely hard-wired N connections would pass every other cell.
+
+**AND THE BANNER COULD NOT HAVE CAUGHT IT — house rule 1 from a new angle.** The per-test banner printed
+`", mux"` whenever `+m` was passed, *including on the leg where it did nothing*. It reported the FLAG,
+not the behaviour. There is now a `ConnectionCount` that legs override with the number they ACTUALLY
+created, printed on the `### ... ###` announce line (so it survives `-q`) and in the per-test banner.
+**`Run-GarnetAb.ps1` should gate on `conns:`, not on `-c`.**
+
+**Consequence for the rig: the pin must move.** `RESPite.Benchmark 3.1.13` on NuGet is the
+one-connection build, so a many-connections run needs a source build until a fixed version is published,
+and every figure taken with 3.1.13 is single-connection whatever `-c` said.
 
 ### GAP FOUND IN PASSING: Garnet `CLIENT LIST` shows `addr=socketset`, not an endpoint
 
@@ -185,11 +219,45 @@ One more, cheap and unpredicted: `rio` is now a hostable Garnet backend, and thi
 BEATING IOCP under TLS at 256 KB (+20.5%) while trailing it by 30.9% on plaintext. A Garnet A/B is a
 second, differently-shaped venue for that inversion.
 
-### LEAD (2026-08-07, NOT ATTRIBUTED): Garnet on RIO collapses, and DEGRADES, at depth 1
+### LEAD (2026-08-07, NOT ATTRIBUTED): Garnet on RIO collapses, and DEGRADES, at depth 1 — QUALIFIED SAME DAY: ON ONE CONNECTION ONLY
 
 Found within minutes of having a generator that could see it. **Exploratory only** — single pass,
 unpinned, no repetitions, `GarnetDemo --shards 12`, `resp-benchmark -c 50 -P 1 -n 100000 -t GET`. These
 are NOT numbers of record and nothing here is scored.
+
+**QUALIFIED THE SAME DAY BY THE CONNECTION-COUNT FIX ABOVE: EVERYTHING IN THIS SECTION IS THE
+SINGLE-CONNECTION SHAPE, AND THE COLLAPSE DOES NOT REPRODUCE WITH REAL CONNECTIONS.** Re-run with the
+fixed client — exploratory, one session, `--shards 12`, `-c 50 -P 1 -t GET -n 200000`, four passes each,
+none discarded. The `+m` arm is an IN-SESSION control on the same server instance reproducing the old
+one-connection shape, so nothing here is subtracted across runs (house rule 6):
+
+| leg | 50 real connections | 1 connection (`+m` control) |
+|---|---|---|
+| `iocp` | 239,293 – 248,258 | 513,304 – 598,031 |
+| `rio` | **231,948 – 250,104** | **15,622 – 17,333** |
+| `stock` | 243,867 – 256,265 | 511,114 – 551,886 |
+
+RIO moves ~15x and lands inside IOCP's range, while the control reproduces the collapse at ~30-35x on
+the same server. So the defect is a SHAPE effect — not drift, not a fixed cost, and not an instrument
+artefact.
+
+**The 50-connection arm establishes nothing about transport ranking, and saying so matters** (house rule
+5, and the same trap as the shard sweep below): all three legs sit in one ~232-256k band with fully
+OVERLAPPING ranges, across three very differently-shaped transports. That uniformity is the signature of
+a CLIENT-side ceiling — fifty multiplexers in one process, each with its own heartbeat and backlog
+machinery. Read it as "RIO's defect is absent here", not "RIO equals IOCP". Settling that needs a
+generator on another box, or N processes summed.
+
+**AND THE SHAPE WHERE RIO COLLAPSES IS THE PRODUCTION SHAPE FOR SE.REDIS, so this RAISES the priority
+rather than lowering it.** A `ConnectionMultiplexer` is one connection per endpoint, shared process-wide
+— that IS the `+m` arm. A real SE.Redis application against a SocketSet-hosted Garnet on RIO gets the
+~16k path, not the ~240k one. The single-connection case is not an artefact to be explained away; it is
+the default deployment, so the `SubmitOutbound` candidate fix below matters MORE, not less.
+
+Also visible, and consistent with the send counters below: on EVERY leg one deeply-pipelined connection
+beats fifty unpipelined ones by ~2x. That is the expected shape — multiplexing avoids packet
+fragmentation and gives an efficient syscall pattern. The many-connections shape earns its keep by
+scaling out to genuine clients on other boxes, which is exactly what this one machine cannot show.
 
 | leg | GET @ `-P 1` |
 |---|---|
