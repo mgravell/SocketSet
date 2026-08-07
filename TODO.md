@@ -66,6 +66,15 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   `run-client-shape.sh`, which are Linux-only as written (`taskset`, `/proc`). A `Run-GarnetAb.ps1` is
   the deliverable, and `Verify-GarnetDemo.ps1` is its correctness gate — run that first, exactly as
   `Run-SmokeMatrix` precedes the transport rigs.
+
+  **DO NOT USE `+m` FOR A TRANSPORT COMPARISON** (Marc, 2026-08-07), and this is a trap the tool leads
+  you into because `+m` is often the preferred mode for client-side work. With multiplexing on, every
+  client SHARES ONE CONNECTION — which lands on exactly ONE SHARD. The rig would then measure 1/12th of
+  our transport against stock Garnet's whole thread pool, and report it as a transport result. Use the
+  DEFAULT (`-m`, a connection per client) for any leg comparing transports, and if `+m` is used at all,
+  label it as what it is: a single-shard/per-connection latency measurement, not a throughput one. The
+  2026-08-07 exploratory numbers above were all taken at the default; the single `+m` cell there is a
+  RIO variation, not a comparison.
 - ~~**A GENERATOR, and this is the real blocker.**~~ **SOLVED 2026-08-07: use `resp-benchmark`**
   (`RESPite.Benchmark`, `PackAsTool` in the sibling StackExchange.Redis checkout;
   `dotnet build -p:TargetVer=3 -f net10.0 -c Release`). It takes redis-benchmark's arguments
@@ -119,6 +128,15 @@ are NOT numbers of record and nothing here is scored.
 **It also DEGRADES, which is the more interesting half.** On a freshly started RIO server the first run
 managed 87,489; every run after it settled to ~18-21k and stayed there. `-c 1` (20,138) and `-c 50 +m`
 (21,019) land in the same place, so it is not a concurrency or multiplexing effect.
+
+**AND IT DOES NOT SCALE WITH CONNECTIONS AT ALL, which is the sharpest clue.** `-c 1` gives **20,138**
+and `-c 50` gives **18,373** — fifty times the concurrency buys NOTHING, and if anything costs a little.
+Note what that rules out: a per-operation latency stall would show ~20k on one connection and ~50x that
+on fifty. So the shape is not "each op is slow", it is **"the whole server is doing one op at a time"** —
+a GLOBAL serialisation. One concrete and cheaply checkable hypothesis: **RIO connection placement is
+putting every connection on one shard**, which would make `-c 50` and `-c 1` identical by construction.
+Check `ActiveConnections` per shard before looking anywhere else. (Nothing has been run against this
+hypothesis; it is a first place to look, not a diagnosis.)
 
 **The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
 one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
