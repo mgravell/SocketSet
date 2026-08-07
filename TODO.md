@@ -83,8 +83,14 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   **THE PINNED INSTRUMENT, and use this one:**
 
   ```
-  dotnet tool install -g RESPite.Benchmark --version 3.1.13
+  dotnet tool install -g RESPite.Benchmark --version 3.1.13    # invoked as: resp-benchmark
   ```
+
+  **INSTALLED AND CONFIRMED 2026-08-07.** It announces `### classic SE.Redis 3.1.13.8476 ###` on every
+  run — **that is the string the rig should gate on** (house rule 1: trust the banner, not the flag).
+  Cross-checked against the source build it replaces: `iocp` 570,315 vs 578,344 GET/s and `rio` 20,971
+  vs 21,695, i.e. the two clients agree within ~1.5% and the RIO gap reproduces at 27.2x against 26.7x.
+  So the pin is usable and the RIO finding is not an artefact of one particular client build.
 
   Marc published 3.1.13 to NuGet on 2026-08-07 specifically so this rig could pin to a public,
   identified build. **Prefer the global tool over a source build**, and prefer a PINNED version over
