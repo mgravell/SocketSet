@@ -66,13 +66,28 @@ disjoint**, abstract-UDS SET +11-12.5%) is **Linux**. What is missing:
   `run-client-shape.sh`, which are Linux-only as written (`taskset`, `/proc`). A `Run-GarnetAb.ps1` is
   the deliverable, and `Verify-GarnetDemo.ps1` is its correctness gate — run that first, exactly as
   `Run-SmokeMatrix` precedes the transport rigs.
-- **A GENERATOR, and this is the real blocker.** Every Garnet number here came from `redis-benchmark`,
-  which is not on the Windows box. Three routes, none free: a Windows `redis-benchmark` build; WSL
-  (which adds a network hop and needs its own control leg before any number is quotable); or driving it
-  from `SE.Redis`, which changes the client stack and so cannot be compared against any existing figure.
-  **Whichever is chosen, it is a NEW baseline and must not be differenced against the Linux tables**
-  (house rule 1). Note also the rigs' own caveat that `redis-benchmark` reports QUANTISED rps at short
-  durations, so it is not a tool to substitute casually.
+- ~~**A GENERATOR, and this is the real blocker.**~~ **SOLVED 2026-08-07: use `resp-benchmark`**
+  (`RESPite.Benchmark`, `PackAsTool` in the sibling StackExchange.Redis checkout;
+  `dotnet build -p:TargetVer=3 -f net10.0 -c Release`). It takes redis-benchmark's arguments
+  (`-h -p -c -n -d -P -t -q -l`) plus `+m` multiplexing and `--batch`/`--queue`. **It is a NEW baseline
+  and must not be differenced against the Linux tables** (house rule 1) — but that was true of every
+  option, so it costs nothing.
+
+  **Two rejected alternatives, with the reasons, so they are not re-litigated:**
+  - **`redis-benchmark.exe` 3.0.503** (in `StackExchange.Redis/tests/RedisConfigs/3.0.503`, the dead
+    MSOpenTech Windows fork) EXISTS and talks to Garnet, and is **unusable as an instrument**. It is
+    single-threaded (`--threads` is 6.0+) and ceilings at ~92k: measured 2026-08-07, `iocp` 92,336,
+    `stock` 92,251, `rio` 91,158 PING_INLINE — three structurally different transports inside **1.3%**,
+    which is a generator bound, not parity. At `-P 16` its runs finish in ~0.14 s and rps snaps to a
+    coarse grid (`1,369,863` twice EXACTLY; `1,428,571` = 200000/0.14). `resp-benchmark` does ~**563k**
+    GET at `-P 1` on the same server — an order of magnitude more headroom.
+  - **Building redis-benchmark from source on Windows.** Not worth it, and the toolchain is not even the
+    main reason: modern redis-benchmark needs hiredis + the `ae` loop + pthreads and POSIX headers, so
+    MSVC is a porting project rather than a build. MSYS2/MinGW is more plausible (it is a client, so no
+    `fork()`), but **a generator running on a POSIX emulation layer is itself a confounder** — measuring
+    a Windows server's IOCP/RIO behaviour through an MSYS syscall shim is a bad instrument to introduce
+    on purpose. WSL gets the genuine modern tool in seconds but puts a Hyper-V vSwitch in the path
+    instead of loopback, so it needs its own control leg and would likely become the new ceiling.
 - **The abstract-UDS legs cannot transfer at all.** `@abstract` is a Linux namespace; Windows AF_UNIX is
   pathname-only, and RIO cannot do AF_UNIX in any case (the library routes it to IOCP). Those cells are
   structurally Linux-only, like kTLS NIC offload.
@@ -88,6 +103,40 @@ used, on every cell.
 One more, cheap and unpredicted: `rio` is now a hostable Garnet backend, and this session measured RIO
 BEATING IOCP under TLS at 256 KB (+20.5%) while trailing it by 30.9% on plaintext. A Garnet A/B is a
 second, differently-shaped venue for that inversion.
+
+### LEAD (2026-08-07, NOT ATTRIBUTED): Garnet on RIO collapses, and DEGRADES, at depth 1
+
+Found within minutes of having a generator that could see it. **Exploratory only** — single pass,
+unpinned, no repetitions, `GarnetDemo --shards 12`, `resp-benchmark -c 50 -P 1 -n 100000 -t GET`. These
+are NOT numbers of record and nothing here is scored.
+
+| leg | GET @ `-P 1` |
+|---|---|
+| `iocp` | 563,399 |
+| `stock` (Garnet SAEA) | 555,529 |
+| **`rio`** | **18,103** |
+
+**It also DEGRADES, which is the more interesting half.** On a freshly started RIO server the first run
+managed 87,489; every run after it settled to ~18-21k and stayed there. `-c 1` (20,138) and `-c 50 +m`
+(21,019) land in the same place, so it is not a concurrency or multiplexing effect.
+
+**The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
+one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
+did not complete — the loop exited 255, most likely the port not yet released — so stock REPEATS are
+unmeasured; its single-run figure above is all there is.)
+
+**What this is NOT.** It is not "RIO is slow at depth 1" in general: the 2026-08-06 baseline has
+`rio` at 512 B HTTP keep-alive (also sequential per connection) at 145.5 MiB/s against `iocp`'s 143.5,
+i.e. no deficit at all. So the fault is specific to this workload or this PAIRING, and the candidates
+are at least three — the RIO backend, `SocketSetNetworkSender`'s write pattern against RIO's
+`maxSendDataBuffers = 1` cap, or something in the handler path. **Nothing here isolates it, and it is
+recorded as a lead rather than a finding.**
+
+**Why nobody saw it before, and it is a clean instrument lesson:** `redis-benchmark` 3.0.503's own
+ceiling is ~92k and RIO's BEST observed run was 87k. The old tool would have reported RIO sitting at the
+ceiling alongside everything else — a 31x defect rendered invisible by a generator that could not go
+faster than the bug. That is house rule 2 from the other direction: not "did the fast path run?" but
+"could my instrument have SEEN it not running?"
 
 ---
 
