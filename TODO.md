@@ -56,6 +56,9 @@ is unnamed).
 
 ### Queued, in the order I would take them
 
+0. **OUTBOUND CONNECTIONS HAVE NO `RemoteAddress` ON ANY BACKEND** — a known gap in the endpoint work,
+   found immediately after it landed and recorded before it could be rediscovered. Detail under item 4
+   below. Small, bounded, fail-closed, and it needs a gate cell that does not exist yet.
 1. **RUN THE LINUX GATES.** Non-negotiable before trusting anything below.
 2. **A scored `Run-GarnetAb.ps1` run** — the rig exists and is smoke-tested, but no scored numbers are
    recorded yet. This is the original backlog item's remaining half.
@@ -285,6 +288,28 @@ and the cost sits where the interface requires it.
 **Watch for `AF_INET6` if IPv6 ever lands**: it is 23 on Windows and 10 on Linux, and `Native/LibC.cs`
 does not define it at all. `PeerAddress.FromSockAddr` picks the value per-platform; hard-coding either
 would silently misparse on the other, which is the kind of bug that survives a green test suite.
+
+#### KNOWN GAP, found immediately after landing: OUTBOUND connections are not populated
+
+**Only the three ACCEPT paths were wired** — `IocpShard.AdoptAccepted`, `WindowsRioShard.AdoptAccepted`,
+`EpollShard.InitClient`. The connect completions were not, so a connection made by `Connect(...)` has
+`RemoteAddress` unset on every backend. Two different causes, and the second is the awkward one:
+
+- **IOCP / RIO:** `HandleConnect` simply never calls `NativeEndpoints.Populate`. A missing call.
+- **epoll:** `InitClient` DOES call it, but runs at slot-claim — **before** the non-blocking connect
+  completes — so `getpeername` returns `ENOTCONN` and the address silently stays unset. That is a TIMING
+  bug, not a missing call, so the fix is to MOVE the populate to the connect-completion path rather than
+  add a second one. (`getsockname` may succeed there and `getpeername` not, which is exactly the sort of
+  half-populated state worth asserting against.)
+
+**Why no gate caught it:** `bench/verify-endpoints` only exercises inbound connections. It passed 21/21
+without touching this. **An outbound cell is required as part of the fix**, or the same hole reopens.
+
+**Severity: low, and bounded.** Everything driving the endpoint work is accept-side — Garnet's
+`CLIENT LIST`, `IsLocalConnection`, the F9 fix — and the failure is fail-closed (`IsSet` false,
+`IsLoopback` false). But SocketSet does support outbound connections, the proxy and tunnel shapes use
+them, and to a caller "unset" is indistinguishable from "tracking disabled", which is a poor answer to
+give twice for different reasons.
 
 ### ORIGINAL WRITE-UP (kept for the reasoning): Garnet `CLIENT LIST` shows `addr=socketset`
 
