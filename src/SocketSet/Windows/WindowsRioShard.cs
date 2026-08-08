@@ -60,6 +60,15 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     // that never catches anything measures identically to one that is disabled.
     private static long s_spinHits, s_spinMisses;
 
+    // WHERE THE WAIT ACTUALLY IS (2026-08-08). At depth 1 the server sits ~85% IDLE while running 13x
+    // behind IOCP, so this is a LATENCY problem and throughput is just 1/latency — every throughput-shaped
+    // hypothesis so far has half-worked and stalled. These measure the wait directly instead of inferring
+    // it: how long a spin waits before the completion appears, and how long the loop sits blocked.
+    // Timestamped ONLY under ReportStats, so the default path is untouched; the measurement itself costs
+    // two Stopwatch reads per spin and therefore perturbs what it measures — read it as an order of
+    // magnitude, not a scored number.
+    private static long s_spinIters, s_spinHitTicks, s_spinMissTicks, s_blockedTicks, s_blocks;
+
     /// <summary>
     /// Bounded user-mode spin on the completion queue before paying <c>RIONotify</c> + block + wake.
     ///
@@ -99,7 +108,21 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             $"STALE COMPLETIONS={Interlocked.Read(ref s_staleCompletions):n0} (must be 0) " +
             $"out-of-band flushes={Interlocked.Read(ref s_pumpFlush):n0} staged={Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB " +
             $"(inline={Interlocked.Read(ref s_flushInline):n0} marshaled={Interlocked.Read(ref s_flushMarshaled):n0}) | " +
-            $"spin={RioSpin} hits={Interlocked.Read(ref s_spinHits):n0} misses={Interlocked.Read(ref s_spinMisses):n0}");
+            $"spin={RioSpin} hits={Interlocked.Read(ref s_spinHits):n0} misses={Interlocked.Read(ref s_spinMisses):n0} " +
+            $"iters/hit={perHit(Interlocked.Read(ref s_spinIters)):n1} " +
+            $"us/hit={usPer(Interlocked.Read(ref s_spinHitTicks), Interlocked.Read(ref s_spinHits)):n2} " +
+            $"us/miss={usPer(Interlocked.Read(ref s_spinMissTicks), Interlocked.Read(ref s_spinMisses)):n2} | " +
+            $"blocked={usPer(Interlocked.Read(ref s_blockedTicks), Interlocked.Read(ref s_blocks)):n2} us/block " +
+            $"x{Interlocked.Read(ref s_blocks):n0}");
+
+        static double perHit(long v)
+        {
+            long h = Interlocked.Read(ref s_spinHits);
+            return h > 0 ? v / (double)h : 0;
+        }
+
+        static double usPer(long ticks, long count)
+            => count > 0 ? ticks * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency / count : 0;
     }
 
     // Periodic as well as at shutdown: a rig kills the server, and item 0c's lesson is that a measurement
@@ -282,9 +305,18 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             FlushCommits();
 
             uint removed = 0;
+            long blockedFrom = ReportStats ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             bool ok = Win32.GetQueuedCompletionStatusExBlocking(_port, _entries, EntryBatch, &removed, Win32.INFINITE, alertable: false);
             if (!ok) continue; // port closed at shutdown → IsActive ends the loop
-            if (ReportStats) Interlocked.Increment(ref s_portWakes);
+            if (ReportStats)
+            {
+                Interlocked.Increment(ref s_portWakes);
+                // Blocked time is the other half of "where did the idle 85% go": a loop that spins to a
+                // hit and then sits here for milliseconds is a very different diagnosis from one whose
+                // completions simply arrive late.
+                Interlocked.Add(ref s_blockedTicks, System.Diagnostics.Stopwatch.GetTimestamp() - blockedFrom);
+                Interlocked.Increment(ref s_blocks);
+            }
 
             for (uint i = 0; i < removed; i++)
             {
@@ -326,18 +358,30 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         uint n = DrainRioOnce();
         if (n != 0 || RioSpin == 0) return n;
 
+        long started = ReportStats ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         for (int spins = RioSpin; spins > 0; spins--)
         {
             Thread.SpinWait(1);
             n = DrainRioOnce();
             if (n != 0)
             {
-                if (ReportStats) Interlocked.Increment(ref s_spinHits);
+                if (ReportStats)
+                {
+                    Interlocked.Increment(ref s_spinHits);
+                    Interlocked.Add(ref s_spinIters, RioSpin - spins + 1);
+                    Interlocked.Add(ref s_spinHitTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+                }
                 return n;
             }
         }
 
-        if (ReportStats) Interlocked.Increment(ref s_spinMisses);
+        if (ReportStats)
+        {
+            Interlocked.Increment(ref s_spinMisses);
+            // A miss always burns the full budget, so this calibrates the per-iteration cost — which is
+            // what turns "iterations to hit" into a time without a separate benchmark.
+            Interlocked.Add(ref s_spinMissTicks, System.Diagnostics.Stopwatch.GetTimestamp() - started);
+        }
         return 0; // spun out — fall through to the arm/block, exactly as before
     }
 

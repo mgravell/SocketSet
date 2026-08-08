@@ -537,6 +537,65 @@ cell reports `spin=1000 hits=130,511 misses=106,554`, so the path ran under gate
 reports `inline=0 marshaled=211,493`, independently covering the MARSHALED branch of the flush fast path
 above.
 
+#### A CORRECTION TO MY OWN NEXT-STEP: THE COMMIT-PER-SEND IS NOT THE COST
+
+I proposed `commits: send=1.00/send` as the leading remaining candidate. **Reading the code, that is
+weak.** `RIOSend(..., RIO_MSG_DEFER, ...)` is a USER-MODE ring write with no kernel kick
+(`WindowsRioShard.cs:969`); only `FlushCommits` enters the kernel, once per RQ per direction (`:401-402`).
+So a depth-1 round trip costs RIO two kernel transitions — recv commit and send commit — exactly what
+IOCP pays with `WSARecv` + `WSASend`. `1.00/send` looks damning but is only DEFER having nothing to
+batch; it buys no extra syscall.
+
+#### MEASURED, NOT INFERRED: RIO COMPLETION DELIVERY IS ~5-6µs PER OP (2026-08-08)
+
+**The observation that reframed this: the server is ~85% IDLE at depth 1** (0.13-0.21 cores of 24) while
+running 13x behind IOCP. So this was never a throughput or CPU problem — it is LATENCY, and throughput is
+just 1/latency. That is why three successive throughput-shaped hypotheses each half-worked and stalled.
+It also clears the client: the same client on the same connection does 554k against IOCP, so it turns
+around far faster than the ~24µs RIO is taking.
+
+So instead of a fourth hypothesis, the spin was instrumented to measure the wait DIRECTLY — how long
+after the CQ drains empty a completion actually appears. Reproduced at two shard counts:
+
+| | iters/hit | **µs/hit** | µs/miss (1000 iters) |
+|---|---|---|---|
+| `--shards 12` | 98.9 | **6.42** | 54.87 |
+| `--shards 1` | 79.2 | **4.95** | 55.07 |
+
+`µs/miss` calibrates the probe: ~0.055µs per spin iteration in both runs, consistent, so the `Stopwatch`
+overhead is not dominating what it measures.
+
+**A RIO completion takes ~5-6µs to appear while we poll for it in user mode as fast as we can. IOCP's
+ENTIRE round trip is ~1.8µs.** With at least two completions per round trip (recv and send), that is
+~10-12µs of pure delivery latency — most of the ~24µs round trip, and ~6x IOCP's whole round trip on its
+own.
+
+**This is the first explanation that fits the shape of the problem**, and it is not something the loop
+can optimise away: we are not blocking, not marshaling, not failing to batch — the CQ entry simply is not
+there yet. It also fits everything else on record: RIO recovers at `-P 16` and under HTTP pipe mode
+because both amortise per-op delivery latency over many ops, and it is invisible on the many-connections
+shape because other connections' completions fill the wait.
+
+**LIKELY CONCLUSION, and it changes the item from "fix" to "document":** IOCP completes a recv with
+already-buffered data INLINE, generating no completion at all. RIO cannot — every op round-trips through
+the CQ. At depth 1 with ~62-byte payloads every RIO advantage (no per-op syscall at high op rates,
+registered buffers, batched submission) is worth nothing because there is nothing to batch, while that
+one disadvantage is fully exposed. **If that holds, RIO is the wrong backend for this regime and the
+deliverable is a documented recommendation, not a fix.**
+
+**THE BLOCKED-TIME HALF OF THE PROBE IS UNRELIABLE AS BUILT, and is recorded as such rather than
+quoted.** It sums time in `GetQueuedCompletionStatusExBlocking` and divides by block count, but the mean
+is swamped by long idle blocks — shards with no connection at `+m`, and the gaps BETWEEN benchmark
+passes. `--shards 1` removes the first but not the second (1,046µs/block, still implying more blocked
+time than the run's wall clock). **It needs percentiles or a histogram to say anything; the mean says
+nothing.** Left in place, and labelled, so the next reader does not mistake the printed number for a
+finding.
+
+**NEXT (Marc's suggestion, and it survives the above):** check whether the receive is re-armed BEFORE or
+AFTER the reply's send commit. If the arm is serialised behind the send, each round trip pays the two
+delivery latencies in SEQUENCE rather than overlapped — at ~5-6µs each that is worth ~20% of the round
+trip, even though it cannot close a 13x gap.
+
 **The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
 one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
 did not complete — the loop exited 255, most likely the port not yet released — so stock REPEATS are
