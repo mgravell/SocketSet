@@ -234,10 +234,27 @@ restrictive setting, and got the permissive behaviour, with nothing anywhere rep
 `MODULE LOAD` is arbitrary code loading, so the ceiling on this is remote code execution.
 
 **The fix, and why it is not the obvious one.** `Connection` still exposes no peer endpoint (TODO item
-4), so the truthful answer is "cannot prove loopback" — and for a permission check the safe direction is
-DENY. It now returns `false`, making `Local` behave as `No` rather than as `Yes`. That costs a legitimate
-loopback operator their DEBUG/MODULE access and cannot grant a remote peer anything. **Restore the real
-answer when the endpoint work lands, gated on the peer address.**
+4), so for TCP the truthful answer is "cannot prove loopback" — and for a permission check the safe
+direction is DENY. It returns `false` there, making `Local` behave as `No` rather than as `Yes`. That
+costs a legitimate loopback operator their DEBUG/MODULE access and cannot grant a remote peer anything.
+**Restore the real answer when the endpoint work lands, gated on the peer address.**
+
+**REFINED SAME DAY: AF_UNIX is answerable NOW, and blanket-denying it was needlessly wrong.** Marc pointed
+out that the bridge is reachable over UDS — `GarnetDemo --listen-uds` takes `/path` or `@abstract`
+(`Program.cs:36,53`). **A Unix domain socket is same-host by definition; it has no network form at all**,
+so every peer on a UDS listener is provably local with no peer-address plumbing whatsoever. Stock
+`GarnetTcpNetworkSender` agrees — it returns `true` unconditionally for a `UnixDomainSocketEndPoint`
+peer. So `SocketSetGarnetServer` now decides this ONCE from the listen endpoint
+(`endpoint is UnixDomainSocketEndPoint`) and passes it to the sender: **`true` for UDS, `false` for TCP
+until the endpoint work lands.** Zero per-connection cost, and it restores parity with stock Garnet on
+the one family where parity is free.
+
+**What is verified, and what is not.** Verified: builds clean, `Verify-GarnetDemo` 16/16 PASS, and a UDS
+listen still binds on Windows (Garnet reports `Listening on: <path>` and the socket file appears).
+**NOT verified end-to-end:** that DEBUG is actually permitted over UDS and refused over TCP. That needs a
+UDS-capable client and `EnableDebugCommand=Local` configured, which no rig here does — the same gap the
+next paragraph describes. The flag is trivially derived from the endpoint type, but "trivially derived"
+is not "gated", and this file should not imply otherwise.
 
 **Not gateable today, and saying so matters.** No rig can currently distinguish a correct
 `IsLocalConnection` from a wrong one, because nothing in the tree reads a peer endpoint at all. The gate

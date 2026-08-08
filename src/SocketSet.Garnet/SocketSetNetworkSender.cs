@@ -28,14 +28,18 @@ internal sealed unsafe class SocketSetNetworkSender : NetworkSenderBase
     private PoolEntry? _reusableResponse;
 
     public SocketSetNetworkSender(Connection conn, NetworkBufferSettings settings, LimitedFixedBufferPool pool,
-                                  string? remoteName = null, string? localName = null)
+                                  string? remoteName = null, string? localName = null,
+                                  bool localByConstruction = false)
         : base(settings.sendBufferSize)
     {
         _conn = conn;
         _pool = pool;
         _remoteName = remoteName ?? "socketset";
         _localName = localName ?? "socketset";
+        _localByConstruction = localByConstruction;
     }
+
+    private readonly bool _localByConstruction;
 
     public override string RemoteEndpointName => _remoteName;
     public override string LocalEndpointName => _localName;
@@ -55,13 +59,21 @@ internal sealed unsafe class SocketSetNetworkSender : NetworkSenderBase
     /// remote peer, where MODULE LOAD is arbitrary code loading. A silently downgraded security control
     /// is worse than an absent one, because it reads as configured.
     ///
-    /// <c>Connection</c> exposes no peer endpoint yet (see TODO item 4), so the honest answer is "cannot
-    /// prove loopback" — and the safe direction for a permission check is DENY. This makes <c>Local</c>
-    /// behave as <c>No</c> rather than as <c>Yes</c>: it costs a legitimate loopback operator their
-    /// DEBUG/MODULE access, and it cannot hand a remote peer either. Restore the real answer when the
-    /// endpoint work lands, and gate it on the peer address rather than on this comment.
+    /// <c>Connection</c> exposes no peer endpoint yet (see TODO item 4), so for TCP the honest answer is
+    /// "cannot prove loopback" — and the safe direction for a permission check is DENY. That makes
+    /// <c>Local</c> behave as <c>No</c> rather than as <c>Yes</c>: it costs a legitimate loopback operator
+    /// their DEBUG/MODULE access, and it cannot hand a remote peer anything.
+    ///
+    /// **AF_UNIX is the exception, and it is answerable TODAY.** A Unix domain socket is same-host by
+    /// definition — it has no network form at all — so every peer on a UDS listener is provably local
+    /// without any peer-address plumbing. Stock <c>GarnetTcpNetworkSender</c> agrees: it returns
+    /// <c>true</c> unconditionally for a <c>UnixDomainSocketEndPoint</c> peer. The flag is decided once
+    /// from the LISTEN endpoint in <c>SocketSetGarnetServer</c>, so this costs nothing per connection.
+    ///
+    /// Replace the TCP half with a real loopback test when the endpoint work lands — and gate it on the
+    /// peer address rather than on this comment, which is what the previous version got wrong.
     /// </summary>
-    public override bool IsLocalConnection() => false;
+    public override bool IsLocalConnection() => _localByConstruction;
 
     // Enter/Exit guard the response object against concurrent producers. Garnet's own senders use an
     // epoch/spin scheme; a lock is the v1 that is obviously correct, and the session model mostly

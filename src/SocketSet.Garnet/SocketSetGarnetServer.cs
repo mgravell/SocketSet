@@ -24,7 +24,8 @@ public sealed class SocketSetGarnetServer : GarnetServerBase, IServerHook
         protected override void OnAccept(ref AcceptContext ctx)
         {
             var conn = ctx.Connection;
-            var sender = new SocketSetNetworkSender(conn, owner._bufferSettings, owner._pool);
+            var sender = new SocketSetNetworkSender(conn, owner._bufferSettings, owner._pool,
+                                                    localByConstruction: owner._unixDomain);
             var handler = new SocketSetGarnetHandler(owner, sender, owner._bufferSettings, owner._pool);
             handler.StartReceive();
             conn.UserToken = handler;
@@ -53,10 +54,19 @@ public sealed class SocketSetGarnetServer : GarnetServerBase, IServerHook
     private readonly NetworkBufferSettings _bufferSettings;
     private readonly LimitedFixedBufferPool _pool;
 
+    /// <summary>
+    /// Whether every peer on this server is local BY CONSTRUCTION — i.e. we are listening on AF_UNIX,
+    /// which is same-host by definition and has no network form. Decided once at construction from the
+    /// listen endpoint, so answering <c>IsLocalConnection</c> for a UDS peer costs nothing per connection
+    /// and needs no peer-address plumbing. See REVIEW.md F9 for why the TCP case still cannot be answered.
+    /// </summary>
+    private readonly bool _unixDomain;
+
     public SocketSetGarnetServer(EndPoint endpoint, SocketSetOptions options,
                                  int serverBufferSize = 1 << 17, ILogger? logger = null)
         : base(endpoint, serverBufferSize, logger)
     {
+        _unixDomain = endpoint is System.Net.Sockets.UnixDomainSocketEndPoint;
         _bufferSettings = new NetworkBufferSettings(serverBufferSize, serverBufferSize);
         _pool = _bufferSettings.CreateBufferPool(ownerType: PoolOwnerType.ServerNetwork, logger: logger);
         _transport = new Transport(this, options);
