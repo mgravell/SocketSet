@@ -40,8 +40,28 @@ internal sealed unsafe class SocketSetNetworkSender : NetworkSenderBase
     public override string RemoteEndpointName => _remoteName;
     public override string LocalEndpointName => _localName;
 
-    /// <summary>All SocketSet demo traffic is same-host today; revisit if this ever fronts a real NIC.</summary>
-    public override bool IsLocalConnection() => true;
+    /// <summary>
+    /// FAILS CLOSED, deliberately, and this is a SECURITY answer rather than a fidelity one.
+    ///
+    /// Garnet calls this in exactly two places — <c>RespServerSession.CanRunDebug()</c> and
+    /// <c>CanRunModule()</c> — to implement <c>ConnectionProtectionOption.Local</c>, i.e. "allow DEBUG /
+    /// MODULE only from loopback". Stock <c>GarnetTcpNetworkSender</c> answers it with
+    /// <c>IPAddress.IsLoopback(remote)</c>.
+    ///
+    /// This used to return <c>true</c> unconditionally, with a comment that all traffic was same-host.
+    /// That precondition is void — SocketSet binds and serves real LAN addresses (see
+    /// <c>bench/Verify-BindReachability.ps1</c>) — and the consequence was that an operator who chose
+    /// <c>Local</c> BELIEVING it restricted access silently got <c>Yes</c>: DEBUG and MODULE from any
+    /// remote peer, where MODULE LOAD is arbitrary code loading. A silently downgraded security control
+    /// is worse than an absent one, because it reads as configured.
+    ///
+    /// <c>Connection</c> exposes no peer endpoint yet (see TODO item 4), so the honest answer is "cannot
+    /// prove loopback" — and the safe direction for a permission check is DENY. This makes <c>Local</c>
+    /// behave as <c>No</c> rather than as <c>Yes</c>: it costs a legitimate loopback operator their
+    /// DEBUG/MODULE access, and it cannot hand a remote peer either. Restore the real answer when the
+    /// endpoint work lands, and gate it on the peer address rather than on this comment.
+    /// </summary>
+    public override bool IsLocalConnection() => false;
 
     // Enter/Exit guard the response object against concurrent producers. Garnet's own senders use an
     // epoch/spin scheme; a lock is the v1 that is obviously correct, and the session model mostly

@@ -11,12 +11,24 @@ single API over all of them:
 | `SocketSetFactory.IoUring` | Linux (5.x+, with the required features) | thread-per-shard, multishot accept, provided buffers, zero-copy send |
 | `SocketSetFactory.Epoll` | Linux | readiness-driven fallback for kernels without the io_uring features; zero-copy `writev` send, full TLS/kTLS support |
 | `SocketSetFactory.WindowsIocp` | Windows | raw Winsock + IOCP, bypassing managed sockets |
-| `SocketSetFactory.WindowsRio` | Windows | Registered I/O; TCP-only, opt-in, latency-focused |
+| `SocketSetFactory.WindowsRio` | Windows | Registered I/O; TCP-only, opt-in, **throughput**-focused — see the note below before choosing it |
 | `SocketSetFactory.Managed` | anywhere | portable `SocketAsyncEventArgs` fallback |
 
 `SocketSetFactory.Default` probes the host and chooses for you (IOCP on Windows; io_uring on a
 capable Linux kernel, epoll otherwise; the managed fallback elsewhere), so the same binary runs
 everywhere and simply goes faster where the platform lets it.
+
+> **Choosing RIO on Windows: don't, unless you have measured a reason to.** RIO's request queues are
+> drained in user mode with no per-op syscall, but every operation must still round-trip through a
+> completion queue, and that carries a floor of roughly 3µs per completion which no amount of tuning
+> removes — it is only ever amortised across a batch. IOCP avoids it structurally, completing a receive
+> that already has buffered data *inside the syscall* with no completion at all. So RIO pays off with
+> deep pipelines, many continuously-busy connections, or bulk transfer, and loses heavily on low-depth
+> request/response — including any single multiplexed client connection, which is the normal shape for a
+> .NET Redis client. Measured on one machine over loopback, RIO ran 13-25x behind IOCP at depth 1 and
+> reached comparable throughput at depth 16.
+> **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation, and the seven things
+> tried that did not change it.
 
 Supported frameworks: `net10.0` and `net472`. (The native backends are .NET-only; .NET Framework
 gets the managed fallback.)

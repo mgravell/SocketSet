@@ -198,6 +198,59 @@ not" is not a reason to leave a use-after-recycle reachable.
 
 ---
 
+## AUDIT 2026-08-08: the Garnet bridge told Garnet every peer was loopback
+
+Found while scoping an apparently cosmetic gap (`CLIENT LIST` showing `addr=socketset`). It is not
+cosmetic, and it is in a different category from that gap: it silently downgrades a security control the
+operator explicitly opted into.
+
+### F9. `SocketSetNetworkSender.IsLocalConnection()` returned `true` unconditionally — FIXED (fails closed)
+
+**What Garnet uses it for.** Decompiled from the shipped package rather than assumed: `IsLocalConnection`
+is called in exactly two places, `RespServerSession.CanRunDebug()` and `CanRunModule()`, both of the form
+
+```csharp
+serverOptions.EnableDebugCommand switch
+{
+    ConnectionProtectionOption.Local => networkSender.IsLocalConnection(),
+    ConnectionProtectionOption.Yes   => true,
+    _                                => false,
+}
+```
+
+So it *is* the implementation of `ConnectionProtectionOption.Local` — "permit DEBUG / MODULE only from
+loopback". Stock `GarnetTcpNetworkSender` answers `IPAddress.IsLoopback(remote)` (and `true` for a UDS
+peer).
+
+**The defect.** Our sender returned `true` for every connection, carrying the comment *"All SocketSet
+demo traffic is same-host today; revisit if this ever fronts a real NIC."* **That precondition was
+already void** — `bench/Verify-BindReachability.ps1` exists precisely because SocketSet binds and serves
+real LAN addresses. So on a SocketSet-hosted Garnet, `Local` was operationally identical to `Yes`.
+
+**Severity: real, but opt-in gated.** `ConnectionProtectionOption.No = 0` is the default, so DEBUG and
+MODULE are off unless configured. The exposure needs an operator to have set `Local`, and the server to
+be reachable off-box. But that is the *worst* shape for a silent failure: the operator chose the
+restrictive setting, and got the permissive behaviour, with nothing anywhere reporting the difference.
+`MODULE LOAD` is arbitrary code loading, so the ceiling on this is remote code execution.
+
+**The fix, and why it is not the obvious one.** `Connection` still exposes no peer endpoint (TODO item
+4), so the truthful answer is "cannot prove loopback" — and for a permission check the safe direction is
+DENY. It now returns `false`, making `Local` behave as `No` rather than as `Yes`. That costs a legitimate
+loopback operator their DEBUG/MODULE access and cannot grant a remote peer anything. **Restore the real
+answer when the endpoint work lands, gated on the peer address.**
+
+**Not gateable today, and saying so matters.** No rig can currently distinguish a correct
+`IsLocalConnection` from a wrong one, because nothing in the tree reads a peer endpoint at all. The gate
+belongs with TODO item 4, and its discriminating cell must be a **REFUSAL**: a non-loopback peer denied
+DEBUG while a loopback peer is allowed. An accept-only cell passes against both the old code and the new.
+
+### Method note, because it changes what this audit is worth
+
+Garnet ships as binaries here (PackageReference, no fork, no local checkout), so this was established by
+decompiling `Garnet.server` / `Garnet.common` with `ilspycmd` and reading the call sites — not from
+memory or from the API's name. The two call sites and the enum defaults above are quoted from that
+output. Anyone rechecking should do the same rather than trusting this paragraph.
+
 ## NOT FIXED: design calls, in priority order
 
 These are not left out because they are small. They are left out because each one has a decision in it
