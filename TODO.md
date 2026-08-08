@@ -135,6 +135,46 @@ created, printed on the `### ... ###` announce line (so it survives `-q`) and in
 one-connection build, so a many-connections run needs a source build until a fixed version is published,
 and every figure taken with 3.1.13 is single-connection whatever `-c` said.
 
+#### THE GENERATOR SHAPE FOR `Run-GarnetAb.ps1`, MEASURED (2026-08-08)
+
+With the client fixed, the open question was whether the many-connections shape can discriminate on this
+box at all — the first 50-connection run put all three legs in one overlapping band, which is what a
+generator ceiling looks like. **It was a generator ceiling, and the cure is PROCESSES, not `-c`:**
+
+| shape | total connections | GET/s | server CPU |
+|---|---|---|---|
+| 1 proc x 50 | 50 | 276,514 | 8.7 cores |
+| 1 proc x 200 | 200 | 262,747 | 8.2 |
+| **4 proc x 50** | 200 | **444,192** | 9.7 |
+| 8 proc x 50 | 400 | 372,629 | 9.6 |
+
+More connections in ONE process buys nothing (262,747 at 200 connections against 276,514 at 50) — a
+single benchmark process is bounded around ~270k however many it holds. The SAME 200 connections split
+across FOUR processes reach 444k. Eight is past the optimum on this box. Note this also corrects a
+narrower test run first: 2x25 and 4x13 barely moved, because they held TOTAL connections at ~50 — that
+isolates the process boundary but cannot see the connection bound, and reading it alone would have said
+"fan-out does not help".
+
+**And the fanned-out shape DOES separate the legs, which the single-process shape did not** (exploratory,
+three passes each, 4 procs x 50 conns, `--shards 12`):
+
+| leg | GET/s, three passes |
+|---|---|
+| `iocp` | 314,742 – 358,637 |
+| `rio` | 315,008 – 378,392 |
+| `stock` | 254,656 – 255,342 |
+
+`stock` is tight and clearly below, with no overlap against either SocketSet leg; `iocp` and `rio` are
+indistinguishable from each other here. **The caveats matter more than the numbers.** Three passes is
+below the house standard of six; the SocketSet legs span 14-20% while `stock` spans 0.3%; and a single
+earlier pass read 444k where three later passes read 314-358k, so the spread is real. Nothing here is
+scored. **Server CPU sits at ~9-10 of 24 cores in EVERY cell**, so the server is not saturated in any of
+them — the true ceiling is above all these figures, and the generator is competing for the same box,
+which is a limit no amount of fan-out removes.
+
+**For the rig: fan out ~4 processes and sum, gate on `conns:`, take six passes, and report server cores
+alongside throughput** — a cell where the server is at 40% of the box is not measuring the server.
+
 ### GAP FOUND IN PASSING: Garnet `CLIENT LIST` shows `addr=socketset`, not an endpoint
 
 Visible in the output above: every row reads `addr=socketset laddr=socketset`. `SocketSetNetworkSender`
