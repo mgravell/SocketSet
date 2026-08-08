@@ -616,6 +616,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock
         conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
         conn.ResetReceiveParking();
+        conn.RemoteAddress = conn.LocalAddress = default; // pooled slot: never inherit the last tenant's
 
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
@@ -896,6 +897,10 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         uint slot = conn.Slot;
 
         if (!SetupConnection(conn)) { Win32.closesocket(socket); FreeSlot(conn); return; }
+
+        // Before OnAccept (and before the TLS deferral below), so a callback on either path sees them.
+        // Valid here because HandleAccept already applied SO_UPDATE_ACCEPT_CONTEXT.
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, socket);
 
         // TLS: the app must not see this connection until the handshake completes, so OnAccept is deferred
         // to FireTlsOpen and everything below is skipped.

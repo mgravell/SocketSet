@@ -675,6 +675,11 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock
         conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
         conn.ResetReceiveParking();
+        // CLEARED ON CLAIM, not merely overwritten on populate. Slots are pooled and reused, so a path
+        // that fails to populate (tracking off, a socket reset before getpeername) would otherwise report
+        // the PREVIOUS TENANT's address - one peer's identity leaking to the next, the same shape as the
+        // buffer-tail disclosure. Unset is the honest answer and the safe one.
+        conn.RemoteAddress = conn.LocalAddress = default;
 
         // Bump the generation before publishing Socket: any out-of-band Close/flush captured against the
         // previous tenant now mismatches and is dropped rather than misapplied.
@@ -1050,6 +1055,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         // flag is rejected, SkipOnSuccess stays false and the socket keeps the always-async model.
         conn.SkipOnSuccess = Win32.SetFileCompletionNotificationModes(socket,
             (byte)(Win32.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | Win32.FILE_SKIP_SET_EVENT_ON_HANDLE));
+
+        // Peer/local addresses, before OnAccept so a callback can read them. Safe here specifically
+        // because SO_UPDATE_ACCEPT_CONTEXT ran in HandleAccept; earlier than that these would fail.
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, socket);
 
         if (!_recvBuffer.TryLease(out int ri, out _))
         {

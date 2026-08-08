@@ -624,6 +624,22 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
         // Managed never recycles a Connection (a fresh object per socket), so parking state starts clean
         // anyway; called for uniformity, so the five backends have one visible seeding site each.
         conn.ResetReceiveParking();
+
+        // No recycle hazard here (a fresh ManagedConnection per socket), and no native parse either - the
+        // managed backend gets real EndPoints from the Socket, so this is the one path that can currently
+        // produce IPv6. Guarded because the endpoints throw on an already-reset socket, which is ordinary
+        // load rather than an error: an address we could not read stays unset, and unset fails closed.
+        if (Parent.Options.TrackEndpoints)
+        {
+            try
+            {
+                conn.RemoteAddress = PeerAddress.FromEndPoint(socket.RemoteEndPoint);
+                conn.LocalAddress = PeerAddress.FromEndPoint(socket.LocalEndPoint);
+            }
+            catch (SocketException) { }
+            catch (ObjectDisposedException) { }
+        }
+
         _connections[conn] = 0;
         return conn;
     }

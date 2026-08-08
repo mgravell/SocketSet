@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Directory.Build.props sets TargetFrameworks (plural) for the whole repo, and setting the singular
+         does NOT clear it, so `dotnet run` refuses with "targets multiple frameworks" unless the plural
+         is emptied here. The other verify rigs omit this and so need an explicit framework argument,
+         which AGENTS.md does not mention. -->
+    <TargetFrameworks></TargetFrameworks>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup><Compile Include="../GateBackends.cs" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="../../src/SocketSet/SocketSet.csproj" /></ItemGroup>
+</Project>

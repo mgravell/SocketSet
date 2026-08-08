@@ -133,6 +133,18 @@ both have caused hesitation:
     quiet is actually reaped. Self-controlling rather than merely positive: a COMPLETED handshake must
     survive the same budget (so "reaped" cannot mean "we drop everything"), and the idle-off/idle-on pair
     is a controlled A/B proving both that the default is off and that the option is not inert.
+  - **`bench/verify-endpoints`** (added 2026-08-08; cross-platform) — that `Connection.RemoteAddress` /
+    `LocalAddress` report the REAL peer, that a POOLED connection cannot report the PREVIOUS tenant's, and
+    that `TrackEndpoints` is neither inert nor leaked into the default. It is a security gate, not a
+    cosmetic one: nothing read a peer endpoint before it existed, which is how the Garnet bridge came to
+    answer "is this peer local?" with a hard-coded `true` (`REVIEW.md` F9) and silently turn an operator's
+    DEBUG/MODULE restriction into a no-op. The discriminating cells are `lan/not-loopback` — connect over
+    the host's own LAN address and require `IsLoopback` FALSE, which a hard-coded answer or a
+    byte-order-reversed parser fails and nothing else catches — and `recycle/new-tenant`, which churns
+    connections and demands each report its own port, catching an implementation that populates on
+    success but forgets to clear on claim. `tracking-off/unset` asserts the INVERSE half per the
+    `verify-tailwipe` pattern. On a backend that declines (io_uring) it asserts the DOCUMENTED
+    degradation rather than skipping. A host with no LAN address reports INCONCLUSIVE, not PASS.
   - **`bench/verify-bind-address.sh`** (Linux) / **`bench/Verify-BindAddress.ps1`** (Windows), added
     2026-08-04 — that
     `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code

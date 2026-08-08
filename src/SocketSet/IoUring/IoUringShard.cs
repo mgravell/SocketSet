@@ -406,6 +406,19 @@ internal sealed class IoUringShard : SocketSetShard
         });
     }
 
+    /// <summary>
+    /// DECLINED, and this is a real capability gap rather than an omission. The accept SQE below uses
+    /// <c>IORING_ACCEPT_MULTISHOT</c>, which does not fill an address buffer — one SQE serves many
+    /// accepts, so there is nowhere per-accept to put a sockaddr. Getting the peer would therefore cost a
+    /// <c>getpeername</c> syscall PER ACCEPT, on the backend whose entire point is not making syscalls per
+    /// operation, for a value most callers never read.
+    ///
+    /// So it reports false and leaves the addresses unset, and <see cref="SocketSet.ToString"/> prints
+    /// <c>endpoints=unsupported</c>. Anyone who needs peer addresses on Linux should use epoll, where
+    /// <c>accept4</c> fills the address in the syscall that was happening anyway.
+    /// </summary>
+    protected internal override bool SupportsEndpointTracking => false;
+
     private void EnqueueAccept(int listenerFd, bool local)
     {
         var sqe = new LibC.io_uring_sqe

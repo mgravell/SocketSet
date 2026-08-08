@@ -216,6 +216,19 @@ public abstract class SocketSetShard
     {
     }
 
+    /// <summary>
+    /// Whether this backend can populate <see cref="Connection.RemoteAddress"/>/<see
+    /// cref="Connection.LocalAddress"/> at accept. True for every backend whose accept already yields the
+    /// peer sockaddr; **false for io_uring**, whose multishot accept does not fill an address buffer, and
+    /// which declines rather than paying a <c>getpeername</c> per accept on the fastest Linux path.
+    ///
+    /// Exists so the degradation is DISCOVERED and REPORTED rather than silent: without it, an io_uring
+    /// server would show every peer as anonymous, which reads as "no client is remote" — the failure
+    /// direction that matters when something admits on locality. Surfaced in
+    /// <see cref="SocketSet.ToString"/> as <c>endpoints=unsupported</c>.
+    /// </summary>
+    protected internal virtual bool SupportsEndpointTracking => true;
+
     protected abstract void OnRun();
 
     // 0 while the loop is not running. Managed thread ids are never 0, so the initial and torn-down

@@ -173,7 +173,28 @@ public abstract partial class SocketSet : IDisposable
         }
 
         sb.Append(" wipe=").Append(Options.DangerousDisableBufferWipe ? "off" : "on");
+
+        // Three states, not two, and the third is the point: a backend that CANNOT track says so rather
+        // than printing "on" and silently reporting every peer as anonymous. Same reasoning as wipe= being
+        // unconditional — a rig must be able to gate on what happened, not on what was requested.
+        sb.Append(" endpoints=").Append(
+            !Options.TrackEndpoints ? "off" : SupportsEndpointTracking ? "on" : "unsupported");
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Whether this set's backend can supply peer/local addresses at all — see
+    /// <see cref="SocketSetOptions.TrackEndpoints"/>. False on io_uring. Combine with the option: the
+    /// addresses are populated only when both are true, which is what <c>endpoints=</c> in
+    /// <see cref="ToString"/> reports.
+    /// </summary>
+    public bool SupportsEndpointTracking
+    {
+        get
+        {
+            var shards = _shards; // snapshot, as elsewhere: growth publishes a longer array atomically
+            return shards.Length > 0 && shards[0].SupportsEndpointTracking;
+        }
     }
 
     private static string BackendLabel(SocketSetShard[] shards)

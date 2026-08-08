@@ -256,10 +256,22 @@ UDS-capable client and `EnableDebugCommand=Local` configured, which no rig here 
 next paragraph describes. The flag is trivially derived from the endpoint type, but "trivially derived"
 is not "gated", and this file should not imply otherwise.
 
-**Not gateable today, and saying so matters.** No rig can currently distinguish a correct
-`IsLocalConnection` from a wrong one, because nothing in the tree reads a peer endpoint at all. The gate
-belongs with TODO item 4, and its discriminating cell must be a **REFUSAL**: a non-loopback peer denied
-DEBUG while a loopback peer is allowed. An accept-only cell passes against both the old code and the new.
+**~~Not gateable today~~ — RESOLVED 2026-08-08, same session.** The endpoint work (TODO item 4) landed,
+so `IsLocalConnection()` is now a real test — `_localByConstruction || _conn.RemoteAddress.IsLoopback` —
+rather than a constant. `PeerAddress.IsLoopback` is **false for an address that could not be obtained**,
+so the fail-closed property survives every degraded case: tracking off, io_uring declining, or a socket
+reset before `getpeername`. That is the property the original hard-coded `true` lacked, and it is now
+structural rather than commented.
+
+**And it is gated.** `bench/verify-endpoints` covers the transport half on IOCP, RIO and managed, and its
+discriminating cell is exactly the refusal shape this paragraph asked for: `lan/not-loopback` connects
+over the host's own LAN address and requires `IsLoopback` FALSE. A hard-coded `true`, or a parser with
+the address bytes reversed, fails there and passes everything else. `recycle/new-tenant` covers the
+pooling hazard, and `tracking-off/unset` asserts the inverse half.
+
+**Still not gated, and stated rather than implied:** that Garnet itself then permits DEBUG over loopback
+and refuses it remotely. That needs `EnableDebugCommand=Local` configured plus a remote peer, which no
+rig here sets up. What is verified is the input Garnet makes that decision from.
 
 ### Method note, because it changes what this audit is worth
 

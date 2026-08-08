@@ -75,6 +75,34 @@ public abstract class Connection : IBufferWriter<byte>
     /// </summary>
     public string? RequestedServerName => Tls?.RequestedServerName ?? KernelServerName;
 
+    /// <summary>
+    /// The peer's address, and ours, or <see cref="PeerAddress.IsSet"/> false when unavailable. Valid from
+    /// <c>OnAccept</c>/<c>OnConnect</c> onwards. Inline value types, so reading costs nothing and storing
+    /// allocates nothing — format with <see cref="PeerAddress.TryFormat"/> rather than <c>ToString</c> on
+    /// any per-connection path.
+    ///
+    /// THREE WAYS THIS IS LEGITIMATELY UNSET, and callers must handle all of them rather than treating
+    /// unset as a bug:
+    /// <list type="bullet">
+    /// <item><see cref="SocketSetOptions.TrackEndpoints"/> is off;</item>
+    /// <item>the backend cannot supply it — io_uring uses multishot accept, which does not fill an address
+    /// buffer, so it declines rather than paying a <c>getpeername</c> per accept. It SAYS so via
+    /// <see cref="SocketSet.SupportsEndpointTracking"/>, because a silent degradation here would make every
+    /// peer look anonymous and so read as "nobody is remote";</item>
+    /// <item>the peer genuinely has no address — an accepted AF_UNIX connection whose client never bound
+    /// one, which is the normal case. <see cref="PeerAddress.Family"/> is still <c>Unix</c> there, so
+    /// "unnamed Unix peer" stays distinguishable from "not tracked".</item>
+    /// </list>
+    ///
+    /// SECURITY: <see cref="PeerAddress.IsLoopback"/> is false when unset, deliberately. Anything deciding
+    /// admission on locality must fail closed on an address it could not obtain — see REVIEW.md F9, where
+    /// exactly that decision was being made on a hard-coded <c>true</c>.
+    /// </summary>
+    public PeerAddress RemoteAddress { get; internal set; }
+
+    /// <inheritdoc cref="RemoteAddress"/>
+    public PeerAddress LocalAddress { get; internal set; }
+
     /// <summary>When this connection was created, and when it last carried a byte (Clock.Millis).
     /// Written only by the owning loop thread; read by the sweep, which is also the loop thread, so no
     /// synchronisation is needed. See <see cref="SocketSetOptions.HandshakeTimeout"/>.</summary>

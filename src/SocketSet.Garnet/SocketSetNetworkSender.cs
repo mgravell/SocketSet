@@ -23,7 +23,7 @@ internal sealed unsafe class SocketSetNetworkSender : NetworkSenderBase
 {
     private readonly Connection _conn;
     private readonly LimitedFixedBufferPool _pool;
-    private readonly string _remoteName, _localName;
+    private string? _remoteName, _localName;
 
     private PoolEntry? _reusableResponse;
 
@@ -34,15 +34,38 @@ internal sealed unsafe class SocketSetNetworkSender : NetworkSenderBase
     {
         _conn = conn;
         _pool = pool;
-        _remoteName = remoteName ?? "socketset";
-        _localName = localName ?? "socketset";
+        _remoteName = remoteName;
+        _localName = localName;
         _localByConstruction = localByConstruction;
     }
 
     private readonly bool _localByConstruction;
 
-    public override string RemoteEndpointName => _remoteName;
-    public override string LocalEndpointName => _localName;
+    /// <summary>
+    /// Garnet surfaces these directly in <c>CLIENT LIST</c> as <c>addr=</c> / <c>laddr=</c>, and they
+    /// were both the literal <c>"socketset"</c> until 2026-08-08 — which broke <c>CLIENT KILL ADDR</c>,
+    /// <c>CLIENT LIST</c> filtering, and any tool that identifies a client by address, because every
+    /// client was indistinguishable.
+    ///
+    /// FORMATTED LAZILY AND CACHED, because the interface demands a <c>string</c> and the transport must
+    /// not pay for one per accept. <see cref="Connection.RemoteAddress"/> is an inline value type;
+    /// nothing allocates until Garnet actually asks, and then once per connection.
+    ///
+    /// Falls back to <c>"socketset"</c> only when the address is genuinely unavailable — tracking off, an
+    /// io_uring backend, or an unnamed AF_UNIX peer. That string is a poor answer, but it is the HONEST
+    /// one, and it is now the exception rather than the rule.
+    /// </summary>
+    public override string RemoteEndpointName => _remoteName ??= Describe(_conn.RemoteAddress);
+
+    /// <inheritdoc cref="RemoteEndpointName"/>
+    public override string LocalEndpointName => _localName ??= Describe(_conn.LocalAddress);
+
+    private static string Describe(PeerAddress address)
+    {
+        if (!address.IsSet) return "socketset";
+        Span<char> buf = stackalloc char[64];
+        return address.TryFormat(buf, out int n) ? buf.Slice(0, n).ToString() : "socketset";
+    }
 
     /// <summary>
     /// FAILS CLOSED, deliberately, and this is a SECURITY answer rather than a fidelity one.
@@ -70,10 +93,12 @@ internal sealed unsafe class SocketSetNetworkSender : NetworkSenderBase
     /// <c>true</c> unconditionally for a <c>UnixDomainSocketEndPoint</c> peer. The flag is decided once
     /// from the LISTEN endpoint in <c>SocketSetGarnetServer</c>, so this costs nothing per connection.
     ///
-    /// Replace the TCP half with a real loopback test when the endpoint work lands — and gate it on the
-    /// peer address rather than on this comment, which is what the previous version got wrong.
+    /// **RESOLVED 2026-08-08:** the TCP half is now a real test against the peer address rather than a
+    /// comment. <see cref="PeerAddress.IsLoopback"/> is false for an address we could not obtain, so the
+    /// fail-closed behaviour survives every case where tracking is off or the backend cannot supply one —
+    /// which is the property that mattered, and the one the original hard-coded <c>true</c> lacked.
     /// </summary>
-    public override bool IsLocalConnection() => _localByConstruction;
+    public override bool IsLocalConnection() => _localByConstruction || _conn.RemoteAddress.IsLoopback;
 
     // Enter/Exit guard the response object against concurrent producers. Garnet's own senders use an
     // epoch/spin scheme; a lock is the v1 that is obviously correct, and the session model mostly

@@ -362,6 +362,10 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock starts here
         conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
         conn.ResetReceiveParking();
+        conn.RemoteAddress = conn.LocalAddress = default; // pooled slot: never inherit the last tenant's
+        // Populated here rather than at the accept4 site because a CONNECT lands here too, and both want
+        // it. The fd is live by this point; a peer that has already reset leaves the address unset.
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, fd);
         conn.Tls = null;
         conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
         conn.Zc = null;         // ditto — any in-flight zero-copy send was finished in CloseClient

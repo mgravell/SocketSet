@@ -259,6 +259,17 @@ internal static unsafe partial class LibC
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int accept4(int fd, void* addr, uint* addrlen, int flags);
 
+    /// <summary>Peer / local address of a connected fd, for
+    /// <see cref="SocketSetOptions.TrackEndpoints"/>. epoll could get the peer from
+    /// <see cref="accept4"/> for free, but uses these so both addresses come from one code path shared
+    /// with the Windows backends — one place to be wrong rather than three.</summary>
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int getpeername(int fd, void* addr, uint* addrlen);
+
+    /// <inheritdoc cref="getpeername"/>
+    [LibraryImport(Lib, SetLastError = true)]
+    internal static partial int getsockname(int fd, void* addr, uint* addrlen);
+
     [LibraryImport(Lib, SetLastError = true)]
     internal static partial int connect(int fd, SockAddrIn* addr, uint addrlen);
 

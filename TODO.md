@@ -175,7 +175,39 @@ which is a limit no amount of fan-out removes.
 **For the rig: fan out ~4 processes and sum, gate on `conns:`, take six passes, and report server cores
 alongside throughput** — a cell where the server is at 40% of the box is not measuring the server.
 
-### GAP FOUND IN PASSING: Garnet `CLIENT LIST` shows `addr=socketset`, not an endpoint
+### ~~GAP: Garnet `CLIENT LIST` shows `addr=socketset`~~ — DONE 2026-08-08
+
+**Implemented, gated, and it closed a security hole on the way** (`REVIEW.md` F9). `PeerAddress` is a
+24-byte inline value type on `Connection` (`RemoteAddress`/`LocalAddress`), `SocketSetOptions.TrackEndpoints`
+defaults ON and is reported as `endpoints=on|off|unsupported`, io_uring declines and SAYS so, and
+`bench/verify-endpoints` gates all of it. `CLIENT LIST` now reads `addr=127.0.0.1:62264
+laddr=127.0.0.1:7960` on IOCP, RIO and managed.
+
+**TWO OF MY OWN CLAIMS ABOVE WERE WRONG, and both are worth keeping visible:**
+
+1. **"IOCP/RIO are FREE because `AcceptEx` already wrote both sockaddrs."** They are cheap, not free. The
+   bytes really are in the accept buffer, but the accept completes on the LISTENER's shard while the
+   connection is adopted on a DIFFERENT one, so the buffer does not survive the handoff — and parsing it
+   in place needs `GetAcceptExSockaddrs`, whose offsets are implementation-defined rather than something
+   to assume. It is **two syscalls per ACCEPT** (`getpeername`/`getsockname`), not per operation, only
+   when tracking is on. That is a good trade, but it is not the one I described.
+2. **"UDS needs 108 bytes, so the struct may have to be 128."** It does not, and the reason is the third
+   UDS form: an accepted peer that never called `bind()` is **unnamed** — `getpeername` returns the family
+   alone. The useful UDS name is the LISTENER's, which is per-listener, not per-connection. So AF_UNIX
+   records the family and stops, and 24 bytes covers everything.
+
+**The design, as built:** family + port + 16 address bytes + scope id, no `unsafe`, no `[InlineArray]`,
+no fixed buffers — so it compiles identically on net472, which matters because `Connection` is shared.
+Formatting is lazy and allocation-free for IPv4 (`TryFormat`); IPv6 defers to `IPAddress`, which
+allocates, on the rarer path and only on demand. Garnet's `INetworkSender` demands a `string`, so
+`SocketSetNetworkSender` caches one per connection on first access — the transport stays allocation-free
+and the cost sits where the interface requires it.
+
+**Watch for `AF_INET6` if IPv6 ever lands**: it is 23 on Windows and 10 on Linux, and `Native/LibC.cs`
+does not define it at all. `PeerAddress.FromSockAddr` picks the value per-platform; hard-coding either
+would silently misparse on the other, which is the kind of bug that survives a green test suite.
+
+### ORIGINAL WRITE-UP (kept for the reasoning): Garnet `CLIENT LIST` shows `addr=socketset`
 
 Visible in the output above: every row reads `addr=socketset laddr=socketset`. `SocketSetNetworkSender`
 defaults `RemoteEndpointName`/`LocalEndpointName` to the literal `"socketset"` because

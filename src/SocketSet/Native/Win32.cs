@@ -219,6 +219,24 @@ internal static unsafe partial class Win32
     [LibraryImport(Ws2, EntryPoint = "listen", SetLastError = true)]
     internal static partial int listen(nint s, int backlog);
 
+    /// <summary>
+    /// Peer and local address of a connected socket, for <see cref="SocketSetOptions.TrackEndpoints"/>.
+    ///
+    /// WHY THESE RATHER THAN THE AcceptEx BUFFER, since AcceptEx did already write both sockaddrs: the
+    /// accept completes on the LISTENER's shard and the connection is adopted on a DIFFERENT one, so the
+    /// buffer's contents do not survive the handoff — and parsing it in place needs
+    /// <c>GetAcceptExSockaddrs</c>, whose offsets are implementation-defined rather than something to
+    /// assume. Two syscalls per ACCEPT (not per operation) on a path that already makes several, only
+    /// when tracking is on, is the honest trade. Valid here because <c>SO_UPDATE_ACCEPT_CONTEXT</c> has
+    /// already been applied — without it these fail on an AcceptEx socket.
+    /// </summary>
+    [LibraryImport(Ws2, EntryPoint = "getpeername", SetLastError = true)]
+    internal static partial int getpeername(nint s, void* addr, int* namelen);
+
+    /// <inheritdoc cref="getpeername"/>
+    [LibraryImport(Ws2, EntryPoint = "getsockname", SetLastError = true)]
+    internal static partial int getsockname(nint s, void* addr, int* namelen);
+
     [SuppressGCTransition]
     [LibraryImport(Ws2, EntryPoint = "setsockopt", SetLastError = true)]
     internal static partial int setsockopt(nint s, int level, int optname, void* optval, int optlen);

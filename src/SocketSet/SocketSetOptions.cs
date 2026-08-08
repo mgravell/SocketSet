@@ -201,6 +201,32 @@ public class SocketSetOptions
     /// </summary>
     public bool DangerousDisableBufferWipe { get; set; }
 
+    /// <summary>
+    /// Record each connection's peer and local address into <see cref="Connection.RemoteAddress"/> /
+    /// <see cref="Connection.LocalAddress"/>. DEFAULT ON, because the surprising direction is the other
+    /// one: a server that cannot tell its clients apart, and — worse — cannot answer "is this peer local?"
+    /// for anything making an admission decision (REVIEW.md F9).
+    ///
+    /// POSITIVELY NAMED, unlike <see cref="DangerousDisableBufferWipe"/>, and the difference is meant.
+    /// That one carries "Dangerous" because turning it off risks DISCLOSING one tenant's bytes to the
+    /// next; turning this off only loses information, and leaks nothing. An embedding that never surfaces
+    /// a peer address can decline the work without being warned about a hazard that does not exist here.
+    ///
+    /// WHAT IT ACTUALLY COSTS, which is uneven enough to be worth stating: on IOCP and RIO, nothing much —
+    /// <c>AcceptEx</c> has already written both sockaddrs into a buffer we already allocate, so this is a
+    /// parse and two stores. On the managed backend it is two property reads. On epoll it is free for the
+    /// peer (<c>accept4</c> fills the address in the same syscall) and a <c>getsockname</c> for ours.
+    /// **On io_uring it is not available at all**: multishot accept does not fill an address buffer, and
+    /// paying a <c>getpeername</c> per accept would tax the fastest Linux path for a value most callers
+    /// never read. That backend reports <see cref="SocketSet.SupportsEndpointTracking"/> false and leaves
+    /// the addresses unset — DISCOVERED, not assumed, in the same spirit as
+    /// <see cref="Connection.SupportsReceiveParking"/> and the kTLS receive probe.
+    ///
+    /// IT IS REPORTED. <see cref="SocketSet.ToString"/> prints <c>endpoints=on|off|unsupported</c>
+    /// unconditionally, so a rig can gate on what actually happened rather than on what was asked for.
+    /// </summary>
+    public bool TrackEndpoints { get; set; } = true;
+
     /// <summary>Backlog passed to <c>listen()</c> on every backend — the kernel's queue of
     /// completed-handshake connections awaiting accept. Cheap; size it to absorb connection bursts.</summary>
     public int ListenBacklog { get; set; } = 512;
