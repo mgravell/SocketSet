@@ -55,6 +55,27 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     // Split of s_pumpFlush by HOW it was delivered. House rule 2: a fast path that silently declines
     // measures identically to one that ran and did not pay, so the inline share has to be observable.
     private static long s_flushInline, s_flushMarshaled;
+
+    // Spin outcomes: found work without arming, vs expired and armed anyway. House rule 2 again — a spin
+    // that never catches anything measures identically to one that is disabled.
+    private static long s_spinHits, s_spinMisses;
+
+    /// <summary>
+    /// Bounded user-mode spin on the completion queue before paying <c>RIONotify</c> + block + wake.
+    ///
+    /// WHY THIS EXISTS: IOCP sets <c>FILE_SKIP_COMPLETION_PORT_ON_SUCCESS</c>, so a synchronously
+    /// completing recv/send posts no port packet and the loop never blocks — at depth 1 on loopback it
+    /// turns a whole request/response round trip without one. RIO has no equivalent: the CQ is drained
+    /// in user mode (no per-op syscall, which is the RIO win) but learning it went non-empty costs an
+    /// arm/block/wake. Spinning briefly is the only way to get the same "do not block when the next
+    /// event is microseconds away" behaviour.
+    ///
+    /// Iterations of <c>Thread.SpinWait(1)</c> + one dequeue attempt each. Set via <c>SS_RIO_SPIN</c>.
+    /// DEFAULT 0 — off, i.e. the pre-existing arm-immediately behaviour — because a spin trades CPU for
+    /// latency on EVERY shard, and the default does not move until a measurement earns it.
+    /// </summary>
+    private static readonly int RioSpin =
+        int.TryParse(Environment.GetEnvironmentVariable("SS_RIO_SPIN"), out int spin) && spin > 0 ? spin : 0;
     private static long s_recvs, s_recvBytes;   // receive-side; see the dispatch site for why they exist
     // DumpStats is static, so the per-shard receive buffer size is mirrored here purely so the B/recv
     // figure can be read against the buffer it had to fit in. Every shard in a set uses the same value.
@@ -77,7 +98,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             $"cq-drains={Interlocked.Read(ref s_cqDrains):n0} completions={Interlocked.Read(ref s_completions):n0} | " +
             $"STALE COMPLETIONS={Interlocked.Read(ref s_staleCompletions):n0} (must be 0) " +
             $"out-of-band flushes={Interlocked.Read(ref s_pumpFlush):n0} staged={Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB " +
-            $"(inline={Interlocked.Read(ref s_flushInline):n0} marshaled={Interlocked.Read(ref s_flushMarshaled):n0})");
+            $"(inline={Interlocked.Read(ref s_flushInline):n0} marshaled={Interlocked.Read(ref s_flushMarshaled):n0}) | " +
+            $"spin={RioSpin} hits={Interlocked.Read(ref s_spinHits):n0} misses={Interlocked.Read(ref s_spinMisses):n0}");
     }
 
     // Periodic as well as at shutdown: a rig kills the server, and item 0c's lesson is that a measurement
@@ -291,12 +313,40 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     // StatusEx — which is where accept/CONNECT completions get serviced. Left unbounded, connect
     // completions arriving after the echo ramps up starve forever (the conns<64 bug). Drain up to a
     // budget, then re-arm and yield to the OnRun loop; active load re-fires the notify so we come back.
+    /// <summary>
+    /// One dequeue; if the CQ is empty, spin briefly rather than immediately paying the arm/block/wake
+    /// round trip (see <see cref="RioSpin"/>). Returns as soon as anything arrives.
+    ///
+    /// Deliberately NOT applied to the gap-drain after <c>RIONotify</c> below: that one exists to close
+    /// an arm/arrival race and must return promptly, and by then the arm has already been paid — the
+    /// whole point here is to avoid paying it.
+    /// </summary>
+    private uint DrainRioOrSpin()
+    {
+        uint n = DrainRioOnce();
+        if (n != 0 || RioSpin == 0) return n;
+
+        for (int spins = RioSpin; spins > 0; spins--)
+        {
+            Thread.SpinWait(1);
+            n = DrainRioOnce();
+            if (n != 0)
+            {
+                if (ReportStats) Interlocked.Increment(ref s_spinHits);
+                return n;
+            }
+        }
+
+        if (ReportStats) Interlocked.Increment(ref s_spinMisses);
+        return 0; // spun out — fall through to the arm/block, exactly as before
+    }
+
     private void DrainRio()
     {
         int budget = RioDrainBudget;
         while (true)
         {
-            uint n = DrainRioOnce();
+            uint n = DrainRioOrSpin();
             FlushCommits(); // kick the recv-rearms + echo sends this chunk deferred — bounds their hold
                             // time to ~one RioBatch (keeps latency tight) while still batching per-RQ.
             if (n == 0)

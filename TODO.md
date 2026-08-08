@@ -478,6 +478,65 @@ and a wake per flush), costs one predicate on a path already doing an interlocke
 nothing — all 48 smoke cells and all nine narrower gates pass with it on. It is **not** kept because the
 measurement established a win, and a future reader should not cite it as one.
 
+#### THE NEXT HYPOTHESIS, AND IT IS HALF RIGHT: RIO BLOCKS WHERE IOCP DOES NOT (2026-08-08)
+
+**Why RIO should block more, structurally.** IOCP sets `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS |
+FILE_SKIP_SET_EVENT_ON_HANDLE` (`IocpShard.cs:1051`), so a synchronously-completing recv/send posts NO
+port packet and is picked up by `DrainInline` — at depth 1 on loopback it turns an entire
+request/response round trip **without the loop ever blocking**. RIO has no equivalent: the CQ drains in
+user mode (no per-op syscall, which is RIO's whole point) but learning it went non-empty costs
+`RIONotify` + block + wake. The arithmetic fitted: ~20k/s on one connection is ~50µs per round trip
+against IOCP's ~1.8µs, and a thread block/wake pair is exactly that order.
+
+**A bounded user-mode spin on the CQ before arming (`SS_RIO_SPIN`, `DrainRioOrSpin`) roughly DOUBLES RIO
+at depth 1.** Five passes per setting, first discarded, `-c 50 +m -P 1 -t GET -n 200000`:
+
+| spin | scored median | range | spin hit rate |
+|---|---|---|---|
+| 0 (control) | 21,932 | 17,015 – 23,742 | — |
+| 50 | 24,364 | 18,126 – 26,768 | 42% |
+| 200 | 26,895 | 25,017 – 31,458 | 85% |
+| **1000** | **42,252** | **41,181 – 49,415** | **96%** |
+| 5000 | 35,944 | 32,804 – 40,359 | 98% |
+
+`spin=1000`'s range does NOT overlap the control's, so this one is quotable. 5000 is past the optimum —
+the hit rate barely improves while the loop wastes more time not returning.
+
+**The mechanism is confirmed, not merely the outcome:** notify-rearms fell 0.43 → **0.02**/send and
+port-wakes 0.40 → **0.02**/send (against 0.99 and 1.31 in the original baseline). The arm/block/wake
+cycle is now essentially GONE.
+
+**AND THAT IS WHY THE REMAINING GAP IS THE FINDING.** In-session IOCP at the identical shape medians
+**554,628**. So RIO moves from **25.3x behind to 13.1x behind** — with blocking eliminated. Half the gap
+was the block. **The other half cannot be attributed to the notify cycle by anyone, because the cycle is
+down 50x and 13x remains.**
+
+**Leading candidate for the remainder, visible in the same counters:** `commits: send=1.00/send` is
+UNCHANGED across every spin setting. Every RIOSend still costs a separate commit kick, and at depth 1
+there is nothing for the deferred-submit machinery to batch — against IOCP's single inline `WSASend`.
+That is the most visible structural difference left, and it is where to look next.
+
+Also visible: **the spin REDUCED coalescing** (77 → 62 B/send, RIOSends 181k → 224k). Replies go out
+sooner instead of accumulating, which is a real trade rather than a free win.
+
+**REGRESSION CHECK, many connections** (4 procs x 50, three passes): spin=0 gave 354,519–500,903 at ~9.6
+server cores; spin=1000 gave 322,055–505,018 at ~9.9. **Not detected, but NOT ruled out** — ~40%
+pass-to-pass variance would hide a modest regression, so this is "no evidence", not "no effect". The spin
+is self-limiting by construction: an idle shard never enters `DrainRio`, so it never spins.
+
+**DEFAULT STAYS 0.** It is a 2x win on the shape that matters most for SE.Redis, but a spin trades CPU
+across every shard and the many-connections evidence is not clean enough to earn a default change. What
+would earn it: a six-pass many-connections A/B with tighter variance, and probably an ADAPTIVE spin that
+backs off when misses dominate — the miss rate is already counted, so the input exists. **If the default
+ever moves, the setting must appear in the `/config` banner** (house rule 1); it does not today, because
+today it is off.
+
+**Gated with the spin FORCED ON** (`SS_RIO_SPIN=1000`): all 48 smoke cells and all nine narrower gates
+pass. Propagation to the child processes was verified directly rather than assumed — a `--rio ... --poke`
+cell reports `spin=1000 hits=130,511 misses=106,554`, so the path ran under gate load. That cell also
+reports `inline=0 marshaled=211,493`, independently covering the MARSHALED branch of the flush fast path
+above.
+
 **The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
 one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
 did not complete — the loop exited 255, most likely the port not yet released — so stock REPEATS are
