@@ -591,10 +591,32 @@ time than the run's wall clock). **It needs percentiles or a histogram to say an
 nothing.** Left in place, and labelled, so the next reader does not mistake the printed number for a
 finding.
 
-**NEXT (Marc's suggestion, and it survives the above):** check whether the receive is re-armed BEFORE or
-AFTER the reply's send commit. If the arm is serialised behind the send, each round trip pays the two
-delivery latencies in SEQUENCE rather than overlapped — at ~5-6µs each that is worth ~20% of the round
-trip, even though it cannot close a 13x gap.
+**RECV/SEND ORDERING (Marc's suggestion): CHECKED, AND IT IS NOT HAPPENING.** `HandleRecv` dispatches to
+the application — which submits the send — at `:1043`, then arms the next receive at `:1052`. Both are
+`RIO_MSG_DEFER` and a single `FlushCommits` kicks both directions, so both completions are outstanding
+simultaneously: **the two waits are already overlapped.** Worth noting why it cannot be improved by
+arming even earlier: the receive cannot be armed BEFORE dispatch without double-buffering, because the
+receive buffer is the one the application is currently reading from.
+
+**AND THE DECISIVE TEST, which is what closes this out.** If the ~5-6µs were "waiting for data to
+arrive", it would vanish at depth, where the next request is certainly already in the kernel buffer. It
+does not (`--shards 1`, one connection, three passes):
+
+| depth | GET/s | µs per completion wait |
+|---|---|---|
+| `-P 1` | 24,521 – 28,915 | 7.00 |
+| `-P 4` | 270,159 – 388,494 | **3.16** |
+| `-P 16` | 327,278 – 542,519 | **3.32** |
+
+**A hard ~3.2µs floor per completion survives a full pipeline.** So it is RIO's completion machinery, not
+data arrival, and it is never removed — only amortised across the ops in a batch. That is the whole
+shape: paid per round trip at `-P 1`, divided by 16 at `-P 16` (where RIO reaches IOCP-comparable
+throughput), and hidden entirely on many busy connections because other connections' completions arrive
+during the wait.
+
+**→ THE CONCLUSION AND THE RECOMMENDATION NOW LIVE IN `IOCP-VS-RIO.md`**, along with all seven things
+tried that did not fix it. This item is closed as *characterised, not fixed*: the cost is in the Windows
+API, and the deliverable was a documented recommendation rather than a code change.
 
 **The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
 one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
