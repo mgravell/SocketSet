@@ -106,6 +106,33 @@ internal abstract unsafe class WindowsShardBase<TConn> : SocketSetShard, IWindow
     public abstract void SubmitFlush(uint slot, uint generation, byte[] data, int length);
     public abstract void SubmitResumeReceive(uint slot, uint generation);
 
+    /// <summary>
+    /// Fast path for <see cref="SubmitFlush"/> when the caller is ALREADY the loop thread (the common
+    /// case: a response written from <c>OnReceive</c>). Pumps the bytes inline, skipping both the
+    /// cross-thread queue and the wake that follows it.
+    ///
+    /// Returns false — meaning "use <see cref="SubmitFlush"/> instead" — whenever it cannot prove the
+    /// inline order is the correct one. Two conditions, and the second is the subtle one:
+    /// <list type="bullet">
+    /// <item>not on the loop thread, so loop-owned state is not ours to touch; and</item>
+    /// <item>the flush queue is NOT empty, because a flush enqueued by another thread BEFORE this call
+    /// must go out first — jumping it would reorder a connection's byte stream. A flush that arrives
+    /// after the check is genuinely concurrent with this one, so no ordering guarantee exists to break.
+    /// The queue is shard-wide rather than per-connection, so this declines for an unrelated
+    /// connection's pending flush too: conservative, and correctness is worth more than the hop.</item>
+    /// </list>
+    /// </summary>
+    public abstract bool TryFlushOnLoop(uint slot, uint generation, byte[] data, int length);
+
+    /// <summary>
+    /// Measurement escape hatch for the fast path above: <c>SS_NO_ONLOOP_FLUSH=1</c> forces every flush
+    /// back through the cross-thread queue. It exists so the A/B runs on ONE binary in ONE session
+    /// rather than across a rebuild (house rule 6) — and so the fast path can be FALSIFIED rather than
+    /// assumed, which a change that only ever runs one way cannot be.
+    /// </summary>
+    protected static readonly bool OnLoopFlushDisabled =
+        Environment.GetEnvironmentVariable("SS_NO_ONLOOP_FLUSH") == "1";
+
     // --- write-page backpressure ---
     // Connections that wanted a write page while the pool was dry. Their bytes are staged in Pending and
     // retried on a later loop pass.

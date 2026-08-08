@@ -51,6 +51,10 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
 
     private static long s_staleCompletions;   // MUST stay 0 - a completion from a previous tenant
     private static long s_sends, s_sendBytes, s_commitSend, s_commitRecv, s_notify, s_portWakes, s_cqDrains, s_completions, s_pumpFlush, s_stagedBytes;
+
+    // Split of s_pumpFlush by HOW it was delivered. House rule 2: a fast path that silently declines
+    // measures identically to one that ran and did not pay, so the inline share has to be observable.
+    private static long s_flushInline, s_flushMarshaled;
     private static long s_recvs, s_recvBytes;   // receive-side; see the dispatch site for why they exist
     // DumpStats is static, so the per-shard receive buffer size is mirrored here purely so the B/recv
     // figure can be read against the buffer it had to fit in. Every shard in a set uses the same value.
@@ -72,7 +76,8 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
             $"port-wakes={Interlocked.Read(ref s_portWakes):n0} ({per(Interlocked.Read(ref s_portWakes)):n2}/send) " +
             $"cq-drains={Interlocked.Read(ref s_cqDrains):n0} completions={Interlocked.Read(ref s_completions):n0} | " +
             $"STALE COMPLETIONS={Interlocked.Read(ref s_staleCompletions):n0} (must be 0) " +
-            $"out-of-band flushes={Interlocked.Read(ref s_pumpFlush):n0} staged={Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB");
+            $"out-of-band flushes={Interlocked.Read(ref s_pumpFlush):n0} staged={Interlocked.Read(ref s_stagedBytes) / (double)(1 << 20):n1} MiB " +
+            $"(inline={Interlocked.Read(ref s_flushInline):n0} marshaled={Interlocked.Read(ref s_flushMarshaled):n0})");
     }
 
     // Periodic as well as at shutdown: a rig kills the server, and item 0c's lesson is that a measurement
@@ -445,9 +450,24 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     public override void SubmitResumeReceive(uint slot, uint generation) { _resumes.Enqueue((slot, generation)); Poke(); }
     public override void SubmitFlush(uint slot, uint generation, byte[] data, int length)
     {
-        if (ReportStats) { Interlocked.Increment(ref s_pumpFlush); Interlocked.Add(ref s_stagedBytes, length); }
+        if (ReportStats) { Interlocked.Increment(ref s_pumpFlush); Interlocked.Add(ref s_stagedBytes, length); Interlocked.Increment(ref s_flushMarshaled); }
         _flush.Enqueue((slot, generation, data, length));
         Poke();
+    }
+
+    /// <inheritdoc />
+    public override bool TryFlushOnLoop(uint slot, uint generation, byte[] data, int length)
+    {
+        if (OnLoopFlushDisabled || !IsLoopThread || !_flush.IsEmpty) return false;
+        // Counted identically to the marshaled path: the stats compare flush VOLUME across a change to
+        // how flushes are DELIVERED, so a fast path that stopped counting would read as "fewer flushes".
+        if (ReportStats) { Interlocked.Increment(ref s_pumpFlush); Interlocked.Add(ref s_stagedBytes, length); Interlocked.Increment(ref s_flushInline); }
+
+        // Same ownership contract as the drain in DrainCrossThread: the array is ours now, and must be
+        // returned however PumpFlush exits — including its drop paths, where the slot was re-tenanted.
+        try { PumpFlush(slot, generation, data, length); }
+        finally { ArrayPool<byte>.Shared.Return(data); }
+        return true;
     }
 
     private void DrainCrossThread()

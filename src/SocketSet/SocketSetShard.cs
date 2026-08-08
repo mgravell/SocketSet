@@ -174,7 +174,13 @@ public abstract class SocketSetShard
                 _parent.SignalStartupComplete();
             }
 
-            OnRun(); // the event loop; reached only if init succeeded
+            // Publish the loop thread's identity before entering it, so work submitted from a callback
+            // can recognise it is ALREADY on the loop and skip the cross-thread marshal. Cleared in the
+            // finally below: after the loop exits, nothing is "on" it, and a stale id would let a
+            // recycled thread id take a fast path into a dead shard.
+            Volatile.Write(ref _loopThreadId, Environment.CurrentManagedThreadId);
+            try { OnRun(); } // the event loop; reached only if init succeeded
+            finally { Volatile.Write(ref _loopThreadId, 0); }
         }
         catch (Exception ex)
         {
@@ -211,6 +217,17 @@ public abstract class SocketSetShard
     }
 
     protected abstract void OnRun();
+
+    // 0 while the loop is not running. Managed thread ids are never 0, so the initial and torn-down
+    // states can never match a live caller by accident.
+    private int _loopThreadId;
+
+    /// <summary>
+    /// True when the CALLER is the thread running this shard's event loop — i.e. we are inside a
+    /// callback (<c>OnReceive</c>, <c>OnAccept</c>, ...) and may act on loop-owned state directly
+    /// instead of marshaling to it. False from every other thread, and false once the loop has exited.
+    /// </summary>
+    protected bool IsLoopThread => Environment.CurrentManagedThreadId == Volatile.Read(ref _loopThreadId);
 
     /// <summary>Runs on the worker thread as it exits (after a clean stop, a mid-run
     /// fault, or a failed init). Must tolerate partially-initialized state.</summary>

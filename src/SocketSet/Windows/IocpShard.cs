@@ -625,6 +625,18 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         Poke();
     }
 
+    /// <inheritdoc />
+    public override bool TryFlushOnLoop(uint slot, uint generation, byte[] data, int length)
+    {
+        if (OnLoopFlushDisabled || !IsLoopThread || !_flush.IsEmpty) return false;
+
+        // Same ownership contract as the drain in DrainCrossThread: the array is ours now, and must be
+        // returned however PumpFlush exits — including its drop paths, where the slot was re-tenanted.
+        try { PumpFlush(slot, generation, data, length); }
+        finally { ArrayPool<byte>.Shared.Return(data); }
+        return true;
+    }
+
     /// <summary>Marshal a parked-receive resume onto the loop thread (from <see cref="Connection.ResumeReceive"/>,
     /// which runs on whichever thread completed the consumer's flush).</summary>
     public override void SubmitResumeReceive(uint slot, uint generation)

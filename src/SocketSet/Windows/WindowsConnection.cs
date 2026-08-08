@@ -7,14 +7,16 @@ namespace SocketSets.Windows;
 /// through this instead of holding a backend-typed shard reference - which is the only thing that
 /// previously stopped <c>Close</c> / <c>SubmitOutbound</c> from being written once.
 ///
-/// Interface dispatch is fine here: both members enqueue onto a <c>ConcurrentQueue</c> and poke the loop,
-/// so the call is already dominated by the enqueue, and neither is on the per-operation path.
+/// Interface dispatch is fine here: the marshaling members enqueue onto a <c>ConcurrentQueue</c> and poke
+/// the loop, so the call is already dominated by the enqueue. <see cref="TryFlushOnLoop"/> IS on the
+/// per-operation path, but it replaces strictly more work than the dispatch costs.
 /// </summary>
 internal interface IWindowsShard
 {
     void SubmitClose(uint slot, uint generation);
     void SubmitFlush(uint slot, uint generation, byte[] data, int length);
     void SubmitResumeReceive(uint slot, uint generation);
+    bool TryFlushOnLoop(uint slot, uint generation, byte[] data, int length);
 }
 
 /// <summary>
@@ -123,7 +125,15 @@ internal abstract class WindowsConnection : OutboundConnection
         // Generation-captured marshal onto the loop (same guard as Close): a flush for a since-closed and
         // re-tenanted slot is dropped on the loop thread rather than misdelivered.
         if (Volatile.Read(ref Socket) == 0) return false;
-        _shard.SubmitFlush(Slot, Volatile.Read(ref Generation), data, length);
+        uint generation = Volatile.Read(ref Generation);
+
+        // A response written from OnReceive is ALREADY on the loop thread, so the queue-plus-wake below
+        // is a round trip back to the thread we are standing on. Try to issue it directly; the shard
+        // declines (returning false) whenever it cannot prove the inline order is the correct one, and we
+        // fall through to the marshal unchanged. See IWindowsShard.TryFlushOnLoop for the two conditions.
+        if (_shard.TryFlushOnLoop(Slot, generation, data, length)) return true;
+
+        _shard.SubmitFlush(Slot, generation, data, length);
         return true;
     }
 }

@@ -417,6 +417,8 @@ and the send counts are what killed it. (Also visible: IOCP's zero-copy path is 
 **What RIO pays that IOCP does not is a NOTIFY ROUND TRIP PER SEND.** Every RIOSend is accompanied by
 ~1 commit, ~1 `RIONotify` re-arm and ~1.2 port wakes: an arm/block/wake cycle per send batch rather than
 per drain. With ~26.7x the throughput gap and ~1.0 the send count, the cost has to be in that cycle.
+**↑ THAT LAST SENTENCE IS FALSIFIED — 2026-08-08. The cycle was cut by ~60% and the throughput did not
+follow. See "Candidate fix" below; the observation stands, the inference from it does not.**
 
 **This is very probably item 0d's undiagnosed root cause, now visible WITHOUT the confounds it had.**
 0d ("RIO + TLS out-of-band send is starved at the default page", 2026-07-29) is recorded as *"NOT
@@ -431,12 +433,50 @@ arm/block/wake round trip per page?)". Both are ~1.00.
 (145.5 MiB/s against `iocp`'s 143.5). Garnet at `-P 1` has nothing to batch: one command in, one reply
 out. Consistent with RIO recovering to ~977k SET / ~463k GET at `-P 16`, where batching returns.
 
-**Candidate fix, untested:** `WindowsConnection.SubmitOutbound` marshals EVERY flush through the
-cross-thread queue plus a `PostQueuedCompletionStatus` wake — there is no "already on the loop thread"
-short-circuit, even though `OnReceive` runs on that thread. An on-loop fast path that issues the send
-directly would remove a wake per flush for both Windows backends, and on RIO would also remove the
-notify round trip that follows it. **Measure before believing it**: the send-count data says the loop is
-already coalescing, so the win may be smaller than the 26.7x gap suggests.
+**Candidate fix — IMPLEMENTED AND MEASURED 2026-08-08, AND IT FALSIFIES THE ATTRIBUTION ABOVE.**
+`WindowsConnection.SubmitOutbound` marshaled EVERY flush through the cross-thread queue plus a
+`PostQueuedCompletionStatus` wake, with no "already on the loop thread" short-circuit even though
+`OnReceive` runs on that thread. There is one now — `IWindowsShard.TryFlushOnLoop`, which declines back
+to the marshal whenever it cannot prove the inline order is correct: not on the loop thread, or a
+non-empty flush queue (a flush enqueued by another thread BEFORE this call must go out first, or the
+connection's byte stream reorders). `SS_NO_ONLOOP_FLUSH=1` forces the old behaviour, so the A/B is one
+binary in one session rather than across a rebuild.
+
+**The fast path RAN, and the counters are the proof, not the flag** (house rule 2):
+
+| | notify-rearms | port-wakes | flush split |
+|---|---|---|---|
+| fast path ON | 54,612 (**0.41**/send) | 52,167 (**0.39**/send) | inline 157,109 / marshaled 0 |
+| control (`SS_NO_ONLOOP_FLUSH=1`) | 123,705 (0.99/send) | 163,329 (1.31/send) | inline 0 / marshaled 169,215 |
+
+**It did exactly what it was designed to do — the arm/block/wake cycle per send fell by ~60%. And the
+throughput did not follow.** Seven passes per arm, first discarded, six scored, `-c 50 +m -P 1 -t GET
+-n 200000`:
+
+| arm | scored range | median |
+|---|---|---|
+| ON | 17,090 – 23,233 | 20,956 |
+| ON (independent repeat) | 18,421 – 22,066 | 21,303 |
+| OFF (control) | 15,028 – 19,194 | 18,318 |
+
+**The ranges OVERLAP, so no delta is quoted** (house rule 5). Both ON runs sit above the control and
+agree closely with each other, which suggests something real around 15% that six passes cannot separate
+from the noise. What is NOT in doubt is the SCALE: **the gap is ~30x and the most generous reading of
+this is ~15%.**
+
+**So "the cost has to be in that cycle" is dead.** The cycle was cut by ~60% and throughput moved at most
+~15%. Whatever RIO pays at depth 1, it is not the notify round trip — the leading candidate is now
+ELIMINATED rather than confirmed, and **the lead is still open with no candidate to replace it.** That is
+the finding; the fix is a side effect.
+
+**On IOCP there is no detectable effect**: ON 502,370–643,283 against OFF 506,732–599,746, overlapping
+heavily at ~28% spread. A 15% effect could not be seen through that variance in either direction, so this
+establishes nothing for IOCP beyond "no regression".
+
+**KEPT, and the reason matters because it is not the usual one:** it strictly removes work (a queue hop
+and a wake per flush), costs one predicate on a path already doing an interlocked enqueue, and regresses
+nothing — all 48 smoke cells and all nine narrower gates pass with it on. It is **not** kept because the
+measurement established a win, and a future reader should not cite it as one.
 
 **The control says this is RIO-specific, not general degradation:** IOCP over three consecutive runs on
 one server went 407,288 → 589,190 → 539,808, i.e. stable once warm. (The `stock` arm of that control
