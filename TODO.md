@@ -4,7 +4,86 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## SESSION CLOSE 2026-08-07 — READ THIS FIRST; the 2026-08-05 section below is now HISTORY
+## SESSION CLOSE 2026-08-08 — READ THIS FIRST; the 2026-08-07 section below is now HISTORY
+
+Eleven commits, all pushed. **Library code changed this session, so gates ARE implicated** — the full
+Windows suite (`bench/Run-SecurityGates.ps1`) is green, including the new gate. **Linux is not**: see the
+warning at the end of this section, which is the single most important thing here for whoever runs next.
+
+### What landed
+
+1. **A SECURITY FIX** (`REVIEW.md` **F9**). `SocketSetNetworkSender.IsLocalConnection()` returned `true`
+   for every peer. Decompiling Garnet showed that method IS the implementation of
+   `ConnectionProtectionOption.Local` — so on a SocketSet-hosted Garnet, `Local` was operationally
+   identical to `Yes`, and `MODULE LOAD` is arbitrary code loading. Opt-in gated (`No` is the default),
+   but the worst SHAPE of failure: the operator chose the restrictive setting and silently got the
+   permissive one. Now a real test against the peer address, failing closed on anything it cannot prove.
+2. **Peer/local endpoints on `Connection`** (item 4, done): `PeerAddress`, 24 bytes inline, no allocation;
+   `TrackEndpoints` defaults on and is reported as `endpoints=on|off|unsupported`; io_uring DECLINES and
+   says so. Garnet's `CLIENT LIST` reads real `addr=`/`laddr=` instead of the literal `socketset`.
+3. **`IOCP-VS-RIO.md`** — a new doc of record, wired into the table above. The RIO depth-1 investigation
+   is CLOSED as *characterised, not fixed*: the cost is in the Windows API.
+4. **Two real transport fixes, both kept, together worth ~2x at depth 1**: an on-loop flush fast path
+   (`TryFlushOnLoop`) removing a queue hop and wake per flush, and `SS_RIO_SPIN` (default OFF) which
+   roughly doubles depth-1 RIO.
+5. **`bench/Run-GarnetAb.ps1`** — the Windows Garnet A/B rig, with this week's four confounders encoded
+   in it rather than left to the operator.
+6. **`bench/verify-endpoints`** — new gate, registered in `Run-SecurityGates.ps1`.
+
+### What was FALSIFIED, which is the larger half
+
+**Five confident explanations died this session, three of them mine, and the record is written so nobody
+re-derives them.** In order:
+
+- "The generator is fine, `-c` means connections" → **it was a CLIENT BUG**; the classic `resp-benchmark`
+  leg handed one multiplexer to every worker, so `-c 50` opened ONE connection.
+- "The RIO collapse is placement / concurrency / small writes" → all three ruled out earlier.
+- "The cost has to be in the notify cycle" → **cut it by 60%, throughput moved ≤15%.**
+- "Then it must be blocking" → **half right**: a spin doubled it and left 13x.
+- "Then it is commit-per-send" → **wrong**; `RIO_MSG_DEFER` is a user-mode ring write, so RIO pays the
+  same two kernel transitions per round trip that IOCP does.
+- "The recv is armed behind the send" → **it is not**; both are deferred and committed together.
+
+**What it actually is, measured rather than inferred:** a **~3.2µs floor per RIO completion that survives
+a full pipeline**, so it is the completion machinery and not data arrival. Never removed, only amortised —
+which is why RIO is 13-25x behind at `-P 1` and comparable at `-P 16`. The clue that reframed it: the
+server is **~85% idle** at depth 1, so this was always a latency problem and every throughput-shaped
+hypothesis was doomed to half-work.
+
+Also falsified, in the endpoint work: **"IOCP/RIO tracking is free via the `AcceptEx` buffer"** (cheap,
+not free — two syscalls per accept) and **"UDS may force 128 bytes"** (it does not; an accepted UDS peer
+is unnamed).
+
+### Queued, in the order I would take them
+
+1. **RUN THE LINUX GATES.** Non-negotiable before trusting anything below.
+2. **A scored `Run-GarnetAb.ps1` run** — the rig exists and is smoke-tested, but no scored numbers are
+   recorded yet. This is the original backlog item's remaining half.
+3. **Publish a fixed `RESPite.Benchmark`** so the rig can re-pin (branch pushed, unmerged — see below).
+4. `SS_RIO_SPIN` as a possible default: needs a six-pass many-connections A/B with tighter variance, and
+   probably an adaptive spin that backs off when misses dominate (the miss rate is already counted).
+5. The blocked-time probe needs percentiles; its mean is uninterpretable and is labelled as such.
+
+### External dependency, and it blocks nothing but the pin
+
+`resp-benchmark`'s one-connection bug is FIXED on `marc/benchmark-connection-per-client` in
+`StackExchange.Redis` (pushed, **unmerged**, awaiting Marc's review). Until a fixed version is published,
+`Run-GarnetAb.ps1` defaults to the sibling SOURCE BUILD and **refuses to run against the pinned 3.1.13** —
+verified by pointing it at the pin and watching it decline.
+
+### ⚠ LINUX IS UNBUILT AND UNTESTED THIS SESSION
+
+The endpoint work touched **`EpollShard`** (population + recycle-clear) and **`IoUringShard`**
+(declination). Both compile in the net10.0 build; **neither has been exercised.** This is exactly the
+hazard the AGENTS.md preamble warns about, in the direction it warns about. Before trusting the Linux
+side: `bench/run-smoke-matrix.sh`, then `dotnet run --project bench/verify-endpoints`, and confirm
+io_uring reports `endpoints=unsupported` while epoll reports real addresses. Also note `verify-endpoints`
+has **no Linux-side equivalent of the `@abstract`-UDS cells** — an unnamed UDS peer should report
+`Family=Unix` with no address, and that path has never run.
+
+---
+
+## SESSION CLOSE 2026-08-07 — superseded by the section above; kept as history
 
 Five commits (this handover is the fifth). A Windows-only measurement session on a
 quiet box: **all three of the previous handover's queued measurements (a), (b), (c) are DONE**, and each

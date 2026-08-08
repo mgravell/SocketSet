@@ -14,6 +14,13 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > for the findings and the method, not as a baseline. **Never compare a number across the two.** Where an
 > older section's conclusion has been re-tested, that is stated inline.
 
+> **WINDOWS BACKEND CHOICE IS NOT A COIN FLIP, added 2026-08-08.** Nothing in this file is a basis for
+> picking `rio` over `iocp`. RIO carries a **~3.2µs floor per completion** that is only ever amortised,
+> never removed: it runs **13-25x behind IOCP at pipeline depth 1** and reaches comparable throughput by
+> depth 16. Any RIO figure here is therefore only meaningful with its DEPTH and CONNECTION COUNT
+> attached. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation, and the seven
+> things tried that did not change it.
+
 ## WHERE THINGS STAND (2026-08-03) — the consolidated view, RESP era
 
 > **EVERY NUMBER IN THIS SECTION IS LINUX** (7900X bare metal, io_uring/epoll, OpenSSL), and that
