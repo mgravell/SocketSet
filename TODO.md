@@ -146,8 +146,76 @@ defaults `RemoteEndpointName`/`LocalEndpointName` to the literal `"socketset"` b
 operator or monitoring tool that identifies a client by address are all broken against a SocketSet-hosted
 Garnet — every client is indistinguishable. Stock `GarnetServerTcp` reports real `ip:port`, so this is a
 behaviour DIFFERENCE between the two legs as well as a missing feature, and an A/B that ever compares
-admin-plane behaviour would trip on it. The endpoints are available on `Connection` at accept time, so
-this is plumbing rather than design. Not fixed here; found while confirming the connection count.
+admin-plane behaviour would trip on it.
+
+> **RETRACTION 2026-08-08.** The sentence that stood here — *"The endpoints are available on `Connection`
+> at accept time, so this is plumbing rather than design"* — **is wrong, and it understated the item by
+> about a day.** `Connection` (`src/SocketSet/Connection.cs`) exposes NO remote or local endpoint: its
+> surface is `UserToken`, the TLS/ALPN/SNI accessors, parking, and the `IBufferWriter` methods.
+> `AcceptContext` carries none either. The only `RemoteEndPoint` in the library is on the outbound
+> CONNECT path. It was written from the Garnet side, where the seam really is two arguments, without
+> checking that the transport had anything to pass. Recorded rather than deleted because "I checked the
+> consumer and assumed the producer" is the reusable mistake.
+
+**The Garnet half really is trivial**, and that part was right: `SocketSetNetworkSender` already takes
+optional `remoteName`/`localName` (`SocketSetNetworkSender.cs:30-37`, defaulting to `"socketset"`) and
+`SocketSetGarnetServer.cs:27` simply passes neither. Two arguments at one call site — once there is
+something to put in them.
+
+**The transport half is the actual work, and io_uring makes it a DESIGN call rather than plumbing:**
+
+| backend | remote address at accept | cost |
+|---|---|---|
+| IOCP / RIO | already sitting in the `AcceptEx` output buffer — `AcceptBufSize = 2 * AddrStride` is literally "local + remote sockaddr", and `SO_UPDATE_ACCEPT_CONTEXT` is already set | free; parse what is already written |
+| managed | `Socket.RemoteEndPoint` / `LocalEndPoint` | free |
+| epoll | thrown away today: `accept4(listenFd, null, null, ...)` passes NULL for the address | free for remote (same syscall); local needs `getsockname` |
+| io_uring | **unavailable** — the accept SQE sets only `opcode`/`fd`/`ioprio`/`user_data` and uses `IORING_ACCEPT_MULTISHOT`, which does not fill an address buffer | a `getpeername` PER ACCEPT, or give up multishot accept |
+
+So the fastest Linux path is the one that cannot have it for free. **Follow the house pattern and let the
+capability be DISCOVERED, not assumed** — the same shape as `SupportsReceiveParking` and the
+`BIO_get_ktls_recv` probe: io_uring either pays the extra syscall or reports that it declines, and
+whichever it does must be visible rather than silent.
+
+Two limits inherited from elsewhere: the native backends speak `sockaddr_in` ONLY (IPv4; see the
+2026-08-04 audit note at `Native/LibC.cs:131`), so an IPv6 peer has no representation today; and a UDS
+peer has no `ip:port` at all and needs its own string form.
+
+**THE TRAP, and it is the real correctness risk — CONNECTIONS ARE POOLED AND REUSED.** Endpoint state
+stored on `Connection` must be cleared on recycle, or a recycled connection reports the PREVIOUS
+tenant's address in `CLIENT LIST`. That is the same shape as the tail-wipe disclosure vector — one
+peer's identity leaking to the next — and **no existing gate can see it, because nothing reads an
+endpoint at all today.** A gate cell must assert that a recycled connection reports the NEW peer, not
+merely that it reports something; "reports something" passes against the stale value.
+
+Formatting should be LAZY and cached: accept is hot, `CLIENT LIST` is not, and building a string per
+accept would tax exactly the path the shard design exists to make fast.
+
+**PROPOSED: an opt-out on `SocketSetOptions`, DEFAULT ON** (Marc's call, 2026-08-08). Endpoint tracking
+is overhead that a closed embedding — one that never surfaces a peer address — should be able to decline,
+and on io_uring that overhead is a syscall per accept rather than a few instructions. Default ON because
+the surprising-and-broken direction is the current one: a server whose every client is indistinguishable.
+Prefer a positively-named `TrackEndpoints { get; init; } = true` over a `DangerousDisable...` negative —
+`DangerousDisableBufferWipe` is named that way because disabling it is a DISCLOSURE risk, and this is
+not; turning this off loses information, it does not leak any.
+
+**Whatever it is called, two house rules bind it:**
+- **It must be REPORTED, not merely configured** — `SocketSet.ToString`/`/config` prints `wipe=on/off`
+  unconditionally for exactly this reason, and the endpoint flag needs the same treatment or a rig
+  cannot gate on it (house rule 1).
+- **The gate must run every cell TWICE, once per setting, and assert the INVERSE on the off-half** —
+  the `verify-tailwipe` pattern. An inert flag leaves the on-half green, and a flag that leaked into the
+  default leaves the off-half green; only the pair can tell those apart.
+
+**Sibling defect, same missing information, fold it into the same change:**
+`SocketSetNetworkSender.cs:44` hardcodes `IsLocalConnection() => true`, commented *"All SocketSet demo
+traffic is same-host today; revisit if this ever fronts a real NIC."* **That precondition no longer
+holds** — `Verify-BindReachability.ps1` exists precisely because SocketSet now binds and serves real LAN
+addresses. Garnet gates some behaviour on locality, so an unconditional `true` may be telling it that a
+REMOTE peer is local. What Garnet actually does with it is UNVERIFIED and must be checked against the
+package before severity is claimed — but it is the same missing datum, so it should not be rediscovered
+separately later.
+
+Not fixed here; found while confirming the connection count, and re-scoped 2026-08-08.
 - ~~**A GENERATOR, and this is the real blocker.**~~ **SOLVED 2026-08-07: use `resp-benchmark`.**
   It takes redis-benchmark's arguments (`-h -p -c -n -d -P -t -q -l`) plus `+m` multiplexing and
   `--batch`/`--queue`. **It is a NEW baseline and must not be differenced against the Linux tables**
