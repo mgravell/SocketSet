@@ -85,9 +85,10 @@ is unnamed).
    larger than four receives, so a soft park there could be much weaker than it looks. Size it, measure
    what the peer actually gets to send after a park, and make `resume` idempotent.
 
-0b. **OUTBOUND CONNECTIONS HAVE NO `RemoteAddress` ON ANY BACKEND** — a known gap in the endpoint work,
-   found immediately after it landed and recorded before it could be rediscovered. Detail under item 4
-   below. Small, bounded, fail-closed, and it needs a gate cell that does not exist yet.
+0b. ~~**OUTBOUND CONNECTIONS HAVE NO `RemoteAddress` ON ANY BACKEND**~~ — **DONE 2026-08-09**, and one
+   word of it was wrong: **managed was always correct** (its `Register` runs from `CompleteConnect`, i.e.
+   after success), so it was three backends, not all of them. Detail under item 4 below. **The epoll half
+   is UNRUN — see the Linux warning at the end of this section, which now covers this too.**
 1. **RUN THE LINUX GATES.** Non-negotiable before trusting anything below.
 2. **A scored `Run-GarnetAb.ps1` run** — the rig exists and is smoke-tested, but no scored numbers are
    recorded yet. This is the original backlog item's remaining half.
@@ -109,7 +110,17 @@ The endpoint work touched **`EpollShard`** (population + recycle-clear) and **`I
 (declination). Both compile in the net10.0 build; **neither has been exercised.** This is exactly the
 hazard the AGENTS.md preamble warns about, in the direction it warns about. Before trusting the Linux
 side: `bench/run-smoke-matrix.sh`, then `dotnet run --project bench/verify-endpoints`, and confirm
-io_uring reports `endpoints=unsupported` while epoll reports real addresses. Also note `verify-endpoints`
+io_uring reports `endpoints=unsupported` while epoll reports real addresses.
+
+**2026-08-09 makes this worse, not better, and the epoll change is the one to look at first.** The
+outbound fix MOVED epoll's populate out of `InitClient` and into three separate call sites. On Windows
+that fix is measured (the gate fails without it and passes with it); on Linux **not one line of it has
+run**, and the change is structurally riskier than the Windows one-liners because it relocated an
+existing working call rather than adding a missing one. The specific thing to check is that
+`connect/reports` passes on epoll — including the immediate-success branch, which is the one loopback and
+UDS actually take, and which no test on Windows can reach. A half-populated result (`LocalAddress` set,
+`RemoteAddress` unset) would mean `getsockname` succeeded where `getpeername` did not, i.e. the populate
+is still running too early. Also note `verify-endpoints`
 has **no Linux-side equivalent of the `@abstract`-UDS cells** — an unnamed UDS peer should report
 `Family=Unix` with no address, and that path has never run.
 
@@ -318,7 +329,39 @@ and the cost sits where the interface requires it.
 does not define it at all. `PeerAddress.FromSockAddr` picks the value per-platform; hard-coding either
 would silently misparse on the other, which is the kind of bug that survives a green test suite.
 
-#### KNOWN GAP, found immediately after landing: OUTBOUND connections are not populated
+#### ~~KNOWN GAP~~ FIXED 2026-08-09: OUTBOUND connections were not populated
+
+> **CLOSED.** Populate now runs at the point each backend's connection is genuinely established:
+> `IocpShard.HandleConnect` and `WindowsRioShard.HandleConnect` (immediately after
+> `SO_UPDATE_CONNECT_CONTEXT`, which is what makes the calls legal on a `ConnectEx` socket at all), and on
+> epoll at `AdoptAccepted` / `StartConnect`'s immediate-success branch / `CompleteConnect` — the populate
+> is OUT of `InitClient` entirely, since that was the timing bug. Not `FireOpen`, which TLS re-enters and
+> would pay both syscalls twice per handshake. `bench/verify-endpoints` grew `connect/reports` and
+> `connect-off/unset`; the suite is 27 cells and green on Windows.
+>
+> **The correction to the paragraph below: MANAGED WAS NEVER BROKEN.** Its `Register` is called from
+> `CompleteConnect`, after the connect has succeeded, so `socket.RemoteEndPoint` was always valid. Shown
+> rather than argued — the new gate was run against the pre-fix library and IOCP and RIO fail
+> `connect/reports` while managed passes it. "On every backend" was written from the two native ones.
+>
+> **DECIDED, and it is the one thing here a reader might expect to go the other way: the address is read
+> from the KERNEL, not remembered from the `EndPoint` that was dialled.** Remembering it would give
+> `RemoteAddress` for free and is faithful (`Connect` takes only an `IPEndPoint` or a UDS path, and TCP
+> does not redirect) — but `LocalAddress` is the ephemeral port the kernel assigns, so `getsockname` is
+> unavoidable regardless, leaving one syscall as the entire saving. Against that, populating from the
+> request would set an address on a socket that has not connected yet, and `IsSet` would stop meaning "the
+> kernel says this socket is connected to that peer" — which is the property F9's fail-closed test rests
+> on. The gate encodes the decision rather than the comment: `connect/reports` requires
+> `LocalAddress.Port` to equal the ephemeral port the DIAL TARGET independently saw, which an
+> implementation that remembered its argument cannot produce.
+>
+> **io_uring stays UNSET outbound, deliberately** (Marc's call, 2026-08-09). It holds a real fd there, so
+> the per-accept cost argument does not apply and two syscalls per dial would work — but a set that
+> reports `endpoints=unsupported` and then supplies addresses in one direction is a worse report than one
+> that supplies none. `connect/declines-unset` holds that in place. **If a proxy or tunnel shape on
+> io_uring ever needs outbound addresses, the work is: populate in `IoUringShard.HandleConnect`, and split
+> `SupportsEndpointTracking` (or the banner) so the third state can say `outbound-only`.** Do not do the
+> first without the second.
 
 **Only the three ACCEPT paths were wired** — `IocpShard.AdoptAccepted`, `WindowsRioShard.AdoptAccepted`,
 `EpollShard.InitClient`. The connect completions were not, so a connection made by `Connect(...)` has
@@ -333,6 +376,9 @@ would silently misparse on the other, which is the kind of bug that survives a g
 
 **Why no gate caught it:** `bench/verify-endpoints` only exercises inbound connections. It passed 21/21
 without touching this. **An outbound cell is required as part of the fix**, or the same hole reopens.
+(Done — and note the shape of the miss, because it is reusable: every cell in a 21-cell security gate
+tested ONE direction, and the rig's own header comment described what it discriminated so convincingly
+that nobody noticed the axis it did not vary at all.)
 
 **Severity: low, and bounded.** Everything driving the endpoint work is accept-side — Garnet's
 `CLIENT LIST`, `IsLocalConnection`, the F9 fix — and the failure is fail-closed (`IsSet` false,

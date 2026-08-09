@@ -218,7 +218,7 @@ public abstract class SocketSetShard
 
     /// <summary>
     /// Whether this backend can populate <see cref="Connection.RemoteAddress"/>/<see
-    /// cref="Connection.LocalAddress"/> at accept. True for every backend whose accept already yields the
+    /// cref="Connection.LocalAddress"/> at all. True for every backend whose accept already yields the
     /// peer sockaddr; **false for io_uring**, whose multishot accept does not fill an address buffer, and
     /// which declines rather than paying a <c>getpeername</c> per accept on the fastest Linux path.
     ///
@@ -226,6 +226,13 @@ public abstract class SocketSetShard
     /// server would show every peer as anonymous, which reads as "no client is remote" — the failure
     /// direction that matters when something admits on locality. Surfaced in
     /// <see cref="SocketSet.ToString"/> as <c>endpoints=unsupported</c>.
+    ///
+    /// ONE FLAG FOR BOTH DIRECTIONS, decided 2026-08-09. io_uring holds a real fd on the CONNECT path, so
+    /// the per-accept cost argument does not apply there and it could populate outbound for two syscalls
+    /// per dial. It deliberately does not, and the reason is the paragraph above: a backend that reports
+    /// <c>endpoints=unsupported</c> and then supplies addresses in one direction is a worse report than
+    /// one that supplies none. Splitting this into inbound and outbound halves is available if a proxy
+    /// shape on io_uring ever needs it — but do the split and the flag together, never the flag alone.
     /// </summary>
     protected internal virtual bool SupportsEndpointTracking => true;
 

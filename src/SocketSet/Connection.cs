@@ -88,7 +88,9 @@ public abstract class Connection : IBufferWriter<byte>
     /// <item>the backend cannot supply it — io_uring uses multishot accept, which does not fill an address
     /// buffer, so it declines rather than paying a <c>getpeername</c> per accept. It SAYS so via
     /// <see cref="SocketSet.SupportsEndpointTracking"/>, because a silent degradation here would make every
-    /// peer look anonymous and so read as "nobody is remote";</item>
+    /// peer look anonymous and so read as "nobody is remote". The declination covers OUTBOUND connections
+    /// too, where io_uring could in fact populate cheaply — deliberately, so that
+    /// <c>endpoints=unsupported</c> means unsupported rather than unsupported-in-one-direction;</item>
     /// <item>the peer genuinely has no address — an accepted AF_UNIX connection whose client never bound
     /// one, which is the normal case. <see cref="PeerAddress.Family"/> is still <c>Unix</c> there, so
     /// "unnamed Unix peer" stays distinguishable from "not tracked".</item>
@@ -97,6 +99,16 @@ public abstract class Connection : IBufferWriter<byte>
     /// SECURITY: <see cref="PeerAddress.IsLoopback"/> is false when unset, deliberately. Anything deciding
     /// admission on locality must fail closed on an address it could not obtain — see REVIEW.md F9, where
     /// exactly that decision was being made on a hard-coded <c>true</c>.
+    ///
+    /// BOTH DIRECTIONS, since 2026-08-09. Outbound connections reported nothing on either Windows backend
+    /// until then (a missing call), and on epoll for a subtler reason worth remembering: the populate ran
+    /// at slot-claim, which for a NON-BLOCKING connect is before the connect completes, so
+    /// <c>getpeername</c> returned <c>ENOTCONN</c> and the address silently stayed unset. Both are read
+    /// from the kernel at the point the connection is established, rather than remembered from the
+    /// <see cref="System.Net.EndPoint"/> that was dialled: the dialled address really is the peer, but the
+    /// local one is an ephemeral port only the kernel knows, so a syscall is unavoidable anyway — and
+    /// reading both keeps <see cref="PeerAddress.IsSet"/> meaning "the kernel says this socket is
+    /// connected to that peer", which is the property a locality decision rests on.
     /// </summary>
     public PeerAddress RemoteAddress { get; internal set; }
 

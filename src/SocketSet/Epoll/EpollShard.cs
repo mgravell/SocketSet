@@ -363,9 +363,11 @@ internal sealed unsafe class EpollShard : SocketSetShard
         conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
         conn.ResetReceiveParking();
         conn.RemoteAddress = conn.LocalAddress = default; // pooled slot: never inherit the last tenant's
-        // Populated here rather than at the accept4 site because a CONNECT lands here too, and both want
-        // it. The fd is live by this point; a peer that has already reset leaves the address unset.
-        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, fd);
+        // NOT populated here, though it used to be. A CONNECT lands in this method too, and a non-blocking
+        // connect has NOT completed at slot-claim: getpeername returns ENOTCONN and the address silently
+        // stayed unset for every outbound connection. Population now happens at the three points where the
+        // fd is genuinely connected (AdoptAccepted, StartConnect's immediate-success branch,
+        // CompleteConnect) — the clear above still belongs here, because it must cover every claim.
         conn.Tls = null;
         conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
         conn.Zc = null;         // ditto — any in-flight zero-copy send was finished in CloseClient
@@ -507,6 +509,10 @@ internal sealed unsafe class EpollShard : SocketSetShard
         var conn = InitClient(fd, token, SocketSet.SocketFlags.None);
         if (conn is null) { LibC.close(fd); ReleaseReservation(); return; }
 
+        // An accept4 fd is connected on arrival, so both addresses are readable immediately; a peer that
+        // has already reset leaves them unset, which is ordinary load rather than an error.
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, fd);
+
         if (!_recvBuffer.TryLease(out int ri, out _)) { LibC.close(fd); FreeSlot(conn); return; }
         conn.RecvBuf = ri;
 
@@ -616,7 +622,14 @@ internal sealed unsafe class EpollShard : SocketSetShard
         }
         conn.WantWrite = conn.Connecting;
 
-        if (!conn.Connecting) FireOpen(conn, isClient: true); // connected immediately (loopback/UDS)
+        if (!conn.Connecting)
+        {
+            // Connected immediately (loopback/UDS): the fd is connected NOW, so this is the equivalent
+            // point to CompleteConnect's. Populated here rather than in FireOpen because TLS re-enters
+            // FireOpen after the handshake, which would pay both syscalls twice per TLS connection.
+            if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, fd);
+            FireOpen(conn, isClient: true);
+        }
     }
 
     private void CompleteConnect(EpollConnection conn)
@@ -630,6 +643,10 @@ internal sealed unsafe class EpollShard : SocketSetShard
         }
         conn.Connecting = false;
         DisarmWrite(conn);
+        // The connect has now SUCCEEDED (SO_ERROR read zero above), so getpeername/getsockname finally
+        // have something to report. Before this point they return ENOTCONN, which is why populating at
+        // slot-claim left every outbound connection unset.
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, conn.Fd);
         FireOpen(conn, isClient: true);
     }
 

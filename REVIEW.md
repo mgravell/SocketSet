@@ -269,6 +269,18 @@ over the host's own LAN address and requires `IsLoopback` FALSE. A hard-coded `t
 the address bytes reversed, fails there and passes everything else. `recycle/new-tenant` covers the
 pooling hazard, and `tracking-off/unset` asserts the inverse half.
 
+**One direction only, until 2026-08-09 — and the fix is recorded here because the gap was fail-closed
+rather than harmless.** An OUTBOUND connection reported an unset `RemoteAddress` on IOCP, RIO and epoll
+(managed was always correct), so `IsLocalConnection()` on one would have answered FALSE — the safe
+direction, and the reason this is a defect rather than a vulnerability, but a wrong answer for a
+connection to `127.0.0.1` all the same. Nothing in the Garnet bridge dials outbound today, so no shipped
+decision was affected. Both Windows backends were a missing call at `HandleConnect`; epoll was subtler and
+is the one worth carrying forward — the populate ran at slot-claim, which for a non-blocking connect is
+BEFORE the connect completes, so `getpeername` returned `ENOTCONN` and the address silently stayed unset.
+A populate that runs too early and a populate that is missing are indistinguishable from the outside,
+which is why the fix is asserted by `connect/reports` rather than by inspection. **The epoll half has
+still never run** (Windows-only session); the Linux warning in `TODO.md` covers it.
+
 **Still not gated, and stated rather than implied:** that Garnet itself then permits DEBUG over loopback
 and refuses it remotely. That needs `EnableDebugCommand=Local` configured plus a remote peer, which no
 rig here sets up. What is verified is the input Garnet makes that decision from.

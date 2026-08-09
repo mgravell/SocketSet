@@ -145,6 +145,12 @@ both have caused hesitation:
     success but forgets to clear on claim. `tracking-off/unset` asserts the INVERSE half per the
     `verify-tailwipe` pattern. On a backend that declines (io_uring) it asserts the DOCUMENTED
     degradation rather than skipping. A host with no LAN address reports INCONCLUSIVE, not PASS.
+    **Since 2026-08-09 it also covers OUTBOUND connections**, and the hole it had is worth remembering as
+    a class: outbound reported nothing on IOCP, RIO or epoll while this rig passed 21/21, because every
+    cell varied the IMPLEMENTATION and none varied the DIRECTION. `connect/reports` dials a plain listener
+    and requires `LocalAddress.Port` to equal the ephemeral port that target independently saw — the one
+    number no implementation can produce by remembering the endpoint it was handed, which is what makes it
+    a test of the kernel read rather than of the argument. Run it on any change to a connect path.
   - **`bench/verify-bind-address.sh`** (Linux) / **`bench/Verify-BindAddress.ps1`** (Windows), added
     2026-08-04 — that
     `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code

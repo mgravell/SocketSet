@@ -928,6 +928,11 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_UPDATE_CONNECT_CONTEXT, null, 0);
         if (!SetupConnection(conn)) { CloseClient(slot); return; }
 
+        // Outbound peer/local addresses, before OnConnect so a callback can read them. Valid only after
+        // SO_UPDATE_CONNECT_CONTEXT above — see the longer note on IocpShard.HandleConnect for why this is
+        // read from the kernel rather than remembered from the EndPoint that was dialled.
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, conn.Socket);
+
         // TLS: OnConnect is deferred to FireTlsOpen (the client speaks first — see BeginTls).
         var clientTls = Parent.ResolveClientTls(conn);
         if (clientTls.Refused) { CloseClient(slot); return; }   // never downgrade to plaintext

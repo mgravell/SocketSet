@@ -1094,6 +1094,16 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
 
         Win32.setsockopt(conn.Socket, Win32.SOL_SOCKET, Win32.SO_UPDATE_CONNECT_CONTEXT, null, 0);
 
+        // Peer/local addresses for an OUTBOUND connection, before OnConnect so a callback can read them.
+        // The placement is FORCED, exactly as SO_UPDATE_ACCEPT_CONTEXT forces it in AdoptAccepted: until
+        // the option above is applied, a ConnectEx socket carries none of its connect context and both
+        // calls fail. Read from the kernel rather than remembering the EndPoint the caller dialled: the
+        // requested address really is the peer (TCP does not redirect), but the LOCAL address is the
+        // ephemeral port the kernel picked, so getsockname is unavoidable anyway — and reading both keeps
+        // "IsSet means the kernel says this socket is connected to that peer", which is what anything
+        // deciding on IsLoopback needs (REVIEW.md F9).
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, conn.Socket);
+
         // Handle synchronous recv/send completions inline (see AdoptAccepted). Set after connect
         // completed, so ConnectEx itself stayed on the always-async path.
         conn.SkipOnSuccess = Win32.SetFileCompletionNotificationModes(conn.Socket,
