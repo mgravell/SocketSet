@@ -12,7 +12,7 @@ This library makes extensive and unapologetic use of agent assistance under huma
 | **`TODO.md`** | The backlog, the design calls, and **why** each was made. Starts with a "READ FIRST IF YOU ARE ON WINDOWS" section — read it if that is you, because shared code changed under Windows while it was not running. |
 | **`RESULTS.md`** | Every measurement of record, with its method and its caveats. Opens with "WHERE THINGS STAND" — the consolidated feature matrix and headline numbers. |
 | **`REVIEW.md`** | Security/correctness audits of record: what was found, how it was established, what was decided, and what was deliberately left open. What `RESULTS.md` is to measurements, this is to reviews — including the things checked that turned out to be nothing, so nobody re-derives them. |
-| **`IOCP-VS-RIO.md`** | Which Windows backend to use, and why — with the ~3.2µs RIO completion floor that decides it, and the SEVEN things tried that did not fix the depth-1 gap. Read before touching either Windows backend or proposing a fix for RIO. |
+| **`IOCP-VS-RIO.md`** | Which Windows backend to use, and why — with the ~3.2µs RIO completion floor that decides it, and the EIGHT things tried that did not fix the depth-1 gap. Read before touching either Windows backend or proposing a fix for RIO. |
 | **`bench/README.md`** | How to get a number you can trust on this kind of machine. Written from a session where **eight** separate confounders each produced clean-looking wrong numbers. |
 
 `TODO.md` and `RESULTS.md` are long on purpose: they record retractions and falsified predictions as

@@ -56,7 +56,36 @@ is unnamed).
 
 ### Queued, in the order I would take them
 
-0. **OUTBOUND CONNECTIONS HAVE NO `RemoteAddress` ON ANY BACKEND** — a known gap in the endpoint work,
+0a. **SOFT PARKING FOR io_uring — LOOK AT THIS ON LINUX** (Marc, 2026-08-09). The N-ary receive work
+   redefined parking as *"stop RE-ARMING; let what is posted drain"* rather than *"stop receiving now"*,
+   and that softer definition may be exactly what unblocks io_uring, where parking is currently declined
+   outright (`SupportsReceiveParking => false`, because a multishot receive cannot be un-armed).
+
+   **The mechanism worth trying, and it needs no cancellation at all:** io_uring receives into a
+   PROVIDED-BUFFER ring. If we stop REPLENISHING that ring, the kernel runs out of buffers, the multishot
+   receive stalls with `ENOBUFS`, and the peer's window closes — which is precisely what parking is for.
+   Resume = start replenishing again. No `IORING_OP_ASYNC_CANCEL`, no re-arm, no lost bytes.
+
+   **What to check before believing it:** whether the multishot receive TERMINATES on `ENOBUFS` (in which
+   case resume must re-arm it, and the "cannot un-arm" objection is moot because the kernel un-armed it
+   for us) or merely stalls; and whether buffers already consumed but not yet returned give the park a
+   grace period that makes it less responsive than the other backends'. `bench/verify-parking` already
+   asserts the DOCUMENTED degradation for io_uring, so that cell must flip deliberately rather than
+   quietly — and its `stalled/peer-held` cell is the one that would prove a soft park actually holds the
+   peer.
+
+   **A WARNING FROM THE RIO EXPERIMENT, which tried the same softer definition and got bitten.** N-ary
+   receives on RIO failed three parking cells: the sender reached **4.63 MiB** before the bound dropped
+   the connection, where IOCP holds it at **0.25 MiB**, and a resume never refilled. Both causes were
+   implementation bugs rather than the concept — `ResumeReceive` gated on "any outstanding" so it
+   returned early, and `TryParkReceive` was called on every completion, letting the park lapse — but they
+   are exactly the two mistakes a soft park invites, and neither showed up in the smoke matrix. **The
+   grace period is real and must be BOUNDED**: "let what is posted drain" is only backpressure if what is
+   posted is small. On io_uring the equivalent quantity is the provided-buffer ring's depth, which is far
+   larger than four receives, so a soft park there could be much weaker than it looks. Size it, measure
+   what the peer actually gets to send after a park, and make `resume` idempotent.
+
+0b. **OUTBOUND CONNECTIONS HAVE NO `RemoteAddress` ON ANY BACKEND** — a known gap in the endpoint work,
    found immediately after it landed and recorded before it could be rediscovered. Detail under item 4
    below. Small, bounded, fail-closed, and it needs a gate cell that does not exist yet.
 1. **RUN THE LINUX GATES.** Non-negotiable before trusting anything below.

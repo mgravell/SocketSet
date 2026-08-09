@@ -27,7 +27,7 @@ everywhere and simply goes faster where the platform lets it.
 > request/response — including any single multiplexed client connection, which is the normal shape for a
 > .NET Redis client. Measured on one machine over loopback, RIO ran 13-25x behind IOCP at depth 1 and
 > reached comparable throughput at depth 16.
-> **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation, and the seven things
+> **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation, and the eight things
 > tried that did not change it.
 
 Supported frameworks: `net10.0` and `net472`. (The native backends are .NET-only; .NET Framework

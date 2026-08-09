@@ -111,7 +111,35 @@ Recorded so nobody re-derives them. Each looked plausible and each was measured.
    `RIO_MSG_DEFER` is a user-mode ring write, and only `FlushCommits` enters the kernel, once per RQ per
    direction. A depth-1 round trip costs RIO two kernel transitions — exactly what IOCP pays with
    `WSARecv` + `WSASend`.
-7. **Receive re-armed behind the send.** Checked, and it is not happening. `HandleRecv` dispatches to the
+7. **Only ONE receive posted at a time** (`SS_RIO_RECVS`, added 2026-08-09 to test it). The most
+   promising hypothesis yet, and the queue really was structurally limited: `RIOCreateRequestQueue`'s
+   `maxOutstandingReceive` was hard-coded to **1**, so no posted-receive backlog was possible however the
+   loop was written. The theory was that between a completion and our re-arm there is a window with no
+   receive posted, and data arriving inside it cannot be matched — which would explain why spinning
+   halved the gap and then stopped, since you cannot poll a completion into existence.
+
+   **Implemented (a leased ring of N buffers per connection, cycled in posting order) and FALSIFIED.** At
+   `spin=0`, N=1 medians 20,447 (17,701–22,329) against N=4's 21,355 (16,538–23,029) — fully overlapping.
+   Combined with the spin, two independent repeats put N=4 above N=1 (39,533 / 41,145 against 36,375 /
+   36,479) with closely-agreeing medians but **overlapping ranges**, so no delta is quotable; ~10% at
+   most, against a 13x gap.
+
+   **So the receive was already armed in time**, and this is the strongest confirmation yet that the
+   ~3.2µs is delivery latency rather than anything in our control. It also confirmed RIO completes FIFO
+   per request queue — `--verify-echo` is byte-exact at N=4, which is what makes the ring safe.
+
+   **THE CODE WAS REVERTED, and the reason is not just the null result: N receives BROKE PARKING.**
+   `verify-parking` failed three RIO cells at N=4 while the N=1 default stayed green — the sender ran to
+   4.63 MiB before the bound dropped the connection, where IOCP holds it at 0.25 MiB, and a resume never
+   refilled. Both were mine (`ResumeReceive` gates on "any outstanding", so it returned early; and
+   `TryParkReceive` was called on every completion, letting the park lapse), and both are fixable — but
+   fixing them buys a measured nothing, and a flag that silently breaks backpressure when enabled is a
+   trap rather than a capability. **What survives is the knowledge**: the parameter was 1, completions
+   are FIFO, N does not help at depth 1, and posted-receive backlogs interact badly with parking.
+   **Untested, if anyone revives it:** the many-connections and bulk-transfer regimes, where more
+   completions in flight is at least plausible.
+
+8. **Receive re-armed behind the send.** Checked, and it is not happening. `HandleRecv` dispatches to the
    application (which submits the send) at `:1043` and arms the next receive at `:1052`; both are
    `RIO_MSG_DEFER` and a single `FlushCommits` kicks both directions, so both completions are outstanding
    simultaneously. The two waits are **already overlapped**. Note the receive cannot be armed *before*
