@@ -131,9 +131,29 @@ is unnamed).
       both flip a documented degradation in the same gate; landing them together makes an inverted cell
       ambiguous about which change caused it.
 1. **RUN THE LINUX GATES.** Non-negotiable before trusting anything below.
-2. **A scored `Run-GarnetAb.ps1` run** — the rig exists and is smoke-tested, but no scored numbers are
-   recorded yet. This is the original backlog item's remaining half.
+2. ~~**A scored `Run-GarnetAb.ps1` run**~~ — **DONE 2026-08-09**, and it closes the original backlog item:
+   Garnet on Windows now has scored numbers, where every previous Garnet figure in `RESULTS.md` was Linux.
+   Headline: **SocketSet beats stock Garnet SAEA wherever anything separates** (+13.7% IOCP / +42.2% RIO at
+   `-P 1`; +27.4% / +26.9% at `-P 16`; **nothing quotable at `-P 4`**, all three ranges overlap). The
+   confirmation worth knowing: **at 200 connections RIO is LEVEL with IOCP at depth 1**, which is
+   `IOCP-VS-RIO.md`'s own prediction measured at six passes rather than three — the 13-25x deficit is a
+   SINGLE-CONNECTION statement, and the `RESULTS.md` banner that omitted that qualifier is fixed.
+   **Bounded by the generator, not the transport:** server CPU never exceeded 9.9 of 24 cores and sat at
+   4.4-6.1 at `-P 16`, so every delta is a LOWER bound and no absolute here is a ceiling. **Next:** raise
+   the generator process count until server CPU actually climbs, and look at our variance — our spreads
+   are 16-48% per cell against stock's 0.8-9.8%, which is unattributed and makes any three-pass run here
+   dangerous.
+
+   **A RIG BUG FOUND ON THE WAY, and it is the transferable half:** the `stock` leg had NEVER RUN. An `if`
+   returning a one-element array is unwrapped by PowerShell to a String, so a following `+=` concatenated
+   instead of appending and the server was launched with the single argument `--stock--shards 12 --port
+   7602`. It could only ever hit the single-element branch — which was the CONTROL — while both SocketSet
+   legs returned two elements, stayed arrays, and ran fine, including through the smoke test that
+   pronounced the rig working. Now the third entry in `bench/README.md`'s PowerShell traps. **Run the
+   control leg first: it is the one whose breakage looks least like breakage.**
 3. **Publish a fixed `RESPite.Benchmark`** so the rig can re-pin (branch pushed, unmerged — see below).
+   Not blocking: the 2026-08-09 scored run used the sibling SOURCE build off
+   `marc/benchmark-connection-per-client`, which is what the rig defaults to.
 4. `SS_RIO_SPIN` as a possible default: needs a six-pass many-connections A/B with tighter variance, and
    probably an adaptive spin that backs off when misses dominate (the miss rate is already counted).
 5. The blocked-time probe needs percentiles; its mean is uninterpretable and is labelled as such.

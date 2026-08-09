@@ -14,12 +14,131 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > for the findings and the method, not as a baseline. **Never compare a number across the two.** Where an
 > older section's conclusion has been re-tested, that is stated inline.
 
-> **WINDOWS BACKEND CHOICE IS NOT A COIN FLIP, added 2026-08-08.** Nothing in this file is a basis for
-> picking `rio` over `iocp`. RIO carries a **~3.2µs floor per completion** that is only ever amortised,
-> never removed: it runs **13-25x behind IOCP at pipeline depth 1** and reaches comparable throughput by
-> depth 16. Any RIO figure here is therefore only meaningful with its DEPTH and CONNECTION COUNT
-> attached. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation, and the seven
-> things tried that did not change it.
+> **WINDOWS BACKEND CHOICE IS NOT A COIN FLIP, added 2026-08-08 — qualifier made explicit 2026-08-09.**
+> RIO carries a **~3.2µs floor per completion** that is only ever amortised, never removed. It runs
+> **13-25x behind IOCP at pipeline depth 1 ON A SINGLE CONNECTION** — the qualifier was always in
+> `IOCP-VS-RIO.md`, and was missing HERE, which is the version most readers hit first. It is load-bearing:
+> **at 200 connections and the same depth 1, RIO is level with IOCP** (2026-08-09 Garnet A/B, below). The
+> floor is amortised by CONCURRENCY as well as by depth. So a RIO figure is meaningless without **both its
+> DEPTH and its CONNECTION COUNT**, and the case against RIO bears on few-connection workloads rather than
+> on server-shaped ones. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation,
+> and the eight things tried that did not change it.
+
+## GARNET ON WINDOWS — THE FIRST SCORED NUMBERS (2026-08-09), and RIO's depth-1 collapse turns out to be a SINGLE-CONNECTION effect
+
+**Every Garnet figure in this file before today was Linux.** `bench/Run-GarnetAb.ps1` existed and was
+smoke-tested; nothing scored had ever been run through it. This is that run.
+
+**Method.** `Run-GarnetAb.ps1` at its defaults: GarnetDemo on this box, `GET`, **200 connections as 4
+generator processes x 50 connections, summed** (one process cannot saturate the server — confounder 1 in
+the rig header), 300,000 ops per process, `shards=12`, depths 1/4/16 swept, **7 passes with the first
+discarded → 6 scored**, leg order reshuffled every pass, all three legs in the SAME session.
+`Verify-GarnetDemo` passed as the correctness gate before any measurement. Generator is the
+`marc/benchmark-connection-per-client` source build, and the rig gates on its `conns:` banner reporting
+the count actually opened (confounder 2). Desktop, mains, 24 logical cores, ~4% idle load, loopback.
+Medians below are TRUE medians (mean of the 3rd and 4th of 6); the rig's console prints the upper median,
+so it differs by a hair.
+
+### GET, 200 connections — ops/s, median [min-max], and what the server actually burned
+
+| depth | leg | min | median | max | spread | server cores (of 24) |
+|---|---|---:|---:|---:|---:|---|
+| **P1** | `iocp` | 277,262 | 295,120 | 327,921 | 18.3% | 9.3-9.5 |
+| | `rio` | 329,757 | **369,311** | 396,028 | 20.1% | 9.5-9.7 |
+| | `stock` (Garnet SAEA) | 258,660 | 259,644 | 260,848 | 0.8% | 9.7-9.9 |
+| **P4** | `iocp` | 928,575 | 1,054,204 | 1,193,099 | 28.5% | 6.6-7.2 |
+| | `rio` | 903,206 | 1,016,250 | 1,339,867 | 48.3% | 5.9-6.7 |
+| | `stock` | 909,107 | 924,990 | 930,021 | 2.3% | 7.6-8.1 |
+| **P16** | `iocp` | 1,967,266 | 2,146,433 | 2,296,638 | 16.7% | 4.4-5.1 |
+| | `rio` | 1,953,558 | 2,138,136 | 2,370,407 | 21.3% | 4.4-4.8 |
+| | `stock` | 1,615,763 | 1,684,292 | 1,774,519 | 9.8% | 5.3-6.1 |
+
+### What separates, and what does not
+
+Disjointness computed pairwise from the six scored passes, not eyeballed:
+
+| depth | pair | disjoint? | margin | delta |
+|---|---|---|---:|---:|
+| P1 | `rio` vs `iocp` | yes, **but by 0.56%** | 0.56% | +25.1% |
+| P1 | `iocp` vs `stock` | yes | 6.3% | **+13.7%** |
+| P1 | `rio` vs `stock` | yes | 26.4% | **+42.2%** |
+| P4 | all three pairs | **NO** | — | not quotable |
+| P16 | `iocp` vs `stock` | yes | 10.9% | **+27.4%** |
+| P16 | `rio` vs `stock` | yes | 10.1% | **+26.9%** |
+| P16 | `iocp` vs `rio` | **NO** | — | not quotable |
+
+**SocketSet beats stock Garnet SAEA wherever anything separates at all** — +13.7% (IOCP) and +42.2%
+(RIO) at depth 1, +27.4% and +26.9% at depth 16. **At depth 4 nothing is quotable**: all three ranges
+overlap, `stock`'s max (930,021) sitting 1,446 ops/s above `iocp`'s min (928,575). The medians there
+suggest +14%, and per rule 5 that number is not a result. Say so rather than rounding it into the trend
+it would fit.
+
+**The `rio` vs `iocp` cell at P1 is disjoint by 0.56% and should not be leaned on.** It is one pass's
+worth of drift from overlapping. What survives is the weaker but far more consequential claim in the next
+section, which does not depend on that margin at all.
+
+### A PRE-REGISTERED PREDICTION, CONFIRMED at proper pass count — not a new discovery
+
+**Stated plainly because the first draft of this section overstated it.** `IOCP-VS-RIO.md` already said
+both halves of this: its depth-1 table is explicitly labelled **"Single connection"**, and it predicted
+*"on many busy connections it is hidden entirely, because other connections' completions arrive during
+the wait."* Today's run **confirms that prediction**; it does not correct it.
+
+What today adds is pass count. The existing many-connections datum in that file is **three passes**
+(`rio` 315,008-378,392 against `iocp` 314,742-358,637, called "indistinguishable"), and house rule 4
+exists because three consecutive passes can span 1.2% when the true spread is 9-17%. At **six** scored
+passes the two legs land in the same place — `rio` 329,757-396,028 against `iocp` 277,262-327,921, a
+near-identical window to the three-pass run — so the earlier reading holds up rather than being replaced.
+
+**What was genuinely wrong was the banner at the top of THIS file**, which stated the 13-25x figure with
+no connection-count qualifier at all. That is the version most readers meet first, and it now carries the
+qualifier.
+
+**The bearing on backend choice:** "do not pick RIO, it collapses at depth 1" is right for a
+single-connection or few-connection workload — which is the `ConnectionMultiplexer` shape, i.e. the
+default deployment of a .NET Redis client, so it stays the common case — and does **not** generalise to a
+server holding hundreds of concurrent clients. Neither backend is a default. But the case against RIO
+bears on a narrower regime than this file was saying, and stock Garnet is beaten by *both* backends at
+every depth where anything separates.
+
+**Do not read the P1 `rio`-over-`iocp` cell as RIO winning.** It is disjoint by 0.56%, the prior
+three-pass run called the same comparison indistinguishable, and one pass of drift erases it. Level is the
+claim; ahead is not.
+
+### THE CAVEAT THAT BOUNDS ALL OF THE ABOVE: the server is not saturated
+
+**Server CPU never exceeds 9.9 of 24 cores, and at P16 sits at 4.4-6.1** — under 25% of the box while
+delivering 2.1M ops/s. By confounder 4 in the rig's own header, a leg whose server is far from saturated
+is bounding the **generator**, not the transport. So:
+
+- every delta above is a **LOWER bound** on the transport difference, not an estimate of it;
+- the P4 non-separation is at least as likely to be generator noise as transport parity;
+- **absolute ops/s here are not this server's ceiling** and must not be quoted as one.
+
+Raising generator process count until server CPU climbs is the obvious next step and was not done today.
+
+### Two observations recorded WITHOUT explanation, because nothing here isolates them
+
+1. **Our variance is several times stock's, at every depth.** `stock` spreads 0.8% / 2.3% / 9.8% across
+   six passes; `iocp` spreads 18.3% / 28.5% / 16.7% and `rio` 20.1% / **48.3%** / 21.3%. A 48% spread on
+   a scored cell is the kind of number that makes a three-pass run dangerous, and it is a good argument
+   that six is the floor rather than the target here. Not attributed: shard scheduling, generator
+   scheduling and CPU contention are all live candidates and this sweep separates none of them.
+2. **Server cores FALL as depth rises** (9.9 → 8.1 → 6.1 on stock) while throughput rises 6.5x. Expected
+   in shape — pipelining amortises per-op wakeups — but the magnitude is unattributed.
+
+### AND THE RIG'S CONTROL LEG HAD NEVER RUN
+
+The first attempt at this run died on `server did not listen on 7602 (backend=stock)`. The cause is a
+PowerShell trap now recorded as the third in `bench/README.md`: an `if` returning a **one-element** array
+is unwrapped to a String, so the following `+=` performed string concatenation and the server was launched
+with a single argument `--stock--shards 12 --port 7602`.
+
+**It could only ever have hit the `stock` branch**, that being the only one with a single element; the
+`iocp` and `rio` branches return two, stayed arrays, and ran perfectly — as they did in the smoke test
+that pronounced this rig working. **A harness can be smoke-tested, pass, and produce plausible numbers for
+every leg you are measuring while having never once started the leg you are measuring against.** Run the
+control first: its breakage is the breakage that looks least like breakage.
 
 ## WHERE THINGS STAND (2026-08-03) — the consolidated view, RESP era
 

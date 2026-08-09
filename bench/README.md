@@ -247,13 +247,30 @@ offloaded at all, because that path drives receive as io_uring `POLL` + `SSL_rea
 here means **TX-only offload** — a property of our integration, not of kTLS. `TlsTxDevice` stays 0 and
 always will on loopback.
 
-## Two PowerShell traps
+## Three PowerShell traps
 
 - A **BOM-less `.ps1` containing non-ASCII** is read as ANSI by Windows PowerShell 5.1, which turns an
   em-dash into a string delimiter and reports a syntax error hundreds of lines from the cause. **Keep
   these scripts ASCII-only.**
 - `[IntPtr]0xFFFF0000` is silently **negative** — PowerShell types the literal as `Int32`. Compute
   affinity masks in `Int64`.
+- **An `if` that returns a ONE-element array is unwrapped to a String, and a later `+=` then does string
+  CONCATENATION rather than appending.** Added 2026-08-09, from `Run-GarnetAb.ps1`:
+
+  ```powershell
+  $a = if ($stock) { @("--stock") } else { @("--backend", $b) }   # one element -> String!
+  $a += @("--shards", 12, "--port", 7602)
+  # -> a single argument: "--stock--shards 12 --port 7602"
+  ```
+
+  Write `@(if (...) { "--stock" } else { "--backend"; $b })`. Also never name a local `$args` — it is an
+  automatic variable inside a function.
+
+  **The reason it earns a place here is WHICH leg it broke.** It could only ever hit the single-element
+  branch, which was `stock` — the vanilla-Garnet **control**. The two SocketSet legs returned two elements,
+  stayed arrays, and ran perfectly. A rig can be "smoke-tested", pass, produce plausible numbers for
+  everything you are measuring, and have never once started the thing you are measuring *against*. When a
+  harness has a control, run the control first: it is the leg whose breakage looks least like breakage.
 
 ## Interpreting a result
 

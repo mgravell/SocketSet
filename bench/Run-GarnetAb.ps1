@@ -118,9 +118,19 @@ if (-not $SkipVerify) {
 }
 
 function Start-Server([string]$backend, [int]$port, [string]$log) {
-    $args = if ($backend -eq "stock") { @("--stock") } else { @("--backend", $backend) }
-    $args += @("--shards", $Shards, "--port", $port)
-    $p = Start-Process $exe -ArgumentList $args -PassThru -WindowStyle Hidden `
+    # @(...) AROUND THE if, AND NOT $args. Two distinct PowerShell traps, and the first one silently broke
+    # the CONTROL leg of this rig until 2026-08-09:
+    #
+    #  1. an `if` returning a ONE-element array is UNWRAPPED to a String, so the `+=` below becomes string
+    #     CONCATENATION and joins the next array with $OFS -- the server received a single argument
+    #     `--stock--shards 12 --port 7602` and refused to start. It could only ever hit the stock branch,
+    #     because that is the only one with a single element; iocp/rio return two and stay arrays. So the
+    #     leg that broke was the one every other leg is measured AGAINST.
+    #  2. `$args` is an automatic variable inside a function. It happened to be harmless here, but naming a
+    #     local after it is how a future edit acquires a second bug on top of this one.
+    $srvArgs = @(if ($backend -eq "stock") { "--stock" } else { "--backend"; $backend })
+    $srvArgs += @("--shards", "$Shards", "--port", "$port")
+    $p = Start-Process $exe -ArgumentList $srvArgs -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
     for ($i = 0; $i -lt 80; $i++) {
         if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { return $p }

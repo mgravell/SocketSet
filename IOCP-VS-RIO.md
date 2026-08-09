@@ -83,6 +83,16 @@ produces — StackExchange.Redis holds one connection per endpoint, shared proce
 
 - **Many busy connections**: 4 processes x 50 connections, three passes — `rio` 315,008 – 378,392 against
   `iocp` 314,742 – 358,637. Indistinguishable.
+
+  **RE-MEASURED 2026-08-09 AT SIX SCORED PASSES, against a stock-Garnet control, and it holds** (`GET`,
+  `-P 1`, 200 connections, `bench/Run-GarnetAb.ps1`; full table in `RESULTS.md`): `rio` 329,757 – 396,028
+  against `iocp` 277,262 – 327,921 — a near-identical window to the three-pass run. Technically disjoint,
+  **but by 0.56%**, so the honest reading is unchanged: at this connection count the two are level, and
+  the prediction one bullet above — that many busy connections hide the floor entirely — is confirmed
+  rather than merely plausible. **Both beat stock Garnet SAEA at the same depth** (+13.7% IOCP, +42.2%
+  RIO, both disjoint), which is the first Windows evidence that the depth-1 floor does not cost us the
+  comparison that actually matters. Caveat carried from that run: the server never exceeded 9.9 of 24
+  cores, so these are lower bounds bounded by the generator.
 - **HTTP keep-alive at 512 B**: `rio` 145.5 MiB/s against `iocp` 143.5 (see `RESULTS.md`). No deficit —
   pipe mode batches many responses per flush via `OnLoopDrain`, which amortises the floor.
 - **Deep pipelines**: `-P 16` above.
