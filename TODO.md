@@ -380,6 +380,23 @@ would silently misparse on the other, which is the kind of bug that survives a g
 > would pay both syscalls twice per handshake. `bench/verify-endpoints` grew `connect/reports` and
 > `connect-off/unset`; the suite is 27 cells and green on Windows.
 >
+> **AF_UNIX CELLS, added 2026-08-09 alongside the outbound ones, and they found a second bug.** The rig
+> had no UDS coverage in either direction, so the `sockaddr_un` branch of `PeerAddress.FromSockAddr` had
+> never been asserted by anything. Two shapes, one value: an ACCEPTED Unix peer is unnamed (family alone,
+> 2 bytes) while a DIALLED one returns the listener's pathname (a populated `sockaddr_un`), and both must
+> normalise to `unix` with `IsLoopback` TRUE — the property F9 turns on. Both pass on IOCP and managed.
+> RIO reports the documented refusal instead (TCP-only by design, `WindowsRioShard`'s type doc), asserted
+> in BOTH directions rather than skipped.
+>
+> **AND THE REFUSAL WAS LEAKING CAPACITY.** `SocketSet.Connect` takes a shard reservation from `TryPlace`
+> *before* handing the endpoint to the backend, so a backend that throws on an endpoint type it does not
+> support must release it on the way out. IOCP, epoll and io_uring all do, explicitly and with comments
+> saying why. **RIO's `Connect` did not** — so every UDS dial at a RIO set permanently consumed a slot,
+> and the shard would eventually refuse connections it could have served (`ReleaseReservation`'s own doc
+> calls this a phantom-full drop). One line, fixed the same day. It was invisible at the 4096
+> sockets/shard default, which is the reusable part: `uds-declines/no-capacity-leak` sizes a shard to 4,
+> refuses 4 dials, then requires a TCP connect to still succeed. Verified failing before the fix.
+>
 > **The correction to the paragraph below: MANAGED WAS NEVER BROKEN.** Its `Register` is called from
 > `CompleteConnect`, after the connect has succeeded, so `socket.RemoteEndPoint` was always valid. Shown
 > rather than argued — the new gate was run against the pre-fix library and IOCP and RIO fail

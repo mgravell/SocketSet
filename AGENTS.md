@@ -151,6 +151,14 @@ both have caused hesitation:
     and requires `LocalAddress.Port` to equal the ephemeral port that target independently saw — the one
     number no implementation can produce by remembering the endpoint it was handed, which is what makes it
     a test of the kernel read rather than of the argument. Run it on any change to a connect path.
+    **AF_UNIX cells followed on the same day**, and they found something the endpoint work was not looking
+    for: `uds-declines/no-capacity-leak`. A backend may legitimately refuse AF_UNIX (RIO is TCP-only by
+    design), but `SocketSet.Connect` takes a shard RESERVATION *before* handing the endpoint over, so the
+    refusal must release it — RIO's did not, and every refused UDS dial permanently cost a slot. Invisible
+    at the 4096-sockets/shard default, so the cell sizes a shard to **4**, refuses that many dials, and
+    then requires a *TCP* connect to still succeed. The refusals are setup; the TCP dial is the assertion.
+    Generalise the trick: when a rejection path is meant to be free, make the resource small enough that
+    "free" and "leaks" stop measuring the same.
   - **`bench/verify-bind-address.sh`** (Linux) / **`bench/Verify-BindAddress.ps1`** (Windows), added
     2026-08-04 — that
     `Listen(IPEndPoint)` binds the address it was GIVEN. Every native backend used to hard-code

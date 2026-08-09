@@ -725,7 +725,16 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
     {
         Win32.EnsureWinsock();
         if (endpoint is not IPEndPoint rioTarget)
+        {
+            // RELEASE BEFORE THROWING. TryPlace already took a reservation for this dial, and this is the
+            // one rejection path in the four backends that used to skip it (2026-08-09) — so every UDS dial
+            // at a RIO set permanently consumed a slot's worth of capacity, and the shard eventually
+            // reported "all shards are at capacity" for connections it could have served.
+            // ReleaseReservation's own doc calls that a phantom-full drop. Invisible at 4096 sockets per
+            // shard, which is why verify-endpoints' uds-declines/no-capacity-leak sizes one to 4.
+            ReleaseReservation();
             throw new NotSupportedException("The RIO backend is TCP-only; use the IOCP backend for AF_UNIX.");
+        }
         // IPv4-only sockaddr below; reject rather than truncate (see Win32.RequireIPv4).
         try { Win32.RequireIPv4(rioTarget, nameof(Connect)); }
         catch { ReleaseReservation(); throw; }

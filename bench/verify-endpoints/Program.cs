@@ -55,6 +55,28 @@
 // NO OUTBOUND lan/ CELL, deliberately: dialling this box's LAN address proves much less than receiving
 // from it, because the address under test is one we supplied. The inbound lan/not-loopback cell above is
 // where a reversed-octet parse or a hard-coded locality answer dies, and both directions share that parser.
+//
+// AF_UNIX (added 2026-08-09, closing a gap in the outbound work above and one this rig never had at all):
+//
+//   uds/inbound-unnamed     An ACCEPTED Unix peer has no address -- a client that never bound one has
+//                           nothing to report, so getpeername returns the family alone. The assertion is
+//                           therefore the awkward one: IsSet TRUE, Family Unix, Port 0, and IsLoopback
+//                           TRUE. That last is what a Unix peer is FOR -- a socket with no network form
+//                           is same-host by construction, and REVIEW.md F9 turns on it. An
+//                           implementation that treated the 2-byte sockaddr as a failure would leave it
+//                           unset, IsLoopback would go FALSE, and a Garnet DEBUG restriction over UDS
+//                           would start refusing its own local operator.
+//   uds/outbound-reports    The same, dialled rather than accepted, which is a DIFFERENT kernel answer:
+//                           getpeername on a connected client returns the LISTENER's pathname, not an
+//                           empty address, so this exercises the populated-sockaddr_un branch that the
+//                           inbound cell cannot reach. Both must normalise to the same "unix".
+//   uds/abstract-inbound    LINUX ONLY, and NEVER RUN as of 2026-08-09 -- the gap TODO.md records. An
+//                           abstract-namespace ('@') socket's address begins with a NUL, which is
+//                           exactly the shape a pathname parser mishandles. Skipped, loudly, off Linux.
+//
+// Deliberately NOT asserted: any UDS PATH. PeerAddress stores the family and stops, because the useful
+// name belongs to the listener rather than the connection -- see the type doc. A cell demanding a path
+// would be asserting a design we rejected.
 
 using System.Net;
 using System.Net.Sockets;
@@ -110,8 +132,9 @@ foreach (var (factory, backendName) in GateBackends.All)
         continue;
     }
 
-    int port = nextPort, offPort = nextPort + 1, dialPort = nextPort + 2;
-    nextPort += 3;
+    int port = nextPort, offPort = nextPort + 1, dialPort = nextPort + 2, leakPort = nextPort + 3;
+    nextPort += 4;
+    string udsBase = UdsPathsFor(backendName)[0];
 
     // The OUTBOUND target: a plain listener, deliberately not the set's own, so an outbound connect never
     // lands in the accept-side Seen list that the cells below index with Last(). Kept alive across both
@@ -157,7 +180,7 @@ foreach (var (factory, backendName) in GateBackends.All)
 
         // ---- OUTBOUND: the direction that reported nothing until 2026-08-09 ----
         {
-            var dial = DialOut(set, dialTarget);
+            var dial = DialOut(set, new IPEndPoint(IPAddress.Loopback, dialPort), dialTarget.AcceptSocket);
             if (dial.Error.Length != 0)
             {
                 Cell("connect/reports", false, $"outbound dial failed: {dial.Error}");
@@ -241,6 +264,113 @@ foreach (var (factory, backendName) in GateBackends.All)
                     Inconclusive("lan/not-loopback", $"could not reach {lan}: {ex.SocketErrorCode} (host firewall?)");
                 }
             }
+
+            // ---- AF_UNIX, both directions ----
+            bool declinesUds = false;
+            // Two distinct kernel answers behind one PeerAddress value, which is the whole reason both
+            // cells exist: the accepted peer is UNNAMED (family alone, 2 bytes), the dialled peer returns
+            // the listener's PATHNAME (a populated sockaddr_un). Same normalised result, opposite inputs.
+            foreach (var udsPath in UdsPathsFor(backendName))
+            {
+                string label = udsPath.StartsWith("@", StringComparison.Ordinal) ? "abstract" : "path";
+                Socket udsTarget = null;
+                try
+                {
+                    RemoveUdsFile(udsPath + ".in");
+                    try
+                    {
+                        set.Listen(new UnixDomainSocketEndPoint(udsPath + ".in"));
+                    }
+                    catch (NotSupportedException listenEx)
+                    {
+                        // A backend may legitimately not do AF_UNIX at all -- RIO is TCP-only by design
+                        // (WindowsRioShard's type doc). Assert the REFUSAL rather than skipping, and assert
+                        // it in BOTH directions: a backend that refuses to listen but accepts a dial would
+                        // build an AF_INET socket for a Unix target, which fails later and further away.
+                        string dialMsg = "ACCEPTED a UDS dial, which it must not";
+                        try { set.Connect(new UnixDomainSocketEndPoint(udsPath + ".out")); }
+                        catch (NotSupportedException dialEx) { dialMsg = dialEx.Message; }
+                        Cell($"uds-{label}/declines-both-ways",
+                             listenEx.Message.Contains("TCP-only") && dialMsg.Contains("TCP-only"),
+                             $"documented degradation: listen -> '{listenEx.Message}' / connect -> '{dialMsg}'");
+                        declinesUds = true;
+                        continue;
+                    }
+
+                    using (var c = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified))
+                    {
+                        c.Connect(new UnixDomainSocketEndPoint(udsPath + ".in"));
+                        c.Send("x"u8);
+                        var one = new byte[1];
+                        c.Receive(one);
+                        Thread.Sleep(50);
+                        var rec = Snapshot(set).Last();
+                        Cell($"uds-{label}/inbound-unnamed",
+                             rec.Remote.IsSet && rec.Remote.Family == AddressFamily.Unix && rec.Remote.Port == 0
+                                 && rec.Remote.IsLoopback && rec.Remote.ToString() == "unix",
+                             $"accepted peer={Show(rec.Remote)} family={rec.Remote.Family} "
+                                 + $"IsLoopback={rec.Remote.IsLoopback} (must be True: a Unix peer is same-host by construction)");
+                    }
+
+                    RemoveUdsFile(udsPath + ".out");
+                    udsTarget = ListenUds(udsPath + ".out");
+                    var dial = DialOut(set, new UnixDomainSocketEndPoint(udsPath + ".out"), udsTarget.Accept);
+                    Cell($"uds-{label}/outbound-reports",
+                         dial.Error.Length == 0 && dial.Remote.IsSet && dial.Remote.Family == AddressFamily.Unix
+                             && dial.Remote.IsLoopback && dial.Local.IsSet && dial.Local.Family == AddressFamily.Unix,
+                         dial.Error.Length != 0 ? $"outbound UDS dial failed: {dial.Error}"
+                             : $"remote={Show(dial.Remote)} local={Show(dial.Local)} "
+                                 + $"(dialled a PATHNAME, so this is the populated-sockaddr_un branch)");
+                }
+                catch (Exception ex)
+                {
+                    Cell($"uds-{label}/inbound-unnamed", false, $"{ex.GetType().Name}: {ex.Message}");
+                }
+                finally
+                {
+                    udsTarget?.Dispose();
+                    RemoveUdsFile(udsPath + ".in");
+                    RemoveUdsFile(udsPath + ".out");
+                }
+            }
+
+            // ---- THE REFUSAL MUST NOT COST CAPACITY ----
+            // SocketSet.Connect takes a RESERVATION from a shard before handing the endpoint to it, so a
+            // shard that throws on an endpoint type it does not support must release that reservation on
+            // the way out -- ReleaseReservation's own doc calls the alternative "phantom-full drops". This
+            // is invisible at the default 4096 sockets/shard, which is why the cell sizes the shard to 4
+            // and refuses that many dials: a leak turns the NEXT legitimate connect into "all shards are
+            // at capacity". The TCP dial afterwards is the assertion; the refusals are only the setup.
+            if (declinesUds)
+            {
+                try
+                {
+                    using var tiny = new Harness(new SocketSetOptions
+                    {
+                        Factory = factory, Shards = 1, SocketsPerShard = 4, TrackEndpoints = true,
+                    });
+                    tiny.Listen(new IPEndPoint(IPAddress.Any, leakPort));
+
+                    int refused = 0;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        try { tiny.Connect(new UnixDomainSocketEndPoint(udsBase + ".leak")); }
+                        catch (NotSupportedException) { refused++; }
+                    }
+
+                    var after = DialOut(tiny, new IPEndPoint(IPAddress.Loopback, dialPort), dialTarget.AcceptSocket);
+                    Cell("uds-declines/no-capacity-leak",
+                         refused == 4 && after.Error.Length == 0 && after.Remote.IsSet,
+                         refused != 4 ? $"setup did not refuse 4 dials (got {refused})"
+                             : after.Error.Length != 0
+                                 ? $"after {refused} refused UDS dials on a 4-slot shard, a TCP connect failed: {after.Error}"
+                                 : $"{refused} refused UDS dials cost no capacity; TCP connect still reports {Show(after.Remote)}");
+                }
+                catch (Exception ex)
+                {
+                    Cell("uds-declines/no-capacity-leak", false, $"{ex.GetType().Name}: {ex.Message}");
+                }
+            }
         }
     }
 
@@ -261,7 +391,7 @@ foreach (var (factory, backendName) in GateBackends.All)
 
         // The same inverse for outbound: an opt-out that only covers accepts is still a leak, and the
         // outbound populate is a separate call site on every backend, so it needs its own assertion.
-        var dial = DialOut(off, dialTarget);
+        var dial = DialOut(off, new IPEndPoint(IPAddress.Loopback, dialPort), dialTarget.AcceptSocket);
         Cell("connect-off/unset",
              dial.Error.Length == 0 && !dial.Remote.IsSet && !dial.Local.IsSet && !dial.Remote.IsLoopback,
              dial.Error.Length != 0 ? $"outbound dial failed: {dial.Error}"
@@ -269,6 +399,15 @@ foreach (var (factory, backendName) in GateBackends.All)
     }
 
     dialTarget.Stop();
+}
+
+// ONCE, not once per backend: the abstract namespace is a property of the OS, not of the backend, and an
+// INCONCLUSIVE line only carries signal while it is rare. Three copies of a structural "not on Windows"
+// per run is how a reader learns to skim past the one that means "your host has no LAN address".
+if (!OperatingSystem.IsLinux())
+{
+    Console.WriteLine();
+    Inconclusive("uds-abstract/*", "abstract-namespace UDS is Linux-only; those cells have NEVER RUN as of 2026-08-09");
 }
 
 Console.WriteLine();
@@ -288,21 +427,55 @@ static string Show(PeerAddress a) => a.IsSet ? a.ToString() : "<unset>";
 // says the peer is, what it says WE are, and what the target independently saw the connection arrive
 // from. The third is the cross-check -- it is the only number here the set could not have produced from
 // what it was handed.
-static (PeerAddress Remote, PeerAddress Local, int ServerSawPort, string Error) DialOut(Harness h, TcpListener target)
+static (PeerAddress Remote, PeerAddress Local, int ServerSawPort, string Error) DialOut(
+    Harness h, EndPoint target, Func<Socket> acceptOne)
 {
     Socket accepted = null;
     try
     {
         h.ResetConnect();
-        h.Connect(new IPEndPoint(IPAddress.Loopback, ((IPEndPoint)target.LocalEndpoint).Port));
-        accepted = target.AcceptSocket(); // blocks until the outbound connect actually lands
+        h.Connect(target);
+        accepted = acceptOne(); // blocks until the outbound connect actually lands
         if (!h.WaitForConnect(TimeSpan.FromSeconds(5)))
             return (default, default, 0, "OnConnect never fired within 5s");
-        var sawPort = ((IPEndPoint)accepted.RemoteEndPoint).Port;
+        // Only TCP has a port to cross-check. An ACCEPTED Unix peer is unnamed by construction, so there
+        // is nothing on that side to compare against -- which is why the UDS cells assert the family and
+        // the locality rather than an identity.
+        var sawPort = accepted.RemoteEndPoint is IPEndPoint ipe ? ipe.Port : 0;
         return (h.ConnectRemote, h.ConnectLocal, sawPort, "");
     }
     catch (Exception ex) { return (default, default, 0, $"{ex.GetType().Name}: {ex.Message}"); }
     finally { accepted?.Dispose(); }
+}
+
+// Which UDS forms this OS can be asked about. The abstract namespace ('@') is a Linux kernel feature, not
+// a convention, so it is not merely a different path on Windows -- it does not exist. Returning the list
+// rather than branching at each call site keeps the Linux-only cell VISIBLE in the output (it reports
+// INCONCLUSIVE off Linux) instead of silently absent.
+static string[] UdsPathsFor(string backendName)
+{
+    string baseName = System.IO.Path.Combine(
+        System.IO.Path.GetTempPath(), $"ss-ep-{backendName.ToLowerInvariant()}-{Environment.ProcessId}");
+    return OperatingSystem.IsLinux()
+        ? [baseName, "@ss-ep-" + backendName.ToLowerInvariant() + "-" + Environment.ProcessId]
+        : [baseName];
+}
+
+// A plain AF_UNIX listener, ready to accept exactly one connection.
+static Socket ListenUds(string path)
+{
+    var s = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+    s.Bind(new UnixDomainSocketEndPoint(path));
+    s.Listen(4);
+    return s;
+}
+
+// Pathname sockets are real files and outlive the process that bound them; an abstract one ('@') is not
+// a file at all and must not be passed to File.Delete.
+static void RemoveUdsFile(string path)
+{
+    if (path.StartsWith("@", StringComparison.Ordinal)) return;
+    try { if (System.IO.File.Exists(path)) System.IO.File.Delete(path); } catch { }
 }
 
 sealed class Harness : SocketSet

@@ -281,6 +281,20 @@ A populate that runs too early and a populate that is missing are indistinguisha
 which is why the fix is asserted by `connect/reports` rather than by inspection. **The epoll half has
 still never run** (Windows-only session); the Linux warning in `TODO.md` covers it.
 
+**A RESOURCE LEAK ON A REJECTION PATH, found the same day by the AF_UNIX cells and recorded here because
+the class is worth more than the instance.** `SocketSet.Connect` takes a shard reservation from
+`TryPlace` *before* the endpoint reaches the backend, so a backend rejecting an endpoint type must
+release it. `WindowsRioShard.Connect` — which refuses AF_UNIX by design, RIO being TCP-only — threw
+without releasing, so every refused UDS dial permanently cost a slot until the shard reported itself full
+for connections it could have served. Not remotely triggerable (nothing lets a peer choose what a host
+dials) and so not a vulnerability, but it is the exhaustion SHAPE: a rejection that is supposed to be free
+and is not. IOCP, epoll and io_uring all release explicitly on the same path, each with a comment saying
+why, which is what made RIO's omission legible once anything actually exercised it. Gated by
+`uds-declines/no-capacity-leak`, and the technique generalises — **the cell shrinks the resource (4
+sockets per shard, not 4096) until "free" and "leaks" stop producing the same observation.** Every gate in
+this repo that asserts a path costs nothing should be read against that: at production sizing, a leak of
+one is indistinguishable from a leak of none.
+
 **Still not gated, and stated rather than implied:** that Garnet itself then permits DEBUG over loopback
 and refuses it remotely. That needs `EnableDebugCommand=Local` configured plus a remote peer, which no
 rig here sets up. What is verified is the input Garnet makes that decision from.
