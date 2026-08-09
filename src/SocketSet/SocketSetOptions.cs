@@ -212,15 +212,27 @@ public class SocketSetOptions
     /// next; turning this off only loses information, and leaks nothing. An embedding that never surfaces
     /// a peer address can decline the work without being warned about a hazard that does not exist here.
     ///
-    /// WHAT IT ACTUALLY COSTS, which is uneven enough to be worth stating: on IOCP and RIO, nothing much —
-    /// <c>AcceptEx</c> has already written both sockaddrs into a buffer we already allocate, so this is a
-    /// parse and two stores. On the managed backend it is two property reads. On epoll it is free for the
-    /// peer (<c>accept4</c> fills the address in the same syscall) and a <c>getsockname</c> for ours.
-    /// **On io_uring it is not available at all**: multishot accept does not fill an address buffer, and
-    /// paying a <c>getpeername</c> per accept would tax the fastest Linux path for a value most callers
-    /// never read. That backend reports <see cref="SocketSet.SupportsEndpointTracking"/> false and leaves
-    /// the addresses unset — DISCOVERED, not assumed, in the same spirit as
-    /// <see cref="Connection.SupportsReceiveParking"/> and the kTLS receive probe.
+    /// WHAT IT ACTUALLY COSTS — **CORRECTED 2026-08-09, and the text that stood here was wrong in the way
+    /// that matters: it made a design decision look principled.** It said IOCP/RIO were "a parse and two
+    /// stores" from the <c>AcceptEx</c> buffer, and that epoll got the peer free from <c>accept4</c>.
+    /// Neither is what the code does. **Every native backend pays the SAME two syscalls per accept** —
+    /// <c>getpeername</c> + <c>getsockname</c> on the accepted handle, through the one shared
+    /// <c>NativeEndpoints</c> path, and only when this option is on. The <c>AcceptEx</c> claim was already
+    /// retracted on 2026-08-08 (the accept completes on the LISTENER's shard while the connection is
+    /// adopted on another, so the buffer does not survive the handoff); the <c>accept4</c> claim describes a
+    /// path deliberately NOT taken — epoll passes NULL for the address precisely so both addresses come
+    /// from one place rather than three. The managed backend is the only cheap one: two property reads.
+    ///
+    /// **On io_uring it is unavailable, and that is a CHOICE rather than a capability gap.** Multishot
+    /// accept cannot fill a per-accept sockaddr — one SQE serves many completions, so there is nowhere to
+    /// put one — which makes the address un-FREE there. It does not make it unreachable: <c>getpeername</c>
+    /// on the accepted fd works exactly as it does on epoll, and that backend already pays a
+    /// <c>setsockopt</c> per accept, so the real question is 1→3 syscalls when opted in, not 0→2. On the
+    /// CONNECT path nothing is arguable at all — it holds a real fd and simply declines. It reports
+    /// <see cref="SocketSet.SupportsEndpointTracking"/> false and leaves the addresses unset, which is
+    /// honest about the OUTCOME but must not be read as a kernel limit. See the io_uring item in TODO.md:
+    /// the status quo rests on a cost claim nobody has measured, for a cost every other backend already
+    /// pays.
     ///
     /// IT IS REPORTED. <see cref="SocketSet.ToString"/> prints <c>endpoints=on|off|unsupported</c>
     /// unconditionally, so a rig can gate on what actually happened rather than on what was asked for.

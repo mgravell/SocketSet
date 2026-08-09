@@ -89,6 +89,47 @@ is unnamed).
    word of it was wrong: **managed was always correct** (its `Register` runs from `CompleteConnect`, i.e.
    after success), so it was three backends, not all of them. Detail under item 4 below. **The epoll half
    is UNRUN — see the Linux warning at the end of this section, which now covers this too.**
+0c. **io_uring's ENDPOINT DECLINATION IS A COST CHOICE, NOT A CAPABILITY GAP — AND THE COST CLAIM HAS
+   NEVER BEEN MEASURED** (Marc, 2026-08-09: *"it seems odd that the connecting socket address would be
+   unavailable in any reasonable implementation"*). It is not unavailable. Three doc sites said or implied
+   otherwise; two were stale and are now corrected, and the correction is what turns this into an item.
+
+   **What is actually true:** `IORING_ACCEPT_MULTISHOT` cannot fill a per-accept sockaddr — one SQE serves
+   many completions, so there is nowhere to put one. That makes the address un-FREE. It does not make it
+   unreachable: `AdoptAccepted` holds the accepted fd and `getpeername` on it works exactly as on epoll.
+
+   **What undercut the cost argument, all checkable in the tree:**
+   - io_uring **already** makes a syscall per accept — `setsockopt(TCP_NODELAY)` in `AdoptAccepted`
+     (`IoUringShard.cs`). So opting in is **1→3 syscalls per accept, not 0→2**.
+   - **epoll does not get the peer free from `accept4`.** It passes NULL for the address
+     (`EpollShard.cs:491`) and then calls `getpeername`+`getsockname` anyway, deliberately, so both come
+     from one code path — `LibC.getpeername`'s own comment says so. Two other doc sites described the free
+     path as though it were taken.
+   - **IOCP/RIO "free via the `AcceptEx` buffer" was falsified 2026-08-08** (see item 4 below). They pay
+     the same two syscalls.
+
+   So **every backend that supports tracking pays the identical two syscalls per accept**, and io_uring is
+   the one refusing to pay what the others already pay. The connect path is not arguable at all —
+   `HandleConnect` has a live fd — and stays unset only by the 2026-08-09 banner decision.
+
+   **The part that is arguably a defect rather than a trade:** `TrackEndpoints` defaults ON and io_uring
+   overrides it permanently, with **no way for an operator to opt in**. The option exists so they can
+   choose the cost; the direction chosen for them makes every peer read as anonymous, i.e. "nobody is
+   remote" — `REVIEW.md` F9's failure direction reached by another route.
+
+   **THE WORK, and it is Linux-only on purpose — the whole justification is a number nobody has:**
+   1. Measure first. Accept-churn is the load that would show it; `--churn` in the smoke rigs and the
+      existing connect/churn harnesses are the instruments. Pre-register what would falsify "two syscalls
+      per accept is affordable here" before running it.
+   2. If it is affordable: populate in `AdoptAccepted` and `HandleConnect` (gated on `TrackEndpoints`, as
+      every other backend is), and flip `SupportsEndpointTracking` to true.
+   3. **Two consequences to plan for rather than discover.** `verify-endpoints`' io_uring assertions
+      INVERT — `declines/unset` and `connect/declines-unset` must be re-pointed, not deleted, or the flip
+      becomes silent. And with no backend reporting `unsupported`, the three-state banner loses its only
+      live case; keep the state for future backends, but nothing will exercise it.
+   4. Do NOT do this at the same time as 0a (soft parking). Both touch io_uring's accept/receive paths and
+      both flip a documented degradation in the same gate; landing them together makes an inverted cell
+      ambiguous about which change caused it.
 1. **RUN THE LINUX GATES.** Non-negotiable before trusting anything below.
 2. **A scored `Run-GarnetAb.ps1` run** — the rig exists and is smoke-tested, but no scored numbers are
    recorded yet. This is the original backlog item's remaining half.

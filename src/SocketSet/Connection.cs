@@ -85,12 +85,13 @@ public abstract class Connection : IBufferWriter<byte>
     /// unset as a bug:
     /// <list type="bullet">
     /// <item><see cref="SocketSetOptions.TrackEndpoints"/> is off;</item>
-    /// <item>the backend cannot supply it — io_uring uses multishot accept, which does not fill an address
-    /// buffer, so it declines rather than paying a <c>getpeername</c> per accept. It SAYS so via
+    /// <item>the backend does not supply it — io_uring uses multishot accept, which does not fill an
+    /// address buffer, so it DECLINES rather than paying a <c>getpeername</c> per accept. It SAYS so via
     /// <see cref="SocketSet.SupportsEndpointTracking"/>, because a silent degradation here would make every
-    /// peer look anonymous and so read as "nobody is remote". The declination covers OUTBOUND connections
-    /// too, where io_uring could in fact populate cheaply — deliberately, so that
-    /// <c>endpoints=unsupported</c> means unsupported rather than unsupported-in-one-direction;</item>
+    /// peer look anonymous and so read as "nobody is remote". Read that as "does not", never as "cannot":
+    /// the fd is right there and the call would work, and the OUTBOUND half is unset purely so
+    /// <c>endpoints=unsupported</c> means unsupported rather than unsupported-in-one-direction. It is a
+    /// cost choice whose cost has never been measured — see the io_uring item in TODO.md;</item>
     /// <item>the peer genuinely has no address — an accepted AF_UNIX connection whose client never bound
     /// one, which is the normal case. <see cref="PeerAddress.Family"/> is still <c>Unix</c> there, so
     /// "unnamed Unix peer" stays distinguishable from "not tracked".</item>

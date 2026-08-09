@@ -407,15 +407,45 @@ internal sealed class IoUringShard : SocketSetShard
     }
 
     /// <summary>
-    /// DECLINED, and this is a real capability gap rather than an omission. The accept SQE below uses
-    /// <c>IORING_ACCEPT_MULTISHOT</c>, which does not fill an address buffer — one SQE serves many
-    /// accepts, so there is nowhere per-accept to put a sockaddr. Getting the peer would therefore cost a
-    /// <c>getpeername</c> syscall PER ACCEPT, on the backend whose entire point is not making syscalls per
-    /// operation, for a value most callers never read.
+    /// DECLINED — **and "a real capability gap rather than an omission", which this comment used to claim,
+    /// is WRONG. Corrected 2026-08-09 (Marc: "it seems odd that the connecting socket address would be
+    /// unavailable in any reasonable implementation"). It is a COST CHOICE, and the cost is one every
+    /// other backend already pays.** The distinction matters because "unsupported" reads as a kernel limit
+    /// and is not one.
     ///
-    /// So it reports false and leaves the addresses unset, and <see cref="SocketSet.ToString"/> prints
-    /// <c>endpoints=unsupported</c>. Anyone who needs peer addresses on Linux should use epoll, where
-    /// <c>accept4</c> fills the address in the syscall that was happening anyway.
+    /// WHAT IS ACTUALLY TRUE: the accept SQE below uses <c>IORING_ACCEPT_MULTISHOT</c>, which does not fill
+    /// an address buffer — one SQE serves many accepts, so there is nowhere per-accept to put a sockaddr.
+    /// That makes the peer address un-FREE here. It does NOT make it unreachable: <c>AdoptAccepted</c>
+    /// holds the accepted fd, and <c>getpeername</c>/<c>getsockname</c> on it behave exactly as they do on
+    /// epoll.
+    ///
+    /// THREE THINGS THAT UNDERCUT THE COST ARGUMENT, all checkable in this tree:
+    /// <list type="bullet">
+    /// <item>this backend ALREADY makes a syscall per accept — the <c>setsockopt(TCP_NODELAY)</c> in
+    /// <c>AdoptAccepted</c> — so opting in is 1→3 syscalls, not 0→2;</item>
+    /// <item>epoll does NOT get the peer free from <c>accept4</c>: it passes NULL for the address and then
+    /// calls the same two functions, deliberately, so both addresses come from one code path (see
+    /// <c>LibC.getpeername</c>'s own comment). The sentence that used to end this doc — "use epoll, where
+    /// accept4 fills the address in the syscall that was happening anyway" — described a path the code
+    /// does not take;</item>
+    /// <item>IOCP/RIO being free via the <c>AcceptEx</c> buffer was falsified on 2026-08-08. They pay the
+    /// same two syscalls per accept.</item>
+    /// </list>
+    ///
+    /// AND THE CONNECT PATH IS NOT ARGUABLE AT ALL: <c>HandleConnect</c> has a live fd, and we built the
+    /// target sockaddr ourselves a few lines earlier. It stays unset by decision (2026-08-09), so that
+    /// <c>endpoints=unsupported</c> means unsupported rather than unsupported-in-one-direction — not
+    /// because anything is missing.
+    ///
+    /// SO WHAT REMAINS IS A REAL BUT UNMEASURED TRADE, and one asymmetry worth calling a defect:
+    /// <see cref="SocketSetOptions.TrackEndpoints"/> defaults ON and this backend overrides it
+    /// permanently, with no way for an operator to opt in — the option exists precisely so they can choose
+    /// the cost, and the direction chosen for them makes every peer read as anonymous, i.e. "nobody is
+    /// remote" (REVIEW.md F9's failure direction, reached by another route). **Queued as a Linux item in
+    /// TODO.md: measure it on the accept-churn rigs, and if the cost is what it looks like, honour the
+    /// option here on both paths.** Until then it reports false, and
+    /// <see cref="SocketSet.ToString"/> prints <c>endpoints=unsupported</c>; on Linux today, epoll is the
+    /// backend that answers peer-address questions.
     /// </summary>
     protected internal override bool SupportsEndpointTracking => false;
 
