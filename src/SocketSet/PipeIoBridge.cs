@@ -330,7 +330,7 @@ internal sealed class PipeIoBridge
                 catch { Fail(); return; }
             }
 
-            bool resume = false, done = false;
+            bool resume = false, done = false, teardown = false;
             haveFresh = true;
             lock (_inGate)
             {
@@ -355,13 +355,20 @@ internal sealed class PipeIoBridge
                     }
                     // else: a fresh async flush to await next time round; still behind, so stay parked
                 }
+                if (done) teardown = _teardownPending; // the connection closed mid-drain; we own completion
             }
 
             // OUTSIDE the lock, deliberately: on the managed backend ResumeReceive starts the next receive
             // INLINE on this thread, so doing it under _inGate would run the socket read and the whole
             // application receive callback inside the bridge's own inbound lock.
             if (resume) _conn.ResumeReceive();
-            if (done) return;
+            if (done)
+            {
+                // Deferred from OnConnectionClosed: every staged byte is now IN the pipe, so completing
+                // the writer here is what makes the reader see the whole stream and THEN IsCompleted.
+                if (teardown) Teardown(null);
+                return;
+            }
         }
 
         void Fail()
@@ -377,6 +384,10 @@ internal sealed class PipeIoBridge
             // The connection is going away, so this is not about reading more -- it is about not leaving a
             // parked receive behind if Close races a slot that survives. Cheap, and idempotent.
             if (resume) _conn.ResumeReceive();
+            // If the close already dispatched and deferred its teardown to this drain (see
+            // OnConnectionClosed), nobody else will complete the pipe -- do it here, or the reader waits
+            // forever on a writer that has died. Idempotent, so the not-yet-closed order is unaffected.
+            Teardown(null);
             _conn.Close();
         }
     }
@@ -445,8 +456,33 @@ internal sealed class PipeIoBridge
         }
     }
 
-    /// <summary>The connection has gone away; unblock whoever is waiting on either half.</summary>
-    internal void OnConnectionClosed() => Teardown(null);
+    /// <summary>The connection has gone away; unblock whoever is waiting on either half — but NOT by
+    /// discarding inbound bytes that are still draining.
+    ///
+    /// A close can land while received data is still on its way into the pipe: staged copies queued
+    /// behind an outstanding flush, which the reader has not yet relieved. That is ROUTINE on a backend
+    /// that cannot park its receive (io_uring): it reads AHEAD of the pipe, so a peer that half-closes
+    /// right behind its data — "send request, shutdown(WR), await reply", a completely ordinary client
+    /// shape — delivers its FIN to the loop while the tail of its stream is still staged. Completing the
+    /// writer here DISCARDED that tail: found 2026-08-10, the first Linux run of verify-parking's
+    /// io_uring cells, losing 0.1-1.7 MiB of an 8 MiB one-way blast on two runs in three. The parking
+    /// backends only dodge it by not reading ahead, and even they can carry overshoot.
+    ///
+    /// So: if a drain is live (staged bytes exist only while <c>_flushPending</c> is set, and
+    /// <c>_flushPending</c> is set only with a drain task running), hand completion to the drain — it
+    /// tears down when the last staged byte is IN the pipe, so the reader sees every byte and then
+    /// IsCompleted. The bytes were genuinely received in order, so delivering them is right for an
+    /// abortive close too; the hole, not the tail, is what must never happen.</summary>
+    internal void OnConnectionClosed()
+    {
+        lock (_inGate)
+        {
+            if (_flushPending || _staged.Count > 0) { _teardownPending = true; return; }
+        }
+        Teardown(null);
+    }
+
+    private bool _teardownPending; // guarded by _inGate; honoured by the drain's caught-up path
 
     private void Teardown(Exception? fault)
     {

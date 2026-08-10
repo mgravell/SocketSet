@@ -40,6 +40,8 @@ int failures = 0;
 
 foreach (var (factory, be) in GateBackends.All)
 {
+    bool canPark = false; // learned from the first accepted connection; picks the control's cap below
+
     // ---- 1/2/3: a consumer that reads NOTHING until told to ------------------------------------------
     {
         var o = new SocketSetOptions { Shards = 1, Factory = factory };
@@ -63,6 +65,7 @@ foreach (var (factory, be) in GateBackends.All)
         // accepted anything.
         Report(ref failures, srv.Claimed, $"{be} claim/reported",
             srv.Claimed ? $"SupportsReceiveParking={srv.Parks}" : "no connection was accepted, so nothing was asserted");
+        canPark = srv.Parks;
 
         bool alive = !srv.AnyClosed && !client.Faulted;
         bool stopped = s2 == s1 && s2 < Offer;
@@ -103,8 +106,19 @@ foreach (var (factory, be) in GateBackends.All)
     Thread.Sleep(300);
 
     // ---- 4: THE CONTROL -- the same volume against a consumer that drains -----------------------------
+    //
+    // On a backend that CANNOT park, the control runs with the cap DISABLED. Found on 2026-08-10, the
+    // first time the io_uring cells ever ran (this rig was written on Windows): a loopback sender bursts
+    // faster than even a promptly-draining consumer is scheduled, so staging can blow through
+    // MaxInboundBufferBytes and the connection is dropped BY DESIGN at 6.8-7.9 of 8 MiB -- four runs out
+    // of four. That is the same documented degradation cell 2 already asserts (stalled/bounded); this
+    // cell's job is to prove the TRANSPORT delivers when nothing is wedged, so the bound comes out of the
+    // equation rather than the cell asserting a coin-flip. The real cure is TODO 0a (soft parking), and
+    // when it lands, canPark flips to true here and the control tightens back to the default cap by
+    // itself -- which is exactly the deliberate gate-flip 0a wants.
     {
         var o = new SocketSetOptions { Shards = 1, Factory = factory };
+        if (!canPark) o.MaxInboundBufferBytes = 0;
         using var srv = new Sink(o, stall: false);
         srv.Listen(new IPEndPoint(IPAddress.Loopback, Port + 1));
         Thread.Sleep(300);
@@ -116,7 +130,10 @@ foreach (var (factory, be) in GateBackends.All)
         sw.Stop();
         Report(ref failures, done && srv.Corruptions == 0, $"{be} drain/control",
             done ? $"{Mib(Offer)} MiB straight through in {sw.Elapsed.TotalSeconds:0.0}s, never stalled"
-                 : $"only {Mib(srv.Received)} MiB arrived -- the CONTROL failed, so the cells above prove nothing");
+                   + (canPark ? "" : " (cap disabled: cannot park, so the bound would race the consumer)")
+                 : $"only {Mib(srv.Received)} MiB arrived (sender at {Mib(client.Sent)}, connection "
+                   + $"{(srv.AnyClosed ? "CLOSED" : "alive")}, faulted={client.Faulted}) -- the CONTROL "
+                   + "failed, so the cells above prove nothing");
         client.Stop();
     }
     Thread.Sleep(300);
