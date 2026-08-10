@@ -223,16 +223,13 @@ public class SocketSetOptions
     /// path deliberately NOT taken — epoll passes NULL for the address precisely so both addresses come
     /// from one place rather than three. The managed backend is the only cheap one: two property reads.
     ///
-    /// **On io_uring it is unavailable, and that is a CHOICE rather than a capability gap.** Multishot
-    /// accept cannot fill a per-accept sockaddr — one SQE serves many completions, so there is nowhere to
-    /// put one — which makes the address un-FREE there. It does not make it unreachable: <c>getpeername</c>
-    /// on the accepted fd works exactly as it does on epoll, and that backend already pays a
-    /// <c>setsockopt</c> per accept, so the real question is 1→3 syscalls when opted in, not 0→2. On the
-    /// CONNECT path nothing is arguable at all — it holds a real fd and simply declines. It reports
-    /// <see cref="SocketSet.SupportsEndpointTracking"/> false and leaves the addresses unset, which is
-    /// honest about the OUTCOME but must not be read as a kernel limit. See the io_uring item in TODO.md:
-    /// the status quo rests on a cost claim nobody has measured, for a cost every other backend already
-    /// pays.
+    /// **io_uring honours this too, since 2026-08-10.** Its multishot accept cannot fill a per-accept
+    /// sockaddr (one SQE serves many completions), so it reads both addresses off the accepted fd — the
+    /// same two syscalls as everyone else, on an accept path that already paid a <c>setsockopt</c>. It
+    /// declined for a while on cost grounds; the cost was then measured under accept-churn
+    /// (bench/prereg-uring-endpoints-2026-08-10.md) and the declination dropped. Any FUTURE backend that
+    /// cannot supply addresses must report <see cref="SocketSet.SupportsEndpointTracking"/> false rather
+    /// than leaving them quietly unset.
     ///
     /// IT IS REPORTED. <see cref="SocketSet.ToString"/> prints <c>endpoints=on|off|unsupported</c>
     /// unconditionally, so a rig can gate on what actually happened rather than on what was asked for.

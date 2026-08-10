@@ -220,6 +220,12 @@ for (int i = 0; i < args.Length; i++)
         case "--max-inbound" when i + 1 < args.Length && int.TryParse(args[i + 1], out var mi):
             options.MaxInboundBufferBytes = Math.Max(0, mi);
             break;
+        // The A/B lever for the endpoint-tracking cost (bench/prereg-uring-endpoints-2026-08-10.md):
+        // per-accept and per-connect getpeername+getsockname, on by default like the option itself.
+        // The churn banner prints the set's ToString so a rig gates on endpoints=on/off, not on this flag.
+        case "--track-endpoints" when i + 1 < args.Length && bool.TryParse(args[i + 1], out var te):
+            options.TrackEndpoints = te;
+            break;
         case "--host" when i + 1 < args.Length:
             host = args[i + 1];
             break;
@@ -467,6 +473,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -m / --managed    force the portable managed-socket fallback (default auto-detects)");
     Console.WriteLine("  --cpus SPEC       pin this process to CPUs (e.g. 0-5 or 0,2,4) — covers shards, thread pool and GC");
     Console.WriteLine("  --window N        client keeps up to N messages in flight (1=ping/pong default, N=bounded pipeline)");
+    Console.WriteLine("  --track-endpoints B  populate Connection.Remote/LocalAddress (default true; the A/B lever");
+    Console.WriteLine("                    for the per-accept getpeername/getsockname cost — trust the churn banner)");
     Console.WriteLine("  --max-inbound N   per-connection inbound staging cap in pipe mode (0 disables; default 4 MiB).");
     Console.WriteLine("                    A --window deeper than the cap is dropped BY DESIGN where the backend");
     Console.WriteLine("                    cannot park its receive (io_uring); see bench/verify-parking");
@@ -634,6 +642,7 @@ if (closeAfter > 0 && churn > 0)
     Console.WriteLine(
         $"churn: overlapping soak for {churn}s, target ~{clientCount} live, {closeAfter} msg(s)/conn, " +
         $"sockets/shard={options.SocketsPerShard} shards={options.Shards}");
+    Console.WriteLine($"churn: {set}"); // the banner (endpoints=on|off) is what an A/B gates on, not the flag
 
     long connected = 0;
     var csw = Stopwatch.StartNew();

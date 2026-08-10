@@ -184,9 +184,11 @@ public abstract partial class SocketSet : IDisposable
 
     /// <summary>
     /// Whether this set's backend can supply peer/local addresses at all — see
-    /// <see cref="SocketSetOptions.TrackEndpoints"/>. False on io_uring. Combine with the option: the
-    /// addresses are populated only when both are true, which is what <c>endpoints=</c> in
-    /// <see cref="ToString"/> reports.
+    /// <see cref="SocketSetOptions.TrackEndpoints"/>. True on every current backend (io_uring, the last
+    /// holdout, opted in on 2026-08-10 once the cost claim was measured); the state is kept for future
+    /// backends, and <c>endpoints=</c> in <see cref="ToString"/> still reports all three so a rig can gate
+    /// on what actually happened. Combine with the option: the addresses are populated only when both are
+    /// true.
     /// </summary>
     public bool SupportsEndpointTracking
     {

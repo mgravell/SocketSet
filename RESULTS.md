@@ -24,6 +24,42 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > on server-shaped ones. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation,
 > and the eight things tried that did not change it.
 
+## io_uring ENDPOINT TRACKING COSTS NOTHING MEASURABLE (2026-08-10, Linux) — the declination's cost claim, measured and retired
+
+TODO 0c's whole justification was "a number nobody has": io_uring declined `TrackEndpoints` on the
+grounds that two syscalls per accept (`getpeername`+`getsockname`) might not be affordable, after the
+2026-08-09 audit had already established every other backend pays exactly those two and io_uring already
+paid a `setsockopt` per accept. Pre-registered in `bench/prereg-uring-endpoints-2026-08-10.md` BEFORE the
+populate landed; both predictions held.
+
+Instrument: SmokeTest overlapping churn (`-c 64 --churn 10 --close-after 1 --sockets 128 --reset-close`),
+io_uring, 6 interleaved passes per leg, same session, `--track-endpoints true|false` with the banner
+(`endpoints=on|off`) as the gate on what actually ran. NOTE the instrument is DOUBLY sensitive: client and
+server share the process, so each churn cycle pays the populate on BOTH the accept and the connect path —
+four syscalls per cycle, not two.
+
+| leg | conn/s, 6 passes (min–max) |
+|---|---|
+| plaintext, endpoints=on | 49,399 – 52,653 |
+| plaintext, endpoints=off | 49,273 – 52,622 |
+| TLS (OpenSSL), endpoints=on | 8,910 – 9,684 |
+| TLS (OpenSSL), endpoints=off | 8,946 – 9,594 |
+
+**P12 HELD:** ranges overlap essentially completely (the on-leg median is fractionally HIGHER in both
+tables, i.e. noise); nothing quotable separates the legs, at a workload where ~50k full open/close cycles
+per second each pay the cost twice. **P13 HELD:** TLS dilutes rather than amplifies, as a per-accept cost
+must. Per house rule 5, no delta is quoted — the claim is only that the ranges overlap.
+
+Consequence, landed the same day: io_uring populates on both paths gated on `TrackEndpoints` exactly like
+every other backend, `SupportsEndpointTracking` reverts to the base `true`, and no current backend
+declines (`endpoints=unsupported` has no live producer; the state and its `verify-endpoints` cells remain
+as the contract for future backends). What forced the issue: with tracking declined, REVIEW.md F9's
+fail-closed `IsLocalConnection` denied every peer on the Linux DEFAULT backend, making Garnet's
+`ConnectionProtectionOption.Local` unusable there. Verified end-to-end on GarnetDemo/io_uring:
+`CLIENT LIST` now reports real `addr=`/`laddr=`. Gates: `verify-endpoints` all cells PASS with io_uring
+running the FULL battery (including the `@abstract`-UDS cells, which had never run on any OS), smoke
+matrix 60/60.
+
 ## GARNET ON WINDOWS — THE FIRST SCORED NUMBERS (2026-08-09), and RIO's depth-1 collapse turns out to be a SINGLE-CONNECTION effect
 
 **Every Garnet figure in this file before today was Linux.** `bench/Run-GarnetAb.ps1` existed and was

@@ -214,6 +214,11 @@ internal sealed class IoUringShard : SocketSetShard
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock starts here
         conn.SkipBufferWipe = Parent.Options.DangerousDisableBufferWipe;
         conn.ResetReceiveParking();
+        conn.RemoteAddress = conn.LocalAddress = default; // pooled slot: never inherit the last tenant's
+        // NOT populated here: a CONNECT lands in this method too, and getpeername on an fd whose
+        // non-blocking connect has not completed returns ENOTCONN -- the exact bug epoll had (F9's
+        // outbound half). Population happens where the fd is genuinely connected: AdoptAccepted and
+        // HandleConnect's success branch.
         // Bump the generation before publishing Fd: any out-of-band send/close captured against the
         // previous tenant now mismatches and is dropped rather than misdelivered.
         Volatile.Write(ref conn.Generation, conn.Generation + 1);
@@ -406,48 +411,21 @@ internal sealed class IoUringShard : SocketSetShard
         });
     }
 
-    /// <summary>
-    /// DECLINED — **and "a real capability gap rather than an omission", which this comment used to claim,
-    /// is WRONG. Corrected 2026-08-09 (Marc: "it seems odd that the connecting socket address would be
-    /// unavailable in any reasonable implementation"). It is a COST CHOICE, and the cost is one every
-    /// other backend already pays.** The distinction matters because "unsupported" reads as a kernel limit
-    /// and is not one.
-    ///
-    /// WHAT IS ACTUALLY TRUE: the accept SQE below uses <c>IORING_ACCEPT_MULTISHOT</c>, which does not fill
-    /// an address buffer — one SQE serves many accepts, so there is nowhere per-accept to put a sockaddr.
-    /// That makes the peer address un-FREE here. It does NOT make it unreachable: <c>AdoptAccepted</c>
-    /// holds the accepted fd, and <c>getpeername</c>/<c>getsockname</c> on it behave exactly as they do on
-    /// epoll.
-    ///
-    /// THREE THINGS THAT UNDERCUT THE COST ARGUMENT, all checkable in this tree:
-    /// <list type="bullet">
-    /// <item>this backend ALREADY makes a syscall per accept — the <c>setsockopt(TCP_NODELAY)</c> in
-    /// <c>AdoptAccepted</c> — so opting in is 1→3 syscalls, not 0→2;</item>
-    /// <item>epoll does NOT get the peer free from <c>accept4</c>: it passes NULL for the address and then
-    /// calls the same two functions, deliberately, so both addresses come from one code path (see
-    /// <c>LibC.getpeername</c>'s own comment). The sentence that used to end this doc — "use epoll, where
-    /// accept4 fills the address in the syscall that was happening anyway" — described a path the code
-    /// does not take;</item>
-    /// <item>IOCP/RIO being free via the <c>AcceptEx</c> buffer was falsified on 2026-08-08. They pay the
-    /// same two syscalls per accept.</item>
-    /// </list>
-    ///
-    /// AND THE CONNECT PATH IS NOT ARGUABLE AT ALL: <c>HandleConnect</c> has a live fd, and we built the
-    /// target sockaddr ourselves a few lines earlier. It stays unset by decision (2026-08-09), so that
-    /// <c>endpoints=unsupported</c> means unsupported rather than unsupported-in-one-direction — not
-    /// because anything is missing.
-    ///
-    /// SO WHAT REMAINS IS A REAL BUT UNMEASURED TRADE, and one asymmetry worth calling a defect:
-    /// <see cref="SocketSetOptions.TrackEndpoints"/> defaults ON and this backend overrides it
-    /// permanently, with no way for an operator to opt in — the option exists precisely so they can choose
-    /// the cost, and the direction chosen for them makes every peer read as anonymous, i.e. "nobody is
-    /// remote" (REVIEW.md F9's failure direction, reached by another route). **Queued as a Linux item in
-    /// TODO.md: measure it on the accept-churn rigs, and if the cost is what it looks like, honour the
-    /// option here on both paths.** Until then it reports false, and
-    /// <see cref="SocketSet.ToString"/> prints <c>endpoints=unsupported</c>; on Linux today, epoll is the
-    /// backend that answers peer-address questions.
-    /// </summary>
-    protected internal override bool SupportsEndpointTracking => false;
+    // ENDPOINT TRACKING IS SUPPORTED HERE SINCE 2026-08-10 (no override; the base default is true), and
+    // the override that used to sit here declining it is worth one paragraph of history because its
+    // reasoning was corrected twice. It originally claimed a capability gap ("multishot accept fills no
+    // address buffer"), which is true but only makes the address un-FREE, not unreachable — AdoptAccepted
+    // holds a live fd, and getpeername/getsockname behave exactly as on epoll. The cost claim then died
+    // by audit (2026-08-09): every backend that tracks pays the same two syscalls per accept — epoll
+    // passes NULL to accept4 and calls both functions deliberately, and IOCP/RIO's "free via the AcceptEx
+    // buffer" was falsified 2026-08-08 — while this backend already paid a setsockopt per accept, so
+    // opting in is 1→3 syscalls, not 0→2. The remaining "unmeasured trade" was measured 2026-08-10
+    // (bench/prereg-uring-endpoints-2026-08-10.md; result in the enabling commit): the accept-churn A/B
+    // of TrackEndpoints on/off. What forced the issue: with tracking permanently declined, every peer
+    // read as anonymous, and REVIEW.md F9's fail-closed IsLocalConnection therefore denied even a genuine
+    // loopback operator on the Linux DEFAULT backend — Garnet's ConnectionProtectionOption.Local was
+    // unusable under io_uring. TrackEndpoints (default on) is now honoured on both paths, exactly as on
+    // every other backend.
 
     private void EnqueueAccept(int listenerFd, bool local)
     {
@@ -1622,6 +1600,13 @@ internal sealed class IoUringShard : SocketSetShard
 
         uint slot = conn.Slot;
 
+        // The multishot accept cannot fill a per-accept sockaddr (one SQE, many completions), so the
+        // addresses are read off the accepted fd here -- the same two syscalls every other backend pays
+        // (see 2026-08-09's audit of the "free" claims), on top of the setsockopt above that this path
+        // already paid. Before ResolveServerTls, so OnServerAuthenticate and a TLS-deferred OnAccept both
+        // see real addresses. Cost measured 2026-08-10 (bench/prereg-uring-endpoints-2026-08-10.md).
+        if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, newFd);
+
         var serverTls = Parent.ResolveServerTls(conn);
         // Refused (callback threw, or asked for TLS it could not describe) drops the connection rather
         // than falling back to plaintext: a silent downgrade is the failure this whole path removes.
@@ -1663,6 +1648,13 @@ internal sealed class IoUringShard : SocketSetShard
         int fd = conn.Fd;
         if (res == 0 && fd != 0)
         {
+            // The connect has SUCCEEDED (res == 0), so getpeername/getsockname finally have something to
+            // report -- this is the io_uring equivalent of epoll's CompleteConnect point. We built the
+            // target sockaddr ourselves a few lines up, but the LOCAL half (the kernel-chosen ephemeral
+            // port) only exists here, and remembering the dial is exactly what verify-endpoints'
+            // connect/reports cell is designed to catch.
+            if (Parent.Options.TrackEndpoints) NativeEndpoints.Populate(conn, fd);
+
             var clientTls = Parent.ResolveClientTls(conn);
             if (clientTls.Refused) { CloseClient(slot); return; }
             if (clientTls.Provider is OpenSslTlsProvider { SupportsKernelOffload: true } kop

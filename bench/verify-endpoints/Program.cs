@@ -44,13 +44,13 @@
 //                           ENOTCONN and both addresses silently stayed unset.
 //   connect-off/unset       The inverse half for outbound, matching tracking-off/unset.
 //
-// On a backend that declines tracking (io_uring: multishot accept fills no address buffer), the rig
-// asserts the DOCUMENTED degradation -- unsupported in the banner, addresses unset -- rather than
-// skipping, so a backend that quietly started or stopped supporting it fails. That covers the outbound
-// cells too: io_uring COULD populate on connect (it holds a real fd there, and the per-accept cost
-// argument does not apply), and deliberately does not, so that endpoints=unsupported stays literally true
-// rather than meaning "unsupported in one direction". connect/declines-unset is what holds that decision
-// in place.
+// On a backend that declines tracking, the rig asserts the DOCUMENTED degradation -- unsupported in the
+// banner, addresses unset -- rather than skipping, so a backend that quietly started or stopped
+// supporting it fails. As of 2026-08-10 NO current backend declines: io_uring, the last holdout, opted in
+// (TODO 0c; cost measured per bench/prereg-uring-endpoints-2026-08-10.md), which flipped its cells from
+// declines/unset to the full battery DELIBERATELY -- exactly the visible inversion TODO said the flip
+// must produce. The declines cells stay in the rig as the contract for any future backend that reports
+// SupportsEndpointTracking false.
 //
 // NO OUTBOUND lan/ CELL, deliberately: dialling this box's LAN address proves much less than receiving
 // from it, because the address under test is one we supplied. The inbound lan/not-loopback cell above is

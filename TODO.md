@@ -103,10 +103,25 @@ is unnamed).
    word of it was wrong: **managed was always correct** (its `Register` runs from `CompleteConnect`, i.e.
    after success), so it was three backends, not all of them. Detail under item 4 below. **The epoll half
    is UNRUN — see the Linux warning at the end of this section, which now covers this too.**
-0c. **io_uring's ENDPOINT DECLINATION IS A COST CHOICE, NOT A CAPABILITY GAP — AND THE COST CLAIM HAS
-   NEVER BEEN MEASURED** (Marc, 2026-08-09: *"it seems odd that the connecting socket address would be
-   unavailable in any reasonable implementation"*). It is not unavailable. Three doc sites said or implied
-   otherwise; two were stale and are now corrected, and the correction is what turns this into an item.
+0c. ~~**io_uring's ENDPOINT DECLINATION IS A COST CHOICE, NOT A CAPABILITY GAP — AND THE COST CLAIM HAS
+   NEVER BEEN MEASURED**~~ — **DONE 2026-08-10 (Linux), and the cost claim is retired: a clean null.**
+   Measured FIRST per the plan below (pre-registered in `bench/prereg-uring-endpoints-2026-08-10.md`,
+   results in `RESULTS.md`): at ~50k open/close cycles/s, with the instrument paying the populate on BOTH
+   the accept and connect paths per cycle, the on/off ranges overlap completely, plaintext and TLS alike
+   (P12 and P13 both held). io_uring now honours `TrackEndpoints` on both paths like every other backend;
+   `SupportsEndpointTracking` reverts to the base `true`. The planned consequences both landed: the
+   `verify-endpoints` io_uring cells flipped to the FULL battery (visible inversion — the rig branches on
+   the capability, so `declines/unset` gave way to `loopback/reports` etc., including the `@abstract`-UDS
+   cells' first run anywhere), and `endpoints=unsupported` now has no live producer (state kept for future
+   backends, its cells kept as their contract). The Garnet payoff verified end-to-end: `CLIENT LIST` on
+   GarnetDemo/io_uring reports real `addr=`/`laddr=`, and F9's fail-closed `IsLocalConnection` can now say
+   YES to a genuine loopback operator on the Linux default backend. Marc's ask ("even behind a gate we
+   enable for the demo") needed no gate: `TrackEndpoints` defaults on, and the measurement supports the
+   default. Item 4 of the plan (do not land together with 0a) was honoured — 0a remains untouched and
+   next. ORIGINAL ITEM (kept for the reasoning): (Marc, 2026-08-09: *"it seems odd that the connecting
+   socket address would be unavailable in any reasonable implementation"*). It is not unavailable. Three
+   doc sites said or implied otherwise; two were stale and are now corrected, and the correction is what
+   turns this into an item.
 
    **What is actually true:** `IORING_ACCEPT_MULTISHOT` cannot fill a per-accept sockaddr — one SQE serves
    many completions, so there is nowhere to put one. That makes the address un-FREE. It does not make it
