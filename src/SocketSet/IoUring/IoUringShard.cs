@@ -35,6 +35,9 @@ internal sealed class IoUringShard : SocketSetShard
         WriteV = 6, // scatter-gather send of a large payload across N write-pool pages (aux = first page index)
         Cancel = 7, // IORING_OP_ASYNC_CANCEL(CANCEL_FD|ALL) issued during teardown to drain in-flight ops
         Poll = 8,   // IORING_OP_POLL_ADD readiness wait (kTLS: handshake step / RX SSL_read trigger)
+        ParkCancel = 9, // targeted ASYNC_CANCEL of ONE armed multishot recv (soft parking, TODO 0a) —
+                        // matched by the recv's user_data, so it can never touch a send; deliberately
+                        // outside teardown's CancelPending accounting, which belongs to Op.Cancel alone
     }
 
     private struct WriteState
@@ -106,6 +109,8 @@ internal sealed class IoUringShard : SocketSetShard
     // Close requests marshaled from arbitrary threads onto the loop thread. Generation-guarded so a
     // request can't retract a slot that has since been closed and re-tenanted.
     private readonly ConcurrentQueue<(uint Slot, uint Generation)> _closes = [];
+    // Parked-receive resumes, marshaled in from consumer flush continuations (TODO 0a soft parking).
+    private readonly ConcurrentQueue<(uint Slot, uint Generation)> _resumes = [];
 
     /// <summary>SS_URING_TRACE=1 dumps every completion to stderr. Read once, so the hot loop pays only a
     /// never-taken branch. See the use site for why this is worth having.</summary>
@@ -471,6 +476,14 @@ internal sealed class IoUringShard : SocketSetShard
         Poke();
     }
 
+    /// <summary>Marshal a parked-receive resume onto the loop thread (called from
+    /// <see cref="Connection.ResumeReceive"/>, i.e. a consumer's flush continuation on any thread).</summary>
+    internal void SubmitResumeReceive(uint slot, uint generation)
+    {
+        _resumes.Enqueue((slot, generation));
+        Poke();
+    }
+
     // --- out-of-band write pool (thread-safe; used by the IBufferWriter path) ---
 
     /// <summary>Page size of the write pools (bytes).</summary>
@@ -555,6 +568,23 @@ internal sealed class IoUringShard : SocketSetShard
         });
     }
 
+    /// <summary>Loop thread: a parked receive's consumer caught up. By the time this runs the base state
+    /// machine is already Running (<see cref="Connection.ResumeReceive"/> exchanged it before marshaling),
+    /// so the only question is whether anything is armed. If the cancelled multishot has not reaped yet,
+    /// <c>RecvArmed</c> is still true and the <c>-ECANCELED</c> handler will re-arm when it does — doing it
+    /// here too would arm TWO receives on one fd. If it has, arm now. A re-tenanted slot (generation
+    /// mismatch), a closing connection, or an app that closed its receive half all drop the request.</summary>
+    private void ResumeParkedReceive(uint slot, uint generation)
+    {
+        var conn = _conns[slot - 1];
+        if (conn.Generation != generation || conn.Fd == 0 || conn.Closing) return;
+        if (conn.RecvArmed || (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) != 0) return;
+        // A kTLS connection's data phase receives via one-shot POLL+SSL_read (RecvArmed doubles as
+        // "a poll is in flight"); everything else is the multishot recv.
+        if (conn.KtlsSsl != 0 && conn.KtlsReady) SubmitPoll(conn, slot, conn.Fd, LibC.POLLIN);
+        else ArmRecv(slot, conn.Fd);
+    }
+
     private void ArmRecv(uint slot, int fd)
     {
         // Multishot: one SQE yields many recv completions (each selecting a provided buffer),
@@ -589,6 +619,29 @@ internal sealed class IoUringShard : SocketSetShard
             user_data = Pack(Op.Cancel, slot),
         };
         sqe.rw_flags.rw_flags = (int)(LibC.IORING_ASYNC_CANCEL_FD | LibC.IORING_ASYNC_CANCEL_ALL);
+        Submit(sqe);
+    }
+
+    // Soft parking (TODO 0a): retract ONE armed multishot recv, by matching its exact user_data (the
+    // default cancel mode — no CANCEL_FD, no CANCEL_ALL), so an in-flight send is untouched and teardown's
+    // accounting (CancelPending) is not involved. The cancelled recv reaps as -ECANCELED in HandleRecv,
+    // which is where the parked/resumed decision is made; this op's own CQE needs no action (0 = found,
+    // -ENOENT = the recv had already ended by itself, -EALREADY = cancellation in progress — all fine).
+    //
+    // SLOT-REUSE NOTE, because Pack carries no generation: if this cancel somehow outlived the connection
+    // AND the slot was re-tenanted AND a new recv was armed with the identical user_data, the stale cancel
+    // would retract the NEW tenant's recv. That reap lands in the -ECANCELED branch with the new tenant's
+    // park state at Running, which RE-ARMS — a spurious cancel+re-arm cycle, not a hang or a loss. In
+    // practice the window does not exist (the cancel executes in this loop iteration's io_uring_enter;
+    // a re-tenant's ArmRecv cannot happen before the next), but the self-healing shape is the backstop.
+    private void SubmitParkCancel(uint slot)
+    {
+        var sqe = new LibC.io_uring_sqe
+        {
+            opcode = LibC.IORING_OP_ASYNC_CANCEL,
+            addr = Pack(Op.Recv, slot), // the target: that recv's user_data, exactly
+            user_data = Pack(Op.ParkCancel, slot),
+        };
         Submit(sqe);
     }
 
@@ -1299,7 +1352,16 @@ internal sealed class IoUringShard : SocketSetShard
             }
 
             int err = SSL_get_error(conn.KtlsSsl, n);
-            if (err == SSL_ERROR_WANT_READ) { SubmitPoll(conn, slot, fd, LibC.POLLIN); return; }
+            if (err == SSL_ERROR_WANT_READ)
+            {
+                // Soft parking on the kTLS data path is the ONE-SHOT pattern the other backends use: the
+                // poll is re-armed per record burst, so a park simply declines to re-arm it — no cancel,
+                // nothing in flight. (A park requested mid-burst drains the records the kernel already
+                // holds first — bounded by SO_RCVBUF — then lands here.) ResumeParkedReceive arms the
+                // POLL, not the multishot, for a kTLS connection.
+                if (!conn.TryParkReceive()) SubmitPoll(conn, slot, fd, LibC.POLLIN);
+                return;
+            }
             if (err == SSL_ERROR_ZERO_RETURN) { CloseClient(slot); return; } // peer close_notify
             CloseClient(slot); // fatal alert / decrypt error / syscall error
             return;
@@ -1415,6 +1477,10 @@ internal sealed class IoUringShard : SocketSetShard
                 if (conn.Generation == c.Generation && conn.Fd != 0) CloseClient(c.Slot);
             }
 
+            // Re-arm any parked receives whose consumer has caught up (soft parking, TODO 0a).
+            while (_resumes.TryDequeue(out var r))
+                ResumeParkedReceive(r.Slot, r.Generation);
+
             // Fold any cross-thread submissions into the ring.
             if (!_pending.IsEmpty)
                 _ring.Push(_pending);
@@ -1526,6 +1592,12 @@ internal sealed class IoUringShard : SocketSetShard
 
                 case Op.Poll:
                     HandlePoll(res, slot: id);
+                    break;
+
+                case Op.ParkCancel:
+                    // The targeted cancel's own completion carries no work: the RECV's -ECANCELED reap is
+                    // where park/resume is decided (see HandleRecv), and 0 / -ENOENT / -EALREADY here all
+                    // mean the same thing — the multishot is ending or already ended.
                     break;
             }
         }
@@ -1729,15 +1801,39 @@ internal sealed class IoUringShard : SocketSetShard
             bool borrowed = DeliverReceive(slot, fd, bid, res);
             if (hasBuf && !borrowed) _readBuffer.ReleaseBuffer(bid);
 
-            // Multishot stays armed while F_MORE is set; re-arm only when it clears.
-            if (!more && !conn.Closing && (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
-                ArmRecv(slot, fd);
+            if (!conn.Closing && (conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0)
+            {
+                if (more)
+                {
+                    // The delivery above may have requested a park (the bridge's flush went async, on
+                    // this thread, inside DeliverReceive). The multishot is still armed, so "stop
+                    // re-arming" alone cannot honour it — retract the op with a targeted cancel. The
+                    // CAS means exactly one cancel per park: later completions in this batch see
+                    // Parked, not ParkRequested, and fall through.
+                    if (conn.TryParkReceive()) SubmitParkCancel(slot);
+                }
+                // Multishot ended by itself (F_MORE clear): re-arm unless a park was requested, in
+                // which case the park takes effect for free — no cancel needed, nothing is armed.
+                else if (!conn.TryParkReceive()) ArmRecv(slot, fd);
+            }
         }
         else if (res == -LibC.ENOBUFS)
         {
             // Provided-buffer ring was empty, so the multishot ended; re-arm — buffers free as
-            // borrowed ones are returned on send completion.
-            ArmRecv(slot, fd);
+            // borrowed ones are returned on send completion. Unless parked: then the resume re-arms.
+            if (!conn.TryParkReceive()) ArmRecv(slot, fd);
+        }
+        else if (res == -LibC.ECANCELED)
+        {
+            // A parked receive reaping its targeted cancel (teardown's cancel cannot land here: closing
+            // connections returned above). If a resume raced in before this reap, the state is already
+            // Running and the re-arm happens NOW; otherwise stay parked and ResumeParkedReceive re-arms
+            // later. TryParkReceive covers the park-resume-park interleave (ParkRequested → Parked, no
+            // re-arm); ReceiveParkPending covers plain Parked.
+            if (hasBuf) _readBuffer.ReleaseBuffer(bid); // a cancelled recv selects no buffer; belt-and-braces
+            if ((conn.Flags & SocketSet.SocketFlags.ReceiveClosed) == 0
+                && !conn.TryParkReceive() && !conn.ReceiveParkPending)
+                ArmRecv(slot, fd);
         }
         else
         {

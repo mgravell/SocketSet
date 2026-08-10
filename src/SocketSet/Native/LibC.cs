@@ -22,7 +22,7 @@ internal static unsafe partial class LibC
     [StructLayout(LayoutKind.Sequential)]
     internal struct Linger { public int l_onoff; public int l_linger; }
     
-    public const int EAGAIN = 11, EINTR = 4, EBUSY = 16, ENOBUFS = 105;
+    public const int EAGAIN = 11, EINTR = 4, EBUSY = 16, ENOBUFS = 105, ECANCELED = 125;
 
     // send()/recv() message flags
     internal const int MSG_NOSIGNAL = 0x4000; // don't raise SIGPIPE on a broken pipe; report -EPIPE instead

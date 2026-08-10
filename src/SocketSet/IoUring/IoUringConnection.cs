@@ -190,19 +190,30 @@ internal sealed unsafe class IoUringConnection : Connection
     }
 
     /// <summary>
-    /// FALSE, deliberately, and this is the one backend where receive parking was NOT built (TODO item 1,
-    /// 2026-08-04). The other four arm ONE receive at a time, so parking is "do not post the next one" —
-    /// nothing has to be cancelled and there is no window in which the kernel owns an operation we have
-    /// stopped tracking. io_uring's receive is MULTISHOT: an armed operation keeps completing until the
-    /// kernel retires it, so parking means IORING_OP_ASYNC_CANCEL and a later re-arm, sharing the cancel
-    /// path with teardown. Getting that race wrong does not leak — it HANGS, with the connection alive and
-    /// no receive outstanding, which is the failure mode hardest to see and hardest to reproduce.
+    /// TRUE since 2026-08-10 (TODO 0a) — this was the one backend where parking was NOT built, because its
+    /// receive is MULTISHOT: an armed operation keeps completing until the kernel retires it, so "do not
+    /// post the next one" has no direct analogue. The shape that landed: a park that engages while the
+    /// multishot is still delivering issues a TARGETED <c>IORING_OP_ASYNC_CANCEL</c> (matched by the recv's
+    /// own user_data, NOT teardown's cancel-by-fd — the two never share accounting), the cancelled op reaps
+    /// as <c>-ECANCELED</c> on the loop, and the parked state suppresses the re-arm; resume marshals a
+    /// generation-guarded re-arm through the shard queue exactly like Close/Flush. No bytes are lost:
+    /// cancel only retracts the ARMED op, data already accepted by the kernel stays in the socket buffer
+    /// for the re-armed receive, and the closing window is what slows the peer.
     ///
-    /// Reporting false rather than silently doing nothing is the point: both bridges read this and keep
-    /// their MaxInboundBufferBytes bound as the (blunt) mechanism here, instead of waiting for
-    /// backpressure that would never arrive.
+    /// THE GRACE PERIOD IS REAL AND BOUNDED, stated because TODO 0a demanded it be: after the park engages,
+    /// completions already generated (plus anything the multishot consumes before the cancel lands, at most
+    /// one submit cycle later) still deliver and are staged by the bridge; then the socket buffer fills and
+    /// the window closes. bench/verify-parking's stalled/peer-held cell measures what the peer actually got
+    /// to send.
     /// </summary>
-    public override bool SupportsReceiveParking => false;
+    public override bool SupportsReceiveParking => true;
+
+    private protected override void SubmitResumeReceive()
+    {
+        // Generation-captured marshal onto the loop, exactly like Close: re-arming is a per-slot SQE, so a
+        // resume for a re-tenanted slot must be dropped, not applied.
+        if (Volatile.Read(ref Fd) != 0) Shard.SubmitResumeReceive(Slot, Volatile.Read(ref Generation));
+    }
 
     public override void Close()
     {

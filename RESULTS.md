@@ -24,6 +24,27 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > on server-shaped ones. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation,
 > and the eight things tried that did not change it.
 
+## io_uring SOFT PARKING: THE GRACE PERIOD, MEASURED (2026-08-10, Linux)
+
+TODO 0a demanded the park's grace be sized, not assumed: "let what is posted drain" is only backpressure
+if what is posted is small. With soft parking landed (targeted cancel of the armed multishot; see TODO 0a
+for why the provided-buffer-starvation sketch was rejected — the ring is per-shard), verify-parking's
+`stalled/peer-held` cell measures what a blocked-consumer's peer actually got to send before the window
+held it:
+
+| backend | sender held at (of 8 MiB offered) |
+|---|---|
+| io_uring (multishot + targeted cancel) | 3.00 MiB |
+| epoll (EPOLL_CTL_MOD) | 2.56 MiB |
+| managed (skip next ReceiveAsync) | 2.56 MiB |
+
+Same rig, same session, single connection. The ~0.44 MiB delta is the multishot's extra drain (in-flight
+completions plus cancel latency) and is the bounded overshoot the item predicted. Behaviour proof, not a
+throughput claim: the discriminating number is that `echo-pipe-8m-deep` at the DEFAULT 4 MiB cap went
+from ~2-in-3 FAIL (pre-parking, the D3 drop) to 10/10 PASS — staged inbound now stays under the bound
+because the receive stops. Full battery green: smoke 60/60, verify-parking 5/5 with the io_uring cells
+inverted to the full parking contract, verify-aspnet 18/18.
+
 ## io_uring ENDPOINT TRACKING COSTS NOTHING MEASURABLE (2026-08-10, Linux) — the declination's cost claim, measured and retired
 
 TODO 0c's whole justification was "a number nobody has": io_uring declined `TrackEndpoints` on the

@@ -42,12 +42,10 @@ verify-tls-floor 8/8, verify-bind-address 6/6.
 
 ### Queued, in the order I would take them
 
-1. **0a — SOFT PARKING FOR io_uring** (unchanged below, but it gained urgency and gates this session):
-   THREE reasons now — backpressure hygiene, the 8m-deep cell's default-cap restoration, and
-   verify-parking's control cap restoration — plus F10 showed what read-ahead does at EOF. Its gate flips
-   are pre-built: restore the default cap in the smoke 8m-deep cell and in verify-parking's control, and
-   `stalled/bounded (no parking)` inverts to `stalled/peer-held`. It was deliberately NOT touched this
-   session (0c item 4's do-not-land-together warning, honoured).
+1. ~~**0a — SOFT PARKING FOR io_uring**~~ — **DONE, same session, after 0c landed and gated** (see 0a
+   below for the mechanism decision and the measured grace). All three pre-built gate flips executed:
+   smoke 8m-deep back at the default cap (10/10), verify-parking control back at the default cap,
+   `stalled/bounded` inverted to `stalled/peer-held`. **Every backend now parks.**
 2. The 2026-08-08 Windows-side queue below (RESPite.Benchmark publish, `SS_RIO_SPIN` default, blocked-time
    percentiles) is untouched and still current.
 
@@ -56,7 +54,8 @@ verify-tls-floor 8/8, verify-bind-address 6/6.
 `PipeIoBridge` (F10 fix, 77c0779) and SmokeTest changed on Linux; both are SHARED. The F10 fix is
 exercised by verify-parking (in `Run-SecurityGates.ps1`) — run that suite FIRST, as ever. The Windows
 parking backends were latent-vulnerable to F10's shape (parking has overshoot), so the fix matters there
-too, not just on io_uring.
+too, not just on io_uring. The soft-parking change itself (0a) is io_uring-only code, but
+`verify-parking` on Windows re-checks the shared state machine all the same.
 
 ---
 
@@ -112,7 +111,38 @@ is unnamed).
 
 ### Queued, in the order I would take them
 
-0a. **SOFT PARKING FOR io_uring — LOOK AT THIS ON LINUX** (Marc, 2026-08-09). The N-ary receive work
+0a. ~~**SOFT PARKING FOR io_uring — LOOK AT THIS ON LINUX**~~ — **DONE 2026-08-10 (Linux), same session
+   as 0c but strictly AFTER it, per 0c's do-not-land-together warning. One mechanism decision differs
+   from the sketch below, and the reasoning is the part worth keeping:**
+
+   **The provided-buffer-starvation mechanism was NOT used, because the ring is per-SHARD.** Stopping
+   replenishment to park ONE connection would starve every connection on the shard — a shard-wide park
+   masquerading as per-connection backpressure, and the single-connection gate would have passed it.
+   (The sketch's open question IS answered en route: multishot DOES terminate on ENOBUFS — the
+   pre-existing `HandleRecv` ENOBUFS re-arm path is proof — it just cannot be triggered per-connection.)
+
+   **What landed instead: a TARGETED cancel, which is per-connection by construction.** Park engages at
+   the re-arm decision like every other backend; if the multishot is still armed (`F_MORE`), a targeted
+   `IORING_OP_ASYNC_CANCEL` matching the recv's own user_data retracts it (never touching sends, never
+   sharing teardown's `CancelPending` accounting — that was the old hang worry, and separation is the
+   answer to it); the recv reaps as `-ECANCELED` on the loop, where Running/Parked decides re-arm vs
+   stay. Resume marshals a generation-guarded re-arm through the shard queue exactly like Close/Flush.
+   No bytes are lost: cancel retracts the ARMED OP, not the socket buffer. kTLS's data phase (one-shot
+   POLL+SSL_read) parks by declining the re-arm, and resume arms the right op per mode.
+
+   **Measured, per this item's own demand:** the park grace is real and bounded — `stalled/peer-held`
+   holds the sender at **3.00 MiB** on io_uring vs **2.56 MiB** on epoll/managed (~0.44 MiB of multishot
+   drain + cancel latency), and the RIO experiment's two traps (early-return resume, lapsing park) are
+   structurally absent (resume is a state exchange + marshaled re-arm; the park CAS fires once).
+
+   **Gate flips, all deliberate and all green:** verify-parking's io_uring cells inverted from
+   `stalled/bounded` to the full parking contract (5/5 runs), its `drain/control` tightened itself back
+   to the default cap via `canPark`, and the smoke `echo-pipe-8m-deep` cell went back to the DEFAULT cap
+   — 10/10 standalone where pre-parking it failed ~2/3, which is the proof the soft park holds under
+   echo load. Full battery: smoke 60/60, verify-aspnet 18/18, endpoints/timeouts/tailwipe/tlsname ALL
+   PASS. **io_uring was the last backend without parking; every backend now parks.**
+
+   ORIGINAL ITEM (kept for the mechanism discussion): (Marc, 2026-08-09). The N-ary receive work
    redefined parking as *"stop RE-ARMING; let what is posted drain"* rather than *"stop receiving now"*,
    and that softer definition may be exactly what unblocks io_uring, where parking is currently declined
    outright (`SupportsReceiveParking => false`, because a multishot receive cannot be un-armed).
