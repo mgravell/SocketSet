@@ -46,8 +46,16 @@ verify-tls-floor 8/8, verify-bind-address 6/6.
    below for the mechanism decision and the measured grace). All three pre-built gate flips executed:
    smoke 8m-deep back at the default cap (10/10), verify-parking control back at the default cap,
    `stalled/bounded` inverted to `stalled/peer-held`. **Every backend now parks.**
-2. The 2026-08-08 Windows-side queue below (RESPite.Benchmark publish, `SS_RIO_SPIN` default, blocked-time
-   percentiles) is untouched and still current.
+2. ~~RESPite.Benchmark publish~~ — **DONE 2026-08-10, later the same session**: Marc published **3.1.14**
+   and the connection-per-client fix is VERIFIED on this box by the discriminating pair (same
+   GarnetDemo/io_uring server, same `-c 50` command: 3.1.13 shows **1** benchmark connection in
+   `CLIENT LIST` mid-run, 3.1.14 shows **50**, banner self-reports `clients: 50, conns: 50`). The
+   `bench/README.md` pin is now 3.1.14 and `Run-GarnetAb.ps1`'s refusal text names 3.1.14 as the
+   acceptable tool (its `conns:` banner gate was always the real protection; the sibling source build
+   stays the default so the scored series stays comparable). Neat closure: the verification instrument
+   was `CLIENT LIST` on io_uring — which only reports real addresses because of THIS session's 0c.
+3. The rest of the 2026-08-08 Windows-side queue below (`SS_RIO_SPIN` default, blocked-time percentiles)
+   is untouched and still current.
 
 ### ⚠ FOR THE NEXT WINDOWS SESSION
 

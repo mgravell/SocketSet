@@ -41,9 +41,14 @@
     controls.
 
 .PARAMETER BenchmarkExe
-    resp-benchmark. Defaults to the sibling StackExchange.Redis source build, because the NuGet-pinned
-    3.1.13 is the one-connection build described in confounder 2 and cannot be used for this rig. Re-point
-    at the global tool once a fixed version is published.
+    resp-benchmark. Defaults to the sibling StackExchange.Redis source build (the configuration every
+    scored run so far used; changing generators mid-series invalidates cross-run comparison). The NuGet
+    tool is ACCEPTABLE from 3.1.14: the one-connection bug of 3.1.13 (confounder 2) is fixed there, and
+    the fix was verified 2026-08-10 on Linux by the discriminating pair -- 3.1.13 showed 1 connection in
+    CLIENT LIST during a -c 50 run, 3.1.14 showed 50, same box, same server, same command. To use it:
+    -BenchmarkExe "$env:USERPROFILE\.dotnet\tools\resp-benchmark.exe" after
+    `dotnet tool install -g RESPite.Benchmark --version 3.1.14`. The conns: banner gate below holds
+    either way, and is the thing actually protecting the numbers.
 
 .EXAMPLE
     .\Run-GarnetAb.ps1
@@ -93,7 +98,9 @@ if (-not (Test-Path $BenchmarkExe)) {
     throw @"
 resp-benchmark not found at: $BenchmarkExe
 Build it:  dotnet build C:\Code\StackExchange.Redis\src\RESPite.Benchmark\RESPite.Benchmark.csproj -c Release -f net10.0
-The NuGet-pinned 3.1.13 is NOT a substitute - it is the one-connection build (see confounder 2).
+Or use the NuGet tool at 3.1.14+ (3.1.13 is the one-connection build, see confounder 2; 3.1.14's fix
+is verified): dotnet tool install -g RESPite.Benchmark --version 3.1.14, then
+-BenchmarkExe "`$env:USERPROFILE\.dotnet\tools\resp-benchmark.exe"
 "@
 }
 
