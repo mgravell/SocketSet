@@ -299,7 +299,7 @@ foreach (var (factory, backendName) in GateBackends.All)
 
                     using (var c = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified))
                     {
-                        c.Connect(new UnixDomainSocketEndPoint(udsPath + ".in"));
+                        c.Connect(PlainUdsEp(udsPath + ".in"));
                         c.Send("x"u8);
                         var one = new byte[1];
                         c.Receive(one);
@@ -465,10 +465,19 @@ static string[] UdsPathsFor(string backendName)
 static Socket ListenUds(string path)
 {
     var s = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-    s.Bind(new UnixDomainSocketEndPoint(path));
+    s.Bind(PlainUdsEp(path));
     s.Listen(4);
     return s;
 }
+
+// The PLAIN-socket half of the abstract cells. '@' is SocketSet's convention (and socat/systemd's) --
+// the BCL has none, so a raw Socket handed "@name" binds or dials a FILE literally called @name (the
+// exact mistake UnixSocketFile.ValidatePath documents; the dial surfaces as ENOENT, which the Unix PAL
+// reports as "Cannot assign requested address"). The BCL's abstract form is a leading NUL. Found on
+// 2026-08-10, the FIRST time these Windows-written cells ever ran -- the SocketSet side under test was
+// right all along; it was the rig's own counterparty that spoke the wrong dialect.
+static UnixDomainSocketEndPoint PlainUdsEp(string path)
+    => new(path.StartsWith('@') ? "\0" + path.Substring(1) : path);
 
 // Pathname sockets are real files and outlive the process that bound them; an abstract one ('@') is not
 // a file at all and must not be passed to File.Delete.
