@@ -212,6 +212,14 @@ for (int i = 0; i < args.Length; i++)
         case "--window" when i + 1 < args.Length && int.TryParse(args[i + 1], out var w):
             window = Math.Max(1, w);
             break;
+        // Exposed 2026-08-10, when the D3 bound met the 8m-deep smoke cell: a --window whose in-flight
+        // bytes exceed MaxInboundBufferBytes (4 MiB default) is DROPPED BY DESIGN on a backend that
+        // cannot park its receive (io_uring, until TODO 0a), so a cell whose purpose is deep-pipeline
+        // byte-exactness must be able to opt out of the cap (0 disables) rather than flake against it.
+        // The bound's own behaviour is gated by bench/verify-parking, not here.
+        case "--max-inbound" when i + 1 < args.Length && int.TryParse(args[i + 1], out var mi):
+            options.MaxInboundBufferBytes = Math.Max(0, mi);
+            break;
         case "--host" when i + 1 < args.Length:
             host = args[i + 1];
             break;
@@ -459,6 +467,9 @@ if (!server && clientCount == 0)
     Console.WriteLine("  -m / --managed    force the portable managed-socket fallback (default auto-detects)");
     Console.WriteLine("  --cpus SPEC       pin this process to CPUs (e.g. 0-5 or 0,2,4) — covers shards, thread pool and GC");
     Console.WriteLine("  --window N        client keeps up to N messages in flight (1=ping/pong default, N=bounded pipeline)");
+    Console.WriteLine("  --max-inbound N   per-connection inbound staging cap in pipe mode (0 disables; default 4 MiB).");
+    Console.WriteLine("                    A --window deeper than the cap is dropped BY DESIGN where the backend");
+    Console.WriteLine("                    cannot park its receive (io_uring); see bench/verify-parking");
     Console.WriteLine("  --pipeline        unbounded in-flight (throughput, but can wedge a symmetric echo; use --window instead)");
     Console.WriteLine("  --poke            server echoes out-of-band via Connection.Send from a background thread");
     Console.WriteLine("  --pipe            accepted connections use ctx.UsePipe(IDuplexPipe); the server echoes over");

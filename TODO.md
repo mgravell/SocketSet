@@ -85,6 +85,20 @@ is unnamed).
    larger than four receives, so a soft park there could be much weaker than it looks. Size it, measure
    what the peer actually gets to send after a park, and make `resume` idempotent.
 
+   **THE SMOKE MATRIX NOW CARRIES 0a's GATE FLIP, found 2026-08-10 on Linux.**
+   `iouring/echo-pipe-8m-deep` had been failing INTERMITTENTLY (~2/3) since D3 itself (8dfbe6c,
+   2026-08-04) — bisected at six runs per point after every single-run answer proved untrustworthy; D3's
+   recorded "smoke 60/60" was a lucky pass, and every handover since inherited "green". Mechanism,
+   confirmed by A/B (window 512 passes 6/6, cap opted out passes 8/8, socket observed torn down seconds
+   into a failing run): the cell's 2048x4KB window legitimately puts 8 MiB in flight, io_uring cannot
+   park, and `MaxInboundBufferBytes` (4 MiB) drops the connection BY DESIGN when staging blows the cap.
+   NOT the Windows session's fault — every pulled commit was innocent. The cell now runs `--max-inbound 0`
+   (new SmokeTest knob) because its purpose is >IovMax zero-copy prefix math and the bound's behaviour is
+   `verify-parking`'s gate, not the matrix's. **When 0a lands, RESTORE the default cap on that cell
+   deliberately: passing at the default cap with an 8 MiB window is precisely the proof the soft park
+   holds under echo load.** Until then the deep-pipe drop is a REAL behaviour a real >4MiB-pipelining
+   client will hit on io_uring — one more reason 0a is next.
+
 0b. ~~**OUTBOUND CONNECTIONS HAVE NO `RemoteAddress` ON ANY BACKEND**~~ — **DONE 2026-08-09**, and one
    word of it was wrong: **managed was always correct** (its `Register` runs from `CompleteConnect`, i.e.
    after success), so it was three backends, not all of them. Detail under item 4 below. **The epoll half

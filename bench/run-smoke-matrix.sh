@@ -165,8 +165,17 @@ fi
 # sent as several zero-copy writevs rather than falling back to a full copy (proven separately on the demo:
 # an 8MB response goes 100% zero-copy). Byte-exact here is the correctness guard for the prefix boundary
 # math. Both native backends (epoll's pipe path exercises the same many-segment send without zero-copy).
+#
+# --max-inbound 0 (added 2026-08-10): the 2048x4KB window legitimately puts 8 MiB in flight, and since D3
+# (8dfbe6c, 2026-08-04) MaxInboundBufferBytes drops a connection that runs >4 MiB ahead of the consumer on
+# a backend that cannot park its receive. io_uring is exactly that backend (until TODO 0a lands soft
+# parking), so this cell failed INTERMITTENTLY (~2/3) from D3 onwards — D3's own "smoke 60/60" was a lucky
+# pass. >IovMax outbound segments structurally REQUIRE >4 MiB in flight, so the window cannot shrink;
+# instead the cell opts out of the cap, whose behaviour is verify-parking's gate, not this one's. When 0a
+# lands, restore the default cap here DELIBERATELY: with parking, staged inbound stays near zero and the
+# cell passing at the default cap is precisely the proof the soft park works under echo load.
 for bi in 0 1; do   # iouring, epoll
-    add_cell "${backend_names[$bi]}/echo-pipe-8m-deep" "${backend_args[$bi]} --verify-echo 8388608 -z 4096 --pipe --window 2048" echo-cb-64k
+    add_cell "${backend_names[$bi]}/echo-pipe-8m-deep" "${backend_args[$bi]} --verify-echo 8388608 -z 4096 --pipe --window 2048 --max-inbound 0" echo-cb-64k
 done
 
 # Filter (glob).
