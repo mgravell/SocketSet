@@ -6,10 +6,16 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ## SESSION CLOSE 2026-08-10 — READ THIS FIRST; the 2026-08-08 section below is now HISTORY
 
-The Linux catch-up session the 2026-08-08 handover demanded, plus TODO 0c. Six commits, not pushed.
-**Every Linux gate is green on this tree**: smoke 60/60, verify-endpoints ALL PASS (io_uring now runs the
-FULL battery), verify-parking 3/3, verify-timeouts, verify-tailwipe, verify-tlsname, verify-aspnet 18/18,
-verify-tls-floor 8/8, verify-bind-address 6/6.
+The Linux catch-up session the 2026-08-08 handover demanded, plus TODO 0c, plus — later the same day —
+TODO 0a and the resp-benchmark re-pin. Eleven commits, ALL PUSHED (through d791a2f). **Every Linux gate
+is green on this tree**: smoke 60/60 (with the 8m-deep cell back at the DEFAULT cap), verify-endpoints
+ALL PASS (io_uring runs the FULL battery), verify-parking 5/5 (io_uring cells inverted to the full
+parking contract), verify-timeouts, verify-tailwipe, verify-tlsname, measure-parking, verify-aspnet
+18/18, verify-tls-floor 8/8, verify-bind-address 6/6.
+
+**THE HEADLINE: both capability matrices are FULL.** All five backends now park
+(`SupportsReceiveParking`) and all five track endpoints (`TrackEndpoints`); `endpoints=unsupported` and
+parking-declined have no live producers and survive only as the contract for future backends.
 
 ### What landed, in the order it happened
 
@@ -39,6 +45,17 @@ verify-tls-floor 8/8, verify-bind-address 6/6.
    real `addr=`/`laddr=`, and F9's fail-closed `IsLocalConnection` can finally say YES to a loopback
    operator on the Linux default backend. No demo gate needed — the default is on and the measurement
    supports it.
+5. **TODO 0a DONE** (77efd78, strictly after 0c was landed and gated): soft parking for io_uring via a
+   TARGETED cancel of the armed multishot — the buffer-starvation sketch was rejected because the
+   provided-buffer ring is per-SHARD (details under 0a below). Grace measured at 3.00 MiB held vs
+   epoll's 2.56; the engaged cost measured FREE the same day (d791a2f, measure-parking's first io_uring
+   run: 95 parks/pass, 100.4% of the consumer's drain rate). All three pre-built gate flips executed;
+   the 8m-deep smoke cell at the default cap is parking's sentinel now (10/10, was ~2-in-3 FAIL).
+6. **resp-benchmark RE-PINNED to 3.1.14** (b7cb4bb): Marc published the connection-per-client fix;
+   verified here by the discriminating pair against GarnetDemo/io_uring — 3.1.13 opens 1 connection at
+   `-c 50`, 3.1.14 opens 50 (`CLIENT LIST` mid-run; banner self-reports `conns: 50`). `bench/README.md`
+   pin and `Run-GarnetAb.ps1` refusal text updated; the sibling source build stays the rig default so
+   the scored series stays comparable.
 
 ### Queued, in the order I would take them
 
