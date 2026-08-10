@@ -45,6 +45,14 @@ from ~2-in-3 FAIL (pre-parking, the D3 drop) to 10/10 PASS — staged inbound no
 because the receive stops. Full battery green: smoke 60/60, verify-parking 5/5 with the io_uring cells
 inverted to the full parking contract, verify-aspnet 18/18.
 
+**And the CONTINUOUSLY-ENGAGED cost, same day (`bench/measure-parking`, io_uring's first-ever run of
+it):** 95 parks per 96 MiB pass against a rate-limited consumer, byte-complete every pass, delivering at
+**100.4% of the consumer's 48 MiB/s drain rate** — against epoll's 100.2% and managed's 100.5%, i.e. the
+cancel-based park is indistinguishable from the one-shot backends' free park even when it fires
+constantly. (The rig's CPU column reports itself unusable under a rate limit, per its own rule 9b — the
+rate-tracking number is the honest one.) This closes 0a's last open half: the park is free-ish idle by
+construction, holds the peer when engaged, and costs nothing measurable when engaged continuously.
+
 ## io_uring ENDPOINT TRACKING COSTS NOTHING MEASURABLE (2026-08-10, Linux) — the declination's cost claim, measured and retired
 
 TODO 0c's whole justification was "a number nobody has": io_uring declined `TrackEndpoints` on the
