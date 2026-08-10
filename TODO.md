@@ -4,7 +4,63 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## SESSION CLOSE 2026-08-08 — READ THIS FIRST; the 2026-08-07 section below is now HISTORY
+## SESSION CLOSE 2026-08-10 — READ THIS FIRST; the 2026-08-08 section below is now HISTORY
+
+The Linux catch-up session the 2026-08-08 handover demanded, plus TODO 0c. Six commits, not pushed.
+**Every Linux gate is green on this tree**: smoke 60/60, verify-endpoints ALL PASS (io_uring now runs the
+FULL battery), verify-parking 3/3, verify-timeouts, verify-tailwipe, verify-tlsname, verify-aspnet 18/18,
+verify-tls-floor 8/8, verify-bind-address 6/6.
+
+### What landed, in the order it happened
+
+1. **The 59/60 smoke result was NOT the Windows pull's fault** (71ead61). `iouring/echo-pipe-8m-deep` has
+   been flaky (~2/3) since **D3 itself** (8dfbe6c, 2026-08-04): the cell's 8 MiB window meets the 4 MiB
+   bound on the one backend that cannot park, and the drop is BY DESIGN. D3's own "smoke 60/60" was a
+   lucky pass. Bisected at SIX runs per point after three separate single-run answers were wrong — the
+   method note worth keeping: **against an intermittent, a single-run bisect actively lies.** The cell
+   now opts out of the cap (`--max-inbound 0`, new SmokeTest knob); restoring the default cap there is
+   0a's ready-made gate flip.
+2. **F10, the session's real find** (77c0779, `REVIEW.md`): **a graceful EOF discarded staged inbound
+   bytes** — data loss on any half-closing peer ("send request, FIN, await reply"), 0.1–1.7 MiB of an
+   8 MiB blast, two runs in three on io_uring, latent on ALL backends (parking merely makes it unlikely).
+   Found by verify-parking's io_uring cells on their FIRST run anywhere. Fix: `PipeIoBridge` completion is
+   handed to the live drain; the reader now sees every byte, then IsCompleted. **This is SHARED code and
+   has not run on Windows** — see the warning below.
+3. **Two rig fixes from first-runs of Windows-written cells**: verify-endpoints' `@abstract` cells spoke
+   '@' to a BCL that has no such convention (118af7d — the library was right; the rig's plain-socket
+   counterparty was wrong), and verify-parking's `drain/control` now runs cap-off on a non-parking
+   backend (in 77c0779; on io_uring a loopback sender outruns even a healthy consumer into the bound —
+   4 runs in 4).
+4. **TODO 0c DONE** (058ca2c): io_uring endpoint tracking, measured first per
+   `bench/prereg-uring-endpoints-2026-08-10.md` — **a clean null** (P12 and P13 both held; ranges overlap
+   completely at ~50k open/close cycles/s paying the populate twice per cycle; table in `RESULTS.md`).
+   `TrackEndpoints` honoured on both paths, `SupportsEndpointTracking` back to base-true, no current
+   backend declines. **Garnet payoff verified end-to-end**: `CLIENT LIST` on GarnetDemo/io-uring shows
+   real `addr=`/`laddr=`, and F9's fail-closed `IsLocalConnection` can finally say YES to a loopback
+   operator on the Linux default backend. No demo gate needed — the default is on and the measurement
+   supports it.
+
+### Queued, in the order I would take them
+
+1. **0a — SOFT PARKING FOR io_uring** (unchanged below, but it gained urgency and gates this session):
+   THREE reasons now — backpressure hygiene, the 8m-deep cell's default-cap restoration, and
+   verify-parking's control cap restoration — plus F10 showed what read-ahead does at EOF. Its gate flips
+   are pre-built: restore the default cap in the smoke 8m-deep cell and in verify-parking's control, and
+   `stalled/bounded (no parking)` inverts to `stalled/peer-held`. It was deliberately NOT touched this
+   session (0c item 4's do-not-land-together warning, honoured).
+2. The 2026-08-08 Windows-side queue below (RESPite.Benchmark publish, `SS_RIO_SPIN` default, blocked-time
+   percentiles) is untouched and still current.
+
+### ⚠ FOR THE NEXT WINDOWS SESSION
+
+`PipeIoBridge` (F10 fix, 77c0779) and SmokeTest changed on Linux; both are SHARED. The F10 fix is
+exercised by verify-parking (in `Run-SecurityGates.ps1`) — run that suite FIRST, as ever. The Windows
+parking backends were latent-vulnerable to F10's shape (parking has overshoot), so the fix matters there
+too, not just on io_uring.
+
+---
+
+## SESSION CLOSE 2026-08-08 — superseded by the section above; kept as history
 
 Eleven commits, all pushed. **Library code changed this session, so gates ARE implicated** — the full
 Windows suite (`bench/Run-SecurityGates.ps1`) is green, including the new gate. **Linux is not**: see the
