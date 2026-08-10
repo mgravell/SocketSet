@@ -306,6 +306,57 @@ decompiling `Garnet.server` / `Garnet.common` with `ilspycmd` and reading the ca
 memory or from the API's name. The two call sites and the enum defaults above are quoted from that
 output. Anyone rechecking should do the same rather than trusting this paragraph.
 
+## AUDIT 2026-08-10: a graceful EOF discarded staged inbound bytes (data loss, all backends latent)
+
+Found on the first Linux run of `verify-parking`'s io_uring cells (2026-08-04 Windows work; io_uring was
+absent from every prior run by definition), while chasing what looked like a rig problem in its
+`drain/control` cell. It was not a rig problem.
+
+### F10. `PipeIoBridge.Teardown` threw the staged queue away on close — FIXED (drain owns completion)
+
+**The failure.** A peer that sends its data and half-closes (`shutdown(SHUT_WR)` — the ordinary "send
+request, FIN, await reply" client shape) lost the TAIL of its stream: 0.1–1.7 MiB of an 8 MiB one-way
+blast, roughly two runs in three, `corruptions=0` throughout. A clean truncation, never a hole — which is
+exactly why nothing protocol-shaped ever noticed.
+
+**Mechanism.** The bridge stages inbound bytes while a flush is outstanding. A backend that cannot park
+its receive (io_uring) reads AHEAD of the pipe, so it delivers the whole stream plus the FIN to the loop
+while the tail is still staged; EOF → `CloseClient` → `DispatchClosed` → `OnConnectionClosed` →
+`Teardown`, whose first act was to clear `_staged` and complete the pipe. The parking backends dodge it
+only because parking stops them reading ahead — even they can carry overshoot, so it was latent on all
+five, io_uring merely made it likely.
+
+**The fix** (77c0779): completion is handed to the live drain. `OnConnectionClosed` defers when
+`_flushPending || _staged.Count > 0` — sound because staged bytes exist only while `_flushPending` is
+set, and `_flushPending` is set only with a drain task running — and the drain's caught-up path completes
+the pipe once the last staged byte is in it. The reader sees every byte, in order, then `IsCompleted`.
+Delivering the tail on an ABORTIVE close too is deliberate: the bytes were genuinely received in order.
+The contract this leans on is the standard one — the pipe READER must read to completion; a reader that
+abandons mid-stream now leaves the pipe uncompleted rather than being force-completed (Kestrel and every
+consumer in this repo read to completion).
+
+**Checked for the same shape and clean:** the BYO bridge (`SocketSetConnection.WriteInbound`) has no
+external staging queue, and `PipeWriter.Complete()` makes already-written bytes readable rather than
+discarding them.
+
+**Gates.** 20-line repro: 4/10 wedged before, 20/20 clean after. `verify-parking` 3/3 ALL PASS, smoke
+60/60, `verify-aspnet.sh` 18/18, plus the full narrow-gate battery, all on the fixed tree. Note
+`verify-parking`'s io_uring `drain/control` now runs with the cap disabled (a backend that cannot park
+lets a loopback sender outrun a healthy consumer into `MaxInboundBufferBytes` — the same documented
+degradation its `stalled/bounded` cell asserts on purpose); TODO 0a records that the cap comes back
+deliberately when soft parking lands.
+
+### Same session, separated because it is a DESIGN behaviour, not a bug: the D3 bound vs. deep pipelines
+
+`iouring/echo-pipe-8m-deep` in the smoke matrix had been failing intermittently (~2/3) since D3 itself
+(8dfbe6c, 2026-08-04) — D3's own "smoke 60/60" was a lucky pass. The cell's 2048×4KB window puts 8 MiB in
+flight; io_uring cannot park; the 4 MiB bound drops the connection BY DESIGN. Bisected at six runs per
+point (single runs repeatedly gave wrong answers), mechanism confirmed by window-512 and cap-off A/Bs
+plus watching the socket get torn down mid-run. Disposition in 71ead61: the cell opts out of the cap
+(`--max-inbound 0`, new SmokeTest knob) because its purpose is >IovMax zero-copy prefix math and the
+bound's behaviour is `verify-parking`'s gate. The behaviour itself — a real client pipelining >4 MiB into
+an io_uring pipe-mode server gets dropped — stands until TODO 0a, and is one more reason 0a is next.
+
 ## NOT FIXED: design calls, in priority order
 
 These are not left out because they are small. They are left out because each one has a decision in it
