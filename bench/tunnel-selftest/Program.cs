@@ -61,7 +61,7 @@ if (picked.Name is null)
 }
 var options = new SocketSetOptions { Shards = 1, Factory = picked.Factory };
 
-if (surface is "mux" or "mux-tls" or "mux-tls-noprovider")
+if (surface is "mux" or "mux-tls" or "mux-tls-noprovider" or "mux-classic")
 {
     if (surface is "mux-tls")
     {
@@ -83,7 +83,10 @@ if (surface is "mux" or "mux-tls" or "mux-tls-noprovider")
     {
         EndPoints = { new IPEndPoint(IPAddress.Parse(target), port) },
         AbortOnConnectFail = true,
-        Tunnel = new SocketSetTunnel(options),
+        // mux-classic is the CONTROL: identical cells, ordinary sockets, no tunnel at all. Without it a
+        // failure here cannot be attributed -- "the tunnel is broken" and "this server/rig cannot do
+        // that" look identical.
+        Tunnel = surface is "mux-classic" ? null : new TracingTunnel(new SocketSetTunnel(options)),
         // The TLS intent, stated where SE.Redis states it. SslHost is what the certificate is verified
         // against (and announced as SNI); without it the endpoint's host is used, which for an IP
         // literal means iPAddress-SAN verification and no SNI -- both legitimate, but the demo
@@ -134,6 +137,14 @@ if (surface is "mux" or "mux-tls" or "mux-tls-noprovider")
     }
     await using var owned = mux;
 
+    // The multiplexer reports per-CONNECTION trouble through events, not through ConnectAsync: the
+    // subscription connection is opened later, and its failures are otherwise visible only as a
+    // timed-out command with no reason attached.
+    mux.ConnectionFailed += (_, e) => Console.WriteLine($"  ....  ConnectionFailed {e.ConnectionType} {e.FailureType}: {e.Exception?.GetBaseException().Message}");
+    mux.ConnectionRestored += (_, e) => Console.WriteLine($"  ....  ConnectionRestored {e.ConnectionType}");
+    mux.InternalError += (_, e) => Console.WriteLine($"  ....  InternalError {e.ConnectionType} {e.Origin}: {e.Exception?.GetBaseException().Message}");
+    mux.ErrorMessage += (_, e) => Console.WriteLine($"  ....  ErrorMessage: {e.Message}");
+
     // Under Ssl=true this is already the assertion that the transport reported ENCRYPTED: the library
     // fails the connection outright when a tunnel's transport says otherwise.
     Report("mux-connect", mux.IsConnected);
@@ -149,6 +160,56 @@ if (surface is "mux" or "mux-tls" or "mux-tls-noprovider")
     await Task.WhenAll(tasks);
     Report("mux-burst x500", Array.TrueForAll(tasks, t => t.Result));
     Report("mux-burst-verify", await db.StringGetAsync($"{key}:499") == "499");
+
+    // PUB/SUB: the SECOND connection. Everything above rides the Interactive connection, so a tunnel
+    // that works exactly once would pass all of it -- and the anchor's whole claim is that N connections
+    // share ONE engine. A subscription is how the multiplexer asks for another transport, and the
+    // message has to come back over it.
+    var sub = mux.GetSubscriber();
+    var channel = StackExchange.Redis.RedisChannel.Literal($"tt:chan:{Guid.NewGuid():N}");
+    var got = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+    await sub.SubscribeAsync(channel, (_, v) => got.TrySetResult(v));
+    await sub.PublishAsync(channel, "hello");
+    var delivered = await Task.WhenAny(got.Task, Task.Delay(TimeSpan.FromSeconds(5))) == got.Task;
+    Report("mux-pubsub", delivered && got.Task.Result == "hello", delivered ? $"got \"{got.Task.Result}\"" : "no message in 5s");
+    Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
+    return failures == 0 ? 0 : 1;
+}
+
+if (surface is "twin")
+{
+    // THE ANCHOR CLAIM, on its own: TWO transports, ONE engine, both live at once. A multiplexer
+    // opens an interactive AND a subscription connection through the same tunnel, so if that shape
+    // is broken the failure surfaces three layers up as a timed-out SUBSCRIBE, where it cannot be
+    // attributed to the seam.
+    Console.WriteLine($"=== tunnel-selftest: surface=twin backend={picked.Name} target={target} ===");
+    var twinEngine = new SocketSetClientEngine(options);
+    var twinEp = new IPEndPoint(IPAddress.Parse(target), port);
+    var ta = await SocketSetClientTransport.ConnectAsync(twinEp, twinEngine);
+    var tb = await SocketSetClientTransport.ConnectAsync(twinEp, twinEngine);
+    var rxa = new Receiver();
+    var rxb = new Receiver();
+    ta.Start(rxa);
+    tb.Start(rxb);
+
+    static void Ping(SocketSetClientTransport t)
+    {
+        "*1\r\n$4\r\nPING\r\n"u8.ToArray().AsSpan().CopyTo(t.GetSpan(32));
+        t.Advance(14);
+        t.Flush();
+    }
+
+    Ping(ta);
+    Report("twin-a-ping", await rxa.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+    Ping(tb);
+    Report("twin-b-ping", await rxb.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+    // A again, to prove B arriving did not steal A's routing (UserToken dispatch is the whole design)
+    rxa.Reset();
+    Ping(ta);
+    Report("twin-a-again", await rxa.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+    await ta.DisposeAsync();
+    await tb.DisposeAsync();
+    twinEngine.Dispose();
     Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
     return failures == 0 ? 0 : 1;
 }
@@ -266,4 +327,30 @@ sealed class Receiver : TransportReceiver
 
     public async Task<bool> WaitClosed(TimeSpan timeout)
         => await Task.WhenAny(_closed.Task, Task.Delay(timeout)) == _closed.Task;
+}
+
+
+/// <summary>Announces every dial the multiplexer makes through the tunnel, and what came back. A
+/// multiplexer opens MORE than one connection (interactive, then subscription on first subscribe), and
+/// a seam that works for the first and silently never completes the second looks, from the outside,
+/// like "SUBSCRIBE timed out" -- which is where the diagnosis stops without this.</summary>
+sealed class TracingTunnel(StackExchange.Redis.Configuration.Tunnel inner) : StackExchange.Redis.Configuration.Tunnel
+{
+    public override async ValueTask<DuplexTransport?> ConnectTransportAsync(
+        EndPoint endpoint, StackExchange.Redis.ConnectionType connectionType,
+        StackExchange.Redis.Configuration.TlsOptions tls, CancellationToken cancellationToken)
+    {
+        Console.WriteLine($"  ....  dial {connectionType} ssl={tls.IsEnabled}");
+        try
+        {
+            var t = await inner.ConnectTransportAsync(endpoint, connectionType, tls, cancellationToken);
+            Console.WriteLine($"  ....  dial {connectionType} -> {(t is null ? "null (socket path)" : $"transport encrypted={t.IsEncrypted}")}");
+            return t;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ....  dial {connectionType} -> THREW {ex.GetType().Name}: {ex.Message}");
+            throw;
+        }
+    }
 }

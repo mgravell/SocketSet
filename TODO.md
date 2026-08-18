@@ -64,13 +64,35 @@ carries a provider.
    one-directional assertion passes against a hard-coded answer), and gains
    `mux-tls-noprovider` — TLS demanded with nothing to do it with, which MUST fail.
 
+### F13, FOUND BY ASKING THE OBVIOUS QUESTION ("does it work with Redis, with and without TLS?")
+
+Pub/sub had never been exercised through this seam, on either OS. The moment a gate cell subscribed,
+the SUBSCRIBE timed out: the transport DROPPED inbound that arrived before `Start`, the consumer writes
+its handshake before it starts reading, and the subscription connection lost that race every time (the
+interactive one wins it every time, which is why everything else has always worked). 325 bytes of
+handshake reply, discarded. Staged-and-replayed now, bounded at 256 KiB. Full write-up in `REVIEW.md`.
+
+The diagnosis is worth keeping as a method note: the failure presented as "SUBSCRIBE timed out in the
+backlog", three layers above the cause. What located it was building DOWNWARDS — a `mux-classic` control
+(same cells, ordinary sockets: pub/sub fine, so not the server), then a `twin` cell (two transports on
+one engine directly: fine, so not the anchor), which left the SE.Redis-specific path, where a temporary
+counter on the dropped branch printed the answer in one run.
+
 ### What it measured/ran
 
-**Windows, first time ever for this seam.** `plain` and `mux` PASS on IOCP, RIO and managed; `tls` and
-`mux-tls` PASS on all three (SChannel, trust pinned to the demo cert, name verified as `localhost` from
-`SslHost` per dial); `mux-tls-noprovider` refuses. Batch-end counts: 10 per 1000-command burst on
-IOCP/RIO, 2 on managed — the coalescing is real, and was zero before today. `Run-SecurityGates.ps1`
-green (see the run log in the commit message).
+**Windows, first time ever for this seam.** Five surfaces x three backends, ALL PASS: `plain`, `twin`,
+`mux` (SET/GET/500-burst/pub-sub) against Garnet, and `tls` + `mux-tls` against a TLS Garnet (SChannel,
+trust pinned to the demo cert, name verified as `localhost` from `SslHost` per dial). Plus
+`mux-tls-noprovider` refused and `mux-classic` (the control) green. Batch-end counts: 10 per
+1000-command burst on IOCP/RIO, 2 on managed — the coalescing is real, and was zero before today.
+`Run-SecurityGates.ps1` ALL GATES PASS (smoke 48/48, aspnet 18/18, tls-floor 12/12, the rest).
+
+**AND AGAINST REAL REDIS**, not just Garnet: `redis-server.exe` 3.0.503 (the Windows port that ships in
+the sibling checkout's `tests/RedisConfigs`), plaintext, all three backends, pub/sub included. TLS
+against a THIRD-PARTY Redis is NOT covered: nothing on this box terminates Redis-over-TLS except our
+own stack, so the TLS cells have our provider on both ends. An interop cell against an independent TLS
+server (an `SslStream` terminator in front of `redis-server`, or a real Azure endpoint) is the honest
+next step, and is not done.
 
 ### ⚠ LINUX IS UNBUILT AND UNTESTED THIS SESSION
 

@@ -400,6 +400,33 @@ backs `Connection.IsEncrypted`. **Found by inspection while adding that flag, no
 is still no gate cell for it.** A churn-with-kTLS cell asserting that a recycled connection reports no
 inherited ALPN would close that, and does not exist. LINUX CODE: not compiled or run this session.
 
+### F13. Inbound that arrived before `Start` was DROPPED, and it cost the subscription connection — FIXED
+
+**What.** `SocketSetClientTransport` delivered inbound only once the consumer had called
+`DuplexTransport.Start(receiver)`; anything that arrived first was discarded, with a comment saying so.
+
+**Why that is not the harmless case the comment assumed.** The consumer's own order is: take the
+transport, initialise the output, WRITE its handshake, and only then start reading
+(`PhysicalConnection.StartReading` is what calls `StartTransportReading`). So the reply can be on the
+wire before `Start`, and whether it lands first is a race the consumer cannot see. SE.Redis's
+INTERACTIVE connection happened to win it every time; its SUBSCRIPTION connection lost it every time —
+**325 bytes of handshake reply dropped**, the connection never became usable, and the symptom three
+layers up was `RedisTimeoutException ... command=SUBSCRIBE ... no connection became available`.
+
+**Why nothing caught it for a fortnight.** No gate had ever subscribed through the seam — not
+`tunnel-selftest`, not `mux-ab`, on either OS. Every cell used the interactive connection, which is the
+one that wins the race. The failure needs a SECOND connection to show up, and nothing opened one.
+
+**Fix.** Pre-`Start` inbound is STAGED and replayed to the receiver the instant it is set, under a lock
+that publishes the receiver only after the replay, so no live delivery can overtake staged bytes.
+Staging is bounded (256 KiB) and hitting the bound closes the connection rather than truncating it.
+
+**Gate.** `tunnel-selftest`'s `mux` cells now subscribe and require the published message back, with
+`mux-classic` (the same cells over ordinary sockets, no tunnel) as the control that says whether a
+failure belongs to the seam or to the server. A `twin` cell dials two transports on ONE engine directly
+— the anchor claim, isolated from SE.Redis — because that is the layer the diagnosis had to rule out
+first. Verified against **real `redis-server` 3.0.503** and Garnet, on IOCP, RIO and managed.
+
 ## NOT FIXED: design calls, in priority order
 
 These are not left out because they are small. They are left out because each one has a decision in it

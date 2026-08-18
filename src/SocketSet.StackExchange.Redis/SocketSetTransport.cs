@@ -106,8 +106,15 @@ public sealed class SocketSetClientTransport : DuplexTransport
     private readonly TaskCompletionSource<bool> _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SocketSetClientEngine? _ownedEngine; // only when the convenience overload built it
     private Connection? _conn;
-    private TransportReceiver? _receiver;
+    private volatile TransportReceiver? _receiver;
     private volatile bool _encrypted; // captured at connect; see IsEncrypted
+    private readonly object _startGate = new(); // orders staged-vs-live inbound around Start
+    private System.Buffers.ArrayBufferWriter<byte>? _staged; // inbound that beat Start; see OnEngineReceive
+
+    /// <summary>How much inbound may be staged before <see cref="Start"/>. Generous next to any
+    /// handshake, small next to a flood: a peer cannot use the gap between connect and Start to make us
+    /// buffer without bound.</summary>
+    private const int MaxStagedBeforeStart = 256 * 1024;
     internal bool PendingBatchEnd; // loop-thread-local via the engine's touched list
 
     /// <summary>What this dial was told to do about TLS, read back by the engine's
@@ -172,8 +179,39 @@ public sealed class SocketSetClientTransport : DuplexTransport
         _connected.TrySetResult(true);
     }
 
+    /// <summary>
+    /// Inbound from the engine. Bytes that arrive BEFORE <see cref="Start"/> are STAGED and replayed to
+    /// the receiver the moment it is set -- they used to be dropped, and dropping them loses a handshake.
+    ///
+    /// WHY THE RACE IS REAL rather than theoretical (found 2026-08-18, by the first gate cell that ever
+    /// subscribed through this seam). The contract says a receiver is set "before any data is expected",
+    /// but the consumer's own order is: take the transport, init the output, WRITE its handshake, and
+    /// only then start reading. So the reply can be on the wire before Start, and whether it lands first
+    /// is a race the consumer cannot see. SE.Redis's interactive connection happened to win it; its
+    /// SUBSCRIPTION connection lost it every time -- 325 bytes of handshake reply dropped, the connection
+    /// never became usable, and the symptom three layers up was "SUBSCRIBE timed out in the backlog".
+    ///
+    /// Staging is bounded: a peer that talks before we are listening cannot make us buffer without limit,
+    /// and hitting the bound closes the connection rather than quietly truncating it.
+    /// </summary>
     internal bool OnEngineReceive(ReadOnlySpan<byte> payload)
-        => _receiver is not { } r || r.OnReceived(payload); // no receiver yet: pre-Start data is dropped
+    {
+        if (_receiver is { } fast) return fast.OnReceived(payload); // steady state: no lock, no staging
+
+        lock (_startGate)
+        {
+            // Re-check under the lock: Start publishes the receiver INSIDE it, after replaying, so this
+            // either stages ahead of a replay that has not happened yet, or delivers live behind one that
+            // has. Ordering is what the lock is for; the fast path above is why it is not a cost.
+            if (_receiver is { } now) return now.OnReceived(payload);
+
+            _staged ??= new();
+            if (_staged.WrittenCount + payload.Length > MaxStagedBeforeStart) return false; // close, loudly
+            payload.CopyTo(_staged.GetSpan(payload.Length));
+            _staged.Advance(payload.Length);
+            return true;
+        }
+    }
 
     internal void OnEngineBatchEnd() => _receiver?.OnBatchEnd();
 
@@ -204,8 +242,25 @@ public sealed class SocketSetClientTransport : DuplexTransport
 
     public override void Start(TransportReceiver receiver)
     {
-        if (Interlocked.CompareExchange(ref _receiver, receiver, null) is not null)
-            throw new InvalidOperationException("receiver already started");
+        ArgumentNullException.ThrowIfNull(receiver);
+        lock (_startGate)
+        {
+            if (_receiver is not null) throw new InvalidOperationException("receiver already started");
+
+            // Replay BEFORE publishing, so the first thing this receiver sees is the earliest byte that
+            // arrived, and no live delivery can slip in front of the staged ones.
+            if (_staged is { WrittenCount: > 0 } staged)
+            {
+                _staged = null;
+                if (!receiver.OnReceived(staged.WrittenSpan))
+                {
+                    _conn?.Close(); // the receiver asked to close on the staged bytes; honour it
+                    return;
+                }
+            }
+            _staged = null;
+            _receiver = receiver;
+        }
     }
 
     public override ValueTask DisposeAsync()
