@@ -75,6 +75,22 @@ public abstract class Connection : IBufferWriter<byte>
     /// </summary>
     public string? RequestedServerName => Tls?.RequestedServerName ?? KernelServerName;
 
+    /// <summary>Set at handshake completion on the kTLS path, where there is no <see cref="Tls"/> filter to
+    /// ask because the kernel holds the keys. Cleared on slot claim like every other per-tenant field.</summary>
+    internal bool KernelTls { get; set; }
+
+    /// <summary>
+    /// Whether this connection's bytes are ENCRYPTED ON THE WIRE — true for a userspace TLS filter and for
+    /// kernel offload (kTLS) alike, since the difference is where the record crypto happens, not whether it
+    /// happened. Valid from OnAccept/OnConnect onwards (those fire after the handshake).
+    ///
+    /// It exists because a consumer that hands us its TLS intent has to be able to CHECK the outcome rather
+    /// than trust it: SE.Redis's transport seam refuses a transport that reports plaintext when the
+    /// configuration demanded TLS, and a hard-coded "yes" there is the silent-downgrade hole that check is
+    /// for. So this is read off the connection's actual state, never off the configuration that asked.
+    /// </summary>
+    public bool IsEncrypted => Tls is not null || KernelTls;
+
     /// <summary>
     /// The peer's address, and ours, or <see cref="PeerAddress.IsSet"/> false when unavailable. Valid from
     /// <c>OnAccept</c>/<c>OnConnect</c> onwards. Inline value types, so reading costs nothing and storing

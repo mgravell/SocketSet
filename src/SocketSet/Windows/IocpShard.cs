@@ -236,6 +236,10 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
             {
                 // WAIT_TIMEOUT (nothing ready on a poll), or the port closed during shutdown
                 // (ERROR_ABANDONED_WAIT_0) — the IsActive check ends the loop. Re-loop either way.
+                // The batch still ENDS here: DrainInline above may have delivered receives, and we are
+                // about to go round and block. Deferring the notification to the next iteration would
+                // strand whatever it staged for an unbounded time.
+                EndBatch();
                 continue;
             }
 
@@ -244,6 +248,8 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
                 ref Win32.OVERLAPPED_ENTRY e = ref _entries[i];
                 if (e.lpCompletionKey == WakeKey || e.lpOverlapped == null)
                     continue; // wake packet: work is drained at the top of the next iteration
+
+                _batchWork = true; // a real completion: this iteration ends in a batch-end (see EndBatch)
 
                 // Real I/O completion: OVERLAPPED is the first field, so the OVERLAPPED* IS the op ctx.
                 // Kind sits at the same offset in every op-ctx type, so read it through IocpOp*.
@@ -262,7 +268,35 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
                         HandleSend(op->Slot, bytes, failed); break;
                 }
             }
+
+            EndBatch();
         }
+    }
+
+    // =====================================================================
+    // Batch end (2026-08-18): the completion batch is drained, tell the application ONCE
+    // =====================================================================
+    //
+    // WHY THIS EXISTS, AND WHY ITS ABSENCE WAS INVISIBLE. OnLoopDrain is the "a delivery burst has
+    // ended" point: it is what lets an application flush responses it composed during the burst as ONE
+    // send instead of one per callback (measured 3x send amplification when that is missed, which is
+    // why the RESP proxy and the SE.Redis transport both hang their flush on it). It was implemented on
+    // epoll and io_uring only — the two backends the consumers that use it were developed against — so
+    // on Windows a transport's batch-end callback simply never fired. Nothing caught it because no
+    // Windows gate had a consumer that used it until bench/tunnel-selftest was made cross-platform.
+    //
+    // It is not merely a coalescing loss: a write STAGED during inbound processing and left for the
+    // batch boundary to flush (a fire-and-forget command issued from a completion continuation) has no
+    // other flush point, so the bytes sit until something unrelated flushes — a stall, not a slowdown.
+    //
+    // Fires only when this iteration actually dispatched something, and costs one bool test otherwise.
+    private bool _batchWork;
+
+    private void EndBatch()
+    {
+        if (!_batchWork) return;
+        _batchWork = false;
+        Parent.OnLoopDrain();
     }
 
     private void DrainCrossThread()
@@ -319,6 +353,7 @@ internal sealed unsafe class IocpShard : WindowsShardBase<IocpConnection>
         for (int budget = InlineBurst; budget > 0 && _inline.Count > 0; budget--)
         {
             var io = _inline.Dequeue();
+            _batchWork = true; // inline completions are deliveries too; the loop ends the batch below
             switch (io.Kind)
             {
                 case OpKind.Recv: HandleRecv(io.Slot, io.Bytes, io.Failed); break;

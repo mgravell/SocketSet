@@ -370,6 +370,9 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // CompleteConnect) — the clear above still belongs here, because it must cover every claim.
         conn.Tls = null;
         conn.KtlsReady = false; // KtlsSsl is 0 by the time a slot is freed (CloseClient frees it); belt-and-braces
+        conn.KernelTls = false; // pooled slot: never inherit the last tenant's kTLS verdict, ALPN or SNI
+        conn.KernelAlpn = null;
+        conn.KernelServerName = null;
         conn.Zc = null;         // ditto — any in-flight zero-copy send was finished in CloseClient
         conn.IsClient = false;
         // Bump the generation before publishing Fd: any out-of-band Close/flush captured against the
@@ -1235,6 +1238,7 @@ internal sealed unsafe class EpollShard : SocketSetShard
         // No TlsFilter here, so publish the ALPN result straight off the SSL — NegotiatedProtocol reads it.
         conn.KernelAlpn = OpenSslTlsFilter.GetAlpnSelected(conn.KtlsSsl);
         if (!conn.IsClient) conn.KernelServerName = OpenSslTlsFilter.GetRequestedServerName(conn.KtlsSsl);
+        conn.KernelTls = true; // Connection.IsEncrypted: the kernel holds the keys, but the wire is ciphertext
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         conn.Opened = true; // app now sees it open → pairs with OnClosed

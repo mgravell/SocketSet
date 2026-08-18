@@ -1,6 +1,7 @@
 using System.Net;
 using RESPite.Transports;
 using SocketSets;
+using SocketSets.Tls;
 
 namespace SocketSets.StackExchangeRedis;
 
@@ -20,6 +21,24 @@ public sealed class SocketSetClientEngine(SocketSetOptions options) : SocketSet(
 {
     internal void Dial(EndPoint endpoint, SocketSetClientTransport transport)
         => Connect(endpoint, userToken: transport);
+
+    /// <summary>
+    /// THE per-connection TLS decision, and the case this callback was designed for: one engine dials
+    /// many endpoints, so the posture cannot live on the engine. <see cref="Connection.UserToken"/> is the
+    /// transport, which carries the intent its own dial was given.
+    ///
+    /// A transport with no stated intent (the direct ConnectAsync entry points) falls through to the
+    /// engine's own configuration, so nothing that worked before this existed behaves differently.
+    /// </summary>
+    protected override bool OnClientAuthenticate(ref TlsClientAuthenticateContext ctx)
+    {
+        if (ctx.Connection.UserToken is not SocketSetClientTransport t || !t.Tls.Specified)
+            return base.OnClientAuthenticate(ref ctx);
+
+        if (!t.Tls.Enabled) return false; // configured plaintext: a provider on the engine does not override it
+        ctx.TargetHost = t.Tls.TargetHost; // validated non-blank when the intent was built
+        return true; // Provider is seeded from the engine's options; TlsIntent refused a null one already
+    }
 
     protected override void OnConnect(ref ConnectContext ctx)
     {
@@ -88,17 +107,32 @@ public sealed class SocketSetClientTransport : DuplexTransport
     private readonly SocketSetClientEngine? _ownedEngine; // only when the convenience overload built it
     private Connection? _conn;
     private TransportReceiver? _receiver;
+    private volatile bool _encrypted; // captured at connect; see IsEncrypted
     internal bool PendingBatchEnd; // loop-thread-local via the engine's touched list
 
-    private SocketSetClientTransport(SocketSetClientEngine? ownedEngine) => _ownedEngine = ownedEngine;
+    /// <summary>What this dial was told to do about TLS, read back by the engine's
+    /// <see cref="SocketSetClientEngine.OnClientAuthenticate"/> when the handshake is about to start.</summary>
+    internal readonly TlsIntent Tls;
+
+    private SocketSetClientTransport(SocketSetClientEngine? ownedEngine, TlsIntent tls)
+    {
+        _ownedEngine = ownedEngine;
+        Tls = tls;
+    }
 
     /// <summary>Dial <paramref name="endpoint"/> on a SHARED <paramref name="engine"/> (TCP or UDS incl.
     /// @abstract; TLS per the engine's options + TlsMode) and complete when the connection — including
     /// any TLS handshake — is established.</summary>
-    public static async Task<SocketSetClientTransport> ConnectAsync(
+    public static Task<SocketSetClientTransport> ConnectAsync(
         EndPoint endpoint, SocketSetClientEngine engine, CancellationToken cancellationToken = default)
+        => ConnectAsync(endpoint, engine, TlsIntent.EngineDefault, cancellationToken);
+
+    /// <summary>As above, but with the TLS posture stated per connection (the tunnel path) rather than
+    /// taken from the engine's options.</summary>
+    internal static async Task<SocketSetClientTransport> ConnectAsync(
+        EndPoint endpoint, SocketSetClientEngine engine, TlsIntent tls, CancellationToken cancellationToken)
     {
-        var transport = new SocketSetClientTransport(ownedEngine: null);
+        var transport = new SocketSetClientTransport(ownedEngine: null, tls);
         engine.Dial(endpoint, transport);
         using var reg = cancellationToken.Register(static s => ((SocketSetClientTransport)s!)._connected.TrySetCanceled(), transport);
         await transport._connected.Task.ConfigureAwait(false);
@@ -115,7 +149,7 @@ public sealed class SocketSetClientTransport : DuplexTransport
         var engine = new SocketSetClientEngine(options);
         try
         {
-            var transport = new SocketSetClientTransport(ownedEngine: engine);
+            var transport = new SocketSetClientTransport(ownedEngine: engine, TlsIntent.EngineDefault);
             engine.Dial(endpoint, transport);
             using var reg = cancellationToken.Register(static s => ((SocketSetClientTransport)s!)._connected.TrySetCanceled(), transport);
             await transport._connected.Task.ConfigureAwait(false);
@@ -131,6 +165,10 @@ public sealed class SocketSetClientTransport : DuplexTransport
     internal void OnEngineConnect(Connection connection)
     {
         _conn = connection;
+        // Capture rather than read through later: Connection objects are POOLED, so a live read after this
+        // one closed would report whatever the next tenant negotiated. Set before the connect completes,
+        // so IsEncrypted is already true by the time the consumer checks it.
+        _encrypted = connection.IsEncrypted;
         _connected.TrySetResult(true);
     }
 
@@ -157,6 +195,12 @@ public sealed class SocketSetClientTransport : DuplexTransport
     public override void Advance(int count) => ConnectedOrThrow().Advance(count);
 
     public override bool Flush() => _conn is { } c && c.Flush();
+
+    /// <summary>Whether this connection's bytes are encrypted on the wire — the OUTCOME of the handshake,
+    /// read off the connection at connect, not the intent that asked for it. A consumer refuses a
+    /// transport that reports plaintext when its configuration demanded TLS, and that check is worthless
+    /// against a value derived from the same configuration it is checking.</summary>
+    public override bool IsEncrypted => _encrypted;
 
     public override void Start(TransportReceiver receiver)
     {
