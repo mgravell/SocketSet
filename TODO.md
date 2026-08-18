@@ -88,11 +88,18 @@ trust pinned to the demo cert, name verified as `localhost` from `SslHost` per d
 `Run-SecurityGates.ps1` ALL GATES PASS (smoke 48/48, aspnet 18/18, tls-floor 12/12, the rest).
 
 **AND AGAINST REAL REDIS**, not just Garnet: `redis-server.exe` 3.0.503 (the Windows port that ships in
-the sibling checkout's `tests/RedisConfigs`), plaintext, all three backends, pub/sub included. TLS
-against a THIRD-PARTY Redis is NOT covered: nothing on this box terminates Redis-over-TLS except our
-own stack, so the TLS cells have our provider on both ends. An interop cell against an independent TLS
-server (an `SslStream` terminator in front of `redis-server`, or a real Azure endpoint) is the honest
-next step, and is not done.
+the sibling checkout's `tests/RedisConfigs`), plaintext, all three backends, pub/sub included. Re-run
+BOUND TO LOOPBACK (`--bind 127.0.0.1`) after the first run raised a Windows firewall prompt — same
+result, and worth doing rather than arguing that the first one was fine, because a result reached
+through a dialog nobody saw is not a result.
+
+**TLS INTEROP, the gap this section previously declared open, is now HALF closed.** `GarnetDemo
+--stock --tls` hosts Garnet's OWN SAEA transport terminating TLS with `SslStream`, so the server side
+is the BCL rather than our provider: `tls` and `mux-tls` PASS against it on all three backends. What
+that proves is that our client interoperates with a different TLS IMPLEMENTATION; what it does not
+prove is interoperation with a different TLS STACK, since SslStream is SChannel underneath on Windows
+exactly as our provider is. The remaining honest test is OpenSSL on the far end — Linux `redis-server`
+6+ with TLS, or a real Azure endpoint — and it is not done.
 
 ### ⚠ LINUX IS UNBUILT AND UNTESTED THIS SESSION
 
