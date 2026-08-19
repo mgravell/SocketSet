@@ -225,7 +225,24 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
     /// to marshal on this backend — start reading again on the caller's thread.</summary>
     private void ResumeReceive(ManagedConnection conn) => PumpReceive(conn);
 
+    /// <summary>Arm receives until one goes pending (or the connection parks/closes), then END THE
+    /// BATCH — <see cref="SocketSet.OnLoopDrain"/>, the point where an application flushes what it
+    /// staged while the burst was being delivered.
+    ///
+    /// There is no shared loop here to drain, so the batch is this connection's run of SYNCHRONOUS
+    /// completions on this thread: the moment we are about to wait, the burst is over by any useful
+    /// definition. Fired unconditionally (the notification is a no-op when nothing was touched) because
+    /// the alternative — tracking dispatches through two receive paths — buys nothing measurable.
+    ///
+    /// The managed backend had no such point at all until 2026-08-18, which meant a consumer staging a
+    /// response for the batch boundary never got one. See <c>IocpShard.EndBatch</c>.</summary>
     private void PumpReceive(ManagedConnection conn)
+    {
+        try { PumpReceiveCore(conn); }
+        finally { Parent.OnLoopDrain(); }
+    }
+
+    private void PumpReceiveCore(ManagedConnection conn)
     {
         while (true)
         {
@@ -775,7 +792,10 @@ internal sealed unsafe class ManagedSocketShard : SocketSetShard
                 switch (LastOperation)
                 {
                     case SocketAsyncOperation.Receive:
+                        // PumpReceive ends the batch on the continuing path; the stopping path (closed,
+                        // input shut) still delivered bytes, so it needs the notification too.
                         if (Shard.ProcessReceive(Conn)) Shard.PumpReceive(Conn);
+                        else Shard.Parent.OnLoopDrain();
                         break;
                     case SocketAsyncOperation.Send:
                         Shard.AdvanceSend(Conn);

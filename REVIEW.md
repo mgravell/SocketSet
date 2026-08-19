@@ -357,6 +357,76 @@ plus watching the socket get torn down mid-run. Disposition in 71ead61: the cell
 bound's behaviour is `verify-parking`'s gate. The behaviour itself — a real client pipelining >4 MiB into
 an io_uring pipe-mode server gets dropped — stands until TODO 0a, and is one more reason 0a is next.
 
+## AUDIT 2026-08-18: two holes found by making the transport gate cross-platform
+
+Both were found by running `bench/tunnel-selftest` on Windows for the first time — it was written on
+Linux and hard-coded io_uring, so three backends had never been under it.
+
+### F11. `OnBatchEnd` never fired on IOCP, RIO or managed — a stall, not a slowdown — FIXED
+
+**What.** `SocketSet.OnLoopDrain` — the "a delivery burst has ended" notification — was implemented only
+in `EpollShard` and `IoUringShard`. On the three other backends it never fired, so a consumer's
+`TransportReceiver.OnBatchEnd` never fired either.
+
+**Why it matters more than coalescing.** The contract asks consumers to flush ONE send per burst rather
+than one per callback (a measured 3x send amplification when that is missed, which is why both the RESP
+proxy and the SE.Redis transport hang their flush there). But a write that is STAGED during inbound
+processing and left for the batch boundary — a fire-and-forget command issued from a completion
+continuation — has no other flush point at all. Those bytes sit until something unrelated flushes.
+
+**How it stayed invisible.** The two consumers that use it were developed on Linux, and no Windows gate
+had a consumer that used it. The failing assertion is `batch-end fired count=0` in
+`tunnel-selftest plain`, on a rig that had never run on this OS.
+
+**Fix.** IOCP and RIO end the batch when their completion batch is drained, guarded by a dirty flag so
+an idle iteration costs one bool test; the notification also fires on the poll-returned-nothing path,
+because deferring it to the next iteration means deferring it across a blocking wait. Managed has no
+loop to drain, so its batch is one connection's run of synchronous receives — fired when the pump is
+about to wait, plus on the stopping path out of the receive completion.
+
+**Verified**: `batch-end fired` = 10 per 1000-command burst on IOCP and RIO, 2 on managed, 0 before.
+
+### F12. A recycled slot could report the previous tenant's kTLS ALPN and SNI — FIXED
+
+`Connection.KernelAlpn` and `KernelServerName` are the kTLS-path sources for the public
+`NegotiatedProtocol` and `RequestedServerName`. Slot claim clears `Tls` (and everything else per-tenant)
+but never cleared those two, so a pooled slot whose previous tenant was a kTLS connection kept reporting
+that tenant's negotiated protocol and the name IT had asked for. `RequestedServerName` is a value a
+server may route or admit on, which is what makes this more than cosmetic: it is another tenant's data
+surfacing as this one's.
+
+Cleared now on claim in both backends that have a kTLS path, alongside the new `KernelTls` flag that
+backs `Connection.IsEncrypted`. **Found by inspection while adding that flag, not by a gate — and there
+is still no gate cell for it.** A churn-with-kTLS cell asserting that a recycled connection reports no
+inherited ALPN would close that, and does not exist. LINUX CODE: not compiled or run this session.
+
+### F13. Inbound that arrived before `Start` was DROPPED, and it cost the subscription connection — FIXED
+
+**What.** `SocketSetClientTransport` delivered inbound only once the consumer had called
+`DuplexTransport.Start(receiver)`; anything that arrived first was discarded, with a comment saying so.
+
+**Why that is not the harmless case the comment assumed.** The consumer's own order is: take the
+transport, initialise the output, WRITE its handshake, and only then start reading
+(`PhysicalConnection.StartReading` is what calls `StartTransportReading`). So the reply can be on the
+wire before `Start`, and whether it lands first is a race the consumer cannot see. SE.Redis's
+INTERACTIVE connection happened to win it every time; its SUBSCRIPTION connection lost it every time —
+**325 bytes of handshake reply dropped**, the connection never became usable, and the symptom three
+layers up was `RedisTimeoutException ... command=SUBSCRIBE ... no connection became available`.
+
+**Why nothing caught it for a fortnight.** No gate had ever subscribed through the seam — not
+`tunnel-selftest`, not `mux-ab`, on either OS. Every cell used the interactive connection, which is the
+one that wins the race. The failure needs a SECOND connection to show up, and nothing opened one.
+
+**Fix.** Pre-`Start` inbound is STAGED and replayed to the receiver the instant it is set, under a lock
+that publishes the receiver only after the replay, so no live delivery can overtake staged bytes.
+Staging is bounded (256 KiB) and hitting the bound closes the connection rather than truncating it.
+
+**Gate.** `tunnel-selftest`'s `mux` cells now subscribe and require the published message back, with
+`mux-classic` (the same cells over ordinary sockets, no tunnel) as the control that says whether a
+failure belongs to the seam or to the server. A `twin` cell dials two transports on ONE engine directly
+— the anchor claim, isolated from SE.Redis — because that is the layer the diagnosis had to rule out
+first. Verified against **real `redis-server` 3.0.503** and Garnet, on IOCP, RIO and managed.
+
 ## NOT FIXED: design calls, in priority order
 
 These are not left out because they are small. They are left out because each one has a decision in it

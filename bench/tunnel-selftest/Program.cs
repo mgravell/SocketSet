@@ -7,12 +7,36 @@ using System.Text;
 using RESPite.Transports;
 using SocketSets;
 using SocketSets.StackExchangeRedis;
+using SocketSets.Tls;
 
-// usage: tunnel-selftest [plain|tls|uds] [host-or-@name] [port] [tls-trust-pem]
+// usage: tunnel-selftest [plain|tls|uds|mux|mux-tls|mux-tls-noprovider] [host-or-@name] [port] [tls-trust-pem]
+//
+// CROSS-PLATFORM since the TLS-owning seam landed: the backend and the TLS provider come from this OS
+// (io_uring + OpenSSL on Linux, IOCP + SChannel on Windows) rather than being hard-coded to the box it
+// was written on. The seam's TLS half is Windows-relevant -- SE.Redis clients do TLS to Azure Redis
+// constantly -- so a gate that could only run on Linux was gating the wrong half.
 string surface = args.Length > 0 ? args[0] : "plain";
 string target = args.Length > 1 ? args[1] : "127.0.0.1";
 int port = args.Length > 2 ? int.Parse(args[2]) : 7379;
-string trustPem = args.Length > 3 ? args[3] : "/home/marc/code/SocketSet/bench/.tools/tls-demo/cert.pem";
+string trustPem = args.Length > 3 ? args[3] : FindDemoCert();
+
+static string FindDemoCert()
+{
+    // Walk up from the binary to the repo, so the rig works from any working directory on either OS.
+    for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+    {
+        var candidate = Path.Combine(dir.FullName, "bench", ".tools", "tls-demo", "cert.pem");
+        if (File.Exists(candidate)) return candidate;
+    }
+    return Path.Combine("bench", ".tools", "tls-demo", "cert.pem"); // report the miss where it is used
+}
+
+// The demo server's certificate as a TRUST ROOT for the client, on whichever provider this OS has.
+// Pinning it keeps verification ON without installing anything in a machine store.
+static TlsProvider Trusting(string pem) => GateBackends.IsWindows
+    ? new SocketSets.Tls.SChannel.SChannelTlsProvider(
+        trustCertificate: System.Security.Cryptography.X509Certificates.X509Certificate2.CreateFromPem(File.ReadAllText(pem)))
+    : new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(pem));
 
 int failures = 0;
 void Report(string name, bool ok, string detail = "")
@@ -21,33 +45,126 @@ void Report(string name, bool ok, string detail = "")
     if (!ok) failures++;
 }
 
-var options = new SocketSetOptions { Shards = 1, Factory = SocketSetFactory.IoUring };
+// For a cell whose subject lives in the OTHER repo: it can pass, but its failure is not this tree's
+// failure, so it reports INCONCLUSIVE rather than red. Vacuous-pass is the thing to avoid, and this
+// still says out loud which side is missing. Flip it to Report() once the upstream change lands.
+void ReportCrossRepo(string name, bool ok, string detailOk, string detailPending)
+    => Console.WriteLine(ok
+        ? $"  PASS  {name,-24} {detailOk}"
+        : $"  ????  {name,-24} INCONCLUSIVE (needs the SE.Redis side): {detailPending}");
 
-if (surface is "mux" or "mux-tls")
+// Backend: this OS's default unless SS_GATE_BACKEND names one. The three Windows backends do not share
+// a receive loop -- IOCP dequeues completion batches, RIO drains a user-mode CQ, managed rides SAEA
+// callbacks with no loop at all -- and the batch-end contract has to hold on each, so the gate has to be
+// able to ASK for each. (Left as an env var rather than a positional argument so existing invocations,
+// which pass target/port positionally, keep working.)
+var backendName = Environment.GetEnvironmentVariable("SS_GATE_BACKEND");
+var picked = backendName is null
+    ? GateBackends.All[0]
+    : Array.Find(GateBackends.All, b => string.Equals(b.Name, backendName, StringComparison.OrdinalIgnoreCase));
+if (picked.Name is null)
+{
+    Console.WriteLine($"unknown SS_GATE_BACKEND '{backendName}'; this OS has: {string.Join(", ", Array.ConvertAll(GateBackends.All, b => b.Name))}");
+    return 2;
+}
+var options = new SocketSetOptions { Shards = 1, Factory = picked.Factory };
+
+if (surface is "mux" or "mux-tls" or "mux-tls-noprovider" or "mux-classic")
 {
     if (surface is "mux-tls")
     {
-        // TLS lives in the TRANSPORT (SocketSet's OpenSSL, pinned trust, verification on); config.Ssl
-        // stays false by contract -- the connect path throws if both are set.
-        options.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
-        // TargetHost is mandatory since 2026-08-04 (it used to default to null, which silently disabled
-        // the hostname check). We dial an IP literal, which the provider verifies against the
-        // certificate's iPAddress SAN rather than its DNS names -- the demo cert carries the loopback
-        // address for exactly this.
-        options.TlsClient.TargetHost = target;
+        // TLS lives in the TRANSPORT -- but the INTENT now travels with the seam: config.Ssl=true is
+        // what turns it on (it used to THROW alongside a transport tunnel), and the engine supplies only
+        // the provider. Nothing here sets TlsClient.TargetHost any more: the name comes from the
+        // configuration, per dial, which is the whole point of the change.
+        options.Tls = Trusting(trustPem);
     }
+    // mux-tls-noprovider: the same demand with NO provider on the engine. It must FAIL. Without that
+    // cell the TLS cell above passes just as happily against a transport that reports "encrypted"
+    // because it was asked to be, rather than because it is.
     // The END-TO-END cell: a real ConnectionMultiplexer whose IO core is SocketSet, via
     // Tunnel.ConnectTransportAsync -> SocketSetTunnel -> PhysicalConnection transport mode (push-feed).
     // No socket, no Stream, no SslStream and no reader thread exist on the SE.Redis side; if these
     // pass, the whole chain (handshake HELLO/AUTH included) ran through the transport.
-    Console.WriteLine($"=== tunnel-selftest: surface={surface} target={target} ===");
+    Console.WriteLine($"=== tunnel-selftest: surface={surface} backend={picked.Name} target={target} ===");
     var muxCfg = new StackExchange.Redis.ConfigurationOptions
     {
         EndPoints = { new IPEndPoint(IPAddress.Parse(target), port) },
         AbortOnConnectFail = true,
-        Tunnel = new SocketSetTunnel(options),
+        // mux-classic is the CONTROL: identical cells, ordinary sockets, no tunnel at all. Without it a
+        // failure here cannot be attributed -- "the tunnel is broken" and "this server/rig cannot do
+        // that" look identical.
+        Tunnel = surface is "mux-classic" ? null : new TracingTunnel(new SocketSetTunnel(options)),
+        // The TLS intent, stated where SE.Redis states it. SslHost is what the certificate is verified
+        // against (and announced as SNI); without it the endpoint's host is used, which for an IP
+        // literal means iPAddress-SAN verification and no SNI -- both legitimate, but the demo
+        // certificate is named, not addressed.
+        Ssl = surface is "mux-tls" or "mux-tls-noprovider",
+        SslHost = "localhost",
     };
-    await using var mux = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(muxCfg);
+
+    if (surface is "mux-tls-noprovider")
+    {
+        // THE DISCRIMINATING CELL: TLS demanded, nothing to do it with. Either the tunnel refuses the
+        // dial (it does, naming the missing provider) or it hands back a plaintext transport and the
+        // library refuses THAT (IsEncrypted false against Ssl=true). Both are failures; a connection is
+        // not.
+        bool refused = false;
+        string detail = "connected in the clear";
+        var refusalLog = new StringWriter();
+        var started = DateTime.UtcNow;
+        try
+        {
+            await using var bad = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(muxCfg, refusalLog);
+            refused = !bad.IsConnected;
+        }
+        catch (Exception ex)
+        {
+            refused = true;
+            detail = ex.GetBaseException().Message;
+            if (detail.Length > 90) detail = detail.Substring(0, 90) + "...";
+        }
+        Report("tls-demanded/refused", refused, $"in {(DateTime.UtcNow - started).TotalSeconds:f1}s: {detail}");
+
+        // Does the REASON survive? A refusal the library reports as a bare timeout tells an operator
+        // nothing; the tunnel threw a sentence naming the missing provider, and that sentence should
+        // reach the connect log rather than dying in a fire-and-forget task.
+        var reasonReached = refusalLog.ToString().Contains("TlsProvider", StringComparison.Ordinal);
+        ReportCrossRepo("refusal-reason/reported", reasonReached,
+            "the tunnel's own message reached the connect log",
+            "the reason is lost - ConnectTransportAsync throws above the try in BeginConnectAsync, which runs fire-and-forget, so an operator sees only the timeout");
+        Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
+        return failures == 0 ? 0 : 1;
+    }
+
+    // Capture the multiplexer's own connect log and print it ONLY on failure: a failed connect here
+    // reports "not possible to connect" and nothing else, which is useless against a seam whose failure
+    // modes are all configuration-shaped (no provider, unmappable option, name mismatch).
+    var connectLog = new StringWriter();
+    StackExchange.Redis.ConnectionMultiplexer mux;
+    try
+    {
+        mux = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(muxCfg, connectLog);
+    }
+    catch (Exception ex)
+    {
+        Report("mux-connect", false, ex.GetBaseException().Message);
+        Console.WriteLine(connectLog.ToString());
+        Console.WriteLine($"=== tunnel-selftest: {failures} FAILURE(S) ===");
+        return 1;
+    }
+    await using var owned = mux;
+
+    // The multiplexer reports per-CONNECTION trouble through events, not through ConnectAsync: the
+    // subscription connection is opened later, and its failures are otherwise visible only as a
+    // timed-out command with no reason attached.
+    mux.ConnectionFailed += (_, e) => Console.WriteLine($"  ....  ConnectionFailed {e.ConnectionType} {e.FailureType}: {e.Exception?.GetBaseException().Message}");
+    mux.ConnectionRestored += (_, e) => Console.WriteLine($"  ....  ConnectionRestored {e.ConnectionType}");
+    mux.InternalError += (_, e) => Console.WriteLine($"  ....  InternalError {e.ConnectionType} {e.Origin}: {e.Exception?.GetBaseException().Message}");
+    mux.ErrorMessage += (_, e) => Console.WriteLine($"  ....  ErrorMessage: {e.Message}");
+
+    // Under Ssl=true this is already the assertion that the transport reported ENCRYPTED: the library
+    // fails the connection outright when a tunnel's transport says otherwise.
     Report("mux-connect", mux.IsConnected);
     var db = mux.GetDatabase();
     var rtt = await db.PingAsync();
@@ -61,6 +178,56 @@ if (surface is "mux" or "mux-tls")
     await Task.WhenAll(tasks);
     Report("mux-burst x500", Array.TrueForAll(tasks, t => t.Result));
     Report("mux-burst-verify", await db.StringGetAsync($"{key}:499") == "499");
+
+    // PUB/SUB: the SECOND connection. Everything above rides the Interactive connection, so a tunnel
+    // that works exactly once would pass all of it -- and the anchor's whole claim is that N connections
+    // share ONE engine. A subscription is how the multiplexer asks for another transport, and the
+    // message has to come back over it.
+    var sub = mux.GetSubscriber();
+    var channel = StackExchange.Redis.RedisChannel.Literal($"tt:chan:{Guid.NewGuid():N}");
+    var got = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+    await sub.SubscribeAsync(channel, (_, v) => got.TrySetResult(v));
+    await sub.PublishAsync(channel, "hello");
+    var delivered = await Task.WhenAny(got.Task, Task.Delay(TimeSpan.FromSeconds(5))) == got.Task;
+    Report("mux-pubsub", delivered && got.Task.Result == "hello", delivered ? $"got \"{got.Task.Result}\"" : "no message in 5s");
+    Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
+    return failures == 0 ? 0 : 1;
+}
+
+if (surface is "twin")
+{
+    // THE ANCHOR CLAIM, on its own: TWO transports, ONE engine, both live at once. A multiplexer
+    // opens an interactive AND a subscription connection through the same tunnel, so if that shape
+    // is broken the failure surfaces three layers up as a timed-out SUBSCRIBE, where it cannot be
+    // attributed to the seam.
+    Console.WriteLine($"=== tunnel-selftest: surface=twin backend={picked.Name} target={target} ===");
+    var twinEngine = new SocketSetClientEngine(options);
+    var twinEp = new IPEndPoint(IPAddress.Parse(target), port);
+    var ta = await SocketSetClientTransport.ConnectAsync(twinEp, twinEngine);
+    var tb = await SocketSetClientTransport.ConnectAsync(twinEp, twinEngine);
+    var rxa = new Receiver();
+    var rxb = new Receiver();
+    ta.Start(rxa);
+    tb.Start(rxb);
+
+    static void Ping(SocketSetClientTransport t)
+    {
+        "*1\r\n$4\r\nPING\r\n"u8.ToArray().AsSpan().CopyTo(t.GetSpan(32));
+        t.Advance(14);
+        t.Flush();
+    }
+
+    Ping(ta);
+    Report("twin-a-ping", await rxa.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+    Ping(tb);
+    Report("twin-b-ping", await rxb.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+    // A again, to prove B arriving did not steal A's routing (UserToken dispatch is the whole design)
+    rxa.Reset();
+    Ping(ta);
+    Report("twin-a-again", await rxa.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+    await ta.DisposeAsync();
+    await tb.DisposeAsync();
+    twinEngine.Dispose();
     Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
     return failures == 0 ? 0 : 1;
 }
@@ -71,8 +238,10 @@ switch (surface)
     case "tls":
         // The SE.Redis-to-managed-Redis shape: TLS client dial, trust pinned to the server's cert,
         // verification ON. ConnectAsync completes only after the handshake (the OnConnect contract).
-        options.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
-        options.TlsClient.TargetHost = target; // mandatory; an IP literal verifies against iPAddress SANs
+        // This is the ENGINE-configured path (no intent stated), which the seam change deliberately
+        // leaves untouched -- so this cell is also the regression test for that promise.
+        options.Tls = Trusting(trustPem);
+        options.TlsClient.TargetHost = "localhost"; // mandatory since 2026-08-04; the demo cert is named
         endpoint = new IPEndPoint(IPAddress.Parse(target), port);
         break;
     case "uds":
@@ -83,7 +252,7 @@ switch (surface)
         endpoint = new IPEndPoint(IPAddress.Parse(target), port);
         break;
 }
-Console.WriteLine($"=== tunnel-selftest: surface={surface} target={target} ===");
+Console.WriteLine($"=== tunnel-selftest: surface={surface} backend={picked.Name} target={target} ===");
 var transport = await SocketSetClientTransport.ConnectAsync(endpoint, options);
 
 var rx = new Receiver();
@@ -94,6 +263,12 @@ transport.Start(rx);
 transport.Advance(14);
 Report("flush", transport.Flush());
 Report("ping-roundtrip", await rx.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+
+// IsEncrypted is the OUTCOME, and it is what a consumer refuses a transport on, so assert both
+// directions: a plaintext dial must not claim encryption, and a TLS dial must not fail to claim it.
+// One direction alone passes against a hard-coded answer.
+Report("encrypted-reported", transport.IsEncrypted == (surface == "tls"),
+    $"IsEncrypted={transport.IsEncrypted} on surface={surface}");
 
 // 2: pipelined burst — one flush for many commands, replies counted, batch-end observed
 rx.Reset();
@@ -170,4 +345,30 @@ sealed class Receiver : TransportReceiver
 
     public async Task<bool> WaitClosed(TimeSpan timeout)
         => await Task.WhenAny(_closed.Task, Task.Delay(timeout)) == _closed.Task;
+}
+
+
+/// <summary>Announces every dial the multiplexer makes through the tunnel, and what came back. A
+/// multiplexer opens MORE than one connection (interactive, then subscription on first subscribe), and
+/// a seam that works for the first and silently never completes the second looks, from the outside,
+/// like "SUBSCRIBE timed out" -- which is where the diagnosis stops without this.</summary>
+sealed class TracingTunnel(StackExchange.Redis.Configuration.Tunnel inner) : StackExchange.Redis.Configuration.Tunnel
+{
+    public override async ValueTask<DuplexTransport?> ConnectTransportAsync(
+        EndPoint endpoint, StackExchange.Redis.ConnectionType connectionType,
+        StackExchange.Redis.Configuration.TlsOptions tls, CancellationToken cancellationToken)
+    {
+        Console.WriteLine($"  ....  dial {connectionType} ssl={tls.IsEnabled}");
+        try
+        {
+            var t = await inner.ConnectTransportAsync(endpoint, connectionType, tls, cancellationToken);
+            Console.WriteLine($"  ....  dial {connectionType} -> {(t is null ? "null (socket path)" : $"transport encrypted={t.IsEncrypted}")}");
+            return t;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ....  dial {connectionType} -> THREW {ex.GetType().Name}: {ex.Message}");
+            throw;
+        }
+    }
 }

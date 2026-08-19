@@ -4,6 +4,141 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## SESSION 2026-08-18 (Windows) — THE SE.REDIS SEAM MERGED **WITH TLS ON OUR SIDE**; adapted, and it found two Windows holes
+
+Marc merged the experimental transport API upstream **with a change**: TLS moved to the transport's side
+of the line, so a tunnel is no longer wrapped in `SslStream` at all. Everything below follows from that.
+
+### What upstream now looks like (all on SE.Redis `main`)
+
+`#3152` (SER009 tunnel API), `#3153` (BufferedStreamWriter into RESPite.Streams), `#3165` (`!@abstract`
+UDS config) and — new since this repo last looked — **`#3173` "Support transport feeds"**, i.e. the
+`PhysicalConnection` transport mode that used to live on `marc/transport-push-feed`. The sibling
+checkout no longer needs a special branch; `main` carries the lot.
+
+The API itself changed shape in the merge:
+
+- `Tunnel.ConnectTransportAsync(endpoint, connectionType, **TlsOptions tls**, ct)` — the TLS INTENT
+  travels with the dial, because "a transport cannot honour an intent it cannot see".
+- `DuplexTransport.IsEncrypted` — the transport ASSERTS what it did; `config.Ssl` with a transport that
+  reports plaintext is refused outright (`PhysicalConnection.cs:1044`), instead of the old
+  "`config.Ssl` + transport tunnel throws".
+- `TlsOptions` is a read-only VIEW over the configuration (host, protocols, callbacks, revocation), not
+  a copy.
+
+**This retires the anchor shape's oldest wart.** "One engine = one TLS posture; mixed targets want two
+tunnels" is gone: the decision now arrives per connection and lands in `OnClientAuthenticate`, which is
+the callback D1 built for exactly this case and which had nothing upstream feeding it until now. One
+engine, many endpoints, each with its own name — and `Ssl=false` means plaintext even on an engine that
+carries a provider.
+
+### What landed here (branch `tunnel-owns-tls`, committed, NOT pushed)
+
+1. **The adaptation**: `SocketSetTunnel` overrides the new signature; a new `TlsIntent` translates one
+   dial's configuration into what the per-connection callback needs; `SocketSetClientEngine`
+   overrides `OnClientAuthenticate` and routes by `Connection.UserToken`. The direct
+   `SocketSetClientTransport.ConnectAsync` entry points state no intent and keep the engine-configured
+   behaviour exactly — the `tls` gate cell is the regression test for that promise.
+2. **`Connection.IsEncrypted`** (public), covering kTLS via a new internal `KernelTls` flag: the
+   transport reports the handshake's OUTCOME, read off the connection at connect. A value derived from
+   the configuration would make upstream's mismatch check worthless, which is the whole reason that
+   check exists.
+3. **THE REFUSALS ARE THE DESIGN.** SE.Redis's TLS configuration is `SslStream`-shaped; ours is
+   provider-shaped. Validation callback, client-certificate selector, `SslProtocols`,
+   `SslClientAuthenticationOptions` each THROW, naming the provider-level knob that does express them,
+   rather than being silently dropped. **`CheckCertificateRevocation` is the one exception and is a
+   known gap**: it defaults to TRUE and the view exposes only the resolved value, so refusing it failed
+   every TLS dial on a default nobody typed (first run did exactly that). Revocation therefore stays a
+   provider-construction decision (`SChannelTlsProvider` takes an `X509RevocationMode`) and the flag is
+   NOT applied per connection. Written down here rather than left to be rediscovered.
+4. **F11 — `OnLoopDrain` existed only on epoll and io_uring**, so `TransportReceiver.OnBatchEnd` never
+   fired on IOCP, RIO or managed. Not a coalescing loss: a write staged during inbound processing and
+   left for the batch boundary has no other flush point, so it is a STALL. Implemented on all three
+   (IOCP/RIO: end of each completion batch, guarded by a dirty flag; managed: the end of a connection's
+   synchronous receive run, which is the only boundary that backend has). See `REVIEW.md`.
+5. **F12 — a recycled slot could report the previous tenant's kTLS ALPN and SNI.** `KernelAlpn` /
+   `KernelServerName` were never cleared on claim (only `Tls` was). Cleared now on epoll and io_uring,
+   alongside the new `KernelTls`. **LINUX-ONLY CODE, AND LINUX HAS NOT RUN THIS.**
+6. **The gate is cross-platform and now covers TLS**: `bench/tunnel-selftest` picks this OS's backend
+   (`SS_GATE_BACKEND` names another) and provider, asserts `IsEncrypted` in BOTH directions (a
+   one-directional assertion passes against a hard-coded answer), and gains
+   `mux-tls-noprovider` — TLS demanded with nothing to do it with, which MUST fail.
+
+### F13, FOUND BY ASKING THE OBVIOUS QUESTION ("does it work with Redis, with and without TLS?")
+
+Pub/sub had never been exercised through this seam, on either OS. The moment a gate cell subscribed,
+the SUBSCRIBE timed out: the transport DROPPED inbound that arrived before `Start`, the consumer writes
+its handshake before it starts reading, and the subscription connection lost that race every time (the
+interactive one wins it every time, which is why everything else has always worked). 325 bytes of
+handshake reply, discarded. Staged-and-replayed now, bounded at 256 KiB. Full write-up in `REVIEW.md`.
+
+The diagnosis is worth keeping as a method note: the failure presented as "SUBSCRIBE timed out in the
+backlog", three layers above the cause. What located it was building DOWNWARDS — a `mux-classic` control
+(same cells, ordinary sockets: pub/sub fine, so not the server), then a `twin` cell (two transports on
+one engine directly: fine, so not the anchor), which left the SE.Redis-specific path, where a temporary
+counter on the dropped branch printed the answer in one run.
+
+### What it measured/ran
+
+**Windows, first time ever for this seam.** Five surfaces x three backends, ALL PASS: `plain`, `twin`,
+`mux` (SET/GET/500-burst/pub-sub) against Garnet, and `tls` + `mux-tls` against a TLS Garnet (SChannel,
+trust pinned to the demo cert, name verified as `localhost` from `SslHost` per dial). Plus
+`mux-tls-noprovider` refused and `mux-classic` (the control) green. Batch-end counts: 10 per
+1000-command burst on IOCP/RIO, 2 on managed — the coalescing is real, and was zero before today.
+`Run-SecurityGates.ps1` ALL GATES PASS (smoke 48/48, aspnet 18/18, tls-floor 12/12, the rest).
+
+**AND AGAINST REAL REDIS**, not just Garnet: `redis-server.exe` 3.0.503 (the Windows port that ships in
+the sibling checkout's `tests/RedisConfigs`), plaintext, all three backends, pub/sub included. Re-run
+BOUND TO LOOPBACK (`--bind 127.0.0.1`) after the first run raised a Windows firewall prompt — same
+result, and worth doing rather than arguing that the first one was fine, because a result reached
+through a dialog nobody saw is not a result.
+
+**TLS INTEROP, the gap this section previously declared open, is now HALF closed.** `GarnetDemo
+--stock --tls` hosts Garnet's OWN SAEA transport terminating TLS with `SslStream`, so the server side
+is the BCL rather than our provider: `tls` and `mux-tls` PASS against it on all three backends. What
+that proves is that our client interoperates with a different TLS IMPLEMENTATION; what it does not
+prove is interoperation with a different TLS STACK, since SslStream is SChannel underneath on Windows
+exactly as our provider is. The remaining honest test is OpenSSL on the far end — Linux `redis-server`
+6+ with TLS, or a real Azure endpoint — and it is not done.
+
+### ⚠ LINUX IS UNBUILT AND UNTESTED THIS SESSION
+
+`Connection.cs`, `EpollShard.cs` and `IoUringShard.cs` all changed (F12 + `KernelTls`). Nothing here has
+compiled on Linux. Before trusting that side: `bench/run-smoke-matrix.sh`, then
+`dotnet run --project bench/tunnel-selftest -- mux-tls 127.0.0.1 <tls-port>` against a TLS GarnetDemo,
+and re-run `bench/run-mux-ab.sh` — the A/B legs changed shape (the tunnel leg now sets `config.Ssl`,
+so BOTH legs verify the same name; the numbers of record predate that and should be re-taken).
+
+### QUEUED NEXT, in the order I would take them
+
+1. **A CONNECT FAILURE IS INVISIBLE, AND THE CLIENT HANGS.** `DispatchClosed` is gated on the app having
+   seen the connection open, and no backend has any other notification, so an outbound dial that FAILS
+   (dead port, refused, handshake denied) tells the application nothing at all: `ConnectAsync` never
+   completes. Demonstrated: `tunnel-selftest plain 127.0.0.1 7999` produces its header and then hangs
+   forever. Through the seam this means a down Redis leaks a pending task and a transport per retry, and
+   the multiplexer waits out its own timeout with no reason to report. **Shape**: an unconditional
+   `DispatchConnectFailed`/`OnConnectFailed` fired from the connect-failure paths, exactly as
+   `DispatchTlsFault` is fired ungated for the same reason (a failed handshake never opened either).
+   Five backends plus a gate cell — dial a dead port, demand a notification within a bound, on every
+   backend. It is its own change, which is why it is not in this one.
+2. ~~**For Marc, upstream**~~ **PR'd 2026-08-18: StackExchange.Redis#3188**
+   (`marc/transport-read-before-handshake`), two commits, awaiting review:
+   - **Start reading before the handshake is written.** The upstream half of F13 — with it, pub/sub
+     works through the tunnel even with OUR staging removed, which is the discriminating pair that
+     proves the fix belongs there. Our staging stays regardless: it is what makes any transport safe
+     against a consumer that writes first, and it is the belt to that fix's braces.
+   - **Record an exception out of `ConnectTransportAsync`.** It is thrown above the `try` in
+     `BeginConnectAsync`, which runs fire-and-forget, so a tunnel's refusal reached nobody. With the
+     change the tunnel's own sentence lands in the connect log; without it the log carries only the
+     timeout. Gated here by `tunnel-selftest`'s `refusal-reason/reported`, which reports INCONCLUSIVE
+     rather than FAIL while the PR is unmerged, because the subject lives in the other repo — flip it
+     to a hard assertion when it lands.
+   - Raised in the PR text, no code: `TlsOptions.CheckCertificateRevocation` is a resolved `bool` that
+     defaults to TRUE, so a transport cannot tell an explicit choice from the default (see the
+     revocation gap above). `SslProtocols` is nullable and shows the right shape.
+
+3. The 2026-08-10 queue below is untouched and still current.
+
 ## SESSION CLOSE 2026-08-10 — READ THIS FIRST; the 2026-08-08 section below is now HISTORY
 
 The Linux catch-up session the 2026-08-08 handover demanded, plus TODO 0c, plus — later the same day —

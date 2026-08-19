@@ -51,11 +51,14 @@ if (tunnel)
     var ss = new SocketSetOptions { Shards = shards, Factory = factory };
     if (tls)
     {
+        // The engine supplies the PROVIDER (trust pinned to the demo cert, verification on); the
+        // INTENT now travels with the seam -- config.Ssl below is what turns TLS on for each dial, and
+        // the name verified comes from config.SslHost. Both legs therefore verify the same name against
+        // a pinned certificate: the fairness gap this A/B carried until 2026-08-04 stays closed, now by
+        // construction rather than by remembering to set TlsClient.TargetHost.
         ss.Tls = new SocketSets.Tls.OpenSsl.OpenSslTlsProvider(trustCertPem: File.ReadAllText(trustPem));
-        // Mandatory since 2026-08-04. Note this ALSO closes a fairness gap in this very A/B: the
-        // SslStream control leg below sets config.SslHost and pins by thumbprint, so until now the two
-        // legs were not running the same verification posture and ours was doing strictly less work.
-        ss.TlsClient.TargetHost = host;
+        config.Ssl = true;
+        config.SslHost = "localhost";
     }
     config.Tunnel = counting = new CountingTunnel(new SocketSetTunnel(ss));
 }
@@ -151,9 +154,9 @@ sealed class CountingTunnel(Tunnel inner) : Tunnel
     private int _connects;
     public int Connects => Volatile.Read(ref _connects);
 
-    public override ValueTask<DuplexTransport?> ConnectTransportAsync(EndPoint endpoint, ConnectionType connectionType, CancellationToken cancellationToken)
+    public override ValueTask<DuplexTransport?> ConnectTransportAsync(EndPoint endpoint, ConnectionType connectionType, TlsOptions tls, CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref _connects);
-        return inner.ConnectTransportAsync(endpoint, connectionType, cancellationToken);
+        return inner.ConnectTransportAsync(endpoint, connectionType, tls, cancellationToken);
     }
 }

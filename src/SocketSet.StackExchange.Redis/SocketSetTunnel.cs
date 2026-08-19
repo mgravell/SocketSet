@@ -14,8 +14,13 @@ namespace SocketSets.StackExchangeRedis;
 /// can do whatever it likes; this one takes in a socket-set.)
 ///
 /// Lifetime: pass an engine you own (shareable across tunnels/multiplexers; you dispose it), or pass
-/// options and the tunnel lazily builds one engine for its own lifetime. One engine = one TLS posture
-/// (the provider + TlsMode live on the engine's options); mixed TLS/plaintext targets want two tunnels.
+/// options and the tunnel lazily builds one engine for its own lifetime.
+///
+/// ONE ENGINE IS NO LONGER ONE TLS POSTURE (this used to say mixed targets wanted two tunnels). TLS is
+/// now the transport's job end-to-end, and the seam hands us the configured intent per dial, so the
+/// engine supplies the PROVIDER (trust roots, version floor - construction-time decisions) while each
+/// connection carries its own decision: on or off, and which name to verify. See <see cref="TlsIntent"/>
+/// for what maps and what is refused rather than dropped.
 /// </summary>
 public sealed class SocketSetTunnel : Tunnel
 {
@@ -43,7 +48,17 @@ public sealed class SocketSetTunnel : Tunnel
         }
     }
 
+    /// <summary>Supply the WHOLE transport for one SE.Redis connection: a SocketSet dial on the shared
+    /// engine, TLS included. <paramref name="tls"/> is the configuration's TLS intent, which this
+    /// transport owns outright - the library applies none of it on our behalf, and checks
+    /// <see cref="DuplexTransport.IsEncrypted"/> afterwards to make sure we did.</summary>
     public override async ValueTask<DuplexTransport?> ConnectTransportAsync(
-        EndPoint endpoint, ConnectionType connectionType, CancellationToken cancellationToken)
-        => await SocketSetClientTransport.ConnectAsync(endpoint, Engine, cancellationToken).ConfigureAwait(false);
+        EndPoint endpoint, ConnectionType connectionType, TlsOptions tls, CancellationToken cancellationToken)
+    {
+        // Translate (and refuse the unmappable) BEFORE dialling, so a configuration we cannot honour
+        // fails as a configuration error rather than as a connection that quietly is not what it says.
+        var intent = TlsIntent.From(tls, endpoint, Engine);
+        return await SocketSetClientTransport.ConnectAsync(endpoint, Engine, intent, cancellationToken)
+            .ConfigureAwait(false);
+    }
 }

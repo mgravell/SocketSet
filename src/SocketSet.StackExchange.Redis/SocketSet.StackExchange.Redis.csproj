@@ -13,18 +13,24 @@ StackExchange.Redis#3152); the [Experimental] contract lives there, not here.
     </Description>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!-- Where the sibling StackExchange.Redis checkout lives. Overridable so a build can be pointed at a
+         WORKTREE (dotnet build -p:SERedisRoot=...) without touching the developer's own checkout, which
+         is how a fix on both sides of this seam gets tested against each other. -->
+    <SERedisRoot Condition="'$(SERedisRoot)' == ''">$(MSBuildThisFileDirectory)../../../StackExchange.Redis</SERedisRoot>
+  </PropertyGroup>
+
   <ItemGroup>
     <ProjectReference Include="../SocketSet/SocketSet.csproj" />
-    <!-- Cross-repo sibling references: /home/marc/code/StackExchange.Redis at or after the SER009
-         merge (#3152, on main). Pre-alpha, single-machine arrangement; becomes a package reference
-         when SER009 ships in a preview. -->
-    <ProjectReference Include="../../../StackExchange.Redis/src/RESPite/RESPite.csproj" />
-    <ProjectReference Include="../../../StackExchange.Redis/src/StackExchange.Redis/StackExchange.Redis.csproj" />
+    <!-- Cross-repo sibling references, at or after the transport-feed merge (#3173, on main). Pre-alpha,
+         single-machine arrangement; becomes a package reference when SER009 ships in a preview. -->
+    <ProjectReference Include="$(SERedisRoot)/src/RESPite/RESPite.csproj" />
+    <ProjectReference Include="$(SERedisRoot)/src/StackExchange.Redis/StackExchange.Redis.csproj" />
   </ItemGroup>
 
   <Target Name="RequireSiblingCheckout" BeforeTargets="BeforeBuild"
-          Condition="!Exists('../../../StackExchange.Redis/src/RESPite/RESPite.csproj')">
-    <Error Text="SocketSet.StackExchange.Redis needs a sibling StackExchange.Redis checkout with SER009 merged (see csproj comments)." />
+          Condition="!Exists('$(SERedisRoot)/src/RESPite/RESPite.csproj')">
+    <Error Text="SocketSet.StackExchange.Redis needs a StackExchange.Redis checkout at $(SERedisRoot) (see csproj comments); set -p:SERedisRoot=... to point elsewhere." />
   </Target>
 
 </Project>

@@ -8,11 +8,18 @@
     <OutputType>Exe</OutputType>
     <TargetFrameworks>net10.0</TargetFrameworks>
     <IsPackable>false</IsPackable>
-    <NoWarn>$(NoWarn);SER009</NoWarn>
+    <!-- SER009: the transport contract is [Experimental] by design and this rig is its gate.
+         StringToRedisValue: upstream made the implicit string->RedisValue conversion experimental after
+         this rig was written; the rig's string keys/values are test fixtures, not an opinion on it. -->
+    <NoWarn>$(NoWarn);SER009;StringToRedisValue</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../src/SocketSet.StackExchange.Redis/SocketSet.StackExchange.Redis.csproj" />
   </ItemGroup>
+
+  <!-- Same OS-picks-its-own-backends helper the security gates use: this rig stopped being Linux-only
+       when TLS became the transport's job, and the Windows half is the half nothing was gating. -->
+  <ItemGroup><Compile Include="../GateBackends.cs" /></ItemGroup>
 
 </Project>
