@@ -45,6 +45,14 @@ void Report(string name, bool ok, string detail = "")
     if (!ok) failures++;
 }
 
+// For a cell whose subject lives in the OTHER repo: it can pass, but its failure is not this tree's
+// failure, so it reports INCONCLUSIVE rather than red. Vacuous-pass is the thing to avoid, and this
+// still says out loud which side is missing. Flip it to Report() once the upstream change lands.
+void ReportCrossRepo(string name, bool ok, string detailOk, string detailPending)
+    => Console.WriteLine(ok
+        ? $"  PASS  {name,-24} {detailOk}"
+        : $"  ????  {name,-24} INCONCLUSIVE (needs the SE.Redis side): {detailPending}");
+
 // Backend: this OS's default unless SS_GATE_BACKEND names one. The three Windows backends do not share
 // a receive loop -- IOCP dequeues completion batches, RIO drains a user-mode CQ, managed rides SAEA
 // callbacks with no loop at all -- and the batch-end contract has to hold on each, so the gate has to be
@@ -103,9 +111,11 @@ if (surface is "mux" or "mux-tls" or "mux-tls-noprovider" or "mux-classic")
         // not.
         bool refused = false;
         string detail = "connected in the clear";
+        var refusalLog = new StringWriter();
+        var started = DateTime.UtcNow;
         try
         {
-            await using var bad = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(muxCfg);
+            await using var bad = await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(muxCfg, refusalLog);
             refused = !bad.IsConnected;
         }
         catch (Exception ex)
@@ -114,7 +124,15 @@ if (surface is "mux" or "mux-tls" or "mux-tls-noprovider" or "mux-classic")
             detail = ex.GetBaseException().Message;
             if (detail.Length > 90) detail = detail.Substring(0, 90) + "...";
         }
-        Report("tls-demanded/refused", refused, detail);
+        Report("tls-demanded/refused", refused, $"in {(DateTime.UtcNow - started).TotalSeconds:f1}s: {detail}");
+
+        // Does the REASON survive? A refusal the library reports as a bare timeout tells an operator
+        // nothing; the tunnel threw a sentence naming the missing provider, and that sentence should
+        // reach the connect log rather than dying in a fire-and-forget task.
+        var reasonReached = refusalLog.ToString().Contains("TlsProvider", StringComparison.Ordinal);
+        ReportCrossRepo("refusal-reason/reported", reasonReached,
+            "the tunnel's own message reached the connect log",
+            "the reason is lost - ConnectTransportAsync throws above the try in BeginConnectAsync, which runs fire-and-forget, so an operator sees only the timeout");
         Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
         return failures == 0 ? 0 : 1;
     }

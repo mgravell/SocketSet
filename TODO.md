@@ -121,13 +121,22 @@ so BOTH legs verify the same name; the numbers of record predate that and should
    `DispatchTlsFault` is fired ungated for the same reason (a failed handshake never opened either).
    Five backends plus a gate cell — dial a dead port, demand a notification within a bound, on every
    backend. It is its own change, which is why it is not in this one.
-2. **For Marc, upstream**: an exception out of `ConnectTransportAsync` is currently invisible. The call
-   sits ABOVE the `try` in `PhysicalConnection.BeginConnectAsync` (`:187` vs the try at `:205`), and the
-   method is invoked as `BeginConnectAsync(log).RedisFireAndForget()` — so a tunnel that refuses a dial
-   with a precise message produces a generic "not possible to connect" after the full connect timeout,
-   with the message nowhere. Moving the acquisition inside the try (recording via
-   `RecordConnectionFailed`) would make a misconfigured tunnel say what is wrong. Observed with the
-   `mux-tls-noprovider` cell.
+2. ~~**For Marc, upstream**~~ **PR'd 2026-08-18: StackExchange.Redis#3188**
+   (`marc/transport-read-before-handshake`), two commits, awaiting review:
+   - **Start reading before the handshake is written.** The upstream half of F13 — with it, pub/sub
+     works through the tunnel even with OUR staging removed, which is the discriminating pair that
+     proves the fix belongs there. Our staging stays regardless: it is what makes any transport safe
+     against a consumer that writes first, and it is the belt to that fix's braces.
+   - **Record an exception out of `ConnectTransportAsync`.** It is thrown above the `try` in
+     `BeginConnectAsync`, which runs fire-and-forget, so a tunnel's refusal reached nobody. With the
+     change the tunnel's own sentence lands in the connect log; without it the log carries only the
+     timeout. Gated here by `tunnel-selftest`'s `refusal-reason/reported`, which reports INCONCLUSIVE
+     rather than FAIL while the PR is unmerged, because the subject lives in the other repo — flip it
+     to a hard assertion when it lands.
+   - Raised in the PR text, no code: `TlsOptions.CheckCertificateRevocation` is a resolved `bool` that
+     defaults to TRUE, so a transport cannot tell an explicit choice from the default (see the
+     revocation gap above). `SslProtocols` is nullable and shows the right shape.
+
 3. The 2026-08-10 queue below is untouched and still current.
 
 ## SESSION CLOSE 2026-08-10 — READ THIS FIRST; the 2026-08-08 section below is now HISTORY
