@@ -9,7 +9,7 @@ using SocketSets;
 using SocketSets.StackExchangeRedis;
 using SocketSets.Tls;
 
-// usage: tunnel-selftest [plain|tls|uds|mux|mux-tls|mux-tls-noprovider] [host-or-@name] [port] [tls-trust-pem]
+// usage: tunnel-selftest [plain|tls|uds|prestart|twin|mux|mux-tls|mux-tls-noprovider|mux-classic] [host-or-@name] [port] [tls-trust-pem]
 //
 // CROSS-PLATFORM since the TLS-owning seam landed: the backend and the TLS provider come from this OS
 // (io_uring + OpenSSL on Linux, IOCP + SChannel on Windows) rather than being hard-coded to the box it
@@ -45,13 +45,6 @@ void Report(string name, bool ok, string detail = "")
     if (!ok) failures++;
 }
 
-// For a cell whose subject lives in the OTHER repo: it can pass, but its failure is not this tree's
-// failure, so it reports INCONCLUSIVE rather than red. Vacuous-pass is the thing to avoid, and this
-// still says out loud which side is missing. Flip it to Report() once the upstream change lands.
-void ReportCrossRepo(string name, bool ok, string detailOk, string detailPending)
-    => Console.WriteLine(ok
-        ? $"  PASS  {name,-24} {detailOk}"
-        : $"  ????  {name,-24} INCONCLUSIVE (needs the SE.Redis side): {detailPending}");
 
 // Backend: this OS's default unless SS_GATE_BACKEND names one. The three Windows backends do not share
 // a receive loop -- IOCP dequeues completion batches, RIO drains a user-mode CQ, managed rides SAEA
@@ -130,9 +123,12 @@ if (surface is "mux" or "mux-tls" or "mux-tls-noprovider" or "mux-classic")
         // nothing; the tunnel threw a sentence naming the missing provider, and that sentence should
         // reach the connect log rather than dying in a fire-and-forget task.
         var reasonReached = refusalLog.ToString().Contains("TlsProvider", StringComparison.Ordinal);
-        ReportCrossRepo("refusal-reason/reported", reasonReached,
-            "the tunnel's own message reached the connect log",
-            "the reason is lost - ConnectTransportAsync throws above the try in BeginConnectAsync, which runs fire-and-forget, so an operator sees only the timeout");
+        // A HARD assertion since StackExchange.Redis#3188 merged (3ecc6146, 2026-08-20): the library
+        // now records an exception out of ConnectTransportAsync instead of losing it to a
+        // fire-and-forget task, so a refusal that reaches nobody is a real failure again, not a
+        // missing dependency. It reported INCONCLUSIVE while that PR was open.
+        Report("refusal-reason/reported", reasonReached,
+            reasonReached ? "the tunnel's own message reached the connect log" : "reason lost: the log carries only the timeout");
         Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
         return failures == 0 ? 0 : 1;
     }
@@ -190,6 +186,41 @@ if (surface is "mux" or "mux-tls" or "mux-tls-noprovider" or "mux-classic")
     await sub.PublishAsync(channel, "hello");
     var delivered = await Task.WhenAny(got.Task, Task.Delay(TimeSpan.FromSeconds(5))) == got.Task;
     Report("mux-pubsub", delivered && got.Task.Result == "hello", delivered ? $"got \"{got.Task.Result}\"" : "no message in 5s");
+    Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
+    return failures == 0 ? 0 : 1;
+}
+
+if (surface is "prestart")
+{
+    // STAGING, ASSERTED DIRECTLY. The transport stages inbound that arrives before Start and replays
+    // it when the receiver is set. That behaviour existed because SE.Redis wrote its handshake before
+    // starting to read; since StackExchange.Redis#3188 it does not, so nothing in the mux cells
+    // exercises staging any more — and an untested safety net is the thing this repo keeps finding
+    // rotted. So provoke it on purpose: send a command, WAIT for the reply to land while no receiver
+    // exists, and only then Start. The reply must survive.
+    Console.WriteLine($"=== tunnel-selftest: surface=prestart backend={picked.Name} target={target} ===");
+    var psEngine = new SocketSetClientEngine(options);
+    var ps = await SocketSetClientTransport.ConnectAsync(new IPEndPoint(IPAddress.Parse(target), port), psEngine);
+
+    "*1\r\n$4\r\nPING\r\n"u8.ToArray().AsSpan().CopyTo(ps.GetSpan(32));
+    ps.Advance(14);
+    Report("prestart-flush", ps.Flush());
+    await Task.Delay(500); // the reply is now on the floor unless it was staged
+
+    var psRx = new Receiver();
+    ps.Start(psRx);
+    Report("prestart-replayed", await psRx.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)),
+        "the reply that arrived before Start must be delivered after it");
+
+    // and the transport keeps working normally afterwards, i.e. the replay did not consume the path
+    psRx.Reset();
+    "*1\r\n$4\r\nPING\r\n"u8.ToArray().AsSpan().CopyTo(ps.GetSpan(32));
+    ps.Advance(14);
+    ps.Flush();
+    Report("prestart-then-live", await psRx.WaitFor("+PONG\r\n", TimeSpan.FromSeconds(5)));
+
+    await ps.DisposeAsync();
+    psEngine.Dispose();
     Console.WriteLine(failures == 0 ? "=== tunnel-selftest: ALL PASS ===" : $"=== tunnel-selftest: {failures} FAILURE(S) ===");
     return failures == 0 ? 0 : 1;
 }

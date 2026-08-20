@@ -421,6 +421,13 @@ one that wins the race. The failure needs a SECOND connection to show up, and no
 that publishes the receiver only after the replay, so no live delivery can overtake staged bytes.
 Staging is bounded (256 KiB) and hitting the bound closes the connection rather than truncating it.
 
+**Upstream disposition (2026-08-20).** The ordering that made it possible is fixed at the source:
+StackExchange.Redis#3188 (`3ecc6146`) starts inbound delivery before the handshake is written, so a
+transport no longer has to survive being written-through before `Start`. Our staging STAYS — it is what
+makes the transport safe against any consumer that writes first, and the contract still permits one —
+but it means the mux cells no longer reach that path, so it is now gated directly by the `prestart`
+cell rather than incidentally. An untested safety net was the thing that let this bug exist.
+
 **Gate.** `tunnel-selftest`'s `mux` cells now subscribe and require the published message back, with
 `mux-classic` (the same cells over ordinary sockets, no tunnel) as the control that says whether a
 failure belongs to the seam or to the server. A `twin` cell dials two transports on ONE engine directly

@@ -121,21 +121,26 @@ so BOTH legs verify the same name; the numbers of record predate that and should
    `DispatchTlsFault` is fired ungated for the same reason (a failed handshake never opened either).
    Five backends plus a gate cell — dial a dead port, demand a notification within a bound, on every
    backend. It is its own change, which is why it is not in this one.
-2. ~~**For Marc, upstream**~~ **PR'd 2026-08-18: StackExchange.Redis#3188**
-   (`marc/transport-read-before-handshake`), two commits, awaiting review:
+2. ~~**For Marc, upstream**~~ **MERGED 2026-08-20 as StackExchange.Redis#3188** (`3ecc6146`). Both
+   halves are on SE.Redis main; re-verified here against that main, five cells x three backends:
    - **Start reading before the handshake is written.** The upstream half of F13 — with it, pub/sub
      works through the tunnel even with OUR staging removed, which is the discriminating pair that
-     proves the fix belongs there. Our staging stays regardless: it is what makes any transport safe
-     against a consumer that writes first, and it is the belt to that fix's braces.
+     proves the fix belongs there. **Our staging stays**, and now has a gate of its own — see below.
    - **Record an exception out of `ConnectTransportAsync`.** It is thrown above the `try` in
      `BeginConnectAsync`, which runs fire-and-forget, so a tunnel's refusal reached nobody. With the
      change the tunnel's own sentence lands in the connect log; without it the log carries only the
-     timeout. Gated here by `tunnel-selftest`'s `refusal-reason/reported`, which reports INCONCLUSIVE
-     rather than FAIL while the PR is unmerged, because the subject lives in the other repo — flip it
-     to a hard assertion when it lands.
-   - Raised in the PR text, no code: `TlsOptions.CheckCertificateRevocation` is a resolved `bool` that
-     defaults to TRUE, so a transport cannot tell an explicit choice from the default (see the
-     revocation gap above). `SslProtocols` is nullable and shows the right shape.
+     timeout. `tunnel-selftest`'s `refusal-reason/reported` was INCONCLUSIVE while the PR was open and
+     is now a HARD assertion (the `ReportCrossRepo` helper is gone with it). Consequence worth knowing:
+     the gate now REQUIRES a sibling checkout at or after `3ecc6146`; an older one builds and fails that
+     cell, which is the csproj comment's job to say.
+   - **THE FIX UPSTREAM MADE OUR STAGING UNEXERCISED, WHICH IS ITS OWN HAZARD.** SE.Redis no longer
+     writes before it reads, so nothing in the mux cells reaches the staging path any more — a safety
+     net nothing pulls on. New `prestart` cell provokes it deliberately: send a command, WAIT 500ms for
+     the reply to land while no receiver exists, THEN `Start`, and demand the reply. Discriminating,
+     checked both ways (staging off: `prestart-replayed` FAILS; on: passes) on all three backends.
+   - Raised in the PR text, no code, and still open: `TlsOptions.CheckCertificateRevocation` is a
+     resolved `bool` that defaults to TRUE, so a transport cannot tell an explicit choice from the
+     default (see the revocation gap above). `SslProtocols` is nullable and shows the right shape.
 
 3. The 2026-08-10 queue below is untouched and still current.
 

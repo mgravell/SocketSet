@@ -22,8 +22,11 @@ StackExchange.Redis#3152); the [Experimental] contract lives there, not here.
 
   <ItemGroup>
     <ProjectReference Include="../SocketSet/SocketSet.csproj" />
-    <!-- Cross-repo sibling references, at or after the transport-feed merge (#3173, on main). Pre-alpha,
-         single-machine arrangement; becomes a package reference when SER009 ships in a preview. -->
+    <!-- Cross-repo sibling references. MINIMUM is StackExchange.Redis#3188 (3ecc6146, 2026-08-20): the
+         transport seam starts reading before the handshake and reports a tunnel's refusal, and
+         bench/tunnel-selftest asserts the second of those outright. An older checkout builds fine and
+         fails that cell. Pre-alpha, single-machine arrangement; becomes a package reference when SER009
+         ships in a preview. -->
     <ProjectReference Include="$(SERedisRoot)/src/RESPite/RESPite.csproj" />
     <ProjectReference Include="$(SERedisRoot)/src/StackExchange.Redis/StackExchange.Redis.csproj" />
   </ItemGroup>
