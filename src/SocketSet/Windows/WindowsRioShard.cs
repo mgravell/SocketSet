@@ -334,7 +334,22 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
                     default: System.Diagnostics.Debug.WriteLine($"unexpected port completion kind={(int)op->Kind}"); break;
                 }
             }
+
+            EndBatch();
         }
+    }
+
+    /// <summary>The drained-completion-batch notification, for the same reasons spelled out in
+    /// <c>IocpShard.EndBatch</c>: an application that stages a response during a delivery burst flushes
+    /// it HERE, once, and had no such point on this backend before 2026-08-18. The RIO completions are
+    /// dequeued inside <see cref="DrainRio"/> under the loop below, so the flag is set there.</summary>
+    private bool _batchWork;
+
+    private void EndBatch()
+    {
+        if (!_batchWork) return;
+        _batchWork = false;
+        Parent.OnLoopDrain();
     }
 
     // Drain the RIO completion queue in user mode, re-arming the notification race-free: dequeue to
@@ -455,6 +470,7 @@ internal sealed unsafe class WindowsRioShard : WindowsShardBase<RioConnection>
         if (n == Win32.RIO_CORRUPT_CQ)
             throw new InvalidOperationException("RIODequeueCompletion reported a corrupt completion queue.");
         if (ReportStats) { Interlocked.Increment(ref s_cqDrains); Interlocked.Add(ref s_completions, n); }
+        if (n > 0) _batchWork = true; // this loop iteration ends in a batch-end (see EndBatch)
         for (uint i = 0; i < n; i++)
         {
             ref Win32.RIORESULT r = ref _rioResults[i];

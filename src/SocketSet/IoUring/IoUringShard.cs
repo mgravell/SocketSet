@@ -214,6 +214,9 @@ internal sealed class IoUringShard : SocketSetShard
         conn.SendBusy = false;
         conn.TlsClient = false;  // Tls/KtlsSsl are nulled in TryFinalize; belt-and-suspenders for a fresh tenant
         conn.KtlsReady = false;
+        conn.KernelTls = false; // pooled slot: never inherit the last tenant's kTLS verdict, ALPN or SNI
+        conn.KernelAlpn = null;
+        conn.KernelServerName = null;
         conn.Pending?.Clear();
         conn.StartedTicks = conn.LastActivityTicks = Clock.Millis;
         conn.MaxInboundBufferBytes = Parent.Options.MaxInboundBufferBytes; // deadline clock starts here
@@ -1306,6 +1309,7 @@ internal sealed class IoUringShard : SocketSetShard
         // the connection open — Connection.NegotiatedProtocol falls back to this.
         conn.KernelAlpn = OpenSslTlsFilter.GetAlpnSelected(conn.KtlsSsl);
         if (!conn.TlsClient) conn.KernelServerName = OpenSslTlsFilter.GetRequestedServerName(conn.KtlsSsl);
+        conn.KernelTls = true; // Connection.IsEncrypted: the kernel holds the keys, but the wire is ciphertext
 
         bool leased = _writeBuffer.TryLease(out int wi, out byte* wp);
         conn.Opened = true; // app now sees it open → pairs with OnClosed
