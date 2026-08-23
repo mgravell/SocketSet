@@ -4,7 +4,16 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## SESSION 2026-08-18 (Windows) — THE SE.REDIS SEAM MERGED **WITH TLS ON OUR SIDE**; adapted, and it found two Windows holes
+## SESSION 2026-08-18 → 08-23 (Windows) — THE SE.REDIS SEAM MERGED **WITH TLS ON OUR SIDE**; adapted, and it found three holes
+
+> **WHERE THIS STANDS RIGHT NOW (2026-08-23), read this before anything else:**
+> - **SocketSet PR #2** (`mgravell/SocketSet`, branch `tunnel-owns-tls`, six commits, all pushed) is
+>   **OPEN and unmerged**. `main` is still `adc470a`, so NOTHING in this section is on main. The branch
+>   is the state of the work; do not re-derive it on a fresh branch off main.
+> - **StackExchange.Redis#3188 is MERGED** (`3ecc6146`, 2026-08-20): both halves of the upstream fix are
+>   on SE.Redis main. The gate now REQUIRES a sibling checkout at or after that commit.
+> - Windows gates are green on the branch; **Linux has never compiled it** (see the warning below).
+> - Next actions are in QUEUED NEXT at the end of this section, in order.
 
 Marc merged the experimental transport API upstream **with a change**: TLS moved to the transport's side
 of the line, so a tunnel is no longer wrapped in `SslStream` at all. Everything below follows from that.
@@ -32,7 +41,7 @@ the callback D1 built for exactly this case and which had nothing upstream feedi
 engine, many endpoints, each with its own name — and `Ssl=false` means plaintext even on an engine that
 carries a provider.
 
-### What landed here (branch `tunnel-owns-tls`, committed, NOT pushed)
+### What landed here (branch `tunnel-owns-tls`, pushed; **PR #2, open**)
 
 1. **The adaptation**: `SocketSetTunnel` overrides the new signature; a new `TlsIntent` translates one
    dial's configuration into what the per-connection callback needs; `SocketSetClientEngine`
@@ -109,7 +118,29 @@ compiled on Linux. Before trusting that side: `bench/run-smoke-matrix.sh`, then
 and re-run `bench/run-mux-ab.sh` — the A/B legs changed shape (the tunnel leg now sets `config.Ssl`,
 so BOTH legs verify the same name; the numbers of record predate that and should be re-taken).
 
-### QUEUED NEXT, in the order I would take them
+### QUEUED NEXT, in the order I would take them (current as of 2026-08-23)
+
+0. **PR #2 WANTS A DECISION.** It is the only thing standing between all of the above and `main`, and
+   every item below is easier on top of it than beside it. If it is merged before the next session
+   starts, the first job is to re-read this block and delete this item.
+
+0b. **LINUX CATCH-UP, and it is the usual hazard in the usual direction.** `Connection.cs`,
+   `EpollShard.cs` and `IoUringShard.cs` changed on this branch (`KernelTls`, and F12's recycle clear)
+   and **not one line of it has compiled on Linux**. The order, with what each is for:
+   1. `bench/run-smoke-matrix.sh` — 60 cells; the shared-code regression net.
+   2. `dotnet run --project bench/verify-parking`, then `verify-tailwipe`, `verify-timeouts`,
+      `verify-tlsname`, `verify-endpoints` — the security gates, unchanged in intent.
+   3. `dotnet run --project bench/tunnel-selftest -- <surface> 127.0.0.1 <port>` for **plain, prestart,
+      twin, mux, mux-classic** against a Garnet (and a real redis-server if one is to hand), then
+      **tls, mux-tls, mux-tls-noprovider** against a TLS Garnet. `prestart`, `twin`, `mux-classic` and
+      the pub/sub half of `mux` have ONLY ever run on Windows. The sibling checkout must be at or after
+      `3ecc6146`, or point the build elsewhere with `-p:SERedisRoot=<path>`.
+   4. `bench/run-mux-ab.sh` — see the RE-BASELINE note below; the recorded numbers are stale.
+
+0c. **THE mux-ab NUMBERS OF RECORD ARE STALE** (flagged in `RESULTS.md` too). The tunnel leg now sets
+   `config.Ssl`, so both legs verify the same name against a pinned certificate; until this branch, ours
+   did strictly less work than the SslStream control. The +22-82% value-size figures and the p999 claims
+   predate that and must be re-taken on the same box before being quoted again.
 
 1. **A CONNECT FAILURE IS INVISIBLE, AND THE CLIENT HANGS.** `DispatchClosed` is gated on the app having
    seen the connection open, and no backend has any other notification, so an outbound dial that FAILS

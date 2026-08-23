@@ -984,6 +984,14 @@ The queued-behind-inflight coalescing evidently had headroom in the proxy shape 
 flush chains queue behind inflight sends exactly like the client's). Tables above this entry that quote
 +177% describe the PRE-FIX build and are superseded by this one.
 
+> ⚠ **RE-BASELINE REQUIRED BEFORE QUOTING ANY NUMBER IN THIS SECTION (added 2026-08-23).** The A/B legs
+> changed shape on branch `tunnel-owns-tls` (PR #2): TLS is now the transport's job end-to-end, so the
+> tunnel leg sets `config.Ssl` and verifies the configured name per dial. Until then ours ran with the
+> host unset while the `SslStream` control leg pinned by thumbprint AND set `SslHost` — i.e. the two legs
+> were not doing the same work, and the difference favoured us. Everything below was measured under the
+> old arrangement. Re-run `bench/run-mux-ab.sh` on the same box before this section is cited again; the
+> shape of the result may well survive, but it has not been checked.
+
 ### SE.REDIS ON SOCKETSET, v1: BOTH PREDICTIONS FALSIFIED — classic ahead in ALL EIGHT CELLS, and the mechanism is already confirmed (2026-08-03)
 
 The first client-seat A/B (`bench/mux-ab` + `bench/run-mux-ab.sh`: one ConnectionMultiplexer, D

@@ -434,6 +434,20 @@ failure belongs to the seam or to the server. A `twin` cell dials two transports
 — the anchor claim, isolated from SE.Redis — because that is the layer the diagnosis had to rule out
 first. Verified against **real `redis-server` 3.0.503** and Garnet, on IOCP, RIO and managed.
 
+### GATE STATUS FOR THE 2026-08-18 AUDIT (F11-F13)
+
+Windows only; **Linux has not compiled this branch**, which is stated here as well as in `TODO.md`
+because a reader who arrives at REVIEW first should not have to go looking.
+
+| gate | result |
+|---|---|
+| `bench/Run-SecurityGates.ps1` (whole suite) | **ALL GATES PASS** — smoke 48/48, AspNet 18/18, TLS floor 12/12, tailwipe, tlsname, timeouts, parking, endpoints (1 INCONCLUSIVE: Linux-only UDS cells), bind-address 6/6, bind-reachability 9/9 |
+| `bench/tunnel-selftest`, all surfaces x IOCP/RIO/Managed | **ALL PASS** against Garnet, against a TLS Garnet, and against real `redis-server` 3.0.503 |
+| the F11 assertion | `batch-end fired` = 10 per 1000-command burst on IOCP/RIO, 2 on managed; **0 before the fix** |
+| the F13 assertion | `mux-pubsub` passes; against the pre-fix tree the SUBSCRIBE times out every run |
+| the F13 staging assertion | `prestart-replayed` — checked BOTH ways: fails with staging disabled, passes with it |
+| the F12 assertion | **NONE. There is no gate cell for it**, and it is Linux-only code that has not run |
+
 ## NOT FIXED: design calls, in priority order
 
 These are not left out because they are small. They are left out because each one has a decision in it
