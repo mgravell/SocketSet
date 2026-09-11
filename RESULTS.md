@@ -24,6 +24,51 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > on server-shaped ones. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation,
 > and the eight things tried that did not change it.
 
+## THE LINUX GATE BATTERY, RE-RUN ON A NEW KERNEL (2026-09-11) — 7.0.11 -> 7.1.5, tree unchanged
+
+**Why this exists: the box moved and nothing said so.** Every Linux figure in this file is stamped
+*Pop!_OS 24.04, kernel 7.0.11*. That kernel was replaced on 2026-08-28 (booted from 2026-09-02), so the
+first Linux session after the 2026-08-10 close was sitting on **7.1.5** with a month-old green matrix
+behind it and no reason showing on screen to doubt it. The tree itself is byte-identical to adc470a --
+**the kernel is the only variable**, which is the cleanest version of this comparison anyone here is
+going to get, and exactly the cross-run confounder house rule 6 exists to catch.
+
+**It matters more than a version bump usually would** because the newest code in the tree is the piece
+most exposed to kernel behaviour: io_uring soft parking (TODO 0a) works by a targeted
+`IORING_OP_ASYNC_CANCEL` against an armed multishot receive, over a per-shard provided-buffer ring.
+Multishot cancel semantics, the `ENOBUFS` re-arm path and the park grace are all kernel properties, not
+ours.
+
+**Result: every Linux gate is green on 7.1.5, with no assertion changing.**
+
+| gate | result |
+|---|---|
+| `run-smoke-matrix.sh` | 60/60 (incl. `iouring/echo-pipe-8m-deep`, parking's sentinel, at the default cap) |
+| `verify-parking` | ALL PASS, all three backends' full parking contract |
+| `verify-endpoints` | ALL PASS, io_uring on the full battery incl. the LAN and UDS cells |
+| `verify-timeouts` | ALL PASS |
+| `verify-tailwipe` | ALL PASS, both halves (wipe on AND the inverted wipe-off half) |
+| `verify-tlsname` | ALL PASS incl. the refusal cells and the ClientHello announce reads |
+| `verify-tls-floor.sh` | 8/8 incl. the refusal cells |
+| `verify-bind-address.sh` | 6/6 incl. the control |
+| `verify-aspnet.sh` | 18/18 |
+
+**The one number that moved, and it turned out not to have moved.** `verify-parking`'s
+`stalled/peer-held` first read **2.94 MiB** on io_uring against the recorded **3.00**. Six samples settle
+it: io_uring holds the sender at **2.63-3.00 MiB** (2.94, 3.00, 2.63, 2.94, 2.94, 3.00), and the 2026-08-10
+figure sits INSIDE that range, at the top of it. **No kernel effect is quotable** (house rule 5: the
+ranges overlap, so there is no delta to state). What the six samples actually bought is a correction to
+our own record rather than a finding about 7.1.5: the 3.00 was a single sample written as though it were
+a constant. epoll and managed returned **exactly 2.56 on 6 of 6 each**, which is the control -- it rules
+out rig noise and localises the variance to the backend whose mechanism predicts it.
+
+**Method note worth keeping, because it nearly went the other way.** The tempting read of a lone 2.94
+against a recorded 3.00 is "the kernel changed the grace", and it would have been written up as a finding
+on one sample each side. The repo has made this mistake before in the other direction -- `echo-pipe-8m-deep`
+was called green off a lucky single pass and stayed "green" through four handovers. **A single sample
+cannot distinguish a shifted quantity from a noisy one**, and the cheap fix is always the same: sample it
+five more times and print the range, with the deterministic backends alongside as the control.
+
 ## io_uring SOFT PARKING: THE GRACE PERIOD, MEASURED (2026-08-10, Linux)
 
 TODO 0a demanded the park's grace be sized, not assumed: "let what is posted drain" is only backpressure
@@ -37,6 +82,15 @@ held it:
 | io_uring (multishot + targeted cancel) | 3.00 MiB |
 | epoll (EPOLL_CTL_MOD) | 2.56 MiB |
 | managed (skip next ReceiveAsync) | 2.56 MiB |
+
+> **REFINED 2026-09-11 — these were ONE SAMPLE EACH, and the io_uring one is a RANGE.** Six samples on
+> kernel 7.1.5 give io_uring **2.63-3.00 MiB** (median 2.94); the 3.00 recorded here is the TOP of that
+> range, not the centre. epoll and managed returned **exactly 2.56 on 6 of 6**, which is the control that
+> makes this a property of the backend rather than of the rig: the one-shot backends' park is
+> deterministic, io_uring's is not, because its grace IS the racy quantity (in-flight multishot
+> completions plus cancel latency). Nothing here changes the conclusion — the overshoot is still bounded
+> and still ~0.1-0.45 MiB over the one-shot backends — but the single number should not be quoted as
+> though it were stable. See the kernel-7.1.5 section above for why it was re-measured.
 
 Same rig, same session, single connection. The ~0.44 MiB delta is the multishot's extra drain (in-flight
 completions plus cancel latency) and is the bounded overshoot the item predicted. Behaviour proof, not a
@@ -2569,6 +2623,11 @@ it and zero-copy is that `WriteAll` accumulation. `SocketAsyncEventArgs` takes a
 SAEA handles that. That is the same mechanism Kestrel's own transport uses. Untested and unbuilt.
 
 ### Headline numbers, Linux (bare metal, Ryzen 9 7900X, Pop!_OS 24.04, kernel 7.0.11)
+
+> **The box is on kernel 7.1.5 since 2026-08-28.** These numbers were measured on 7.0.11 and the
+> stamp stays accurate as a record; the gates were re-run unchanged on 7.1.5 (2026-09-11 section at
+> the top), but **no THROUGHPUT figure below has been re-measured on the new kernel** -- treat any
+> comparison against a fresh number as cross-kernel, per house rule 6.
 
 **Small messages** - `bench/run-matrix.sh`, `-c 128`, 2-byte responses, median rps, 3 scored passes:
 

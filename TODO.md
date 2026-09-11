@@ -4,7 +4,60 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
-## SESSION CLOSE 2026-08-10 — READ THIS FIRST; the 2026-08-08 section below is now HISTORY
+## STATE REFRESH 2026-09-11 (Linux) — READ THIS FIRST; no code changed, but THE KERNEL DID
+
+A month passed with no commits. This session re-established trust in the tree rather than adding to it,
+and found one thing worth knowing before anybody measures anything.
+
+**THE KERNEL MOVED UNDER THE RESULTS: 7.0.11 -> 7.1.5** (installed 2026-08-28, booted from 2026-09-02).
+Every Linux number in `RESULTS.md` is stamped *kernel 7.0.11*, and nothing on screen says otherwise when
+you sit down. The tree is byte-identical to adc470a, so **the kernel was the only variable** -- and the
+exposure is real rather than theoretical, because the newest code here (io_uring soft parking, TODO 0a)
+is built on a targeted `IORING_OP_ASYNC_CANCEL` against an armed multishot over a per-shard
+provided-buffer ring. Cancel semantics, the `ENOBUFS` re-arm and the park grace are all KERNEL
+properties.
+
+**Every Linux gate is green on 7.1.5, no assertion changed:** smoke 60/60 (incl. `echo-pipe-8m-deep` at
+the default cap, parking's sentinel), verify-parking ALL PASS, verify-endpoints ALL PASS with io_uring on
+the full battery, verify-timeouts, verify-tailwipe (both halves), verify-tlsname (incl. refusals and the
+ClientHello reads), verify-tls-floor 8/8, verify-bind-address 6/6, verify-aspnet 18/18. Table and method
+in `RESULTS.md` under the 2026-09-11 heading.
+
+**One number looked like it moved and did not, and the correction is to OUR record.** io_uring's park
+grace first read 2.94 MiB against the recorded 3.00. Six samples: **2.63-3.00 MiB**, with 3.00 sitting
+inside the range at the top of it -- so no kernel effect is quotable (house rule 5). What it exposes is
+that the 2026-08-10 figure was ONE SAMPLE written as a constant; epoll and managed return exactly 2.56 on
+6 of 6, which is the control that localises the variance to io_uring's mechanism rather than to the rig.
+**A single sample cannot tell a shifted quantity from a noisy one** -- the same shape as the
+`echo-pipe-8m-deep` lucky-pass that survived four handovers, just caught earlier this time.
+
+### Recommended queue, Linux, in order
+
+1. **Break the `-P 1` generator ceiling on `run-proxy-ab.sh`.** This is the blocking measurement debt on
+   the paid direction, and it blocks a RESULT rather than tidying one. At `-P 1` we and Envoy are both
+   pegged at 90% of a CLIENT-limited ceiling (451,613 vs 451,584 ops/s, i.e. the same number twice), so
+   "parity with Envoy" is the strongest claim that generator supports and the gap is a **floor, not an
+   estimate**. Two consequences, both bad for further work: no upper bound on Envoy is quotable from that
+   column, and any L3 improvement would "improve" into a ceiling we cannot see past, with no way to tell
+   whether we closed a gap or just hit the generator. The `-P 16` half is clean (Envoy at 23% of ceiling,
+   genuinely proxy-limited, we are 2.7x it), so this is specifically the UNPIPELINED half.
+2. **The TLS upstream A/B against Envoy's BoringSSL.** Our in-transport OpenSSL upstream TLS vs Envoy's
+   userspace BoringSSL -- both userspace, so loopback is fair, no new hardware, and genuinely unknown (we
+   beat `SslStream` broadly at +13-35%; vs BoringSSL nobody has measured). Groundwork for the
+   TLS-originating-proxy claim. **Pre-registration already stands and must be honoured:** on THIS box
+   expect kTLS to LOSE to our own userspace TLS (the record path costs ~9-20% here and loopback
+   structurally cannot show `TlsTxDevice`), so a losing kTLS leg is the KNOWN REGIME, not a finding.
+3. Lower priority, noted not recommended: the proxy branch `marc/proxy-socketset` is **46 commits behind**
+   SE.Redis `main` (which moved as recently as 2026-09-10) and 28 ahead -- debt that only grows, worth
+   paying when it blocks rather than pre-emptively. And `Verify-BindReachability.ps1` still has **no Linux
+   equivalent**, the one gate that exists on Windows only.
+
+**Standing note, unchanged:** the F10 `PipeIoBridge` fix is SHARED code that still has not run on Windows.
+The warning at the end of the 2026-08-10 block is still live.
+
+---
+
+## SESSION CLOSE 2026-08-10 — superseded by the section above; still the last block in which CODE changed
 
 The Linux catch-up session the 2026-08-08 handover demanded, plus TODO 0c, plus — later the same day —
 TODO 0a and the resp-benchmark re-pin. Eleven commits, ALL PUSHED (through d791a2f). **Every Linux gate
