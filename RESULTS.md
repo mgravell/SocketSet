@@ -24,6 +24,82 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > on server-shaped ones. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation,
 > and the eight things tried that did not change it.
 
+## THE `-P 1` CLIENT CEILING: THE RIG WAS UNDER-THREADED BY TWO CPUs (2026-09-11, Linux)
+
+The `-P 1` column of the proxy A/B could not separate us from Envoy: both legs sat at 90% of a
+client-limited ceiling (451,613 vs 451,584 ops/s -- the same number twice), so "parity" was a FLOOR and
+no upper bound on Envoy was quotable from it. This is the diagnosis of that ceiling. Pre-registered in
+`bench/prereg-client-ceiling-2026-09-11.md`; instrument is `bench/probe-client-ceiling.sh`, which
+measures the GENERATOR using `direct` (redis-benchmark straight to garnet-server, no proxy) and never
+touches a proxy at all.
+
+**Governor caveat, and it is load-bearing here: `powersave`/`balance_performance`** (setting
+`performance` needs root, which that session did not have). The 2026-08-02 proxy table was measured under
+`performance`. **Nothing in this section may be compared against that table** -- every leg here is
+compared only against the other legs in its own run. Kernel is 7.1.5, not the 7.0.11 those figures used.
+
+### Six passes, `-t get -P 1 -d 32`, client = the rig's own third (4 physical cores, 8 logical CPUs)
+
+| leg | procs x conns | `--threads` | summed ops/s, median (min-max) | client cores busy |
+|---|---|---:|---:|---:|
+| `1x64` **(CONTROL: the status quo)** | 1 x 64 | 6 | 470,478 (457,038-470,478) | **5.97 / 8** |
+| `1x64-t8` | 1 x 64 | 8 | 571,347 (551,496-571,347) | 7.95 / 8 |
+| `2x32` | 2 x 32 | 4 | 571,346 (571,306-571,346) | 7.93 / 8 |
+| `4x16` | 4 x 16 | 2 | 571,327 (571,306-575,700) | 7.86 / 8 |
+| `4x64` | 4 x 64 | 6 | 571,480 (565,893-576,115) | 7.96 / 8 |
+
+**THE CAUSE IS EMBARRASSING AND ENTIRELY OURS: `run-proxy-ab.sh` hard-coded `--threads 6` while the
+client third has EIGHT logical CPUs.** The control leg used 5.97 of its 8 cores and left two idle; every
+other leg uses 7.86-7.97. The generator was never at its ceiling -- it was at six-eighths of it, and the
+`-P 1` "parity with Envoy" result was produced partly by a rig that declined to use the CPUs it had been
+given. Fixed 2026-09-11: `--threads` now defaults to the client third's own logical CPU count, is
+overridable as `BENCH_THREADS`, and is **printed in the banner** so a future split change cannot silently
+reintroduce this.
+
+**BOTH PRE-REGISTERED PREDICTIONS WERE FALSIFIED, and the falsification is the finding.**
+
+- **P14 (the ceiling is per-PROCESS) -- FALSIFIED.** Adding processes does beat the control, but it does
+  not beat `1x64-t8` by anything: `1x64-t8`, `2x32`, `4x16` and `4x64` all land within **0.03%** of each
+  other at ~571,3xx, across 1, 2 and 4 processes and across 64 and 256 total connections. The
+  `Run-GarnetAb.ps1` precedent ("one process cannot saturate the server") did not transfer -- there the
+  generator was a different tool with a different threading model.
+- **P15 (`--threads` alone will not fix it) -- FALSIFIED**, and this is the useful half: `--threads 8`
+  ALONE recovers the entire +21.4%. The leg existed precisely because a failed prediction here meant a
+  one-word fix, which is what happened.
+
+### Is it the client or the backend? Lend the client the idle proxy cores (`CORES=8:0:4`)
+
+The `direct` leg leaves the proxy third idle, so it can be handed to the client without disturbing the
+backend's budget. Server third unchanged at 4 physical cores throughout.
+
+| leg | `--threads` | summed ops/s, median (min-max) | client cores busy (of 16) | vs control |
+|---|---:|---:|---:|---|
+| `1x64-t8` **(control)** | 8 | 639,898 (615,290-640,000) | 7.94 | (control) |
+| `4x64-t4` | 4 each | 703,388 (695,502-727,140) | 10.62 | DISJOINT AHEAD +9.9% |
+| `1x64-t16` | 16 | **727,008 (695,531-727,140)** | 11.52 | DISJOINT AHEAD +13.6% |
+
+**So the ~571k IS a client-core limit, not the backend.** Doubling the client's physical cores takes
+`direct` from 571,347 to 727,008, disjoint. The backend was not the binding constraint at 571k, which is
+what P16 asked and what makes the `--threads` fix worth having rather than merely moving the bottleneck.
+
+### The instrument I pre-registered for P16 does not work, and that is worth more than the prediction
+
+P16 was to be judged on garnet-server's CPU. It cannot be: **the server column reads 7.63 of 8 cores at
+470,478 ops/s and 7.63 of 8 at 571,347** -- identical CPU for 21% more work. That is the signature of a
+**spin-waiting server**, and it means garnet-server's CPU is not a saturation signal at any load on this
+rig. The question had to be answered structurally instead, by moving cores and watching the rate. Same
+shape as `measure-parking`'s rule 9b (its CPU column reports itself unusable under a rate limit):
+**before pre-registering a CPU column as evidence, check that the process under it is not spinning.**
+
+### What this does and does not buy
+
+It raises the CEILING by 21.4% inside the existing three-way split, for free, with no change to what is
+under test. It does **not** yet separate the two proxies at `-P 1`, and nothing here should be read as
+predicting that it will -- the proxy legs may have been client-capped too and may simply rise with it.
+That is what the scored re-run answers, and it has two hard prerequisites: **governor set to
+`performance`** (root), and the proxy built from `StackExchange.Redis` branch `marc/proxy-socketset`
+(the sibling checkout currently sits on `main`, and the binary on disk dates from 2026-08-03).
+
 ## THE LINUX GATE BATTERY, RE-RUN ON A NEW KERNEL (2026-09-11) — 7.0.11 -> 7.1.5, tree unchanged
 
 **Why this exists: the box moved and nothing said so.** Every Linux figure in this file is stamped

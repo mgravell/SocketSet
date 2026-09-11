@@ -86,6 +86,16 @@ read -r CLIENT_CPUS PROXY_CPUS SERVER_CPUS <<<"$(lscpu -p=CPU,CORE | grep -v '^#
     print s[1], s[2], s[3]
   }')"
 [[ -n "$SERVER_CPUS" ]] || { echo "CPU split failed"; exit 1; }
+CLIENT_NCPU=$(tr ',' '\n' <<<"$CLIENT_CPUS" | grep -c .)
+
+# redis-benchmark --threads. THIS WAS HARD-CODED AT 6 UNTIL 2026-09-11 AND IT COST 21% OF THE CEILING.
+# The client third is 4 physical cores = 8 LOGICAL CPUs on this host, so `--threads 6` left two of them
+# idle: bench/probe-client-ceiling.sh measured the control leg at 5.97 of 8 cores busy against 7.95 for
+# the same leg at --threads 8, and the summed rate went 470,478 -> 571,347 (+21.4%, disjoint over six
+# passes). That mattered because at -P 1 BOTH proxy legs sat at 90% of the client ceiling and could not
+# be separated -- "parity with Envoy" was a floor produced partly by an under-threaded generator.
+# Defaulting to the client's own logical CPU count is what keeps this honest when the split changes.
+BENCH_THREADS=${BENCH_THREADS:-$CLIENT_NCPU}
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 OUT="$REPO/bench/results/proxy-ab-$STAMP"
@@ -98,7 +108,7 @@ echo "  governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/
 echo "  client=$CLIENT_CPUS"
 echo "  proxy =$PROXY_CPUS"
 echo "  server=$SERVER_CPUS"
-echo "  -c $CLIENTS -n $REQUESTS -d $DATASIZE -t $TESTS shards=$SHARDS"
+echo "  -c $CLIENTS -n $REQUESTS -d $DATASIZE -t $TESTS shards=$SHARDS --threads $BENCH_THREADS (client has $CLIENT_NCPU logical CPUs)"
 echo "  -> $OUT"
 echo
 
@@ -219,7 +229,7 @@ measure() { # $1=leg $2=depth $3=rep
   local target=(-h 127.0.0.1 -p "$port")
   [[ -n "$sockarg" ]] && target=(-s "$sockarg")
   csv=$(taskset -c "$CLIENT_CPUS" "$BENCH" "${target[@]}" -c "$CLIENTS" -n "$nreq" \
-        -d "$DATASIZE" -t "$TESTS" -P "$depth" --threads 6 --csv 2>/dev/null)
+        -d "$DATASIZE" -t "$TESTS" -P "$depth" --threads "$BENCH_THREADS" --csv 2>/dev/null)
   # A COMPLETELY failed measurement produces empty output, and a loop over empty input writes NOTHING --
   # the leg simply vanishes from the summary, which reads as "not run" rather than "failed". Write the
   # failure down. (Found via the @abstract leg silently disappearing under a stock benchmark binary.)

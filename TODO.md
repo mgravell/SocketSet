@@ -33,14 +33,41 @@ that the 2026-08-10 figure was ONE SAMPLE written as a constant; epoll and manag
 
 ### Recommended queue, Linux, in order
 
-1. **Break the `-P 1` generator ceiling on `run-proxy-ab.sh`.** This is the blocking measurement debt on
-   the paid direction, and it blocks a RESULT rather than tidying one. At `-P 1` we and Envoy are both
-   pegged at 90% of a CLIENT-limited ceiling (451,613 vs 451,584 ops/s, i.e. the same number twice), so
-   "parity with Envoy" is the strongest claim that generator supports and the gap is a **floor, not an
-   estimate**. Two consequences, both bad for further work: no upper bound on Envoy is quotable from that
-   column, and any L3 improvement would "improve" into a ceiling we cannot see past, with no way to tell
-   whether we closed a gap or just hit the generator. The `-P 16` half is clean (Envoy at 23% of ceiling,
-   genuinely proxy-limited, we are 2.7x it), so this is specifically the UNPIPELINED half.
+1. **Break the `-P 1` generator ceiling on `run-proxy-ab.sh`** — **DIAGNOSED AND HALF-DONE 2026-09-11;
+   the scored re-run is what remains, and it is BLOCKED ON TWO PREREQUISITES (below).**
+
+   **The cause was ours and it was trivial: the rig hard-coded `--threads 6` while the client third has
+   EIGHT logical CPUs.** The control leg used 5.97 of its 8 cores and left two idle. `--threads 8` alone
+   is worth **+21.4%** (470,478 -> 571,347 summed ops/s, disjoint over six passes), and that is the whole
+   gain: 1, 2 and 4 processes at 64 and 256 total connections all land within **0.03%** of each other at
+   ~571,3xx. Fixed, defaulted to the client third's own logical CPU count, overridable as
+   `BENCH_THREADS`, and **printed in the banner** so a later split change cannot silently undo it.
+   Instrument: `bench/probe-client-ceiling.sh`; pre-registration:
+   `bench/prereg-client-ceiling-2026-09-11.md`; tables in `RESULTS.md`.
+
+   **Both pre-registered predictions were falsified** (per-process ceiling: no; `--threads` alone will not
+   fix it: it did, entirely). And the instrument pre-registered for the third prediction turned out to be
+   junk: **garnet-server's CPU reads 7.63/8 cores at 470k AND at 571k**, i.e. identical CPU for 21% more
+   work, because it SPINS. The client-vs-backend question had to be answered structurally instead, by
+   lending the client the idle proxy cores: `direct` goes 571,347 -> **727,008** (disjoint), so the
+   ceiling is genuinely the CLIENT's cores and not the backend.
+
+   **It is NOT yet known whether this separates us from Envoy at `-P 1`, and it must not be assumed** —
+   the proxy legs may have been client-capped too and may simply rise with the ceiling. That is exactly
+   what the scored re-run answers.
+
+   **PREREQUISITES for the scored re-run, both outstanding:**
+   - **Governor must be `performance`.** The box reboots to `powersave`/`balance_performance` and setting
+     it needs root. Every 2026-09-11 number was taken under `powersave` and is therefore comparable only
+     within its own run, never against the 2026-08-02 proxy table. One command:
+     `sudo bash -c 'for c in /sys/devices/system/cpu/cpu*/cpufreq; do echo performance > $c/scaling_governor; echo performance > $c/energy_performance_preference; done'`
+   - **The proxy must be built from `marc/proxy-socketset`.** The sibling `StackExchange.Redis` checkout
+     is currently on `main`, and the binary at
+     `toys/RESPite.Proxy/bin/Release/net10.0/RESPite.Proxy` dates from 2026-08-03. That branch is also 46
+     commits behind `main` and 28 ahead.
+
+   The `-P 16` half was always clean (Envoy at 23% of ceiling, genuinely proxy-limited, we are 2.7x it),
+   so all of this is specifically the UNPIPELINED half.
 2. **The TLS upstream A/B against Envoy's BoringSSL.** Our in-transport OpenSSL upstream TLS vs Envoy's
    userspace BoringSSL -- both userspace, so loopback is fair, no new hardware, and genuinely unknown (we
    beat `SslStream` broadly at +13-35%; vs BoringSSL nobody has measured). Groundwork for the
