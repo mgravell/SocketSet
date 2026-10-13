@@ -4,6 +4,60 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## 2026-10-13 — tls-session: the in-box .NET 11 TLS engine as a third provider (Linux bring-up)
+
+**What landed** (branch `tls-session-provider`): `Tls/Session/TlsSessionProvider` + `TlsSessionFilter`
+over `System.Net.Security.TlsBufferSession` (.NET 11, experimental SYSLIB5007) — real TLS with no native
+interop of ours and no `SslStream`; the runtime PAL does the crypto, the push loop keeps the bytes. The
+interest is the MANAGED backend (the one backend meant to run where nothing platform-specific does) and
+an A/B reference against the two hand-rolled engines. Enable switch: SmokeTest `--tls-session`, same
+self-signed-loopback shape and TLS 1.3 floor as `--tls-ssl`/`--tls-schannel`, same `--tls-min12` opt-out;
+the banner proves the engine (`tls=tls-session`). net11.0 TFM on the library + SmokeTest ONLY;
+`global.json` now takes the 11.0.100-rc.1 SDK (prerelease allowed) — everything else still targets
+net10/net472 and the new files compile out there.
+
+**Engine semantics that drove the filter** (from the RC1 source, verified empirically):
+- The session does NOT buffer partial input (split record ⇒ `NeedMoreData`, `bytesConsumed=0`,
+  re-present) — hence a carry buffer, same as SChannel's SSPI.
+- Overflow output is stashed internally (`HasPendingOutput`) and input is IGNORED while any is owed —
+  hence drain-before-feed at every loop head.
+- `Write` encrypts at most one record per call; loop.
+- Certificate validation is EXTERNAL (`NeedsCertificateValidation` → we answer) — and the engine pauses
+  on the SERVER too, with no client certificate requested or presented (observed on the Linux PAL; the
+  filter accepts the absence there). Policy is the provider's `ValidateRemote`, verbatim the SChannel
+  provider's (one policy, three engines), enforced FAIL-CLOSED: a client handshake completing without
+  the pause gets validated post-hoc before `HandshakeComplete` is observable.
+
+**Verified (Linux, net11 RC1):** verify/echo cells on managed, epoll AND io_uring (the provider is
+backend-agnostic); poke; churn 10s at ~3.6k conn/s (so the per-connection client `TlsContext` survives
+churn); `--tls-min12` positive path; refusal cells in a scratch pump — wrong-host REFUSED
+("certificate is not valid for host"), untrusted chain REFUSED ("self-signed certificate"), AnyHost and
+`verifyServer:false` opt-outs genuinely opt out, control accepts. Whole solution builds on the RC SDK;
+net10 managed smoke cells re-run as the SDK-bump control.
+
+**Knowingly NOT supported, loudly:** kTLS (the session API has no offload seam; `SupportsKernelOffload`
+stays false), TLS 1.2 renegotiation / post-handshake client auth (the filter FAULTS on the statuses
+rather than guessing), client-side cross-connection session resumption (the client `TlsContext` is
+per-connection because TargetHost rides in it; the SERVER context is shared, which is the half the
+server-heavy rigs care about).
+
+**Still open, in rough order:**
+1. **Perf A/B vs openssl/schannel — no numbers exist yet and none are quoted on purpose** (house rules:
+   six scored passes, ranges, a control in-session). The rig is ready: same cell, `--tls-session` vs
+   `--tls-ssl`, banner-gated.
+2. The smoke matrix builds `-f net10.0`, so NO standing gate covers this provider — a net11 matrix
+   column (or a separate `run-smoke-matrix11.sh` leg) is needed before it can be trusted to stay green.
+3. verify-tlsname / verify-tls-floor refusal batteries not run against this provider (the scratch pump
+   covered the name/chain refusals, but not the on-the-wire SNI-announce assertions nor the
+   below-floor-must-be-REFUSED cell — the floor was only tested in the accepting direction).
+4. Cross-ENGINE interop (tls-session client ↔ openssl server and the reverse) — self-tests pair the
+   provider with itself.
+5. Windows is UNVERIFIED: the SChannel-PAL persisted-key round-trip in `CreateSelfSignedLoopback` is
+   written to match the SChannel provider's but has not run; `--tls-session` vs `--tls-schannel` on
+   Windows is the most interesting A/B of all (same OS engine, two wrappings).
+
+---
+
 ## STATE REFRESH 2026-09-11 (Linux) — READ THIS FIRST; no code changed, but THE KERNEL DID
 
 A month passed with no commits. This session re-established trust in the tree rather than adding to it,

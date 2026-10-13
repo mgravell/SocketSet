@@ -1,6 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
+        <!--
+          net11.0 on top of the repo-wide default (Directory.Build.props), library + SmokeTest only: it
+          exists to light up the in-box TLS engine (System.Net.Security.TlsBufferSession, .NET 11,
+          experimental SYSLIB5007) as a third TlsProvider for A/B against OpenSSL/SChannel — see
+          Tls/Session/. The bridges (Garnet, AspNetCore) gain nothing from it and stay on the defaults.
+        -->
+        <TargetFrameworks>net11.0;net10.0;net472</TargetFrameworks>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <ServerGarbageCollection>true</ServerGarbageCollection>
         <InvariantGlobalization>true</InvariantGlobalization>

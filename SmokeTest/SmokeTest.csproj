@@ -2,6 +2,8 @@
 
     <PropertyGroup>
         <OutputType>Exe</OutputType>
+        <!-- net11.0 so the "tls-session" flag (the in-box TlsBufferSession provider) is runnable; see the library csproj. -->
+        <TargetFrameworks>net11.0;net10.0;net472</TargetFrameworks>
     </PropertyGroup>
 
     <!-- Only NetFxShims.cs needs it, to reach the pointer-based BCL overloads .NET Framework does have. -->

@@ -158,6 +158,18 @@ for (int i = 0; i < args.Length; i++)
                 minProtocol: args.Contains("--tls-min12") ? SocketSets.Tls.TlsProtocol.Tls12 : SocketSets.Tls.TlsProtocol.Tls13);
             options.TlsClient.TargetHost = "localhost";
             break;
+
+#if NET11_0_OR_GREATER
+        case "--tls-session":
+            // Real TLS via the in-box .NET 11 engine (TlsBufferSession, experimental SYSLIB5007) — the
+            // ENABLE SWITCH for A/B'ing it against --tls-ssl / --tls-schannel: same self-signed loopback
+            // shape, same TLS 1.3 floor, same --tls-min12 opt-out, cross-platform, and the banner proves
+            // which engine ran (tls=tls-session vs tls=openssl / tls=schannel). net11.0 builds only.
+            options.Tls = SocketSets.Tls.Session.TlsSessionProvider.CreateSelfSignedLoopback("localhost",
+                minProtocol: args.Contains("--tls-min12") ? SocketSets.Tls.TlsProtocol.Tls12 : SocketSets.Tls.TlsProtocol.Tls13);
+            options.TlsClient.TargetHost = "localhost";
+            break;
+#endif
 #endif
 
         case "--rio":
