@@ -4,6 +4,29 @@ Engineering backlog — design calls and deferred work. Not user-facing (see `RE
 
 ---
 
+## 2026-10-16 — THE TLS ENGINE VERDICT (Linux), recorded so nobody re-litigates it from the numbers alone
+
+Both scored A/Bs are in RESULTS.md ("TLS ENGINE A/B" + "THE SSLSTREAM LEG"); this is the design call
+they support, agreed with Marc on 2026-10-16:
+
+- **openssl stays the production choice on Linux.** It beat tls-session by ~11% (median, ranges
+  disjoint) in BOTH regimes — small-record and bulk — and it is the only engine with a kTLS seam.
+- **tls-session is kept as the portable in-box alternative, not retired.** The ~11% is an acceptable
+  toll where "no native interop of ours" matters (the managed backend's reason to exist), and the number
+  has an EXPIRY DATE: the engine is `[Experimental]` RC1, and an unknown share of the deficit is our
+  wrapper rather than the PAL (same OpenSSL underneath — separating that needs a counter, not the rig).
+  **Re-score at .NET 11 GA, and on Windows vs schannel (same OS engine, two wrappings), before letting
+  this verdict harden.** The rig is one command: `bench/run-tls-engine-ab.sh`.
+- **Hosting SslStream in the push loop is measured and OFF THE TABLE.** The `sslstream` reference leg
+  (kept in-tree for re-measurement, never for production) trails tls-session by +178% at 4KB records —
+  per-wake pool hops plus block-until-quiescent, which serializes a shard's connections — and +34% at
+  256KB bulk. The gap is the reshape, not the cipher, and it lands exactly on the server-shaped
+  workload. This also quantifies the original SE.Redis-side question ("is a span engine worth leaving
+  SslStream for"): in a sync push loop, ~2.8x on record-sized traffic; in an already-async stack,
+  Kestrel's ~8% (dotnet/aspnetcore#69565) is the better prior.
+
+---
+
 ## 2026-10-13 — tls-session: the in-box .NET 11 TLS engine as a third provider (Linux bring-up)
 
 **What landed** (branch `tls-session-provider`): `Tls/Session/TlsSessionProvider` + `TlsSessionFilter`
