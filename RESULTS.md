@@ -64,6 +64,43 @@ Caveats: single box, loopback, one process for both ends; TLS 1.3, AES-GCM, self
 the managed backend only (the provider's target). No kTLS leg — the session API has no offload seam, which
 is the standing structural difference, not an 11% one.
 
+### THE SSLSTREAM LEG (same day, second scored run) — what hosting the ecosystem's TLS shape here costs
+
+A fourth engine, `sslstream` (`Tls/SslStreamBridge/`, SmokeTest `--tls-sslstream`): `SslStream`
+bridged into the push loop — a MEASUREMENT REFERENCE, not a production option. The bridge charges
+SslStream's model where it falls: one staging copy each way, thread-pool hops for handshake/read
+progress, and the loop thread BLOCKING until the stream machinery goes quiescent on every inbound wake
+(so with one shard, other connections stall behind that wait — the threading-model cost, made visible).
+Same rig, same session as a fresh four-leg run; the first run's two-engine deltas reproduced (+10.4% /
++12.1% vs the first run's +10.7% / +11.5% — cross-run agreement, not used as evidence, noted as comfort).
+
+Six scored passes, MiB/s, median (min-max):
+
+| leg | 4k-w64 | 256k-w4 |
+|---|---:|---:|
+| plain (control) | 3,271 (3,198-3,326) | 19,447 (19,072-19,641) |
+| openssl | 2,343 (2,326-2,406) | 8,543 (8,393-8,636) |
+| tls-session | 2,122 (2,097-2,138) | 7,623 (7,580-7,685) |
+| sslstream | 763 (748-772) | 5,679 (5,545-5,713) |
+
+**The pre-registered ordering (openssl > tls-session > sslstream) held in both regimes, all ranges
+disjoint.** The shape of the loss is the finding: sslstream trails tls-session by **+178% at 4KB
+records** (per-wake costs dominate: pool dispatch + block-until-quiescent per receive, serializing the
+shard) but only **+34% at 256KB bulk** (the copies dominate; the crypto is the same OpenSSL). So the
+in-loop span engines are not marginally better than hosting SslStream — they are categorically better
+exactly where a server transport lives (many small records per connection, many connections per shard),
+and the gap is the REshape, not the cipher. This is the measured answer to "why not just wrap
+SslStream": at the workload that matters it costs ~2.8x, and the cost grows with connections per shard
+because the bridge blocks the loop. Correctness first: all SmokeTest cells (verify/echo/pipe/poke/churn)
+PASS for sslstream on managed net11; the refusal battery passes for BOTH managed-engine providers with
+named reasons; and two cross-engine interop cells (sslstream client ↔ tls-session server, both
+directions, one shared certificate) PASS.
+
+Kestrel's union A/B (dotnet/aspnetcore#69565, buffer-session ~8% above SslStream) is NOT comparable in
+magnitude: Kestrel's pipeline is async end-to-end, so it never pays the block-until-quiescent — our
+bridge charges the cost of a sync push loop hosting an async pull stream, which is the integration this
+repo would actually have to ship. The prior art set the ordering; this measures OUR cost.
+
 ## THE `-P 1` CLIENT CEILING: THE RIG WAS UNDER-THREADED BY TWO CPUs (2026-09-11, Linux)
 
 The `-P 1` column of the proxy A/B could not separate us from Envoy: both legs sat at 90% of a

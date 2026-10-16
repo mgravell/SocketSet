@@ -19,8 +19,14 @@
 #    drain-before-feed check per wake, and the engine encrypts one record per Write call; OpenSSL pays
 #    BIO copies but is the tuned incumbent. Falsified if tls-session's six-pass range sits wholly ABOVE
 #    openssl's in either regime.
-#  * Falsifies the RIG: plain not beating both TLS legs; any banner mismatch; any pass where the two
-#    TLS legs and plain all agree within noise (uniformity across cells that should differ).
+#    [OUTCOME, first scored run: held — openssl +10.7% / +11.5%, disjoint. See RESULTS.md.]
+#  * Prediction for the sslstream leg (pre-registered 2026-10-16 before its first scored run): the full
+#    ordering is openssl > tls-session > sslstream in both regimes — the bridge charges a staging copy
+#    each way, pool hops, and a block-until-quiescent on every inbound wake; prior art is Kestrel's union
+#    A/B (dotnet/aspnetcore#69565, buffer-session ~8% above SslStream). Falsified if sslstream's range
+#    sits wholly ABOVE tls-session's in either regime.
+#  * Falsifies the RIG: plain not beating every TLS leg; any banner mismatch; any pass where TLS legs
+#    and plain all agree within noise (uniformity across cells that should differ).
 #
 # TWO REGIMES, because the engines can rank differently in each:
 #  * 4k-w64  — record-sized messages, deep window: per-record loop/filter overhead dominates, the
@@ -57,6 +63,7 @@ LEGS=(
   "plain||tls=off"
   "openssl|--tls-ssl|tls=openssl \(Both"
   "tls-session|--tls-session|tls=tls-session \(Both"
+  "sslstream|--tls-sslstream|tls=sslstream \(Both"
 )
 WORKLOADS=(
   "4k-w64|-z 4096 --window 64"
@@ -82,7 +89,7 @@ run_leg() { # leg_name extra_args banner_re workload_name workload_args pass sco
     # Banner gates: the managed backend AND the expected tls= (or its absence) must be SAID by the process.
     grep -Eq 'set: EchoServer \[managed\]' "$log" || { echo "${c_red}  $wname/$name: backend banner missing/wrong${c_off}"; cat "$log"; exit 3; }
     grep -Eq "$banner_re" "$log" || { echo "${c_red}  $wname/$name: tls banner mismatch (wanted /$banner_re/)${c_off}"; cat "$log"; exit 3; }
-    if [[ "$name" == "plain" ]] && grep -Eq 'tls=(openssl|tls-session|schannel)' "$log"; then
+    if [[ "$name" == "plain" ]] && grep -Eq 'tls=(openssl|tls-session|sslstream|schannel)' "$log"; then
         echo "${c_red}  $wname/plain: control unexpectedly ran TLS${c_off}"; cat "$log"; exit 3; fi
     local done_line bytes secs mibps
     done_line=$(grep -E 'done: [0-9,]+ round-trip bytes' "$log") || { echo "${c_red}  $wname/$name: no done line${c_off}"; cat "$log"; exit 3; }
@@ -103,7 +110,7 @@ for w in "${WORKLOADS[@]}"; do
         while read -r idx; do
             IFS='|' read -r name extra banner_re <<<"${LEGS[$idx]}"
             run_leg "$name" "$extra" "$banner_re" "$wname" "$wargs" "$pass" "$scored"
-        done < <(shuf -e 0 1 2)
+        done < <(shuf -e 0 1 2 3)
     done
 done
 
@@ -111,35 +118,39 @@ echo
 echo "${c_cyan}=== scored ranges (passes 2..$REPS; MiB/s) ===${c_off}"
 awk -F, -v red="$c_red" -v green="$c_green" -v off="$c_off" '
 NR>1 && $4==1 { k=$2 "/" $1; n[k]++; v[k]=v[k] " " $5 }
+function verdict(w, a, b,   ka, kb) {
+    ka = w "/" a; kb = w "/" b
+    if (!(ka in lo) || !(kb in lo)) return
+    if (lo[ka] > hi[kb])
+        printf "  verdict: %s ABOVE %s, ranges DISJOINT (med %+.1f%%)\n", a, b, (medv[ka]/medv[kb]-1)*100
+    else if (lo[kb] > hi[ka])
+        printf "  verdict: %s ABOVE %s, ranges DISJOINT (med %+.1f%%) - check the pre-registered ordering\n", b, a, (medv[kb]/medv[ka]-1)*100
+    else
+        printf "  verdict: %s vs %s ranges OVERLAP - indistinguishable on this rig; quote NO delta\n", a, b
+}
 END {
-    split("4k-w64 256k-w4", ws, " "); split("plain openssl tls-session", ls, " ")
+    split("4k-w64 256k-w4", ws, " "); split("plain openssl tls-session sslstream", ls, " ")
     for (wi=1; wi<=2; wi++) {
         w=ws[wi]; if (!((w "/plain") in v) && !((w "/openssl") in v)) continue
         printf "%s:\n", w
-        for (li=1; li<=3; li++) {
+        for (li=1; li<=4; li++) {
             k=w "/" ls[li]; if (!(k in v)) continue
-            m=split(substr(v[k],2), a, " "); asort_min=a[1]; asort_max=a[1]; sum=0
-            # manual min/median/max (gawk asort not assumed)
-            for (i=1;i<=m;i++){ if (a[i]+0<asort_min+0) asort_min=a[i]; if (a[i]+0>asort_max+0) asort_max=a[i] }
-            # median: sort copy
+            m=split(substr(v[k],2), a, " "); mn=a[1]; mx=a[1]
+            for (i=1;i<=m;i++){ if (a[i]+0<mn+0) mn=a[i]; if (a[i]+0>mx+0) mx=a[i] }
             for (i=1;i<m;i++) for (j=i+1;j<=m;j++) if (a[j]+0<a[i]+0){t=a[i];a[i]=a[j];a[j]=t}
             med = (m%2) ? a[(m+1)/2] : (a[m/2]+a[m/2+1])/2
-            printf "  %-12s n=%d  min=%8.1f  med=%8.1f  max=%8.1f  passes:%s\n", ls[li], m, asort_min, med, asort_max, v[k]
-            lo[w "/" ls[li]]=asort_min+0; hi[w "/" ls[li]]=asort_max+0; medv[w "/" ls[li]]=med+0
+            printf "  %-12s n=%d  min=%8.1f  med=%8.1f  max=%8.1f  passes:%s\n", ls[li], m, mn, med, mx, v[k]
+            lo[k]=mn+0; hi[k]=mx+0; medv[k]=med+0
         }
-        # control first: plain must beat both TLS legs outright
+        # control first: plain must beat every TLS leg outright
         if ((w"/plain") in lo) {
-            ok = (lo[w"/plain"] > hi[w"/openssl"]) && (lo[w"/plain"] > hi[w"/tls-session"])
-            printf "  control: plain beats both TLS legs disjointly: %s\n", ok ? green "YES" off : red "NO - RIG SUSPECT" off
+            ok = 1
+            for (li=2; li<=4; li++) { k=w "/" ls[li]; if ((k in lo) && lo[w"/plain"] <= hi[k]) ok = 0 }
+            printf "  control: plain beats every TLS leg disjointly: %s\n", ok ? green "YES" off : red "NO - RIG SUSPECT" off
         }
-        if ((w"/openssl") in lo && (w"/tls-session") in lo) {
-            if (lo[w"/openssl"] > hi[w"/tls-session"])
-                printf "  verdict: openssl ABOVE tls-session, ranges DISJOINT (med %+.1f%%)\n", (medv[w"/openssl"]/medv[w"/tls-session"]-1)*100
-            else if (lo[w"/tls-session"] > hi[w"/openssl"])
-                printf "  verdict: tls-session ABOVE openssl, ranges DISJOINT (med %+.1f%%) - PREDICTION FALSIFIED\n", (medv[w"/tls-session"]/medv[w"/openssl"]-1)*100
-            else
-                printf "  verdict: ranges OVERLAP - indistinguishable on this rig; quote NO delta\n"
-        }
+        verdict(w, "openssl", "tls-session")
+        verdict(w, "tls-session", "sslstream")
+        verdict(w, "openssl", "sslstream")
     }
 }' "$CSV"
 echo

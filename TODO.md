@@ -51,8 +51,9 @@ server-heavy rigs care about).
 3. verify-tlsname / verify-tls-floor refusal batteries not run against this provider (the scratch pump
    covered the name/chain refusals, but not the on-the-wire SNI-announce assertions nor the
    below-floor-must-be-REFUSED cell — the floor was only tested in the accepting direction).
-4. Cross-ENGINE interop (tls-session client ↔ openssl server and the reverse) — self-tests pair the
-   provider with itself.
+4. Cross-ENGINE interop — PARTLY covered 2026-10-16: tls-session ↔ sslstream (both directions, one
+   shared certificate) PASS in the scratch pump battery. Still open: tls-session ↔ openssl (needs the
+   OpenSSL provider driven through the same in-process pump, or a two-process SmokeTest pairing).
 5. Windows is UNVERIFIED: the SChannel-PAL persisted-key round-trip in `CreateSelfSignedLoopback` is
    written to match the SChannel provider's but has not run; `--tls-session` vs `--tls-schannel` on
    Windows is the most interesting A/B of all (same OS engine, two wrappings).

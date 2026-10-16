@@ -170,6 +170,18 @@ for (int i = 0; i < args.Length; i++)
             options.TlsClient.TargetHost = "localhost";
             break;
 #endif
+
+#if NET10_0_OR_GREATER
+        case "--tls-sslstream":
+            // Real TLS via SslStream bridged into the push loop — the MEASUREMENT REFERENCE leg of the
+            // engine A/B ("what does the ecosystem's standard TLS shape cost in here"), not a production
+            // option; see SslStreamTlsFilter's remarks for what the bridge charges. Same loopback shape,
+            // floor and opt-out as the other engines; banner: tls=sslstream.
+            options.Tls = SocketSets.Tls.SslStreamBridge.SslStreamTlsProvider.CreateSelfSignedLoopback("localhost",
+                minProtocol: args.Contains("--tls-min12") ? SocketSets.Tls.TlsProtocol.Tls12 : SocketSets.Tls.TlsProtocol.Tls13);
+            options.TlsClient.TargetHost = "localhost";
+            break;
+#endif
 #endif
 
         case "--rio":
@@ -519,6 +531,8 @@ if (!server && clientCount == 0)
     Console.WriteLine("  --tls             no-crypto identity filter — plumbing test only, no security");
     Console.WriteLine("  --tls-ssl         real TLS via OpenSSL memory BIOs (userspace transform)");
     Console.WriteLine("  --tls-schannel    real TLS via Windows SSPI/SChannel (userspace transform; Windows only)");
+    Console.WriteLine("  --tls-session     real TLS via the in-box .NET 11 TlsBufferSession engine (net11 builds only)");
+    Console.WriteLine("  --tls-sslstream   real TLS via SslStream bridged into the loop — the A/B reference leg (net10+)");
     Console.WriteLine("  --ktls            as --tls-ssl but offloading bulk crypto to the kernel (io_uring/Linux only)");
     Console.WriteLine("  --alpn a,b        offer these ALPN ids from both ends (e.g. h2,http/1.1) and report what won");
     Console.WriteLine("  --alpn-server a,b give the server a different list (preference / no-overlap testing)");
