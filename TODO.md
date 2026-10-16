@@ -42,9 +42,10 @@ per-connection because TargetHost rides in it; the SERVER context is shared, whi
 server-heavy rigs care about).
 
 **Still open, in rough order:**
-1. **Perf A/B vs openssl/schannel — no numbers exist yet and none are quoted on purpose** (house rules:
-   six scored passes, ranges, a control in-session). The rig is ready: same cell, `--tls-session` vs
-   `--tls-ssl`, banner-gated.
+1. ~~Perf A/B vs openssl~~ **DONE 2026-10-16** — `bench/run-tls-engine-ab.sh`, scored to the house
+   standard; openssl ahead ~11% in both regimes, ranges disjoint. See RESULTS.md ("TLS ENGINE A/B").
+   The scoring exposed and fixed a quadratic carry compact in `TlsSessionFilter` (memmove per record →
+   consume cursor). The schannel half of the A/B is item 5 (Windows).
 2. The smoke matrix builds `-f net10.0`, so NO standing gate covers this provider — a net11 matrix
    column (or a separate `run-smoke-matrix11.sh` leg) is needed before it can be trusted to stay green.
 3. verify-tlsname / verify-tls-floor refusal batteries not run against this provider (the scratch pump
@@ -55,6 +56,12 @@ server-heavy rigs care about).
 5. Windows is UNVERIFIED: the SChannel-PAL persisted-key round-trip in `CreateSelfSignedLoopback` is
    written to match the SChannel provider's but has not run; `--tls-session` vs `--tls-schannel` on
    Windows is the most interesting A/B of all (same OS engine, two wrappings).
+6. **(found 2026-10-16, by the A/B rig's plaintext control, NOT a TLS issue)** SmokeTest on the MANAGED
+   backend WEDGES at `-z 262144 --window 4 --page 262144` with the default 4KB receive buffer: round-trips
+   freeze ~35 messages in, connections stay up, no fault — `--recv-buffer 262144` clears it entirely
+   (~18 GiB/s). The TLS legs sail at the same shape because records are 16KB. Undiagnosed: could be the
+   echo harness's flow at huge-message ping-pong rather than the transport, but a silent stall that looks
+   exactly like a slow transport is worth a cause either way. Rig: `bench/run-tls-engine-ab.sh`.
 
 ---
 

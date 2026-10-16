@@ -24,6 +24,46 @@ bombardier. Run it from the repo's `bench/` folder; raw CSV and per-leg logs lan
 > on server-shaped ones. **[`IOCP-VS-RIO.md`](IOCP-VS-RIO.md)** has the measurements, the recommendation,
 > and the eight things tried that did not change it.
 
+## TLS ENGINE A/B: tls-session vs openssl (2026-10-16, Linux, net11 RC1) — openssl ahead ~11% in both regimes, ranges disjoint
+
+The first scored numbers for the `tls-session` provider (the in-box .NET 11 `TlsBufferSession`, branch
+`tls-session-provider`), against the OpenSSL memory-BIO provider. Rig: **`bench/run-tls-engine-ab.sh`** —
+one net11.0 SmokeTest binary, managed backend, legs differ only by TLS flag, every run gated on the `set:`
+banner (`tls=openssl` / `tls=tls-session` / `tls=off`), seven passes with the first discarded, leg order
+reshuffled per pass, plaintext control read first. Host: kernel 7.1.5, `performance` governor, 24 logical
+CPUs, loopback, client+server in ONE process (so the legs share CPUs — fine for A/B, not an absolute
+throughput claim). SDK 11.0.100-rc.1; the engine is `[Experimental]`, so this number has an expiry date.
+
+Six scored passes, MiB/s, median (min-max):
+
+| leg | 4k-w64 (records, loop overhead) | 256k-w4 (bulk crypto, `--recv-buffer 262144`) |
+|---|---:|---:|
+| plain (control) | 3,242 (3,210-3,273) | 19,446 (19,337-19,813) |
+| openssl | 2,359 (2,302-2,401) | 8,471 (8,359-8,609) |
+| tls-session | 2,132 (2,114-2,171) | 7,594 (7,554-7,627) |
+
+**Verdict: openssl ABOVE tls-session in BOTH regimes, ranges DISJOINT — median +10.7% at 4k-w64,
++11.5% at 256k-w4.** The pre-registered prediction (tls-session trails) held. Per-leg spread is tight
+(0.9-2.7%), and the control behaved (plain disjointly above both TLS legs in every pass). A consistent
+~11% deficit in BOTH regimes suggests a per-wake/per-record wrapper-and-engine overhead rather than a
+cipher gap — the PAL uses the same OpenSSL underneath on this box.
+
+**The rig caught two real things before scoring anything, both worth more than the headline:**
+
+1. **The plaintext control WEDGED at the 256k shape** (default 4KB receive buffer): round-trips froze ~35
+   messages in while a "TLS leg" sailed at 5 GiB/s — impossible, therefore rig failure, exactly what the
+   known-answer control is for. `--recv-buffer 262144` clears it; recorded as TODO item 6 (undiagnosed).
+2. **The first dry run measured OUR WRAPPER, not the engine**: `TlsSessionFilter`'s carry buffer did a
+   memmove per RECORD, which goes quadratic on large receives (~16 records per 256KB chunk) — tls-session
+   DROPPED from 4.2 to 2.0 GiB/s when receive chunks grew, the opposite direction to openssl. Replaced
+   with a consume CURSOR (compact at most once per Append): the bulk cell went 2.0 → 7.6 GiB/s, and only
+   THEN was the A/B worth scoring. The SChannel filter's per-record compact is structural (SSPI decrypts
+   in place); this one was not.
+
+Caveats: single box, loopback, one process for both ends; TLS 1.3, AES-GCM, self-signed loopback trust;
+the managed backend only (the provider's target). No kTLS leg — the session API has no offload seam, which
+is the standing structural difference, not an 11% one.
+
 ## THE `-P 1` CLIENT CEILING: THE RIG WAS UNDER-THREADED BY TWO CPUs (2026-09-11, Linux)
 
 The `-P 1` column of the proxy A/B could not separate us from Envoy: both legs sat at 90% of a

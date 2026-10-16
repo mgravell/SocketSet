@@ -594,6 +594,9 @@ string mode = window == 1 ? "ping/pong" : window == int.MaxValue ? "pipeline(unb
 Console.WriteLine(
     $"backend={options.Factory.GetType().Name} transport={(uds is null ? "tcp" : "uds")} " +
     $"mode={mode} size={size} shards={options.Shards} pin={options.PinWorkerThreads} poke={poke}");
+// The full set banner (tls=<provider> etc.) in EVERY mode, not just churn: an A/B gates on what the
+// process says it did, never on the flag it was handed. Until now only the churn path printed it.
+Console.WriteLine($"set: {set}");
 
 #if NET
 if (server && adopt)

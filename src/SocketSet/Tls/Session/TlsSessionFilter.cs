@@ -60,8 +60,11 @@ internal sealed class TlsSessionFilter : TlsFilter
     // is cleared on return anyway: one rule for every TLS carry buffer beats a per-engine argument about
     // which ones are sensitive.
     private byte[] _carry;
-    private int _carryLen;
-    private int _highWater;
+    private int _carryStart; // consume cursor: Read takes whole records from the front, and a memmove per
+                             // record went quadratic on large receives (16 records per 256KB chunk measured
+                             // ~4x off openssl, 2026-10-16); compaction now happens at most once per Append
+    private int _carryLen;   // live bytes starting at _carryStart
+    private int _highWater;  // furthest byte ever written (so clear-on-return costs what was used)
 
     internal TlsSessionFilter(TlsSessionProvider owner, bool client, TlsContext context, bool ownsContext, string? verifyName)
     {
@@ -337,6 +340,7 @@ internal sealed class TlsSessionFilter : TlsFilter
         {
             PooledBuffers.ReturnCleared(_carry, _highWater);
             _carry = [];
+            _carryStart = 0;
             _carryLen = 0;
             _highWater = 0;
         }
@@ -346,7 +350,7 @@ internal sealed class TlsSessionFilter : TlsFilter
     // Plumbing
     // ===================================================================================
 
-    private ReadOnlySpan<byte> Carry => _carry.AsSpan(0, _carryLen);
+    private ReadOnlySpan<byte> Carry => _carry.AsSpan(_carryStart, _carryLen);
 
     /// <summary>Collect whatever the session stashed because an earlier destination was too small. Returns
     /// the number of bytes moved, so callers can count it as progress.</summary>
@@ -379,24 +383,32 @@ internal sealed class TlsSessionFilter : TlsFilter
         if (_carry.Length < need)
         {
             byte[] bigger = ArrayPool<byte>.Shared.Rent(Math.Max(need, _carry.Length * 2));
-            _carry.AsSpan(0, _carryLen).CopyTo(bigger);
+            Carry.CopyTo(bigger);
             PooledBuffers.ReturnCleared(_carry, _highWater);
             _carry = bigger;
+            _carryStart = 0;
             _highWater = _carryLen;
         }
-        data.CopyTo(_carry.AsSpan(_carryLen));
+        else if (_carryStart > 0 && _carryStart + need > _carry.Length)
+        {
+            // The live tail fits the buffer but not at the cursor: compact once, here, rather than on
+            // every Consume — this is the whole point of the cursor.
+            Carry.CopyTo(_carry);
+            _carryStart = 0;
+        }
+        data.CopyTo(_carry.AsSpan(_carryStart + _carryLen));
         _carryLen = need;
-        if (need > _highWater) _highWater = need;
+        if (_carryStart + need > _highWater) _highWater = _carryStart + need;
     }
 
-    /// <summary>The session consumes from the FRONT (bytesConsumed), so retain the tail. Source and
-    /// destination overlap; Span.CopyTo is a memmove, so that is fine.</summary>
+    /// <summary>The session consumes from the FRONT (bytesConsumed): advance the cursor and copy nothing.
+    /// The tail is only ever moved by <see cref="Append"/>, at most once per receive.</summary>
     private void Consume(int consumed)
     {
         if (consumed <= 0) return;
-        if (consumed >= _carryLen) { _carryLen = 0; return; }
-        _carry.AsSpan(consumed, _carryLen - consumed).CopyTo(_carry);
+        if (consumed >= _carryLen) { _carryLen = 0; _carryStart = 0; return; }
         _carryLen -= consumed;
+        _carryStart += consumed;
     }
 
     private TlsHandshakeStatus Fault(string reason)
